@@ -99,16 +99,20 @@ const STEP_LABELS: Record<string, string> = {
   llm_library: "library scan",
 };
 
+/** ["final picks 12,340", "web search 4,100"] for a by-step token map, largest first, zeros dropped. */
+export function tokenSteps(byStep?: Record<string, number>): string[] {
+  if (!byStep) return [];
+  return Object.entries(byStep)
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([step, n]) => `${STEP_LABELS[step] ?? step} ${n.toLocaleString()}`);
+}
+
 /** "final picks 12,340 · web search 4,100" for a by-step token map, or "" when empty. Callers wrap
  *  it in parentheses or not, whichever their sentence needs — the two previous copies differed only
  *  by that punctuation. */
 export function tokenStepBreakdown(byStep?: Record<string, number>): string {
-  if (!byStep) return "";
-  return Object.entries(byStep)
-    .filter(([, n]) => n > 0)
-    .sort((a, b) => b[1] - a[1])
-    .map(([step, n]) => `${STEP_LABELS[step] ?? step} ${n.toLocaleString()}`)
-    .join(" · ");
+  return tokenSteps(byStep).join(" · ");
 }
 
 /** " · N web search(es)" when any ran, else "". Shown apart from tokens because an external search is

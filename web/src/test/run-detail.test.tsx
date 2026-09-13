@@ -383,7 +383,10 @@ describe("RunDetailPage — grouped by library", () => {
 
     await expandRows();
 
-    expect(await screen.findByText("300,000 in · 60,699 out")).toBeInTheDocument();
+    // The tile's text, not one element's: each part of the hint is its own element so a narrow tile
+    // wraps between "300,000 in" and "60,699 out" rather than inside either.
+    const tile = (await screen.findByText("AI tokens")).closest("[title]");
+    expect(tile).toHaveTextContent("300,000 in · 60,699 out");
   });
 
   it("says what the AI-token figure counts, cache included", async () => {

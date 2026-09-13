@@ -1494,7 +1494,8 @@ by what the AI did, plus any **web searches**. Those are counted separately, sin
 billed (or rate-limited) per request rather than per token.
 
 The token figure is input plus output, as your AI provider reported each call, which is what it
-bills on. The tile shows the two apart, because output costs several times more than input. With Claude nothing is cached, so it is every token sent and received. OpenAI and Gemini
+bills on. The tile shows the two apart, because output costs several times more than input, and
+under them how many tokens each AI step used (web search, library scan, final picks). With Claude nothing is cached, so it is every token sent and received. OpenAI and Gemini
 include any input they served from their own prompt cache, which they bill at a discount. The 7-day
 web-search cache saves searches, not tokens. The runs list shows each run's token total at a glance. Use it to spot
 which people cost the most, then tune with the levers above.

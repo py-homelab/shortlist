@@ -7,13 +7,32 @@ import {
   Sparkles,
   Users,
 } from "lucide-react";
+import { Fragment } from "react";
 
 import { StatTile } from "@/components/stat-tile";
 import { formatDuration, runElapsedMs } from "@/lib/format";
-import { tokenStepBreakdown } from "@/lib/run-format";
+import { tokenSteps } from "@/lib/run-format";
 import type { RunDetail } from "@/lib/types";
 
 /** The finished-run stats as at-a-glance tiles (Dashboard style) rather than one dense text line. */
+
+/**
+ * A hint's parts joined by " · ", wrapping between parts before it wraps inside one: "web search" at
+ * the end of one line and "467,463" at the start of the next reads as two separate figures. Each part
+ * is an inline-block, so a tile too narrow for a whole part still wraps it rather than overflowing.
+ * The dot rides at the end of the part before it, so no line starts with one.
+ */
+function HintParts({ parts }: { parts: string[] }) {
+  return parts.map((part, i) => (
+    <Fragment key={part}>
+      {i > 0 && " "}
+      <span className="inline-block">
+        {part}
+        {i < parts.length - 1 && " ·"}
+      </span>
+    </Fragment>
+  ));
+}
 
 /** What "0 requested" was arrived at from.
  *
@@ -85,30 +104,48 @@ export function RunStatTiles({ run }: { run: RunDetail }) {
   ]
     .filter(Boolean)
     .join(", ");
-  // "web search 467,463 · final picks 52,625 tokens" — the trailing unit makes clear these are token
-  // counts, not the (separate) Exa search count shown in its own tile below.
-  const stepInline = tokenStepBreakdown(s.llm_tokens_by_step);
+  // "web search 467,463 · final picks 52,625" — which AI step the tokens went to.
+  const steps = tokenSteps(s.llm_tokens_by_step);
   // In and out rather than one total when the run measured both: output is billed at several times the
-  // input rate (5x on Claude Haiku), so a total alone cannot say where the money went. A run recorded
-  // before the split was measured keeps the older wording.
+  // input rate (5x on Claude Haiku), so a total alone cannot say where the money went. The steps stay
+  // too, on a line of their own — the split replaced them outright once, and nobody asked for that. A
+  // run recorded before the split was measured keeps the older wording.
   const output = s.llm_output_tokens;
   const tokenHint =
-    output != null && output <= tokens
-      ? `${(tokens - output).toLocaleString()} in · ${output.toLocaleString()} out`
-      : stepInline
-        ? `${stepInline} · sent + received`
-        : "sent + received";
+    output != null && output <= tokens ? (
+      <>
+        <span className="block">
+          <HintParts
+            parts={[
+              `${(tokens - output).toLocaleString()} in`,
+              `${output.toLocaleString()} out`,
+            ]}
+          />
+        </span>
+        {steps.length > 0 && (
+          <span className="block">
+            <HintParts parts={steps} />
+          </span>
+        )}
+      </>
+    ) : steps.length > 0 ? (
+      `${steps.join(" · ")} · sent + received`
+    ) : (
+      "sent + received"
+    );
   // The two AI tiles are conditional, so the track count has to be too. Hard-coding six left a
   // no-AI run's four tiles filling two-thirds of the row with a third of it blank, which reads as
   // something that failed to load. Full class strings — Tailwind cannot see an interpolated one.
+  // Six or seven across waits for `xl`: at `lg` the sidebar leaves about 720px, and seven tiles there
+  // broke "6m 47s" and "520,088" over two lines each and stacked the token hint nine lines deep.
   const showTokens = tokens > 0;
   const showExa = exa > 0 || exaCacheHits > 0;
   const tiles = 5 + (showTokens ? 1 : 0) + (showExa ? 1 : 0);
   const columns =
     tiles === 7
-      ? "sm:grid-cols-3 lg:grid-cols-7"
+      ? "sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-7"
       : tiles === 6
-        ? "sm:grid-cols-3 lg:grid-cols-6"
+        ? "sm:grid-cols-3 xl:grid-cols-6"
         : "sm:grid-cols-3 lg:grid-cols-5";
   return (
     <div className={`grid grid-cols-2 gap-3 ${columns}`}>
