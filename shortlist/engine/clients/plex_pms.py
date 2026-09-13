@@ -663,6 +663,7 @@ class PlexClient:
                         slug = label.tag[len(prefix) :].lower()
                         row = owned.setdefault(slug, OwnedRow(label=label.tag))
                         row.rating_keys.append(collection.ratingKey)
+                        row.section_types.add(section.type)
         return owned
 
     def marked_account_ids(self) -> set[int]:

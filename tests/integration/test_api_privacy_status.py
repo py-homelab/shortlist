@@ -59,7 +59,9 @@ def _stored_everywhere(value: str) -> dict[str, str]:
     return {"filterMovies": value, "filterTelevision": value}
 
 
-def _rows_on_plex(monkeypatch, slugs: list[str], *, marked_but_unlabelled: int = 0) -> None:
+def _rows_on_plex(
+    monkeypatch, slugs: list[str], *, marked_but_unlabelled: int = 0, library_types: set[str] | None = None
+) -> None:
     """The per-person rows that exist on the PMS right now.
 
     `owned_row_surfaces` is NOT optional on this fake. `existing_row_labels` only consults it when
@@ -71,7 +73,7 @@ def _rows_on_plex(monkeypatch, slugs: list[str], *, marked_but_unlabelled: int =
     """
     from shortlist.server.services import privacy_status
 
-    owned = {slug: OwnedRow(label=f"shortlist_{slug}") for slug in slugs}
+    owned = {slug: OwnedRow(label=f"shortlist_{slug}", section_types=set(library_types or ())) for slug in slugs}
     surfaces = [{"marked": True}] * marked_but_unlabelled
     monkeypatch.setattr(
         privacy_status,
@@ -304,7 +306,7 @@ class TestTheVerdictIsAlwaysALiveRead:
                 {"slug": "mike", "plex_account_id": 1001, "enabled": True},
             ],
         )
-        _rows_on_plex(monkeypatch, ["sarah", "mike"])
+        _rows_on_plex(monkeypatch, ["sarah", "mike"], library_types={"movie", "show"})
         filters = {"filterMovies": "label!=shortlist_mike"}
         if tv_filter is not None:
             filters["filterTelevision"] = tv_filter
@@ -316,6 +318,45 @@ class TestTheVerdictIsAlwaysALiveRead:
         assert sarah["missing"] == ["shortlist_mike"]
         assert sarah["state"] == "missing"
         assert sarah["hides"] == []
+
+    def test_a_row_only_in_movie_libraries_is_hidden_by_the_movies_filter_alone(self, client: TestClient, monkeypatch):
+        """`filterTelevision` only applies to TV libraries, so it has nothing to hide for a row that lives in
+        none. Asking it to carry the exclude anyway would report a leak on every movies-only server."""
+        _seed_users(
+            client,
+            [
+                {"slug": "sarah", "plex_account_id": 1000, "enabled": True},
+                {"slug": "mike", "plex_account_id": 1001, "enabled": True},
+            ],
+        )
+        _rows_on_plex(monkeypatch, ["sarah", "mike"], library_types={"movie"})
+        _roster(
+            monkeypatch,
+            {"sarah": {"filterMovies": "label!=shortlist_mike", "filterTelevision": ""}},
+            ids={"sarah": 1000},
+        )
+
+        body = client.get("/api/privacy/status").json()
+
+        sarah = next(a for a in body["accounts"] if a["slug"] == "sarah")
+        assert sarah["missing"] == []
+        assert sarah["state"] == "hiding"
+
+    def test_a_row_whose_libraries_are_unknown_must_be_hidden_in_both(self, client: TestClient, monkeypatch):
+        """No library read, no claim: the conservative answer is that either filter may be the one that shows it."""
+        _seed_users(
+            client,
+            [
+                {"slug": "sarah", "plex_account_id": 1000, "enabled": True},
+                {"slug": "mike", "plex_account_id": 1001, "enabled": True},
+            ],
+        )
+        _rows_on_plex(monkeypatch, ["sarah", "mike"])
+        _roster(monkeypatch, {"sarah": {"filterMovies": "label!=shortlist_mike"}}, ids={"sarah": 1000})
+
+        body = client.get("/api/privacy/status").json()
+
+        assert next(a for a in body["accounts"] if a["slug"] == "sarah")["missing"] == ["shortlist_mike"]
 
     def test_one_unreadable_field_leaves_nothing_counted_as_hidden(self, client: TestClient, monkeypatch):
         _seed_users(

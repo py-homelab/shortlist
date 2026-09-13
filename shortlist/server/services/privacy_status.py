@@ -101,10 +101,16 @@ def per_person_excludes(account: dict) -> list[str]:
     return [v for v in account["shortlist_excludes"] if not unquote(v).lower().startswith(shared)]
 
 
+#: The library type each restricted share filter applies to.
+_FILTER_LIBRARY_TYPE = {"filterMovies": "movie", "filterTelevision": "show"}
+_EVERY_LIBRARY_TYPE = frozenset(_FILTER_LIBRARY_TYPE.values())
+
+
 def existing_row_labels(
     store: SettingsStore,
     fail: Callable[[BaseException], str],
     plex_factory: Callable[[SettingsStore], object] | None = None,
+    library_types: dict[str, set[str]] | None = None,
 ) -> tuple[set[str], str | None]:
     """Lowercased labels of the PER-PERSON rows that exist on Plex right now, plus why not if unread.
 
@@ -128,6 +134,7 @@ def existing_row_labels(
             this install's own identity (rule 9). Passed in because the support report scrubs with the
             per-request literals its own `ContextVar` carries.
         plex_factory: Optional PMS client factory; defaults to this module's.
+        library_types: When given, filled with each returned label's library types ("movie", "show").
 
     Returns:
         ``(labels, error)``. An error means UNKNOWN, never "none": a read that failed must not be
@@ -141,6 +148,10 @@ def existing_row_labels(
         owned = plex.owned_collections(LABEL_PREFIX)
         shared_prefix = SHARED_LABEL_PREFIX.lower()
         labels = {row.label.lower() for row in owned.values() if not row.label.lower().startswith(shared_prefix)}
+        if library_types is not None:
+            for row in owned.values():
+                if row.label.lower() in labels:
+                    library_types[row.label.lower()] = set(row.section_types)
         if not labels:
             # Same client, so the collection list is already cached — this costs no extra listing read.
             marked = sum(1 for row in plex.owned_row_surfaces(flags=False) if row.get("marked"))
@@ -204,7 +215,8 @@ def read_sharing_status(
     # hiding from themselves (see `privacy.desired_excludes`).
     all_users = session.query(User).all()
     labelled = {u.plex_account_id: f"{PER_PERSON_LABEL_PREFIX}{u.slug}".lower() for u in all_users}
-    all_labels, status.rows_error = existing_row_labels(store, fail, plex_factory)
+    library_types: dict[str, set[str]] = {}
+    all_labels, status.rows_error = existing_row_labels(store, fail, plex_factory, library_types)
     status.rows_on_plex = sorted(all_labels)
     # plex.tv gives us a USERNAME; `person()` and every other tool key on a SLUG, and `slugify`
     # lowercases and replaces punctuation — so they differ for essentially every real account
@@ -233,16 +245,17 @@ def read_sharing_status(
         ours: dict[str, list[str]] = {}
         theirs: list[str] = []
         # Our labels Plex actually APPLIES, not merely stores (#116): one behind a `|` is ORed away.
-        # Our labels Plex applies in EVERY restricted field: a label enforced in TV must not vouch for the
-        # Movies filter that ORs the same label away (#116's own shape). A field Plex cannot read applies
-        # nothing at all, and neither does one holding none of our labels: every run merges the excludes
-        # into both, so an empty one was cleared or never reached, and that account sees every row there.
-        enforced_per_field: list[set[str]] = []
+        # Our labels Plex applies, per restricted field. A row is hidden only when EVERY field for a library
+        # it is in applies its label: one enforced in TV must not vouch for the Movies filter that ORs the
+        # same label away (#116's own shape), and a TV filter holding none of our labels (cleared, or never
+        # reached) shows every TV row whatever the Movies filter says. A field Plex cannot read applies
+        # nothing at all.
+        enforced_by_field: dict[str, set[str]] = {}
         unreadable = False
         for name in privacy.RESTRICTED_FILTER_FIELDS:
             raw = account.filters.get(name) or ""
+            enforced_by_field[name] = set()
             if not raw:
-                enforced_per_field.append(set())
                 continue
             try:
                 conditions = privacy.parse_filter(raw)
@@ -250,7 +263,6 @@ def read_sharing_status(
                 # A filter we cannot parse is reported verbatim rather than mis-attributed — the
                 # engine refuses to rewrite one too.
                 theirs.append(f"{name}: {raw} (unparseable)")
-                enforced_per_field.append(set())
                 continue
             candidates = {unquote(v).lower() for c in conditions for v in c.values if is_our_label(v)}
             # A raw `&` inside a value: Plex cannot read this filter at all (measured), so nothing in it is
@@ -258,7 +270,7 @@ def read_sharing_status(
             if privacy.plex_cannot_read(raw):
                 unreadable = True
             else:
-                enforced_per_field.append(candidates - privacy.unenforced_excludes(raw, candidates))
+                enforced_by_field[name] = candidates - privacy.unenforced_excludes(raw, candidates)
             for condition in conditions:
                 mine = [v for v in condition.values if is_our_label(v)]
                 others = [v for v in condition.values if not is_our_label(v)]
@@ -268,7 +280,20 @@ def read_sharing_status(
                     joined = ",".join(others)
                     theirs.append(f"{name}: {condition.field}{condition.op}{joined}" if joined else f"{name}: —")
         ours_flat = sorted({label for labels in ours.values() for label in labels})
-        enforced = set() if unreadable or not enforced_per_field else set.intersection(*enforced_per_field)
+        enforced = (
+            set()
+            if unreadable
+            else {
+                label
+                for label in all_labels
+                if all(
+                    label in enforced_by_field[name]
+                    for name, kind in _FILTER_LIBRARY_TYPE.items()
+                    # Where its rows are is unknown: either filter may be the one that shows it.
+                    if kind in (library_types.get(label) or _EVERY_LIBRARY_TYPE)
+                )
+            }
+        )
         should_hide = all_labels - {labelled.get(account.id, "")}
         status.accounts.append(
             {

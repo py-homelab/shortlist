@@ -1316,6 +1316,9 @@ class OwnedRow:
 
     label: str  # as stored by Plex, which title-cases labels
     rating_keys: list[int] = field(default_factory=list)
+    # The TYPES of library the rows are in ("movie", "show"). A share filter is per type
+    # (`filterMovies`, `filterTelevision`), so this is which filters have a row of theirs to hide.
+    section_types: set[str] = field(default_factory=set)
 
 
 @dataclass

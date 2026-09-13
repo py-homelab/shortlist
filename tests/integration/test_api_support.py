@@ -34,7 +34,9 @@ def _rows_on_plex(monkeypatch, slugs) -> None:
     import shortlist.server.api.support as support
     from shortlist.engine.models import OwnedRow
 
-    owned = {slug: OwnedRow(label=f"shortlist_{slug}") for slug in slugs}
+    # In a movie library, as `owned_row_surfaces` below says: a share filter is per library type, so which
+    # filter has a row to hide depends on where the row is.
+    owned = {slug: OwnedRow(label=f"shortlist_{slug}", section_types={"movie"}) for slug in slugs}
     monkeypatch.setattr(
         support,
         "_plex_client",
@@ -1671,7 +1673,7 @@ class TestSharingCountsLabelsNotClauses:
         from shortlist.engine.models import SHARED_LABEL_PREFIX, OwnedRow
 
         owned = {
-            "mike": OwnedRow(label="shortlist_mike"),
+            "mike": OwnedRow(label="shortlist_mike", section_types={"movie"}),
             "_shared_popular": OwnedRow(label=f"{SHARED_LABEL_PREFIX}popular"),
         }
         monkeypatch.setattr(
