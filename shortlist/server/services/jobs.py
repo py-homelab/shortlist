@@ -1438,7 +1438,7 @@ def _user_restore(state, payload: dict) -> dict:
             # on a surface their row's placement may have switched off.
             row_name_template=(user.prefs or {}).get("row_name_tpl"),
         )
-        # {delivered title -> row slug} rebuilt from the last run's breakdown, which is the same map
+        # {(library, delivered title) -> row slug} rebuilt from the last run's breakdown — the same map
         # `_promote_phase` passes. It is the only way to place a `{top_seed}` row: its title is
         # different every run, so it cannot be re-rendered from the template here.
         marker = row_marker(user.plex_account_id)
@@ -1446,10 +1446,13 @@ def _user_restore(state, payload: dict) -> dict:
         run_user = (
             session.query(RunUser).filter_by(run_id=latest.id, user_id=user.id).first() if latest is not None else None
         )
+        # Keyed by LIBRARY and title, as `promote_user_rows` reads it: two of one person's rows may share
+        # a title in different libraries (issue #121). An entry recorded without its library can't be
+        # placed safely by title, so it is left to the ledger and the rendered-title fallback.
         placements = {
-            entry["row_title"] + marker: entry["row_slug"]
+            (str(entry["library_key"]), entry["row_title"] + marker): entry["row_slug"]
             for entry in ((run_user.breakdown if run_user else None) or [])
-            if entry.get("row_slug") and entry.get("row_title")
+            if entry.get("row_slug") and entry.get("row_title") and entry.get("library_key")
         }
         # The AUTHORITATIVE map: {ratingKey -> row slug} straight from the delivery ledger. Titles
         # above are a fallback for rows delivered before the ledger existed; a `{top_seed}` row has no

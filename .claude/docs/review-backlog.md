@@ -867,3 +867,25 @@ rows key correctly, so this decays to nothing on its own.
 
 What it means for anyone reading the dashboard in the meantime: shared-row watch counts start from
 the first run after the upgrade, not from the row's whole history.
+
+## FIXED 2026-09-13: last-run titles matched in every library on an on-demand removal
+
+Found by the Architecture Review of the issue #121 fix. **Older than that fix; not a regression.**
+
+`collection_reconcile._walk_row_collections` unions `_delivered_titles_by_user` (the last run's
+recorded titles for this row) into `displays` and throws away the library each was recorded in. The
+#121 guard (`titles_other_rows_build`) renders other rows WITHOUT picks, so for a `{top_seed}` row it
+claims only its fallback name, never the "Because you watched X" it actually wore.
+
+Precondition: one person has two `{top_seed}` rows, one Movies-only and one TV-only, and on the last
+run both rendered the same title (both seeded by the same watch). Deleting, switching off or
+resetting the poster of the Movies row then matches the TV row's collection by that recorded title.
+The title-clash check never compared `{top_seed}` templates, so this pair was always allowable.
+
+*Fixed in the same change:* `collection_reconcile._claimed_titles` adds, for every OTHER `{top_seed}`
+row this person is in the audience of, the `(library_key, title)` pairs the delivery ledger last
+recorded for it — per row, so it does not depend on which row the latest run happened to build. A
+claim only ever blocks a title match; it never selects a collection. Static rows are left out because
+a rename writes no ledger entry, so their recorded title can go stale. Pinned by
+`test_collection_reconcile.py::TestATitleAnotherRowBuildsUnderIsNeverThisRows::
+test_what_another_top_seed_row_was_delivered_as_is_claimed_in_that_library`.

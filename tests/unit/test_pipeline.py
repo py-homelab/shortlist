@@ -2011,7 +2011,7 @@ class TestPerRowOverrides:
 
         report = pipeline_mod.run(ctx, [sarah])
 
-        titles = [strip_marker(t) for t in report.users[0].placement_titles]
+        titles = [strip_marker(t) for _library, t in report.users[0].placement_titles]
         assert titles == ["Because you watched Fargo"]
         picks = next(e for e in report.users[0].breakdown if e["library_title"] == "Movies")["picks"]
         assert {p["seed_title"] for p in picks} == {"Fargo"}, "every pick answers to the seed the row names"
@@ -2032,7 +2032,7 @@ class TestPerRowOverrides:
         picks = next(e for e in report.users[0].breakdown if e["library_title"] == "Movies")["picks"]
         ids = [p["tmdb_id"] for p in picks]
         assert {12, 13, 14} <= set(ids), f"unchanged seed keeps the normal carry-forward, got {ids}"
-        titles = [strip_marker(t) for t in report.users[0].placement_titles]
+        titles = [strip_marker(t) for _library, t in report.users[0].placement_titles]
         assert titles == ["Because you watched Fargo"]
 
     def test_a_named_row_rebuilds_when_RANKING_moves_the_seed_its_title_uses(self, ctx: EngineContext, mock_plextv):
@@ -2057,7 +2057,7 @@ class TestPerRowOverrides:
 
         picks = next(e for e in report.users[0].breakdown if e["library_title"] == "Movies")["picks"]
         lead = min(picks, key=lambda p: p["rank"])
-        titles = [strip_marker(t) for t in report.users[0].placement_titles]
+        titles = [strip_marker(t) for _library, t in report.users[0].placement_titles]
         assert titles == [f"Because you watched {lead['seed_title']}"], f"got {titles}, lead {lead}"
         # Not "every pick shares that seed" — above one seed a `{top_seed}` row names its strongest
         # watch and legitimately holds others, which is the trade-off the seed-budget callout warns
@@ -2105,7 +2105,7 @@ class TestPerRowOverrides:
 
         report = pipeline_mod.run(ctx, [sarah])
 
-        titles = [strip_marker(t) for t in report.users[0].placement_titles]
+        titles = [strip_marker(t) for _library, t in report.users[0].placement_titles]
         assert titles != ["Because you watched Chernobyl"], "a frozen cadence must not strand the title"
         picks = next(e for e in report.users[0].breakdown if e["library_title"] == "Movies")["picks"]
         lead = min(picks, key=lambda p: p["rank"])
@@ -2383,7 +2383,7 @@ class TestPerRowOverrides:
         for pick_order in ("best", "rating", "newest", "shuffle"):
             self._two_seed_named_row_ctx(ctx, pick_order)
             report = pipeline_mod.run(ctx, [sarah])
-            titles[pick_order] = [strip_marker(t) for t in report.users[0].placement_titles]
+            titles[pick_order] = [strip_marker(t) for _library, t in report.users[0].placement_titles]
 
         assert len({tuple(t) for t in titles.values()}) == 1, f"the order must not rename the row, got {titles}"
         # Tied back to the data rather than a literal name: whichever seed wins the ranking, the title
@@ -3393,6 +3393,70 @@ class TestPlacement:
             coll, shared=True, home=False, recommended=False
         )  # excluded → NOT mapped; friend → no home
 
+    def _same_title_in_two_libraries(self, ctx: EngineContext):
+        """Issue #121's shape: a Movies-only row and a TV-only row of one person, both titled "Friday",
+        with DIFFERENT placements — so a collection handed the other row's spec is visibly wrong."""
+        from shortlist.engine.delivery import row_marker
+        from shortlist.engine.models import RowSpec, UserProfile, UserType
+
+        user = UserProfile(username="sarah", plex_account_id=100, user_type=UserType.SHARED, slug="sarah")
+        ctx.config.rows = [
+            RowSpec(slug="friday_movies", name_template="Friday", size=10, media="movie", placement="home"),
+            RowSpec(slug="friday_tv", name_template="Friday", size=10, media="show", placement="library"),
+        ]
+        ctx.config.dry_run = False
+        movies = MagicMock(type="movie", key="1", title="Movies")
+        shows = MagicMock(type="show", key="2", title="TV Shows")
+        ctx.delivery_sections = [movies, shows]
+        ctx.plex.sections.return_value = [movies, shows]
+        movies_c = MagicMock(title="Friday" + row_marker(100), ratingKey=11)
+        shows_c = MagicMock(title="Friday" + row_marker(100), ratingKey=22)
+        ctx.plex.find_owned_collections.side_effect = lambda s, label: [movies_c] if s is movies else [shows_c]
+        return user, movies_c, shows_c
+
+    def _flags(self, ctx: EngineContext) -> dict:
+        return {c.args[0].ratingKey: c.kwargs for c in ctx.plex.promote.call_args_list}
+
+    def test_two_rows_sharing_a_title_in_different_libraries_each_keep_their_own_placement(self, ctx: EngineContext):
+        """The rendered-title fallback was keyed by title alone, so the first row claimed BOTH
+        collections and the TV row's "library only" was silently replaced by the Movies row's Home."""
+        from datetime import UTC, datetime
+
+        from shortlist.engine.models import RunReport, UserRunReport
+        from shortlist.engine.pipeline import _promote_phase
+
+        user, _movies_c, _shows_c = self._same_title_in_two_libraries(ctx)
+        report = RunReport(started_at=datetime.now(UTC), users=[UserRunReport(username="sarah", slug="sarah")])
+
+        _promote_phase(ctx, [user], [], filters_ok=True, report=report)
+
+        assert self._flags(ctx) == {
+            11: {"shared": True, "home": False, "recommended": False},
+            22: {"shared": False, "home": False, "recommended": True},
+        }
+
+    def test_recorded_placement_titles_are_told_apart_by_library(self, ctx: EngineContext):
+        """What a run stamps while delivering. Keyed by title alone, the second row overwrote the first's
+        entry, and the TV row's placement then governed the Movies collection too."""
+        from datetime import UTC, datetime
+
+        from shortlist.engine.delivery import row_marker
+        from shortlist.engine.models import RunReport, UserRunReport
+        from shortlist.engine.pipeline import _promote_phase
+
+        user, _movies_c, _shows_c = self._same_title_in_two_libraries(ctx)
+        title = "Friday" + row_marker(100)
+        recorded = UserRunReport(username="sarah", slug="sarah")
+        recorded.placement_titles = {("1", title): "friday_movies", ("2", title): "friday_tv"}
+        report = RunReport(started_at=datetime.now(UTC), users=[recorded])
+
+        _promote_phase(ctx, [user], [], filters_ok=True, report=report)
+
+        assert self._flags(ctx) == {
+            11: {"shared": True, "home": False, "recommended": False},
+            22: {"shared": False, "home": False, "recommended": True},
+        }
+
     def test_fallback_leaves_shared_rows_to_the_shared_promote_loop(self, ctx: EngineContext):
         """A shared row must never be picked up by the PER-PERSON fallback (it promotes in the separate
         shared loop). Even if a collection under this user's label matched the title the fallback would
@@ -3463,7 +3527,7 @@ class TestPlacement:
 
         report = pipeline_mod.run(ctx, [sarah])
 
-        recorded = set(report.users[0].placement_titles)
+        recorded = {title for _library, title in report.users[0].placement_titles}
         # Two libraries with different top seeds -> two distinct titles; the pre-fix code recorded ONE
         # (union) and left the 4K collection unmatched. Every delivered title must be recorded.
         assert len(recorded) == 2, f"expected a distinct title per library, got {recorded}"

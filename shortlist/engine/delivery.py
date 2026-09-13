@@ -341,6 +341,56 @@ def target_sections(sections: list, spec: RowSpec) -> list:
     return sections_for_keys(candidates, spec.library_keys) if spec.library_keys else candidates
 
 
+def rows_can_share_a_library(media_a: str, keys_a, media_b: str, keys_b) -> bool:
+    """Whether two rows could ever build in the same library, answered without reading Plex.
+
+    The duplicate-title check's scope (issue #121): per-person rows are told apart by title only
+    WITHIN a library, so two rows may share a title exactly when this is False. Deliberately static —
+    an empty ``library_keys`` follows the server and picks up libraries added later, so the only safe
+    "no" is one that holds for every library the server could ever have: media types that never meet,
+    or two named library sets with nothing in common. It errs towards "yes" (a refused save) and never
+    towards "no" (two rows on one collection); `test_delivery.py::TestRowsCanShareALibrary` pins that
+    against `target_sections`.
+    """
+    media_types_meet = bool(_allowed_media(media_a) & _allowed_media(media_b))
+    named_sets_apart = bool(keys_a) and bool(keys_b) and not {str(k) for k in keys_a} & {str(k) for k in keys_b}
+    return media_types_meet and not named_sets_apart
+
+
+def titles_other_rows_build(
+    sections: list, profile: UserProfile, config: EngineConfig, rows: list[RowSpec], slug: str
+) -> set[tuple[str, str]]:
+    """``{(section key, display title)}`` that this person's OTHER per-person rows build under.
+
+    The guard every title match on a removal, rename or poster reset applies (issue #121). All of a
+    person's rows share one label and one invisible marker, so a title is the only thing telling them
+    apart — and it tells them apart only WITHIN a library. Two rows may share a title when they build in
+    different libraries, so row A's title found in a library row B builds in is B's collection, not a
+    leftover of A's, whatever library A used to build in.
+
+    Rendered without picks, exactly as the removal paths render their own row. A ``{top_seed}`` row
+    therefore claims only its fallback name, the one title it can be predicted to wear.
+    """
+    claimed: set[tuple[str, str]] = set()
+    for other in rows:
+        if other.slug == slug or other.shared:
+            continue
+        if other.audience is not None and profile.plex_account_id not in other.audience:
+            continue  # builds nothing for this person, so no title of theirs can be its collection
+        template = resolve_row_template(other, profile, config)
+        for section in target_sections(sections, other):
+            display = render_row_name(
+                template,
+                profile,
+                [],
+                library_name=getattr(section, "title", "") or "",
+                fallback_name=other.fallback_name,
+            )
+            if display:
+                claimed.add((str(section.key), display))
+    return claimed
+
+
 def deliver_rows(
     plex: PlexClient,
     profile: UserProfile,
@@ -563,6 +613,7 @@ def remove_row(
     diff: CollectionDiff,
     sections: list | None = None,
     delivered_keys: dict[str, int] | None = None,
+    other_rows: list[RowSpec] | None = None,
 ) -> list[str]:
     """Delete a user's collection for a row they've muted or that a cold start skips, in every library.
 
@@ -586,12 +637,18 @@ def remove_row(
     ``wanted_label``, so identity narrows the search and never widens ownership. Without it an
     unrenderable row is left for a later sweep — which has to mean left ALONE.
 
-    It is used ONLY for an unrenderable title, never as a second matcher for a row that titles fine.
+    It is used ONLY for an unrenderable title, never as a second matcher for a row that titles fine —
+    with one narrower exception: a title another of this person's rows builds under in that library
+    (``other_rows``) needs the key AS WELL as the title, so there it only ever removes less.
     ratingKeys are rowids that Plex reuses, and no delete path here prunes the ledger, so a stale key
     can name a live object; scoped to this label that object would be one of this user's OTHER rows.
     Restricting the key to the case that has no other handle bounds that to rows whose title genuinely
     cannot be computed, where doing nothing is the only alternative. `context_builder._delivered_keys`
     additionally drops any ratingKey two rows both claim, so an ambiguous key selects nothing at all.
+
+    ``other_rows`` is every per-person row the run knows (this one may be among them). A title another
+    of them builds under in a library is that row's collection, never this one's, so it is matched only
+    when the ledger names it as this row's too (issue #121) — see `titles_other_rows_build`.
 
     Returns the section keys a collection was actually deleted in, so the caller can have those ledger
     entries forgotten — a key whose collection is gone must not be re-presented on the next run.
@@ -605,6 +662,7 @@ def remove_row(
     # Look in every library, not just the row's current targets: if its library_keys changed, an
     # earlier copy may linger in a library it no longer targets, and a muted row must leave them all.
     scan = sections if sections is not None else list(plex.sections_by_type().values())
+    claimed = titles_other_rows_build(scan, profile, config, other_rows or [], spec.slug)
     for section in scan:
         # Render the title with THIS library's name so a {library_name} row matches its own per-library
         # collection (delivery wrote "✨ Movies Picked for You" in Movies, "✨ TV Shows …" in TV).
@@ -650,10 +708,19 @@ def remove_row(
             # too would mean a STALE key (ratingKeys are rowids and Plex reuses them) could select a
             # sibling collection under this same label — the user's live default row — and delete it,
             # logged as an ordinary removal. `removed_in` below is what keeps a key from GOING stale.
+            # The claimed-title branch is the one place a titled row consults the key, and only as a
+            # second condition on top of the title — safe because `_delivered_keys` has already dropped
+            # any key two rows hold, which is exactly the key a same-titled sibling would share.
             if unrenderable:
                 if _rating_key(collection) != ledger_key:
                     continue
             elif collection.title != title:
+                continue
+            elif (str(section.key), display) in claimed and (
+                ledger_key is None or _rating_key(collection) != ledger_key
+            ):
+                # Another of this person's rows builds here under this very title (issue #121), so the
+                # title alone names THAT row's collection. Only this row's ledger entry can say otherwise.
                 continue
             # The collection's OWN title, not the computed one — for a `{top_seed}` row matched by
             # identity the computed name is the bare default, which would misreport what was deleted.
@@ -681,6 +748,7 @@ def remove_row_collections(
     dry_run: bool,
     in_sections: set[str] | None = None,
     rating_keys: set[int] | None = None,
+    claimed_titles: set[tuple[str, str]] | None = None,
 ) -> list[str]:
     """Delete Shortlist collections carrying ``label`` — an on-demand reconcile OUTSIDE a run (a
     config change, or a manual "remove from Plex").
@@ -695,6 +763,11 @@ def remove_row_collections(
     whose title is different every run and so matches no computed ``displays`` entry. Both are still
     scoped to ``label``, so neither can reach another user's row or a foreign (Kometa) collection —
     identity narrows the search, it never widens ownership.
+
+    ``claimed_titles`` (``{(section key, display)}``, from `titles_other_rows_build`) are titles another
+    of this person's rows builds under in that library, so ``displays`` never matches them there (issue
+    #121): all of a person's rows share this label, and there the title is that other row's. It limits
+    the title match only — ``rating_keys`` is identity, not a title.
 
     ``in_sections`` (section keys) limits WHERE: used when a row is narrowed rather than removed —
     its ``media`` changed from both to movie, or a library was dropped from ``library_keys`` — so only
@@ -724,7 +797,10 @@ def remove_row_collections(
         for collection in plex.find_owned_collections(section, label):
             display = strip_marker(collection.title)
             by_key = bool(rating_keys) and _rating_key(collection) in rating_keys
-            if displays is not None and display not in displays and not by_key:
+            by_title = displays is None or (
+                display in displays and (str(section.key), display) not in (claimed_titles or set())
+            )
+            if not by_title and not by_key:
                 continue
             removed.append(display)
             if dry_run:
@@ -793,12 +869,14 @@ def reset_row_posters(
     label: str,
     displays: set[str] | None,
     dry_run: bool,
+    claimed_titles: set[tuple[str, str]] | None = None,
 ) -> list[str]:
     """Revert a row's collection(s) to Plex's own artwork — used when a row switches back to 'Plex
     default' after having had a custom poster. Cosmetic and privacy-neutral (the hiding label and
     promotion are untouched). Matches only OUR-labelled collections; ``displays`` limits to those
     marker-stripped titles (per-person rows), or ``None`` resets every collection under ``label``
-    (a shared row's single membership). Returns the library titles reset (or that would be)."""
+    (a shared row's single membership). ``claimed_titles`` are never matched, exactly as in
+    `remove_row_collections`. Returns the library titles reset (or that would be)."""
     if not label.lower().startswith(f"{LABEL_PREFIX}_"):
         # Lowercased like the other two guards — Plex stores the label title-cased, and a
         # case-sensitive test would turn a legitimate reset into a silent no-op. Defensive: both
@@ -813,6 +891,8 @@ def reset_row_posters(
             display = strip_marker(collection.title)
             if displays is not None and display not in displays:
                 continue
+            if displays is not None and (str(section.key), display) in (claimed_titles or set()):
+                continue  # another of this person's rows builds here under that title (issue #121)
             reset.append(section.title)
             if dry_run:
                 logger.info("[dry-run] would reset poster on '{}' in '{}'", display, section.title)

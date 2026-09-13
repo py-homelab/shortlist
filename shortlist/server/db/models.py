@@ -641,6 +641,9 @@ class Delivery(Base):
     # read back — it is here so the ledger is legible in an audit ("which row was this?") without
     # joining anything. Deliberately not used as a fallback: a title match is exactly the mechanism
     # this table replaced, and having two answers would hide which one was wrong.
+    # It IS read as a CLAIM, though: `collection_reconcile._claimed_titles` uses a `{top_seed}` row's
+    # recorded title to stop ANOTHER row's removal, rename or poster reset matching it in that library
+    # (issue #121). It narrows a match and never selects a collection — but blanking it drops that guard.
     title: Mapped[str] = mapped_column(String(512), default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

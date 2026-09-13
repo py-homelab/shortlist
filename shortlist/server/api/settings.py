@@ -24,7 +24,7 @@ from shortlist.engine.models import (
 )
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
-from shortlist.server.db.models import DEFAULT_SLUG, Server
+from shortlist.server.db.models import DEFAULT_SLUG, Collection, Server
 from shortlist.server.net_guard import BlockedUrl, check_url
 from shortlist.server.services import collection_reconcile as reconcile
 from shortlist.server.services import jobs
@@ -490,6 +490,7 @@ async def put_settings(
         # refusal leaves every setting in this request unwritten rather than half-applied.
         proposed_row_name = str(update.values.get("row.name_template") or "").strip()
         if proposed_row_name and proposed_row_name != old_row_name:
+            default_row = session.query(Collection).filter_by(slug=DEFAULT_SLUG).first()
             clash = reconcile.row_titled_from(
                 session,
                 proposed_row_name,
@@ -497,13 +498,17 @@ async def put_settings(
                 exclude_slug=DEFAULT_SLUG,
                 # The default row is per-person, and only a per-person row can share its collection.
                 build="per_person",
+                # ...and only one that can build in a library the default row reaches (issue #121). A
+                # deleted default row reaches nothing, but "both, everywhere" is the safe reading.
+                media=default_row.media if default_row else "both",
+                library_keys=(default_row.library_keys or []) if default_row else [],
             )
             if clash is not None:
                 raise HTTPException(
                     status_code=422,
                     detail=f"{proposed_row_name!r} is already the title of the row {clash.name!r} "
-                    f"({clash.slug}) — two rows with the same title become a single collection on Plex, "
-                    "so pick a different name",
+                    f"({clash.slug}), which can build in the same library — two rows with the same title in one "
+                    "library become a single collection on Plex, so pick a different name",
                 )
         for key, value in update.values.items():
             if key in SECRET_KEYS and value == REDACTED_PLACEHOLDER:

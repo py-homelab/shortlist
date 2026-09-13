@@ -1316,10 +1316,11 @@ class UserRunReport:
     # Plex reuses `metadata_items.id`, so that key can come to name a different collection under this
     # same label — and `promote_user_rows` reads the ledger too, so it is not only removals at stake.
     removed_deliveries: list[dict] = field(default_factory=list)
-    # Each delivered collection TITLE mapped to the slug of the row that produced it, so the promote
-    # phase applies the right row's placement/pin. Recorded per library because a {top_seed} title
-    # differs library to library. Transient (not persisted); populated during delivery.
-    placement_titles: dict[str, str] = field(default_factory=dict)
+    # Each delivered collection, as (section key, marked TITLE), mapped to the slug of the row that
+    # produced it, so the promote phase applies the right row's placement/pin. Keyed by library as well
+    # as title: a {top_seed} title differs library to library, and two of one person's rows may share a
+    # title when they build in different libraries (issue #121). Transient (not persisted).
+    placement_titles: dict[tuple[str, str], str] = field(default_factory=dict)
     # Per-(row, library) delivery result, so the UI can show "added X to Movies, Y to TV" instead of
     # one merged list. Each entry: row_slug/row_title, library_key/library_title, added/removed/kept/
     # deleted, created, and that library's own ranked picks. Persisted on RunUser.breakdown.

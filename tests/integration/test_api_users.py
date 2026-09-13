@@ -202,7 +202,7 @@ class TestUsersApi:
         col = MagicMock(title="sarah's Picks" + marker)
         col.editTitle.side_effect = lambda new: renames.append((col.title, new))
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: [col] if label == "shortlist_sarah" else []
         ctx = SimpleNamespace(plex=plex, config=EngineConfig())
         monkeypatch.setattr(client.app.state.run_service, "build_context", lambda **kw: ctx)
@@ -379,7 +379,7 @@ class TestUsersApi:
 
         deleted: list[str] = []
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: (
             [SimpleNamespace(title="✨ Picked for You" + row_marker(0))] if label == f"shortlist_{slug}" else []
         )
@@ -459,7 +459,7 @@ class TestUsersApi:
         # Record the actual Plex removals, keyed by the shortlist label they came in on.
         removed_labels: list[str] = []
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda section, label: [SimpleNamespace(title=label, _label=label)]
         plex.delete_owned_collection.side_effect = lambda collection, prefix: removed_labels.append(collection._label)
         ctx = SimpleNamespace(plex=plex, config=EngineConfig())

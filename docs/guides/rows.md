@@ -30,6 +30,12 @@ the row is built:
 - `{top_seed}` — the title that most drove their recommendations. `Because you watched {top_seed}`
   becomes "Because you watched The Bear".
 
+Two rows can have the same name as long as they never build in the same library — a movies-only
+row and a TV-only row can both be called "Picked for You". Two rows that could land in one library
+can't share a name, because Plex would hold them as a single collection there; Shortlist refuses the
+save and tells you which row already has it. Rows set to "every library of this type" count as
+reaching libraries you add later, so pick specific libraries if you want to reuse a name.
+
 The seed is the strongest pick that came from something they watched. Some sources suggest a title
 without following one — what's trending, what's popular on your server, a web-search find — so those
 contribute picks but no seed. The name uses the strongest pick that has one.

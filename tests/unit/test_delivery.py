@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -2481,3 +2482,247 @@ class TestTheDiffReportsWhatLandedNotWhatWasAsked:
         added = diff.added if hasattr(diff, "added") else diff[0].added
         assert "Still Here" in added
         assert "Deleted Since" not in added, "the run must not claim it delivered a title Plex dropped"
+
+
+class TestATitleAnotherRowBuildsUnderIsNeverThisRows:
+    """Issue #121: two of one person's rows may share a title when they build in different libraries.
+
+    All of a person's rows carry one label and marker and are told apart by title, and the removal
+    paths scan EVERY library — so muting, disabling or cold-skipping a Movies-only row matched a
+    TV-only row's collection by that same title and deleted it. A title another row builds under in a
+    library now names THAT row's collection there; only this row's ledger entry can say otherwise.
+    """
+
+    MARK = row_marker(100)
+    A: ClassVar[dict] = {"slug": "a", "size": 5, "media": "movie"}
+    B: ClassVar[dict] = {"slug": "b", "size": 5, "media": "show"}
+
+    def _plex(self, owned_by_section: dict[str, list[tuple[str, int]]]):
+        movies, shows = _section("Movies", "movie", "1"), _section("TV Shows", "show", "2")
+        deleted: list[str] = []
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [movies, shows]
+        plex.find_owned_collections.side_effect = lambda section, label: [
+            SimpleNamespace(title=title, ratingKey=key) for title, key in owned_by_section[str(section.key)]
+        ]
+        plex.delete_owned_collection.side_effect = lambda collection, prefix: deleted.append(collection.ratingKey)
+        return plex, [movies, shows], deleted
+
+    def _remove(self, plex, sections, a: dict, others: list[dict], delivered_keys: dict[str, int] | None = None):
+        from shortlist.engine.delivery import remove_row
+        from shortlist.engine.models import CollectionDiff, RowSpec
+
+        spec = RowSpec(**a)
+        return remove_row(
+            plex,
+            make_profile("sarah", account_id=100),
+            EngineConfig(),
+            spec,
+            dry_run=False,
+            diff=CollectionDiff(),
+            sections=sections,
+            delivered_keys=delivered_keys,
+            other_rows=[spec, *(RowSpec(**o) for o in others)],
+        )
+
+    @pytest.mark.parametrize("template", ["{library_name} Picked For You", "Friday Picks"])
+    def test_removing_a_movies_row_leaves_a_tv_row_of_the_same_title_alone(self, template):
+        profile = make_profile("sarah", account_id=100)
+        a_movies = render_row_name(template, profile, [], library_name="Movies") + self.MARK
+        b_shows = render_row_name(template, profile, [], library_name="TV Shows") + self.MARK
+        plex, sections, deleted = self._plex({"1": [(a_movies, 11)], "2": [(b_shows, 22)]})
+
+        removed_in = self._remove(
+            plex, sections, {**self.A, "name_template": template}, [{**self.B, "name_template": template}], {"1": 11}
+        )
+
+        assert deleted == [11], "only row A's own collection may go — B's TV collection wears the same title"
+        assert removed_in == ["1"]
+
+    def test_explicit_libraries_claim_their_titles_the_same_way(self):
+        plex, sections, deleted = self._plex({"1": [("Friday" + self.MARK, 11)], "2": [("Friday" + self.MARK, 22)]})
+
+        self._remove(
+            plex,
+            sections,
+            {"slug": "a", "size": 5, "name_template": "Friday", "library_keys": ["1"]},
+            [{"slug": "b", "size": 5, "name_template": "Friday", "library_keys": ["2"]}],
+        )
+
+        assert deleted == [11]
+
+    def test_a_leftover_in_a_library_no_other_row_claims_still_goes_by_title(self):
+        """Unchanged, and the reason the scan covers every library: a row narrowed away from TV whose
+        narrowing cleanup never ran still has a copy there, and it would otherwise sit on this person's
+        Home for ever. Nothing else builds "Friday" in TV, so the title is still this row's."""
+        plex, sections, deleted = self._plex({"1": [("Friday" + self.MARK, 11)], "2": [("Friday" + self.MARK, 22)]})
+
+        removed_in = self._remove(
+            plex, sections, {**self.A, "name_template": "Friday"}, [{**self.B, "name_template": "Something Else"}]
+        )
+
+        assert sorted(removed_in) == ["1", "2"]
+        assert sorted(deleted) == [11, 22]
+
+    def test_the_ledger_can_still_name_a_claimed_title_as_this_rows(self):
+        plex, sections, deleted = self._plex({"1": [], "2": [("Friday" + self.MARK, 22)]})
+
+        self._remove(
+            plex, sections, {**self.A, "name_template": "Friday"}, [{**self.B, "name_template": "Friday"}], {"2": 22}
+        )
+
+        assert deleted == [22]
+
+    def test_a_row_that_builds_for_nobody_named_claims_its_fallback_name(self):
+        """A `{top_seed}` row with a fallback wears that fallback for anyone with nothing watched — the
+        one title of its that can be predicted, so the one it claims."""
+        plex, sections, deleted = self._plex({"1": [], "2": [("New Here" + self.MARK, 22)]})
+
+        self._remove(
+            plex,
+            sections,
+            {**self.A, "name_template": "New Here"},
+            [{**self.B, "name_template": "Because you watched {top_seed}", "fallback_name": "New Here"}],
+        )
+
+        assert deleted == []
+
+    def test_a_row_this_person_is_not_in_the_audience_of_claims_nothing_for_them(self):
+        """It builds no collection for them, so its title there cannot be theirs — and claiming it would
+        strand this row's leftover copy on their Home for ever."""
+        plex, sections, deleted = self._plex({"1": [], "2": [("Friday" + self.MARK, 22)]})
+
+        self._remove(
+            plex,
+            sections,
+            {**self.A, "name_template": "Friday"},
+            [{**self.B, "name_template": "Friday", "audience": {999}}],
+        )
+
+        assert deleted == [22]
+
+    def test_an_unrenderable_row_is_still_removed_by_ledger_identity(self):
+        """Unchanged: a `{top_seed}` row has no title to guard, and the ledger was already its only handle."""
+        plex, sections, _deleted = self._plex({"1": [], "2": [("Because you watched Fargo" + self.MARK, 22)]})
+
+        removed_in = self._remove(
+            plex, sections, {**self.A, "name_template": "Because you watched {top_seed}"}, [], {"2": 22}
+        )
+
+        assert removed_in == ["2"]
+
+
+class TestRowsCanShareALibrary:
+    """The static test the duplicate-title check uses: could two rows ever build in one library?"""
+
+    @pytest.mark.parametrize(
+        ("a", "b", "expected"),
+        [
+            (("movie", []), ("show", []), False),  # different media types never meet
+            (("movie", ["1"]), ("show", ["2"]), False),
+            (("movie", ["1"]), ("movie", ["3"]), False),  # two named sets with nothing in common
+            (("both", ["1", "2"]), ("both", ["3", "4"]), False),
+            (("movie", []), ("movie", ["3"]), True),  # "every movie library" includes library 3
+            (("both", []), ("show", ["2"]), True),
+            (("movie", ["1"]), ("both", ["1", "2"]), True),
+            (("both", []), ("both", []), True),
+        ],
+    )
+    def test_the_matrix(self, a, b, expected):
+        from shortlist.engine.delivery import rows_can_share_a_library
+
+        assert rows_can_share_a_library(*a, *b) is expected
+        assert rows_can_share_a_library(*b, *a) is expected, "the answer cannot depend on argument order"
+
+    def test_never_says_no_when_delivery_would_put_both_rows_in_one_library(self):
+        """Soundness against the function delivery actually uses. A false "no" is the dangerous one:
+        it lets two rows take one collection. A false "yes" only refuses a save."""
+        from hypothesis import given
+        from hypothesis import strategies as st
+
+        from shortlist.engine.delivery import rows_can_share_a_library, target_sections
+        from shortlist.engine.models import RowSpec
+
+        keys = st.lists(st.sampled_from(["1", "2", "3", "4"]), unique=True, max_size=4)
+        media = st.sampled_from(["movie", "show", "both"])
+        kinds = st.lists(st.sampled_from(["movie", "show"]), min_size=4, max_size=4)
+
+        @given(kinds, media, keys, media, keys)
+        def check(section_kinds, media_a, keys_a, media_b, keys_b):
+            sections = [SimpleNamespace(key=str(i + 1), type=k, title=f"L{i + 1}") for i, k in enumerate(section_kinds)]
+            in_a = {s.key for s in target_sections(sections, RowSpec("a", "", 1, media=media_a, library_keys=keys_a))}
+            in_b = {s.key for s in target_sections(sections, RowSpec("b", "", 1, media=media_b, library_keys=keys_b))}
+            if in_a & in_b:
+                assert rows_can_share_a_library(media_a, keys_a, media_b, keys_b)
+
+        check()
+
+
+class TestOnDemandReconcilesNeverMatchAnotherRowsTitle:
+    """Issue #121, the on-demand half: row delete/disable/audience-shrink (`remove_row_collections`)
+    and a poster reset (`reset_row_posters`) match by title too, across every library."""
+
+    MARK = row_marker(100)
+    CLAIMED: ClassVar[set[tuple[str, str]]] = {("2", "Friday")}  # another of sarah's rows builds "Friday" in TV Shows
+
+    def _plex(self):
+        movies, shows = _section("Movies", "movie", "1"), _section("TV Shows", "show", "2")
+        a = SimpleNamespace(title="Friday" + self.MARK, ratingKey=11)
+        b = SimpleNamespace(title="Friday" + self.MARK, ratingKey=22)
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [movies, shows]
+        plex.find_owned_collections.side_effect = lambda section, label: [a] if str(section.key) == "1" else [b]
+        return plex, a, b
+
+    def test_a_removal_never_matches_a_title_another_row_builds_under(self, engine_config: EngineConfig):
+        from shortlist.engine.delivery import remove_row_collections
+
+        plex, a, _b = self._plex()
+
+        removed = remove_row_collections(
+            plex,
+            engine_config,
+            label="shortlist_sarah",
+            displays={"Friday"},
+            dry_run=False,
+            claimed_titles=self.CLAIMED,
+        )
+
+        assert removed == ["Friday"]
+        plex.delete_owned_collection.assert_called_once_with(a, "shortlist")
+
+    def test_a_ledger_key_still_removes_a_collection_whose_title_is_claimed(self, engine_config: EngineConfig):
+        """Callers hand this only UNAMBIGUOUS keys — a ratingKey two rows both hold is dropped upstream
+        (`pipeline.identity_map`, `collection_reconcile._ledger_keys`) — so a key here is this row's."""
+        from shortlist.engine.delivery import remove_row_collections
+
+        plex, a, b = self._plex()
+
+        remove_row_collections(
+            plex,
+            engine_config,
+            label="shortlist_sarah",
+            displays={"Friday"},
+            rating_keys={22},
+            dry_run=False,
+            claimed_titles=self.CLAIMED,
+        )
+
+        assert [c.args[0] for c in plex.delete_owned_collection.call_args_list] == [a, b]
+
+    def test_a_poster_reset_never_matches_a_title_another_row_builds_under(self, engine_config: EngineConfig):
+        from shortlist.engine.delivery import reset_row_posters
+
+        plex, a, _b = self._plex()
+
+        reset = reset_row_posters(
+            plex,
+            engine_config,
+            label="shortlist_sarah",
+            displays={"Friday"},
+            dry_run=False,
+            claimed_titles=self.CLAIMED,
+        )
+
+        assert reset == ["Movies"]
+        plex.reset_poster.assert_called_once_with(a)

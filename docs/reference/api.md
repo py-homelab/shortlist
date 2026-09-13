@@ -186,6 +186,10 @@ GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first
      Both are refused (422) in combinations that cannot work: `rewatch` + `unstarted_only` together (they ask for opposite things — the row would fill
      with titles nobody has seen, under a "you've already seen" name), and `unstarted_only` on a `media: "movie"` row. PATCH validates the MERGED row,
      not just the fields sent, so neither invalid pair can be reached one field at a time.
+     A row's title (its `name_template`, else `name`, and its `fallback_name`) must not match another row of the same build that could build in
+     one library with it — refused with 422, naming that row. Rows whose `media` types never meet, or whose `library_keys` are both set with no key
+     in common, may share a title; an empty `library_keys` counts as every library of its type, including ones added later. PATCH re-checks when
+     `media`, `library_keys` or `build` change, and refuses only a clash the row did not already have.
 POST /api/collections/{id}/cleanup {dry_run?} (remove this row's Plex collections for everyone; dry-run previews)
 POST /api/collections/{id}/poster/upload (multipart image) · GET/DELETE /api/collections/{id}/poster/image (serve/remove uploaded artwork) · POST /api/collections/{id}/poster/preview {title,subtitle,style} -> generated sample image
 ```

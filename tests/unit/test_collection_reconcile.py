@@ -115,6 +115,22 @@ class TestLedgerKeys:
             session.commit()
             assert rec._ledger_keys(session, "comedy") == {"sarah": {111, 222}, "mike": {333}}
 
+    def test_a_rating_key_another_row_also_claims_for_that_person_is_dropped(self, sessions):
+        """Ambiguous means unusable, exactly as `pipeline.identity_map` rules for a run. A leftover of
+        this row that a same-titled row in that library adopted is recorded under BOTH rows — and this
+        key is a delete handle, so trusting it removed the other row's live collection (issue #121)."""
+        with sessions() as session:
+            session.add_all(
+                [
+                    Delivery(collection_slug="friday", user_slug="sarah", library_key="1", rating_key=11),
+                    Delivery(collection_slug="friday", user_slug="sarah", library_key="2", rating_key=22),
+                    Delivery(collection_slug="friday_tv", user_slug="sarah", library_key="2", rating_key=22),
+                    Delivery(collection_slug="friday_tv", user_slug="mike", library_key="2", rating_key=11),
+                ]
+            )
+            session.commit()
+            assert rec._ledger_keys(session, "friday") == {"sarah": {11}}
+
     def test_a_falsy_rating_key_is_never_recorded(self, sessions):
         with sessions() as session:
             session.add(Delivery(collection_slug="comedy", user_slug="sarah", library_key="1", rating_key=0))
@@ -917,3 +933,227 @@ class TestRunRowRenameFromPlexAudit:
         with sessions() as session:
             event = session.query(Event).filter_by(scope="row.rename").one()
         assert "SEKRETVALUE" not in str(event.message)
+
+
+class TestATitleAnotherRowBuildsUnderIsNeverThisRows:
+    """Issue #121: a Movies-only row and a TV-only row of one person may share a title. Every
+    on-demand reconcile below used to match that title in EVERY library, so deleting, switching off,
+    renaming or resetting the Movies row did the same to the TV row's collection."""
+
+    MARK = row_marker(100)
+
+    def _plex(self):
+        movies, shows = _section("Movies", key="1"), _section("TV Shows", key="2")
+        movies.type, shows.type = "movie", "show"
+        movies_c, shows_c = _collection("Friday" + self.MARK), _collection("Friday" + self.MARK)
+        movies_c.ratingKey, shows_c.ratingKey = 11, 22
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [movies, shows]
+        plex.find_owned_collections.side_effect = lambda sec, label: (
+            ([movies_c] if sec is movies else [shows_c]) if label == "shortlist_sarah" else []
+        )
+        return plex, movies_c, shows_c
+
+    def _movies_row(self, sessions):
+        _add_user(sessions, slug="sarah", account_id=100)
+        with sessions() as session:
+            session.add(Collection(slug="friday", name="Friday", media="movie"))
+            session.add(Collection(slug="friday_tv", name="Friday", media="show"))
+            session.commit()
+
+    def test_removing_a_row_leaves_another_rows_same_title_in_a_different_library(self, sessions):
+        self._movies_row(sessions)
+        plex, movies_c, _shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
+
+    def test_a_deleted_row_still_leaves_the_other_rows_collection_alone(self, sessions):
+        """The DELETE path runs after the row is gone — what protects the TV row is the TV row itself,
+        which is still in the database."""
+        self._movies_row(sessions)
+        with sessions() as session:
+            session.query(Collection).filter_by(slug="friday").delete()
+            session.commit()
+        plex, movies_c, _shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed, template="Friday"
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
+
+    def test_a_ledger_key_the_other_row_now_holds_does_not_delete_its_collection(self, sessions):
+        """The review's reproduction. Row A once built in TV too; its TV copy and ledger entry survived a
+        narrowing Plex was down for. Row B (TV "Friday") then adopted that collection by title and
+        recorded the same ratingKey. Deleting A must leave B's live collection alone."""
+        self._movies_row(sessions)
+        with sessions() as session:
+            session.add_all(
+                [
+                    Delivery(collection_slug="friday", user_slug="sarah", library_key="1", rating_key=11),
+                    Delivery(collection_slug="friday", user_slug="sarah", library_key="2", rating_key=22),
+                    Delivery(collection_slug="friday_tv", user_slug="sarah", library_key="2", rating_key=22),
+                ]
+            )
+            session.commit()
+        plex, movies_c, _shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
+
+    def test_a_leftover_copy_no_other_row_claims_is_still_removed(self, sessions):
+        """Every library is scanned so a copy left behind in a library the row stopped using goes too —
+        it would otherwise sit on that person's Home. Only another row's title is off limits."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        with sessions() as session:
+            session.add(Collection(slug="friday", name="Friday", media="movie"))
+            session.commit()
+        plex, movies_c, shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        assert [c.args[0] for c in plex.delete_owned_collection.call_args_list] == [movies_c, shows_c]
+
+    def test_a_row_whose_audience_leaves_this_person_out_claims_nothing_for_them(self, sessions):
+        from shortlist.server.db.models import CollectionAudience
+
+        self._movies_row(sessions)
+        mike = _add_user(sessions, slug="mike", account_id=200)
+        with sessions() as session:
+            tv = session.query(Collection).filter_by(slug="friday_tv").one()
+            tv.audience = "subset"
+            session.add(CollectionAudience(collection_id=tv.id, user_id=mike))
+            session.commit()
+        plex, _movies_c, _shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        assert plex.delete_owned_collection.call_count == 2, "sarah is not in friday_tv's audience"
+
+    def test_what_another_top_seed_row_was_delivered_as_is_claimed_in_that_library(self, sessions):
+        """Two `{top_seed}` rows — Movies and TV — both seeded by one watch wear the same title, which no
+        template can predict. The ledger recorded where each was delivered as what; deleting the Movies
+        row must not match the TV row's collection by that title."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        seeded = "Because you watched Dune"
+        with sessions() as session:
+            session.add(Collection(slug="friday", name="Because you watched {top_seed}", media="movie"))
+            session.add(Collection(slug="friday_tv", name="Because you watched {top_seed}", media="show"))
+            # No ratingKey match for the TV copy, so only a title could select it.
+            session.add(
+                Delivery(collection_slug="friday_tv", user_slug="sarah", library_key="2", rating_key=99, title=seeded)
+            )
+            run = Run(trigger="manual", status="ok")
+            session.add(run)
+            session.flush()
+            user = session.query(User).filter_by(slug="sarah").one()
+            session.add(
+                RunUser(
+                    run_id=run.id,
+                    user_id=user.id,
+                    status="ok",
+                    breakdown=[{"row_slug": "friday", "row_title": seeded, "library_key": "1"}],
+                )
+            )
+            session.commit()
+        plex, movies_c, shows_c = self._plex()
+        movies_c.title = shows_c.title = seeded + self.MARK
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
+
+    def test_a_static_rows_ledger_title_claims_nothing_since_a_rename_leaves_it_stale(self, sessions):
+        """A rename edits Plex and writes no ledger entry, so a static row's recorded title can be one it
+        no longer wears — and this row may have just been renamed onto it."""
+        self._movies_row(sessions)
+        with sessions() as session:
+            other = session.query(Collection).filter_by(slug="friday_tv").one()
+            other.name, other.media = "Sunday", "movie"
+            session.add(
+                Delivery(collection_slug="friday_tv", user_slug="sarah", library_key="1", rating_key=99, title="Friday")
+            )
+            session.commit()
+        plex, movies_c, _shows_c = self._plex()
+        reset: list[str] = []
+
+        rec._reconcile_poster_reset(_state(sessions, plex), slug="friday", build="per_person", reset=reset)
+
+        assert movies_c in [c.args[0] for c in plex.reset_poster.call_args_list]
+
+    def test_a_switched_off_row_claims_nothing(self, sessions):
+        """A disabled row builds nothing, and its own collections are on their way out anyway."""
+        self._movies_row(sessions)
+        with sessions() as session:
+            session.query(Collection).filter_by(slug="friday_tv").one().enabled = False
+            session.commit()
+        plex, _movies_c, _shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        assert plex.delete_owned_collection.call_count == 2
+
+    def test_a_narrowing_removes_by_title_in_the_library_the_row_left(self, sessions):
+        """`in_sections` names libraries the row NO LONGER builds in, so nothing there is the row's by
+        where it builds — the title still identifies it as long as no other row builds that title there."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        with sessions() as session:
+            session.add(Collection(slug="friday", name="Friday", media="movie"))
+            session.commit()
+        plex, _movies_c, shows_c = self._plex()
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex),
+            slug="friday",
+            build="per_person",
+            dry_run=False,
+            removed=removed,
+            in_sections={"2"},
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(shows_c, LABEL_PREFIX)
+
+    def test_a_poster_reset_leaves_another_rows_same_title_in_a_different_library(self, sessions):
+        self._movies_row(sessions)
+        plex, movies_c, _shows_c = self._plex()
+        reset: list[str] = []
+
+        rec._reconcile_poster_reset(_state(sessions, plex), slug="friday", build="per_person", reset=reset)
+
+        plex.reset_poster.assert_called_once_with(movies_c)
+
+    def test_a_rename_leaves_another_rows_same_title_in_a_different_library(self, sessions):
+        self._movies_row(sessions)
+        plex, movies_c, shows_c = self._plex()
+
+        list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="friday", new_template="Saturday", old_template="Friday"
+            )
+        )
+
+        movies_c.editTitle.assert_called_once_with("Saturday" + self.MARK)
+        shows_c.editTitle.assert_not_called()

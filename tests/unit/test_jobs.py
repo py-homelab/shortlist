@@ -952,7 +952,9 @@ class TestRestoreAfterUnpause:
                     run_id=run.id,
                     user_id=user.id,
                     status="ok",
-                    breakdown=[{"row_slug": "picked", "row_title": "Because you watched Dune"}],
+                    # `library_key` as every breakdown since v1.0.0 carries it: a title is only a row's
+                    # within one library (issue #121).
+                    breakdown=[{"row_slug": "picked", "row_title": "Because you watched Dune", "library_key": "1"}],
                 )
             )
             session.commit()

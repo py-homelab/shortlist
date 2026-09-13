@@ -942,7 +942,7 @@ class TestSettingsThatDoRealWork:
         col = MagicMock(title="✨ Movies Picked for You" + row_marker(acct))
         col.editTitle.side_effect = lambda new: renames.append((col.title, new))
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: [col] if label == f"shortlist_{uslug}" else []
         ctx = SimpleNamespace(plex=plex, config=EngineConfig())
         monkeypatch.setattr(client.app.state.run_service, "build_context", lambda **kw: ctx)

@@ -1080,7 +1080,7 @@ class TestCollectionsApi:
         from shortlist.engine.models import EngineConfig
 
         deleted: list[str] = []
-        section = SimpleNamespace(title="Movies")
+        section = SimpleNamespace(title="Movies", key="1", type="movie")
         plex = MagicMock()
         plex.sections.return_value = [section]
         # Return objects with a .title for each (title, label) pair whose label matches.
@@ -1388,7 +1388,7 @@ class TestCollectionsApi:
             else:
                 col.editTitle.side_effect = lambda new, c=col: renames.append((c.title, new))
             cols[label] = col
-        section = SimpleNamespace(title="Movies")
+        section = SimpleNamespace(title="Movies", key="1", type="movie")
         plex = MagicMock()
         plex.sections.return_value = [section]
         plex.find_owned_collections.side_effect = lambda s, label: [cols[label]] if label in cols else []
@@ -2023,6 +2023,126 @@ class TestNoTwoRowsShareATitle:
         assert first["id"]
 
 
+class TestTheSameTitleInDifferentLibraries:
+    """Issue #121: two rows may share a title when they can never build in the same library.
+
+    Per-person rows are told apart by title only WITHIN a library — the removal, rename and placement
+    paths now refuse a title another row builds under there — so a Movies-only and a TV-only row
+    wearing one name are two collections, exactly as one row spanning both libraries always was.
+    """
+
+    def test_a_movies_row_and_a_tv_row_may_share_a_name(self, client: TestClient):
+        """The issue as reported."""
+        name = "{library_name} Picked For You"
+        assert client.post("/api/collections", json={"name": name, "media": "show"}).status_code == 201
+
+        allowed = client.post("/api/collections", json={"name": name, "media": "movie"})
+
+        assert allowed.status_code == 201, allowed.text
+
+    def test_two_named_libraries_with_nothing_in_common_may_share_a_name(self, client: TestClient):
+        assert (
+            client.post(
+                "/api/collections", json={"name": "Friday", "media": "movie", "library_keys": ["1"]}
+            ).status_code
+            == 201
+        )
+
+        allowed = client.post("/api/collections", json={"name": "Friday", "media": "movie", "library_keys": ["3"]})
+
+        assert allowed.status_code == 201, allowed.text
+
+    @pytest.mark.parametrize(
+        ("first", "second"),
+        [
+            ({"media": "movie"}, {"media": "movie", "library_keys": ["3"]}),  # every movie library includes 3
+            ({"media": "both"}, {"media": "show"}),
+            ({"media": "movie", "library_keys": ["1"]}, {"media": "both", "library_keys": ["1", "2"]}),
+        ],
+    )
+    def test_rows_that_can_meet_in_one_library_still_clash(self, client: TestClient, first, second):
+        assert client.post("/api/collections", json={"name": "Friday", **first}).status_code == 201
+
+        clash = client.post("/api/collections", json={"name": "Friday", **second})
+
+        assert clash.status_code == 422
+        assert "single collection" in clash.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "change",
+        [{"media": "both"}, {"media": "movie"}, {"media": "both", "library_keys": ["1", "2"]}],
+    )
+    def test_moving_a_row_into_a_library_where_its_name_is_taken_is_refused(self, client: TestClient, change):
+        """A new door onto the same collision: the title stays put, the libraries move."""
+        client.post("/api/collections", json={"name": "Friday", "media": "movie"})
+        tv = client.post("/api/collections", json={"name": "Friday", "media": "show"}).json()
+
+        moved = client.patch(f"/api/collections/{tv['id']}", json={"name": "Friday", **change})
+
+        assert moved.status_code == 422, moved.text
+        assert "single collection" in moved.json()["detail"]
+        with client.app.state.sessions() as session:
+            from shortlist.server.db.models import Collection
+
+            assert session.get(Collection, tv["id"]).media == "show", "a refused edit must write nothing"
+
+    def test_moving_a_row_where_its_name_is_free_is_allowed(self, client: TestClient):
+        client.post("/api/collections", json={"name": "Friday", "media": "movie", "library_keys": ["1"]})
+        tv = client.post("/api/collections", json={"name": "Friday", "media": "show"}).json()
+
+        moved = client.patch(
+            f"/api/collections/{tv['id']}", json={"name": "Friday", "media": "movie", "library_keys": ["3"]}
+        )
+
+        assert moved.status_code == 200, moved.text
+
+    def test_switching_to_per_person_where_the_name_is_taken_is_refused(self, client: TestClient):
+        """A shared row never collides with a per-person one, so the build is part of the same door."""
+        client.post("/api/collections", json={"name": "Friday"})
+        shared = client.post("/api/collections", json={"name": "Friday", "build": "shared"}).json()
+
+        flipped = client.patch(f"/api/collections/{shared['id']}", json={"name": "Friday", "build": "per_person"})
+
+        assert flipped.status_code == 422, flipped.text
+        assert "single collection" in flipped.json()["detail"]
+
+    def test_an_existing_clash_does_not_block_a_library_edit_that_keeps_it(self, client: TestClient):
+        """ "No NEW clashes": a row already sharing a library and a title with another (from before this
+        guard, or a restore) must stay editable — including its libraries."""
+        client.post("/api/collections", json={"name": "Friday", "media": "movie"})
+        other = client.post("/api/collections", json={"name": "Sunday", "media": "movie"}).json()
+        from shortlist.server.db.models import Collection
+
+        with client.app.state.sessions() as session:
+            session.get(Collection, other["id"]).name = "Friday"
+            session.commit()
+
+        edit = client.patch(f"/api/collections/{other['id']}", json={"name": "Friday", "media": "both"})
+
+        assert edit.status_code == 200, edit.text
+
+    def test_the_default_rows_template_may_match_a_row_in_libraries_it_cannot_reach(self, client: TestClient):
+        """The default row's title is the global setting, so `PUT /api/settings` is a door too — and it
+        is judged by the DEFAULT row's libraries, not as though that row built everywhere."""
+        from shortlist.server.db.models import DEFAULT_SLUG, Collection
+
+        with client.app.state.sessions() as session:
+            session.query(Collection).filter_by(slug=DEFAULT_SLUG).one().media = "movie"
+            session.commit()
+        client.post("/api/collections", json={"name": "Friday", "media": "show"})
+
+        allowed = client.put("/api/settings", json={"values": {"row.name_template": "Friday"}})
+
+        assert allowed.status_code == 200, allowed.text
+
+    def test_the_default_rows_template_still_clashes_where_it_can_reach(self, client: TestClient):
+        client.post("/api/collections", json={"name": "Friday", "media": "show"})
+
+        clash = client.put("/api/settings", json={"values": {"row.name_template": "Friday"}})
+
+        assert clash.status_code == 422, clash.text
+
+
 class TestRowEditsReachPlexDurably:
     """Editing a row is a Plex write, not just a config change — and it has to survive Plex being down.
 
@@ -2038,7 +2158,7 @@ class TestRowEditsReachPlexDurably:
 
         deleted: list[str] = []
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: [
             SimpleNamespace(title=title) for (title, lbl) in collections if lbl == label
         ]

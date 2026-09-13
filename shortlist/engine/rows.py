@@ -1650,6 +1650,9 @@ def _drop_cold_skipped_rows(
                 diff=report.diff if report.diff is not None else CollectionDiff(),
                 sections=ctx.plex.sections(),
                 delivered_keys=_ledger_keys(ctx, user, spec),
+                # Every library is scanned, so a title another row builds under must not be taken for
+                # this one's (issue #121).
+                other_rows=cfg.per_person_rows(),
             )
         _forget(report, spec, removed_in)
     return keep
@@ -1695,6 +1698,9 @@ def _remove_muted_and_retired(ctx: EngineContext, user: UserProfile, cfg: Engine
                 # be title-matched, so it survived every run — private, but never actually gone. The
                 # ledger identifies it without guessing at a title.
                 delivered_keys=_ledger_keys(ctx, user, spec),
+                # Scanning every library means meeting other rows' collections: a title one of them
+                # builds under in a library is that row's, not a stale copy of this one (issue #121).
+                other_rows=cfg.per_person_rows(),
             )
         _forget(report, spec, removed_in)
 
@@ -3035,7 +3041,7 @@ def _run_user(
                         # this row's spec, and every OTHER unnameable row of theirs would collide on
                         # that same key — handing promote one arbitrary spec for all of them.
                         continue
-                    key = title + marker
+                    key = (str(section_key), title + marker)
                     # Two of this person's rows rendering ONE title in one library is unrecoverable
                     # silently: they share a label and a per-account marker, so delivery's title match
                     # hands the second row the first row's collection and overwrites its membership —

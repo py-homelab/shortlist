@@ -775,7 +775,16 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
 
 
 def _reject_duplicate_name(
-    session, secrets, template: str, *, exclude_slug: str = "", build: str = "", fallback_name: str = ""
+    session,
+    secrets,
+    template: str,
+    *,
+    exclude_slug: str = "",
+    build: str = "",
+    fallback_name: str = "",
+    media: str = "both",
+    library_keys=(),
+    already_clashing: frozenset[str] = frozenset(),
 ) -> None:
     """Refuse a row title another row is already titled from — see `reconcile.row_titled_from` for
     what "already titled from" means and why the `name` column is the wrong thing to compare.
@@ -783,9 +792,27 @@ def _reject_duplicate_name(
     ``template`` is the EFFECTIVE template being proposed (`name_template or name`), not the raw name:
     a row that carries its own template is titled from that, so changing only its `name` cannot clash
     with anything, and changing only its `name_template` very much can.
+
+    ``media``/``library_keys`` are where the row builds: a title only has to be unique among rows that
+    could build in one library with it (issue #121). ``already_clashing`` holds the slugs this row
+    clashed with BEFORE the edit, which are not refused again — the rule is "no NEW clashes".
     """
-    clash = reconcile.row_titled_from(
-        session, template, secrets=secrets, exclude_slug=exclude_slug, build=build, fallback_name=fallback_name
+    clash = next(
+        (
+            row
+            for row in reconcile.rows_titled_from(
+                session,
+                template,
+                secrets=secrets,
+                exclude_slug=exclude_slug,
+                build=build,
+                fallback_name=fallback_name,
+                media=media,
+                library_keys=library_keys,
+            )
+            if row.slug not in already_clashing
+        ),
+        None,
     )
     if clash is None:
         return
@@ -807,8 +834,9 @@ def _reject_duplicate_name(
         where = "\u201cName for people with nothing watched yet\u201d"
     raise HTTPException(
         status_code=422,
-        detail=f"{culprit!r} is already the title of {whose} — two rows with the same title become a "
-        f"single collection on Plex, so pick a different {where}",
+        detail=f"{culprit!r} is already the title of {whose}, which can build in the same library — two rows "
+        f"with the same title in one library become a single collection on Plex, so pick a different {where} "
+        "or build the two rows in different libraries",
     )
 
 
@@ -898,6 +926,8 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             body.name_template or body.name,
             build=body.build,
             fallback_name=body.fallback_name,
+            media=body.media,
+            library_keys=body.library_keys,
         )
         _validate_anchor_rows(session, body, editing_slug="")
         slug = _unique_slug(session, slugify(body.name))
@@ -1183,6 +1213,43 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
         touching_name = before["build"] == "per_person" and not is_default and bool(sent & {"name", "name_template"})
         template_before = (collection.name_template or collection.name) if touching_name else ""
         template_after = template_before
+        # Where the row builds, merged from the request and the row: a title only has to be unique among rows that could
+        # build in one library with it (issue #121), so moving the LIBRARIES — or flipping a shared row
+        # to per-person, the one build that collides with per-person rows — is a door onto the same
+        # collision as renaming. "No NEW clashes" is tracked per ROW, not per library: a row that already
+        # shared a title and a library with another (only a database from before this check) may move to
+        # a second library they share. Tracking libraries would need the server's library list here.
+        old_keys = [str(k) for k in (collection.library_keys or [])]
+        merged_media = body.media if "media" in sent else collection.media
+        merged_keys = [str(k) for k in body.library_keys] if "library_keys" in sent else old_keys
+        merged_build = body.build if "build" in sent else collection.build
+        if (merged_media, sorted(merged_keys), merged_build) != (collection.media, sorted(old_keys), collection.build):
+            title_now = reconcile.row_template(session, collection.slug, state.secrets)
+            fallback_now = collection.fallback_name or ""
+            before_clashes = frozenset(
+                row.slug
+                for row in reconcile.rows_titled_from(
+                    session,
+                    title_now,
+                    secrets=state.secrets,
+                    exclude_slug=collection.slug,
+                    build=collection.build,
+                    fallback_name=fallback_now,
+                    media=collection.media,
+                    library_keys=old_keys,
+                )
+            )
+            _reject_duplicate_name(
+                session,
+                state.secrets,
+                title_now if is_default else _merged_template(collection, body, sent),
+                exclude_slug=collection.slug,
+                build=merged_build,
+                fallback_name=(body.fallback_name if "fallback_name" in sent else fallback_now) or "",
+                media=merged_media,
+                library_keys=merged_keys,
+                already_clashing=before_clashes,
+            )
         # The clash check runs on the MERGED effective template, for the same reason `_validate_pairing`
         # does: a PATCH may send either half. Sending `name_template` ALONE changes the title and used
         # to be checked by nothing at all, while sending `name` alone on a row that carries its own
@@ -1215,8 +1282,10 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
                     state.secrets,
                     merged,
                     exclude_slug=collection.slug,
-                    build=before["build"],
+                    build=merged_build,
                     fallback_name=merged_fallback,
+                    media=merged_media,
+                    library_keys=merged_keys,
                 )
         # The default row has no per-collection name: its title IS the global `row.name_template`
         # (Settings → Defaults), which delivery renders per library. So a rename of it writes that
@@ -1235,7 +1304,13 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
                 # Renaming the default row retitles it on Plex just as surely as renaming any other,
                 # so it owes the same clash check — onto the title EVERY other row already renders.
                 _reject_duplicate_name(
-                    session, state.secrets, new_template, exclude_slug=DEFAULT_SLUG, build="per_person"
+                    session,
+                    state.secrets,
+                    new_template,
+                    exclude_slug=DEFAULT_SLUG,
+                    build="per_person",
+                    media=merged_media,
+                    library_keys=merged_keys,
                 )
                 default_rename_to = new_template
                 template_before, template_after = previous, new_template
@@ -1676,7 +1751,15 @@ async def rename_collection_stream(collection_id: int, body: RenameRequest, requ
             # endpoint documents standalone use one line up, and an API client taking that route
             # could hand two rows one title, or overwrite the global template, with nothing to stop
             # it. Checked BEFORE either write, so a refusal renames nothing here or on Plex.
-            _reject_duplicate_name(session, request.app.state.secrets, new_template, exclude_slug=slug, build=build)
+            _reject_duplicate_name(
+                session,
+                request.app.state.secrets,
+                new_template,
+                exclude_slug=slug,
+                build=build,
+                media=collection.media,
+                library_keys=collection.library_keys or [],
+            )
             # Same rule as the PATCH handler: the DEFAULT row's title IS the global setting, and its
             # own column must stay empty. Writing it here would undo that guard within the same
             # flow — the rename screen PATCHes and then immediately POSTs to this endpoint, so a

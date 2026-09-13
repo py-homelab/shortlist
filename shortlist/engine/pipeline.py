@@ -1300,7 +1300,7 @@ def promote_shared_row(ctx: EngineContext, spec: RowSpec, *, into: set[int]) -> 
 def promote_user_rows(
     ctx: EngineContext,
     user: UserProfile,
-    placement_titles: dict[str, str] | None = None,
+    placement_titles: dict[tuple[str, str], str] | None = None,
     *,
     placement_keys: dict[int, str] | None = None,
     into: set[int] | None = None,
@@ -1318,7 +1318,7 @@ def promote_user_rows(
     * ``placement_keys`` — {Plex ratingKey -> row slug}, from the delivery ledger. Authoritative, and
       the only thing that works for a ``{top_seed}`` row, whose title is different every run and so
       matches nothing computed. The restore path passes it.
-    * ``placement_titles`` — {delivered title -> row slug}, recorded live by a run. What
+    * ``placement_titles`` — {(section key, delivered title) -> row slug}, recorded live by a run. What
       ``_promote_phase`` passes, where it is complete by construction.
 
     With neither, a static-titled row still matches via the rendered-title fallback below, and only a
@@ -1339,7 +1339,9 @@ def promote_user_rows(
     # collection fell to the no-spec fallback — placement silently ignored.
     effective_rows = ctx.config.per_person_rows()
     spec_by_slug = {spec.slug: spec for spec in effective_rows}
-    placements = {title: spec_by_slug[slug] for title, slug in (placement_titles or {}).items() if slug in spec_by_slug}
+    # Keyed (section key, title), never title alone: two of one person's rows may share a title when they
+    # build in different libraries (issue #121), and a title-only map handed one of them both collections.
+    placements = {key: spec_by_slug[slug] for key, slug in (placement_titles or {}).items() if slug in spec_by_slug}
     # Fallback for rows that EXIST but got no picks this run (so they're absent from placement_titles):
     # a STATIC-titled row's title is stable, so map it to its spec by that title — otherwise
     # _promote_one would fall to the everywhere-visible default and yank a "Library only" row onto Home
@@ -1347,38 +1349,49 @@ def promote_user_rows(
     # safe hide-everywhere fallback. resolve_row_template is the shared source of truth for the template
     # precedence delivery also uses — they must not drift.
     marker = row_marker(user.plex_account_id)
-    for spec in effective_rows:
-        if spec.audience is not None and user.plex_account_id not in spec.audience:
-            continue
-        title_template = resolve_row_template(spec, user, ctx.config)
-        if "{top_seed}" not in title_template:
-            # A {library_name} title differs per library, so map one per library — across EVERY library
-            # of the row's media type, not just where it delivers now. `library_keys` says where the row
-            # goes today; its collections may still sit in a library it was narrowed away from, and
-            # since promotion now reaches those, an unmatched one would take the no-spec fallback EVERY
-            # run rather than never being touched. A synthesized title matching no collection is inert,
-            # and setdefault leaves the recorded per-library titles (placement_titles) winning.
-            for section in target_sections(ctx.plex.sections(), replace(spec, library_keys=[])):
+    sections = ctx.plex.sections()
+    static_rows = [
+        (spec, template)
+        for spec in effective_rows
+        if (spec.audience is None or user.plex_account_id in spec.audience)
+        and "{top_seed}" not in (template := resolve_row_template(spec, user, ctx.config))
+    ]
+    # Two passes, so a row's title in a library it BUILDS in always beats another row's leftover there.
+    # First the libraries each row targets today; then EVERY library of its media type, because its
+    # collections may still sit in a library it was narrowed away from, and since promotion reaches
+    # those, an unmatched one would take the no-spec fallback every run rather than never being
+    # touched. A synthesized title matching no collection is inert, and setdefault leaves the recorded
+    # per-library titles (placement_titles) winning. A {library_name} title differs per library, which
+    # is the other reason this is per library.
+    for leftovers in (False, True):
+        for spec, title_template in static_rows:
+            own = target_sections(sections, spec)
+            scope = target_sections(sections, replace(spec, library_keys=[])) if leftovers else own
+            own_keys = {str(s.key) for s in own}
+            for section in scope:
+                if leftovers and str(section.key) in own_keys:
+                    continue
                 name = render_row_name(title_template, user, [], library_name=getattr(section, "title", "") or "")
-                # `{top_seed}` templates never reach here (guarded above), so the only way this is
+                # `{top_seed}` templates never reach here (filtered above), so the only way this is
                 # empty is a template that renders to nothing — and mapping the bare marker would
                 # claim every unnamed collection of this person's for this one spec.
-                if name:
-                    key = name + marker
-                    held = placements.get(key)
-                    if held is not None and held.slug != spec.slug:
-                        # First in Rows-page order wins, which is arbitrary from the owner's side and
-                        # means one row's schedule silently governs the other's collection. Delivery
-                        # already warns on its own side of this; promotion was silent.
-                        logger.warning(
-                            "rows '{}' and '{}' both render '{}' in {} — the first decides that "
-                            "collection's placement, so their day schedules cannot differ there",
-                            held.slug,
-                            spec.slug,
-                            name,
-                            getattr(section, "title", "") or "this library",
-                        )
-                    placements.setdefault(key, spec)
+                if not name:
+                    continue
+                key = (str(section.key), name + marker)
+                held = placements.get(key)
+                if not leftovers and held is not None and held.slug != spec.slug:
+                    # Two rows building in ONE library under one title. First in Rows-page order wins,
+                    # which is arbitrary from the owner's side and means one row's schedule silently
+                    # governs the other's collection. Delivery already warns on its own side of this.
+                    logger.warning(
+                        "rows '{}' and '{}' both render '{}' in {} — the first decides that "
+                        "collection's placement, so their day schedules cannot differ there",
+                        held.slug,
+                        spec.slug,
+                        name,
+                        getattr(section, "title", "") or "this library",
+                    )
+                placements.setdefault(key, spec)
 
     promoted = into if into is not None else set()
     # Every row the user has, in every library — they can have several rows (all sharing their label),
@@ -1408,7 +1421,7 @@ def promote_user_rows(
                 logger.info("[dry-run] {}: would promote for {}", collection.title, user.username)
                 continue
             # Identity first: a ratingKey cannot be wrong, a title can be stale or unrenderable.
-            spec = by_key.get(int(collection.ratingKey)) or placements.get(collection.title)
+            spec = by_key.get(int(collection.ratingKey)) or placements.get((str(section.key), collection.title))
             if spec is None and skip_unmatched:
                 # For a RUN, `_promote_one`'s no-spec branch showing the row is the safe direction —
                 # under-showing makes people's rows silently disappear. For a caller converging a
