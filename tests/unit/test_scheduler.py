@@ -165,6 +165,57 @@ class TestScheduledWorkIsDurable:
         with app.state.sessions() as session:
             assert session.query(Job).filter_by(kind="privacy.sync").count() == 1
 
+    def test_a_scheduled_privacy_sync_is_not_queued_beside_one_waiting_to_retry(self, app, monkeypatch):
+        """A pass that failed (plex.tv down) goes back to `queued` with its `started_at` kept while it backs
+        off, and it re-reads everything when it retries. Counting only never-started jobs queued a fresh
+        pass beside it on every tick of an outage: more plex.tv reads while it is failing, more failure cards."""
+        from datetime import UTC, datetime
+
+        from shortlist.server.db.models import Job
+        from shortlist.server.services import jobs
+
+        async def no_drain(state, reason):
+            return None
+
+        monkeypatch.setattr(jobs, "drain_now", no_drain)
+        with app.state.sessions() as session:
+            session.add(
+                Job(
+                    kind="privacy.sync",
+                    status="queued",
+                    attempts=1,
+                    started_at=datetime.now(UTC),
+                    finished_at=datetime.now(UTC),
+                    error="RuntimeError: could not read the plex.tv user list",
+                )
+            )
+            session.commit()
+
+        self._fire(app, "privacy-sync")
+
+        with app.state.sessions() as session:
+            assert session.query(Job).filter_by(kind="privacy.sync").count() == 1
+
+    def test_a_scheduled_privacy_sync_is_queued_once_the_last_one_finished(self, app, monkeypatch):
+        from datetime import UTC, datetime
+
+        from shortlist.server.db.models import Job
+        from shortlist.server.services import jobs
+
+        async def no_drain(state, reason):
+            return None
+
+        monkeypatch.setattr(jobs, "drain_now", no_drain)
+        with app.state.sessions() as session:
+            for status in ("done", "failed"):
+                session.add(Job(kind="privacy.sync", status=status, attempts=1, started_at=datetime.now(UTC)))
+            session.commit()
+
+        self._fire(app, "privacy-sync")
+
+        with app.state.sessions() as session:
+            assert session.query(Job).filter_by(kind="privacy.sync", status="queued").count() == 1
+
     @pytest.mark.parametrize("kind", ["sync.users", "sync.history", "backup.take", "maintenance.prune"])
     def test_each_handler_actually_runs(self, kind):
         """Mocking `enqueue`/`drain_now` proves the scheduler CALLS the queue and nothing more — it

@@ -321,13 +321,11 @@ def _register_privacy_sync(scheduler: AsyncIOScheduler, app) -> None:
         from shortlist.server.db.models import Job
 
         # Writer jobs wait out a run, so a long run would otherwise leave one pass queued per tick, all run
-        # back to back afterwards. One still waiting will read the state it finds when it starts.
+        # back to back afterwards. One still waiting will read the state it finds when it starts — and so
+        # will one waiting to RETRY, which `_finish` puts back to `queued` with its `started_at` kept. Its
+        # longest backoff (15 minutes) is shorter than a tick, so it never delays a pass by more than that.
         with app.state.sessions() as session:
-            waiting = (
-                session.query(Job)
-                .filter(Job.kind == "privacy.sync", Job.status == "queued", Job.started_at.is_(None))
-                .first()
-            )
+            waiting = session.query(Job).filter(Job.kind == "privacy.sync", Job.status == "queued").first()
         if waiting is not None:
             logger.debug("privacy sync already queued (job {}) — not queuing another", waiting.id)
             return
