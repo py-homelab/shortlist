@@ -53,6 +53,7 @@ from shortlist.server.db.models import (
     CollectionAudience,
     Delivery,
     Event,
+    Job,
     PickRow,
     RequestCandidate,
     RunSharedRow,
@@ -857,10 +858,18 @@ def _unique_slug(session, base: str) -> str:
     The slug is a row's identity in every history table, and deleting a row frees it in `collections`
     alone. A new row that took it over inherited the deleted row's last picks (redelivered as "not due
     to rebuild"), its delivery ledger, its shared-row picks and watch credits, and its queued requests —
-    seen live on 2026-09-13. Retention pruning eventually frees such a slug, once nothing is left to
-    inherit.
+    seen live on 2026-09-13. A delivered row's history is kept (run pruning leaves picks, deliveries and
+    watch credits alone), so in practice its slug stays reserved for good.
+
+    A pending `row.reconcile` for the slug counts too. DELETE queues it before dropping the row, and it
+    cannot start while a run is in flight — a run that still holds the old row, and persists its picks
+    under the slug as each person finishes. When the job does start it removes by the slug's ledger
+    keys, which would by then be the NEW row's collections.
+
+    The default row's slug is never handed out: `picked` makes a row the default one everywhere,
+    titled from the global template and credited with legacy picks stored under a blank slug.
     """
-    base = base if base not in RESERVED_SLUGS else f"{base}_row"
+    base = base if base not in RESERVED_SLUGS | {DEFAULT_SLUG} else f"{base}_row"
     columns = (
         Collection.slug,
         PickRow.collection_slug,
@@ -871,7 +880,14 @@ def _unique_slug(session, base: str) -> str:
     )
 
     def is_taken(slug: str) -> bool:
-        return any(session.query(column).filter(column == slug).first() is not None for column in columns)
+        if any(session.query(column).filter(column == slug).first() is not None for column in columns):
+            return True
+        pending_removal = session.query(Job.id).filter(
+            Job.kind == "row.reconcile",
+            Job.status.in_(("queued", "running")),
+            func.json_extract(Job.payload, "$.slug") == slug,
+        )
+        return pending_removal.first() is not None
 
     return dedupe_slug(base, is_taken)
 
@@ -1722,6 +1738,9 @@ async def delete_collection(collection_id: int, request: Request, dry_run: bool 
         collection = session.get(Collection, collection_id)
         if collection is not None:
             session.query(CollectionAudience).filter_by(collection_id=collection.id).delete()
+            # Keyed by id, and SQLite hands a freed highest id to the next row — which would otherwise
+            # serve, and could push to Plex, this row's artwork.
+            poster_service.clear_assets(session, collection.id)
             session.delete(collection)
             orphaned = _forget_anchor_row(session, slug)
             if orphaned:

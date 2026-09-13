@@ -2033,6 +2033,7 @@ class TestADeletedRowsSlugIsNotHandedToANewRow:
     def _history(self, session, kind: str, slug: str) -> None:
         from shortlist.server.db.models import (
             Delivery,
+            Job,
             PickRow,
             RequestCandidate,
             Run,
@@ -2065,12 +2066,16 @@ class TestADeletedRowsSlugIsNotHandedToANewRow:
                     user_id=user.id, collection_slug=slug, tmdb_id=1, media_type="movie"
                 ),
                 "request_candidates": lambda: RequestCandidate(tmdb_id=1, media_type="movie", title="T", row_slug=slug),
+                # Not history yet, but about to be: DELETE queues this before dropping the row, it cannot
+                # start while a run is in flight, and that run still holds the old row and persists its
+                # picks under the slug. When it does start, it removes by that slug's ledger keys.
+                "reconcile_job": lambda: Job(kind="row.reconcile", status="queued", payload={"slug": slug}),
             }[kind]()
         )
         session.commit()
 
     @pytest.mark.parametrize(
-        "kind", ["picks", "deliveries", "run_shared_rows", "shared_row_watches", "request_candidates"]
+        "kind", ["picks", "deliveries", "run_shared_rows", "shared_row_watches", "request_candidates", "reconcile_job"]
     )
     def test_a_slug_history_still_names_is_not_reused(self, client: TestClient, kind: str):
         from shortlist.server.db.models import Collection
@@ -2085,6 +2090,39 @@ class TestADeletedRowsSlugIsNotHandedToANewRow:
         again = client.post("/api/collections", json={"name": "Hidden Gems"}).json()
 
         assert again["slug"] != "hidden_gems", f"the new row inherited the deleted row's {kind}"
+
+    def test_a_new_row_never_takes_the_default_rows_slug(self, client: TestClient):
+        """`picked` is not just a name: it makes a row THE default row everywhere — titled from the global
+        template, credited with every legacy pick stored under a blank slug."""
+        from shortlist.server.db.models import Collection
+
+        with client.app.state.sessions() as session:
+            session.query(Collection).filter_by(slug=DEFAULT_SLUG).delete()
+            session.commit()
+
+        created = client.post("/api/collections", json={"name": "Picked"}).json()
+
+        assert created["slug"] != DEFAULT_SLUG
+        assert created["name"] == "Picked"
+
+    def test_deleting_a_row_drops_its_uploaded_poster(self, client: TestClient):
+        """SQLite hands a freed highest id to the next row, and the upload is keyed by id — so a new row
+        served, and could push to Plex, the deleted row's artwork."""
+        import base64
+
+        from shortlist.server.services import poster_service
+
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+        )
+        cid = client.post("/api/collections", json={"name": "With Art"}).json()["id"]
+        uploaded = client.post(f"/api/collections/{cid}/poster/upload", files={"file": ("p.png", png, "image/png")})
+        assert uploaded.status_code == 200
+
+        assert client.delete(f"/api/collections/{cid}").status_code == 204
+
+        with client.app.state.sessions() as session:
+            assert poster_service.load_upload(session, cid) is None
 
     def test_a_slug_nothing_remembers_is_still_used_as_is(self, client: TestClient):
         from shortlist.server.db.models import Collection
