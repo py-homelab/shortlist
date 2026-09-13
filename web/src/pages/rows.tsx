@@ -37,14 +37,18 @@ function RowNameChipLegend({ rows }: { rows: Collection[] }) {
   // told it reads "✨ Movies Picked for You", which is true of neither half.
   return (
     <p className="px-1 pt-1 text-xs text-muted-foreground">
-      A chip like{" "}
+      Grey chips like{" "}
       <span className="rounded bg-muted px-1 py-0.5 font-normal">
         library name
       </span>{" "}
-      is a placeholder, filled in when the row is built &mdash; so &ldquo;✨
-      library name Picked for You&rdquo; reads{" "}
-      <span className="text-foreground">✨ Movies Picked for You</span> on Plex.
-      An example: the real library, person or recent watch fills in.
+      are placeholders, filled in when Shortlist builds the row. For example,
+      ✨{" "}
+      <span className="rounded bg-muted px-1 py-0.5 font-normal">
+        library name
+      </span>{" "}
+      Picked for You shows on Plex as{" "}
+      <span className="text-foreground">✨ Movies Picked for You</span>. A
+      person&rsquo;s name or a recent watch fills in the same way.
     </p>
   );
 }

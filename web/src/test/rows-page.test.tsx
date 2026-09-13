@@ -156,6 +156,23 @@ describe("RowsPage", () => {
     ).toBeInTheDocument();
   });
 
+  it("explains the chip in plain sentences, not a run-on with a dangling fragment", async () => {
+    // It read "…reads ✨ Movies Picked for You on Plex. An example: the real library, person or recent
+    // watch fills in." — the owner could not tell whether that was one sentence or two.
+    getUsers.mockResolvedValue([]);
+    listCollections.mockResolvedValue([
+      { ...SUBSET_ROW, name: "✨ {library_name} Picked for You" },
+    ]);
+    renderPage();
+
+    const legend = (await screen.findByText(/Movies Picked for You/)).closest("p");
+    expect(legend?.textContent).toBe(
+      "Grey chips like library name are placeholders, filled in when Shortlist builds the row. " +
+        "For example, ✨ library name Picked for You shows on Plex as ✨ Movies Picked for You. " +
+        "A person’s name or a recent watch fills in the same way.",
+    );
+  });
+
   it("says nothing about chips when no row has one", async () => {
     // An explainer for something not on screen is noise on the page it explains.
     getUsers.mockResolvedValue([]);
