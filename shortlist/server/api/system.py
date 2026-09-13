@@ -1143,7 +1143,8 @@ async def list_jobs(
     jobs started at id 680, so filtering a fetched page client-side answered "8 failed" with an
     empty list. A count over the whole table needs a filter over the whole table.
 
-    `exclude_routine` drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,
+    `exclude_routine` also drops a finished job whose result says it was `quiet` — a scheduled privacy sync
+    that found nothing to change. And it drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,
     and exists for the same reason `status` does: a client filter over a fetched page cannot work
     when the noise outnumbers the news. Measured on a 46-user server, `watch.reconcile` was 165 of
     the 197 jobs queued in a day, so the newest 30 rows the header polls were almost all reconciles
@@ -1151,7 +1152,7 @@ async def list_jobs(
     go to look at reconciles — and a failure is never dropped, because a reconcile that fails is the
     only thing that would say a partial watch went uncredited.
     """
-    from sqlalchemy import or_
+    from sqlalchemy import and_, func, or_
 
     from shortlist.server.db.models import Job
 
@@ -1161,8 +1162,12 @@ async def list_jobs(
             query = query.filter(Job.kind == kind)
         if status:
             query = query.filter(Job.status == status)
-        if exclude_routine and (noisy := jobs.routine_kinds()):
-            query = query.filter(or_(Job.kind.notin_(noisy), Job.status == "failed"))
+        if exclude_routine:
+            if noisy := jobs.routine_kinds():
+                query = query.filter(or_(Job.kind.notin_(noisy), Job.status == "failed"))
+            # A finished job that says it was quiet (a scheduled privacy sync that changed nothing).
+            quiet = func.coalesce(func.json_extract(Job.result, "$.quiet"), 0) == 1
+            query = query.filter(~and_(Job.status == "done", quiet))
         if before_id is not None:
             query = query.filter(Job.id < before_id)
         rows = query.order_by(Job.created_at.desc(), Job.id.desc()).limit(min(limit, 200)).all()

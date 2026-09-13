@@ -1680,7 +1680,7 @@ def _row_keys_by_slug(ctx: EngineContext, report: RunReport, section_key: str) -
 
     The ledger is the base, not this run's report, on purpose. This used to read
     `report.users[].placement_titles`, which only ever holds rows delivered by THE RUN IN PROGRESS —
-    so a `privacy.sync` (`engine_run(ctx, [])`, which is what the nightly privacy-sync job and the
+    so a `privacy.sync` (`engine_run(ctx, [])`, which is what the scheduled privacy-sync job and the
     "Fix privacy" button both run) had an empty map, every group came out empty, and the whole
     ordering pass silently did nothing. On SFLIX that was 31 runs in one day reaching this code and
     issuing not one move (2026-08-12). The ledger is written by past runs, so it answers the same

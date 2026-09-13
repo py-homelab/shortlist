@@ -507,6 +507,11 @@ def _owner_sees_all_rows(session: Session) -> dict | None:
     }
 
 
+def _aware(moment: datetime) -> datetime:
+    """SQLite hands back naive datetimes for values stored as UTC; compare them as UTC."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
 def _failed_jobs(session: Session) -> dict | None:
     """Background jobs that ran out of retries.
 
@@ -519,8 +524,22 @@ def _failed_jobs(session: Session) -> dict | None:
     than staying hidden behind the old one.
     """
     from shortlist.server.db.models import Job
+    from shortlist.server.services import jobs as jobs_service
 
     failed = session.query(Job).filter(Job.status == "failed").order_by(Job.id.desc()).all()
+    # A failure a later successful run of the same whole-job kind has already repaired is not news. By FINISH
+    # time, not id: ids follow queue order, and a pass retrying through an outage can fail after a later one
+    # already succeeded.
+    for kind in {e.kind for e in jobs_service.CATALOG if e.later_success_clears_failure}:
+        last_success = session.query(func.max(Job.finished_at)).filter(Job.kind == kind, Job.status == "done").scalar()
+        if last_success is not None:
+            failed = [
+                job
+                for job in failed
+                if not (
+                    job.kind == kind and job.finished_at is not None and _aware(job.finished_at) < _aware(last_success)
+                )
+            ]
     if not failed:
         return None
     kinds = sorted({job.kind for job in failed})
@@ -529,7 +548,6 @@ def _failed_jobs(session: Session) -> dict | None:
     # false: it never touches Plex, and it is not in the manual allow-list, so "run it again" points
     # at a button that returns 422. The same wrongness was already latent for `backup.take` and
     # `maintenance.prune`.
-    from shortlist.server.services import jobs as jobs_service
 
     entries = {e.kind: e for e in jobs_service.CATALOG}
     touched_plex = any(entries[k].writes_plex for k in kinds if k in entries)

@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -578,6 +579,8 @@ class TestRestoreAfterUnpause:
                 promotion_blockers=[],
                 swept_rows={},
                 converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
             )
 
         import shortlist.engine.pipeline as pipeline_mod
@@ -659,6 +662,8 @@ class TestRestoreAfterUnpause:
             promotion_blockers=["dave (plex account 300): plex.tv 503"],
             swept_rows={},
             converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
         )
 
         with pytest.raises(RuntimeError, match="dave"):
@@ -687,6 +692,8 @@ class TestRestoreAfterUnpause:
                 promotion_blockers=[],
                 swept_rows={},
                 converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
                 hub_orderings=[],
                 left_alone_failures=[],
             )
@@ -708,6 +715,8 @@ class TestRestoreAfterUnpause:
             promotion_blockers=[],
             swept_rows={},
             converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
             hub_orderings=[],
             left_alone_failures=[],
             restrictions_restored={201: "sarah"},
@@ -747,6 +756,8 @@ class TestRestoreAfterUnpause:
                 promotion_blockers=[],
                 swept_rows={},
                 converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
                 hub_orderings=[],
                 left_alone_failures=[],
             )
@@ -770,6 +781,8 @@ class TestRestoreAfterUnpause:
             promotion_blockers=["kid (plex account 500): plex.tv 422"],
             swept_rows={},
             converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
         )
 
         with pytest.raises(RuntimeError) as raised:
@@ -792,6 +805,8 @@ class TestRestoreAfterUnpause:
             promotion_blockers=[],
             swept_rows={},
             converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
         )
 
         with pytest.raises(RuntimeError, match=re.escape("plex.tv 503")):
@@ -1040,6 +1055,8 @@ class TestSafeMode:
                 promotion_blockers=[],
                 swept_rows={},
                 converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
             ),
         )
 
@@ -1807,6 +1824,8 @@ class TestScheduledRowVisibility:
                 promotion_blockers=[],
                 swept_rows={},
                 converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
             )
 
         import shortlist.engine.pipeline as pipeline_mod
@@ -2205,3 +2224,118 @@ class TestScheduledRowVisibility:
         jobs._HANDLERS["rows.visibility"](state, {})
 
         assert seen[0].config.manage_shelf_order is False
+
+
+class TestAPrivacySyncSaysWhenItWasQuiet:
+    """The header's Recent list hides a privacy sync only when the pass says it was quiet: started by the
+    schedule, and nothing changed or went wrong since the last pass. Anything else is news."""
+
+    SCHEDULED: ClassVar[dict] = {"scheduled": True}
+
+    def _run(self, monkeypatch, sessions, payload: dict, **report_fields) -> dict:
+        from shortlist.engine import pipeline
+        from shortlist.engine.models import RunReport
+        from shortlist.server.services import jobs
+
+        report = RunReport(started_at=datetime.now(UTC))
+        for name, value in report_fields.items():
+            setattr(report, name, value)
+        monkeypatch.setattr(pipeline, "run", lambda ctx, users: report)
+        ctx = SimpleNamespace(config=SimpleNamespace(dry_run=False, manage_shelf_order=True))
+        state = SimpleNamespace(run_service=SimpleNamespace(build_context=lambda dry_run: ctx), sessions=sessions)
+        return jobs._privacy_sync(state, payload)
+
+    def _previous_pass(self, sessions, result: dict) -> None:
+        from shortlist.server.db.models import Job
+
+        with sessions() as session:
+            session.add(
+                Job(kind="privacy.sync", status="done", payload={}, result=result, finished_at=datetime.now(UTC))
+            )
+            session.commit()
+
+    def test_a_scheduled_pass_that_changed_nothing_is_quiet(self, monkeypatch, sessions):
+        assert self._run(monkeypatch, sessions, self.SCHEDULED)["quiet"] is True
+
+    def test_a_pass_started_without_the_schedule_is_not_quiet(self, monkeypatch, sessions):
+        """The Jobs page button, the new-account pass and the crash-recovery pass carry no `scheduled`; the
+        owner who pressed the button still needs to see it ran."""
+        assert self._run(monkeypatch, sessions, {})["quiet"] is False
+
+    @pytest.mark.parametrize(
+        "news",
+        [
+            {"reason": "a person was switched off"},
+            {"swept_rows": {"sarah": ["✨ Movies Picked for You"]}},
+            {"filter_writes": {100: {"username": "sarah", "fields": {"filterMovies": ("", "label!=Shortlist_mike")}}}},
+            {"converged": ["sarah's row taken off your Home"]},
+            {"left_alone_failures": {300: "mike: plex.tv refused the write"}},
+            {"restrictions_restored": {201: "sarah"}},
+            {"unreadable_filters": {"sarah": "Movies: a&b"}},
+            {"filters_not_enforced": {"sarah": [5001]}},
+            {"unhideable_rows": {"kid": [5001]}},
+        ],
+        ids=[
+            "caused by a change",
+            "swept unhidable rows",
+            "wrote a filter",
+            "converged",
+            "could not leave an account alone",
+            "restored an owner restriction",
+            "unreadable filter",
+            "filter not enforced",
+            "unhideable rows",
+        ],
+    )
+    def test_a_scheduled_pass_with_news_is_not_quiet(self, monkeypatch, sessions, news):
+        # `hub_orderings` has no row: this job switches shelf ordering off, so that list is always empty.
+        payload = {**self.SCHEDULED, **({"reason": news.pop("reason")} if "reason" in news else {})}
+        assert self._run(monkeypatch, sessions, payload, **news)["quiet"] is False
+
+    def test_a_warning_the_last_pass_already_gave_is_not_news_again(self, monkeypatch, sessions):
+        """A kid profile Plex will not take a hide-list for is reported by EVERY pass. Counting it as news each
+        time would put all 48 passes a day in Recent on exactly the server that has one."""
+        first = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]})
+        self._previous_pass(sessions, first)
+
+        again = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]})
+
+        assert first["quiet"] is False
+        assert again["quiet"] is True
+
+    def test_a_warning_about_someone_new_is_news(self, monkeypatch, sessions):
+        self._previous_pass(sessions, self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]}))
+
+        later = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001], "teen": [5002]})
+
+        assert later["quiet"] is False
+
+    def test_the_baseline_is_the_newest_successful_pass_not_a_failed_or_older_one(self, monkeypatch, sessions):
+        from shortlist.server.db.models import Job
+
+        now = datetime.now(UTC)
+        with sessions() as session:
+            session.add(
+                Job(
+                    kind="privacy.sync",
+                    status="done",
+                    payload={},
+                    result={"standing": []},
+                    finished_at=now - timedelta(hours=1),
+                )
+            )
+            session.add(
+                Job(
+                    kind="privacy.sync",
+                    status="done",
+                    payload={},
+                    result={"standing": ["can see others' rows: kid"]},
+                    finished_at=now - timedelta(minutes=30),
+                )
+            )
+            session.add(Job(kind="privacy.sync", status="failed", payload={}, result={"standing": []}, finished_at=now))
+            session.commit()
+
+        again = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]})
+
+        assert again["quiet"] is True

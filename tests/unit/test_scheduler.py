@@ -140,10 +140,30 @@ class TestScheduledWorkIsDurable:
         self._fire(app, job_id)
 
         assert [k for k, _ in queued] == [kind]
+        if kind == "privacy.sync":
+            # Only a scheduled pass may count as quiet and stay out of Recent.
+            assert queued[0][1] == {"scheduled": True}
         if kind == "backup.take":
             # The payload the SUT controls, not just that something was queued: the keep limit comes
             # from settings and a dropped `max_keep` would silently prune to the built-in default.
             assert set(queued[0][1]) == {"label", "max_keep"}
+
+    def test_a_scheduled_privacy_sync_is_not_queued_behind_one_still_waiting(self, app, monkeypatch):
+        """Every 30 minutes, and writer jobs wait out a run: a two-hour run used to leave four passes queued,
+        run back to back afterwards, each redoing the merge the run itself had just done."""
+        from shortlist.server.db.models import Job
+        from shortlist.server.services import jobs
+
+        async def no_drain(state, reason):
+            return None
+
+        monkeypatch.setattr(jobs, "drain_now", no_drain)
+
+        self._fire(app, "privacy-sync")
+        self._fire(app, "privacy-sync")
+
+        with app.state.sessions() as session:
+            assert session.query(Job).filter_by(kind="privacy.sync").count() == 1
 
     @pytest.mark.parametrize("kind", ["sync.users", "sync.history", "backup.take", "maintenance.prune"])
     def test_each_handler_actually_runs(self, kind):
@@ -218,7 +238,7 @@ class TestSyncUsersOnAnUnlinkedServer:
 
 
 class TestPrivacySyncSchedule:
-    """The nightly share-filter re-merge.
+    """The scheduled share-filter re-merge (every 30 minutes by default).
 
     It exists because the automatic Privacy Check + write gate was removed on 2026-07-16 at the
     owner's request: nothing verifies hiding after the fact any more, so leak-safe write ORDERING is
@@ -235,7 +255,7 @@ class TestPrivacySyncSchedule:
 
         # `next_run_time` only exists once the scheduler is STARTED, so registration + a trigger is
         # the whole claim available here — matching how the other schedule tests assert.
-        assert job is not None, "the nightly privacy sync is not scheduled"
+        assert job is not None, "the privacy sync is not scheduled"
         assert job.trigger is not None
 
     def test_the_retention_prune_has_a_timer_of_its_own(self, app):

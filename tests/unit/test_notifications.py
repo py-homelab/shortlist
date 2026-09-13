@@ -388,6 +388,52 @@ class TestFailedJobs:
         assert result["title"] == "2 background jobs failed"
 
 
+class TestAPrivacySyncFailureAFollowingPassRepaired:
+    """A privacy sync is a full pass that starts from scratch, so the next clean one IS the retry. Every 30
+    minutes, a short plex.tv outage otherwise leaves a failure card that nothing can clear."""
+
+    def test_a_failure_followed_by_a_successful_pass_is_not_reported(self, session):
+        now = datetime.now(UTC)
+        session.add(Job(kind="privacy.sync", status="failed", finished_at=now - timedelta(minutes=30)))
+        session.commit()
+        session.add(Job(kind="privacy.sync", status="done", finished_at=now))
+        session.commit()
+
+        assert notif._failed_jobs(session) is None
+
+    def test_a_failure_after_the_last_success_still_is(self, session):
+        now = datetime.now(UTC)
+        session.add(Job(kind="privacy.sync", status="done", finished_at=now - timedelta(minutes=30)))
+        session.commit()
+        failed = Job(kind="privacy.sync", status="failed", finished_at=now)
+        session.add(failed)
+        session.commit()
+
+        assert notif._failed_jobs(session)["id"] == f"failed-jobs-{failed.id}"
+
+    def test_a_failure_that_finished_after_the_last_success_still_is_even_if_queued_first(self, session):
+        """Ids follow queue order, not finish order: a pass retrying through an outage can fail after a later
+        one already succeeded."""
+        now = datetime.now(UTC)
+        failed = Job(kind="privacy.sync", status="failed", finished_at=now)
+        session.add(failed)
+        session.commit()
+        session.add(Job(kind="privacy.sync", status="done", finished_at=now - timedelta(minutes=4)))
+        session.commit()
+
+        assert notif._failed_jobs(session)["id"] == f"failed-jobs-{failed.id}"
+
+    def test_other_kinds_are_not_cleared_by_their_own_later_success(self, session):
+        """A user cleanup is per person: a later success for someone else repairs nothing."""
+        now = datetime.now(UTC)
+        session.add(Job(kind="user.cleanup", status="failed", finished_at=now - timedelta(minutes=30)))
+        session.commit()
+        session.add(Job(kind="user.cleanup", status="done", finished_at=now))
+        session.commit()
+
+        assert notif._failed_jobs(session) is not None
+
+
 class TestOwnerSeesAllRows:
     """The condition is a four-way AND, and every leg has to be able to switch it off on its own —
     otherwise the owner gets nagged about a shelf they haven't got. The `build == "shared"` leg is

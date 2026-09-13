@@ -113,6 +113,9 @@ class JobKind:
     # shared one. Per-kind because how long to keep trying is a property of what is being called, not
     # of the queue: see `NOTIFY_BACKOFF_S`.
     backoff_s: tuple[int, ...] = ()
+    # A kind whose every run redoes the whole job, so a later success means an earlier failure is repaired
+    # and no longer worth an error card. Not true of per-target kinds (a cleanup for one person).
+    later_success_clears_failure: bool = False
 
 
 # Every registered kind, in the order the Jobs page shows them. `manual` is a deliberate allow-list,
@@ -214,9 +217,9 @@ CATALOG: tuple[JobKind, ...] = (
         manual=True,
         schedule_job_id="privacy-sync",
         schedule_setting="privacy.sync_cron",
-        # Every 30 minutes by default: a clean pass is not news, and 48 a day would own Recent. A failed
-        # one still shows — it means rows may be visible to people they should not be.
-        routine=True,
+        # A full pass from scratch, so the next clean one is the retry of a failed one. Every 30 minutes, a
+        # short plex.tv outage would otherwise leave a failure card nothing can clear.
+        later_success_clears_failure=True,
         trigger=(
             "Also runs on its own whenever something changes who should see what: someone switched "
             "on or off, a row's audience changed, or a new account turning up on your server."
@@ -1131,7 +1134,57 @@ def _privacy_sync(state, payload: dict) -> dict:
     unplaced = [e for e in report.hub_orderings if e.get("placed") is False]
     if unplaced:
         detail += f"; could NOT place rows in {', '.join(e.get('library', '?') for e in unplaced)}"
-    return {"swept": swept, "converged": report.converged, "reason": reason, "dry_run": dry_run, "detail": detail}
+    if report.converged:
+        detail += f"; took {len(report.converged)} row(s) off Home that nothing should have promoted"
+    if report.filters_not_enforced or report.unhideable_rows:
+        seeing = sorted({*report.filters_not_enforced, *report.unhideable_rows})
+        detail += f"; {', '.join(seeing)} can still see other people's rows"
+    # Quiet = started by the schedule, and nothing changed or went wrong. Only a quiet pass is kept out of
+    # the header's Recent list: at every 30 minutes it would otherwise own it. Anything someone started —
+    # the Jobs page button sends no `scheduled` — is their feedback.
+    #
+    # A standing warning (an account Plex will not take a hide-list for, a filter it ignores or cannot read)
+    # is reported by EVERY pass, so it is news only when it differs from the last successful pass's. A read
+    # that fails for one pass drops a warning and the next brings it back: two extra Recent entries, never
+    # a hidden warning.
+    standing = sorted(
+        {f"unreadable: {name}" for name in report.unreadable_filters}
+        | {f"not enforced: {name}" for name in report.filters_not_enforced}
+        | {f"can see others' rows: {name}" for name in report.unhideable_rows}
+    )
+    quiet = bool(payload.get("scheduled")) and not (
+        reason
+        or swept
+        or report.filter_writes
+        or report.converged
+        or report.left_alone_failures
+        or report.restrictions_restored
+        or report.hub_orderings
+        or standing != _last_privacy_sync_standing(state)
+    )
+    return {
+        "swept": swept,
+        "converged": report.converged,
+        "reason": reason,
+        "dry_run": dry_run,
+        "detail": detail,
+        "quiet": quiet,
+        "standing": standing,
+    }
+
+
+def _last_privacy_sync_standing(state) -> list[str]:
+    """The standing warnings the newest successful privacy sync recorded (empty when there is none)."""
+    from shortlist.server.db.models import Job
+
+    with state.sessions() as session:
+        last = (
+            session.query(Job)
+            .filter(Job.kind == "privacy.sync", Job.status == "done")
+            .order_by(Job.finished_at.desc(), Job.id.desc())
+            .first()
+        )
+        return list((last.result or {}).get("standing", [])) if last is not None else []
 
 
 @handler("sync.users")
@@ -1657,7 +1710,7 @@ def _rows_visibility(state, payload: dict) -> dict:
     row narrows its days — every server, until somebody uses this — does one query and stops.
 
     The converging night is NOT free, and the docs say so: it runs ``engine_run(ctx, [])``, which is
-    the nightly privacy sync in full, then re-promotes every row. That is the price of holding no
+    a whole privacy sync, then re-promotes every row. That is the price of holding no
     state, and it is paid only by servers that actually schedule a row.
 
     plex-safety rule 1: this can make a row MORE visible, so every account's excludes are merged and

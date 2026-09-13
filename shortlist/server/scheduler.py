@@ -282,7 +282,7 @@ def _register_backup(scheduler: AsyncIOScheduler, app) -> None:
 
 
 def _register_privacy_sync(scheduler: AsyncIOScheduler, app) -> None:
-    """Nightly re-merge of every account's share filter.
+    """Scheduled re-merge of every account's share filter (every 30 minutes by default).
 
     The automatic Privacy Check + write gate that used to VERIFY hiding before each write was removed
     on 2026-07-16 at the owner's request, so nothing checks it after the fact any more — leak-safe
@@ -300,7 +300,21 @@ def _register_privacy_sync(scheduler: AsyncIOScheduler, app) -> None:
     cron = _resolve_cron(app, "privacy.sync_cron", DEFAULT_CRONS["privacy.sync_cron"])
 
     async def fire() -> None:
-        await _queue_and_drain(app, "privacy.sync")
+        from shortlist.server.db.models import Job
+
+        # Writer jobs wait out a run, so a long run would otherwise leave one pass queued per tick, all run
+        # back to back afterwards. One still waiting will read the state it finds when it starts.
+        with app.state.sessions() as session:
+            waiting = (
+                session.query(Job)
+                .filter(Job.kind == "privacy.sync", Job.status == "queued", Job.started_at.is_(None))
+                .first()
+            )
+        if waiting is not None:
+            logger.debug("privacy sync already queued (job {}) — not queuing another", waiting.id)
+            return
+        # `scheduled`: only a pass the timer started may count as quiet and stay out of Recent.
+        await _queue_and_drain(app, "privacy.sync", {"scheduled": True})
 
     scheduler.add_job(fire, crontab_trigger(cron), id=PRIVACY_SYNC_JOB_ID, replace_existing=True)
 

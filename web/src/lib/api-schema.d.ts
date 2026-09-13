@@ -2002,7 +2002,8 @@ export interface paths {
          *     jobs started at id 680, so filtering a fetched page client-side answered "8 failed" with an
          *     empty list. A count over the whole table needs a filter over the whole table.
          *
-         *     `exclude_routine` drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,
+         *     `exclude_routine` also drops a finished job whose result says it was `quiet` — a scheduled privacy sync
+         *     that found nothing to change. And it drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,
          *     and exists for the same reason `status` does: a client filter over a fetched page cannot work
          *     when the noise outnumbers the news. Measured on a 46-user server, `watch.reconcile` was 165 of
          *     the 197 jobs queued in a day, so the newest 30 rows the header polls were almost all reconciles

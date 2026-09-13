@@ -32,10 +32,11 @@ All notable changes to this project are documented here. This project follows
 
 - **The privacy sync runs every 30 minutes by default, instead of once a night.** It is what hides
   everyone's rows from a Plex account you have just shared your server with. Run once a night, that
-  account could browse every person's rows in the library's Collections tab for up to a day. A pass
-  that finds nothing to change takes about 20 seconds and writes nothing, and it is no longer listed
-  under **Recent** — a privacy sync that fails still is. If you set your own schedule for it, yours is
-  kept. (#119)
+  account could browse every person's rows in the library's Collections tab for up to a day. A scheduled
+  pass that finds nothing to change takes about 20 seconds, writes nothing, and is no longer listed under
+  **Recent**; one that fails, changes something, raises a new warning, or that you caused by changing a
+  setting still is. A failure is no longer reported once a later pass succeeds, and passes no longer pile up behind a
+  long run. If you set your own schedule for it, yours is kept. (#119)
 
 - **The Dashboard no longer shows a row of "needs attention" chips.** Each chip repeated an alert
   the notification bell already lists, so the bell is now the one place to look.
