@@ -311,22 +311,57 @@ class TestRequestTitle:
             "seasons": "all",
         }
 
-    def test_request_as_user_id_is_sent_when_set(self):
+    def test_request_as_user_id_files_the_request_as_that_account(self):
+        """`X-API-User`, never a body `userId`. Overseerr, Seerr and Jellyseerr (`MediaRequest.request`)
+        take `userId` only for quota and request permission, and decide APPROVED or PENDING from the
+        CALLER's permissions. Filing for someone else needs Manage Requests, which is itself an
+        auto-approve permission, so every request filed "as" an account with auto-approve off was
+        approved anyway. `X-API-User` makes the API key act as that account (`middleware/auth.ts`),
+        so its permission, quota and approval all apply."""
         target = SeerrTarget(url="http://overseerr.test", api_key="ok", request_as_user_id=4)
         with respx.mock:
             self._mock_media()
             post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
             _client(target=target).request_title(603, MediaType.MOVIE, dry_run=False)
-        assert json.loads(post.calls[0].request.content)["userId"] == 4
+        request = post.calls[0].request
+        assert request.headers["X-API-User"] == "4"
+        assert request.headers["X-Api-Key"] == "ok"
+        assert json.loads(request.content) == {"mediaType": "movie", "mediaId": 603}
 
-    def test_user_id_is_omitted_entirely_when_unset_not_sent_as_null(self):
-        """A null `userId` is not the same as no `userId` — omitting it lets the instance apply its
-        own default, which is what "Server default" in the UI promises."""
+    def test_request_as_applies_only_to_filing_not_to_reading_what_the_instance_has(self):
+        """The media and blocklist reads need the key's own account: a requester account cannot list
+        every title on the server, and reading as one would fail the duplicate check."""
+        target = SeerrTarget(url="http://overseerr.test", api_key="ok", request_as_user_id=4)
+        with respx.mock:
+            media = self._mock_media()
+            respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
+            _client(target=target).request_title(603, MediaType.MOVIE, dry_run=False)
+        assert all("X-API-User" not in call.request.headers for call in media.calls)
+
+    def test_server_default_sends_no_account_at_all(self):
+        """Neither a header nor a null `userId`: "Server default" in the UI means the key's own account."""
         with respx.mock:
             self._mock_media()
             post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
             _client().request_title(603, MediaType.MOVIE, dry_run=False)
-        assert "userId" not in json.loads(post.calls[0].request.content)
+        request = post.calls[0].request
+        assert "X-API-User" not in request.headers
+        assert "userId" not in json.loads(request.content)
+
+    def test_a_refused_request_says_what_the_instance_said(self):
+        """A 403 on filing is the ACCOUNT's permission or quota, or a blocklisted title, and the instance
+        names which. Blaming Manage Requests sent owners after a permission filing no longer needs."""
+        target = SeerrTarget(url="http://overseerr.test", api_key="ok", request_as_user_id=4)
+        with respx.mock:
+            self._mock_media()
+            respx.post(f"{BASE}/request").mock(
+                return_value=httpx.Response(403, json={"message": "You do not have permission to make movie requests."})
+            )
+            with pytest.raises(SeerrError) as raised:
+                _client(target=target).request_title(603, MediaType.MOVIE, dry_run=False)
+        assert "You do not have permission to make movie requests." in str(raised.value)
+        assert "Manage Requests" not in str(raised.value)
+        assert "rejected the API key" not in str(raised.value)
 
     def test_a_title_overseerr_already_knows_is_skipped_not_re_requested(self):
         with respx.mock:

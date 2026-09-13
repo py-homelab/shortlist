@@ -11,7 +11,8 @@ Two consequences worth knowing before reading the code:
 * **A request carries no tags.** ``POST /request`` accepts only
   ``mediaType, mediaId, tvdbId, seasons, is4k, serverId, profileId, rootFolder, languageProfileId,
   userId`` — there is no tags field, so Shortlist's ``requests.tag`` and per-person ``auto_user_tag``
-  cannot travel this route. ``request_as_user_id`` is the attribution that replaces them.
+  cannot travel this route. ``request_as_user_id`` is the attribution that replaces them, and it is
+  sent as ``X-API-User``, never as ``userId`` — see ``request_title``.
 """
 
 from __future__ import annotations
@@ -90,10 +91,10 @@ _PERM_AUTO_APPROVE_TV = 512
 #: 403 is a WORKING key whose account lacks a permission — not a bad key, which is what a shared
 #: "rejected the API key" message said, sending owners off to regenerate a key that was fine.
 #:
-#: The permission is named PER CALL, because the two that a scoped key actually trips want different
-#: ones: filing on behalf of another account needs Manage Requests, while listing the accounts to
-#: choose from — the "Request as" dropdown itself — needs Manage Users. One shared message sent the
-#: owner to grant the wrong permission on the very screen meant to diagnose it.
+#: The permission is named PER CALL, because the reads a scoped key trips want different ones: the
+#: media and blocklist reads need Manage Requests, while listing the accounts to choose from — the
+#: "Request as" dropdown itself — needs Manage Users. One shared message sent the owner to grant the
+#: wrong permission on the very screen meant to diagnose it. Filing is different again: see `_post`.
 _FORBIDDEN = "{app} accepted the API key but refused this — its account needs the {permission} permission"
 _MANAGE_REQUESTS = "Manage Requests"
 _MANAGE_USERS = "Manage Users"
@@ -150,8 +151,13 @@ class SeerrClient:
         """Which instance this client talks to — so a caller can key a client cache by it."""
         return self._target
 
-    def _headers(self) -> dict[str, str]:
-        return {"X-Api-Key": self._target.api_key}
+    def _headers(self, *, as_user: int = 0) -> dict[str, str]:
+        headers = {"X-Api-Key": self._target.api_key}
+        if as_user:
+            # The API key acts AS this account: its permissions, quota and approval, not the key's own
+            # (Overseerr, Seerr and Jellyseerr `server/middleware/auth.ts`).
+            headers["X-API-User"] = str(as_user)
+        return headers
 
     def _get(self, path: str, *, permission: str = _MANAGE_REQUESTS, **params: object) -> object:
         try:
@@ -173,20 +179,26 @@ class SeerrClient:
             # because "expecting value: line 1" sends people to the wrong place entirely.
             raise SeerrError(f"{self.app_name} returned a non-JSON body — check the URL and any proxy") from e
 
-    def _post(self, path: str, body: dict) -> dict:
+    def _post(self, path: str, body: dict, *, as_user: int = 0) -> dict:
         self._throttle()
         try:
             # Retried only where it provably never landed (connect error) or was rate-limited, never
             # on a read timeout — a retried request would file the title twice.
             r = http_retry.request(
-                "POST", f"{self._base}/api/v1{path}", headers=self._headers(), json=body, timeout=self._timeout
+                "POST",
+                f"{self._base}/api/v1{path}",
+                headers=self._headers(as_user=as_user),
+                json=body,
+                timeout=self._timeout,
             )
         except httpx.HTTPError as e:
             raise SeerrError(f"{self.app_name} unreachable ({type(e).__name__})") from e
         if r.status_code == 401:
             raise SeerrError(f"{self.app_name} rejected the API key")
         if r.status_code == 403:
-            raise SeerrError(_FORBIDDEN.format(app=self.app_name, permission=_MANAGE_REQUESTS))
+            # Filing a request is refused for the ACCOUNT it is filed as: no Request permission, a
+            # spent quota, or a blocklisted title (`routes/request.ts`), and the instance says which.
+            raise SeerrError(f"{self.app_name} refused the request: {_first_error(r)}")
         if r.status_code >= 300:
             raise SeerrError(f"{self.app_name} refused the request (HTTP {r.status_code}): {_first_error(r)}")
         try:
@@ -439,12 +451,13 @@ class SeerrClient:
             # Without this Overseerr files a show request with no seasons, which it accepts and then
             # never sends to Sonarr — the request sits "approved" forever with nothing behind it.
             body["seasons"] = "all"
-        if self._target.request_as_user_id:
-            # Filing on behalf of another account needs MANAGE_REQUESTS; an admin key has it, and a
-            # key that does not comes back 403 naming the permission (see `_FORBIDDEN`). Omitted
-            # entirely when unset, rather than sent as null, so the instance applies its own default.
-            body["userId"] = self._target.request_as_user_id
-        self._post("/request", body)
+        # "Request as" rides in `X-API-User`, not the body's `userId`. `MediaRequest.request` checks a
+        # `userId` account's permission and quota but sets APPROVED or PENDING from the CALLER's
+        # permissions, and filing for another account needs Manage Requests, itself an auto-approve
+        # permission. So every request filed "as" an account with auto-approve off was approved
+        # anyway, straight to the download app, which is the one thing that choice exists to stop.
+        # Nothing at all is sent for "Server default", so the key's own account files it.
+        self._post("/request", body, as_user=self._target.request_as_user_id)
         # Whether it lands as pending or auto-approved is the chosen account's permission, not ours —
         # so the detail says what happened here and lets the *seerr own the rest.
         return "requested", f"requested from {self.app_name}", None
