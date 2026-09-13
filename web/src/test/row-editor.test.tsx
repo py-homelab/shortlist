@@ -1489,6 +1489,20 @@ describe("RowEditor — a typed row says so", () => {
     expect(body.sort_title_prefix).toBe("!010_");
   });
 
+  it("shows a TV-only row sorting under a TV library's name, not a movie library's", () => {
+    // The editor has to hand the field the row's media: the field defaulted to "Movies" on its own.
+    renderEditor(
+      row({
+        media: "show",
+        name_template: "More {library_name} to watch",
+        sort_title_prefix: "!010_",
+      }),
+    );
+
+    expect(screen.getByText("!010_More TV Shows to watch")).toBeInTheDocument();
+    expect(screen.queryByText("!010_More Movies to watch")).not.toBeInTheDocument();
+  });
+
   it("previews the description on the Plex card as the sample person would see it", async () => {
     renderEditor(row());
 

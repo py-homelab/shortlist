@@ -1301,6 +1301,7 @@ export function RowEditor({
             <RowSortPrefixField
               value={input.sort_title_prefix}
               rowName={input.name_template || input.name}
+              media={input.media}
               onChange={(sort_title_prefix) => set({ sort_title_prefix })}
             />
           </SettingsGroup>

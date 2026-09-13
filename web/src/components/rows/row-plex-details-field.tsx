@@ -1,7 +1,8 @@
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { renderRowName } from "@/lib/format";
+import { renderRowName, sampleLibraryName } from "@/lib/format";
+import type { CollectionInput } from "@/lib/types";
 
 /**
  * A row's Plex description (issue #120). Optional: empty means Shortlist leaves the description on
@@ -43,14 +44,19 @@ export function RowDescriptionField({
 export function RowSortPrefixField({
   value,
   rowName,
+  media,
   onChange,
 }: {
   value: string;
   /** The row's name as typed, for the "sorts as" example. */
   rowName: string;
+  /** The row's media type, which decides the library the example fills {library_name} with. */
+  media: CollectionInput["media"];
   onChange: (sortTitlePrefix: string) => void;
 }) {
   const hasPrefix = value.trim() !== "";
+  const sampleLibrary = sampleLibraryName(media);
+  const shownName = renderRowName(rowName, "Fargo", "Sarah", sampleLibrary);
   return (
     <div className="space-y-2 border-t pt-4">
       <Label htmlFor="row-sort-title-prefix">Sort title prefix</Label>
@@ -73,12 +79,12 @@ export function RowSortPrefixField({
           Sorts as{" "}
           <span className="font-mono">
             {value}
-            {renderRowName(rowName)}
+            {shownName}
           </span>
-          {rowName !== renderRowName(rowName) && (
+          {rowName !== shownName && (
             <span className="text-muted-foreground">
               {" "}
-              for Sarah, browsing Movies
+              for Sarah, browsing {sampleLibrary}
             </span>
           )}
         </p>

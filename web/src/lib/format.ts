@@ -281,6 +281,15 @@ export function renderRowName(
 }
 
 /**
+ * The sample library a row's previews fill {library_name} with. It has to match the row's media type,
+ * or a TV-only row previews as "More Movies to watch" — a name it can never produce. `media` is
+ * derived from the libraries the row targets, so a row narrowed to TV libraries is "show" too.
+ */
+export function sampleLibraryName(media: string): string {
+  return media === "show" ? "TV Shows" : "Movies";
+}
+
+/**
  * How a background job's state reads to a person.
  *
  * A job back in `queued` AFTER an attempt is the queue retrying it, not work that has yet to start

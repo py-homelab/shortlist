@@ -1,5 +1,5 @@
 import { api } from "@/lib/api";
-import { renderRowName } from "@/lib/format";
+import { renderRowName, sampleLibraryName } from "@/lib/format";
 import type { CollectionInput } from "@/lib/types";
 
 /** The sample person and library every preview on this card is filled in for. */
@@ -54,9 +54,7 @@ export function RowPlexCard({
   hasImage: boolean;
 }) {
   const template = input.name_template || input.name;
-  // The sample library has to match the row's media type, or a TV-only row previews as
-  // "More Movies to watch" — a name it can never produce.
-  const sampleLibrary = input.media === "show" ? "TV Shows" : "Movies";
+  const sampleLibrary = sampleLibraryName(input.media);
   const shown =
     renderRowName(template, SAMPLE.topSeed, SAMPLE.user, sampleLibrary) ||
     "Picked for You";
