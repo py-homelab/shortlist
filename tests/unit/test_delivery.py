@@ -2347,44 +2347,187 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
             logger.remove(sink)
         return "".join(seen)
 
-    def test_the_conflict_warning_names_what_is_holding_the_title(self):
-        """A 409 that just says "a collection already has that title" is untriageable on its own.
+    @staticmethod
+    def _held(rating_key: int, title: str, section_key) -> MagicMock:
+        holder = MagicMock(ratingKey=rating_key, title=title)
+        holder.librarySectionID = section_key
+        return holder
 
-        The squatter is one of three things with three different answers: this person's other row
-        mid-cycle (self-healing), debris from an interrupted run (the sweep clears it), or something
-        a co-managing tool made (leave it alone, rule 4). Observed on SFLIX 2026-09-06 for
-        twistedstream with no way to tell which. The ratingKey is what makes it findable, because
-        the title carries invisible marker characters and cannot be searched for in Plex.
-        """
+    def _refused_row(self, profile, *, then=None) -> MagicMock:
+        """A row whose first rename is refused; `then` is what every later rename does (default: succeed)."""
+        collection = MagicMock(ratingKey=771)
+        collection.title = "Old Name" + row_marker(profile.plex_account_id)
+        collection.editTitle.side_effect = [BadRequest(self.CONFLICT), then]
+        return collection
+
+    def _rename(self, plex, collection, target, profile, section, spare="spare"):
         from shortlist.engine.delivery import _rename_or_keep
 
+        outcome: list[str] = []
+        text = self._warnings(
+            lambda: outcome.append(
+                _rename_or_keep(
+                    plex,
+                    collection,
+                    target,
+                    profile,
+                    section,
+                    label="Shortlist_sarah",
+                    marker=row_marker(profile.plex_account_id),
+                    spare_item=spare,
+                )
+            )
+        )
+        return outcome[0], text
+
+    def test_a_rename_plex_accepts_needs_nothing_else(self, movies):
+        from shortlist.engine.delivery import RENAMED
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        collection = MagicMock()
+
+        outcome, _ = self._rename(plex, collection, "New", profile, movies)
+
+        assert outcome == RENAMED
+        plex.collections_titled.assert_not_called()
+        plex.create_collection.assert_not_called()
+
+    def test_the_conflict_warning_names_what_is_holding_the_title(self, movies):
+        """A name another collection in THIS library really has is the one refusal nothing here can fix,
+        and "a collection already has that title" is untriageable on its own. The ratingKey is what makes
+        the squatter findable, because the title carries invisible marker characters.
+        """
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
         profile = make_profile()
         target = "New Name" + row_marker(profile.plex_account_id)
-        squatter = MagicMock(ratingKey=99887, title=target)
-        collection = MagicMock()
-        collection.title = "Old Name" + row_marker(profile.plex_account_id)
-        collection.editTitle.side_effect = BadRequest(self.CONFLICT)
-        collection.section.return_value.collections.return_value = [squatter]
+        plex.collections_titled.return_value = [self._held(99887, target, movies.key)]
+        collection = self._refused_row(profile)
 
-        text = self._warnings(lambda: _rename_or_keep(collection, target, profile, "Movies"))
+        outcome, text = self._rename(plex, collection, target, profile, movies)
 
+        assert outcome == KEPT
         assert "99887" in text, "the ratingKey is the only way to find it in Plex"
         assert "also a Shortlist row" in text
+        plex.create_collection.assert_not_called()
 
-    def test_identifying_the_squatter_never_costs_the_row(self):
+    def test_identifying_the_squatter_never_costs_the_row(self, movies):
         """The lookup is diagnostics. A PMS that fails it must not turn a survivable rename into the
         raised exception that once cost a person every row they had."""
-        from shortlist.engine.delivery import _rename_or_keep
+        from shortlist.engine.delivery import KEPT
 
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
         profile = make_profile()
-        collection = MagicMock()
-        collection.title = "Old Name" + row_marker(profile.plex_account_id)
-        collection.editTitle.side_effect = BadRequest(self.CONFLICT)
-        collection.section.side_effect = RuntimeError("PMS down")
+        plex.collections_titled.side_effect = RuntimeError("PMS down")
 
-        text = self._warnings(lambda: _rename_or_keep(collection, "New Name", profile, "Movies"))
+        outcome, text = self._rename(plex, self._refused_row(profile), "New Name", profile, movies)
 
-        assert "could not identify what holds it" in text
+        assert outcome == KEPT
+        assert "could not check what holds it" in text
+        plex.create_collection.assert_not_called()
+
+    def test_a_name_only_a_twin_in_another_library_has_asks_for_a_rebuild(self, movies):
+        """A helper there would share the twin's tag row, and renaming the helper would rename the twin."""
+        from shortlist.engine.delivery import REBUILD
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        target = "New Name" + row_marker(profile.plex_account_id)
+        plex.collections_titled.return_value = [self._held(4242, target, 2)]
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), target, profile, movies)
+
+        assert outcome == REBUILD
+        plex.create_collection.assert_not_called()
+
+    def test_an_orphaned_name_is_freed_and_the_same_row_takes_it(self, movies):
+        """The SFLIX shape: nothing on the server has the name, a deleted collection's tag row does."""
+        from shortlist.engine.delivery import RENAMED
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        marker = row_marker(profile.plex_account_id)
+        target = "New Name" + marker
+        plex.collections_titled.return_value = []
+        helper = MagicMock(ratingKey=5555)
+        plex.create_collection.return_value = helper
+        collection = self._refused_row(profile)
+        order = MagicMock()
+        order.attach_mock(plex.stored_label, "label")
+        order.attach_mock(helper.editTitle, "helper_rename")
+        order.attach_mock(collection.editTitle, "row_rename")
+        order.attach_mock(plex.delete_owned_collection, "delete")
+
+        outcome, _ = self._rename(plex, collection, target, profile, movies, spare="an item of the row")
+
+        assert outcome == RENAMED
+        plex.create_collection.assert_called_once_with(movies, target, ["an item of the row"])
+        steps = [c[0] for c in order.mock_calls]
+        assert steps == ["row_rename", "label", "helper_rename", "row_rename", "delete"], steps
+        # Labelled with this person's label in the create's own write, as a new row is: hidden from
+        # everyone the row is hidden from for the moment it exists.
+        assert plex.stored_label.call_args == call(helper, "Shortlist_sarah", extra=LABEL_PREFIX)
+        freed = helper.editTitle.call_args.args[0]
+        assert freed != target and freed.endswith(marker), "the helper must move away under a name that is ours"
+        assert collection.editTitle.call_args_list[-1] == call(target)
+        plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
+
+    def test_every_helper_moves_to_a_name_no_earlier_helper_left_behind(self, movies):
+        """A freed name stays behind as an orphan, so reusing one would be refused the next time."""
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        names = []
+        for _ in range(2):
+            helper = MagicMock()
+            plex.create_collection.return_value = helper
+            self._rename(plex, self._refused_row(profile), "New", profile, movies)
+            names.append(helper.editTitle.call_args.args[0])
+
+        assert names[0] != names[1]
+
+    def test_the_helper_is_deleted_even_when_the_row_is_refused_again(self, movies):
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        helper = MagicMock()
+        plex.create_collection.return_value = helper
+        collection = self._refused_row(profile, then=BadRequest(self.CONFLICT))
+
+        outcome, text = self._rename(plex, collection, "New", profile, movies)
+
+        assert outcome == KEPT
+        plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
+        assert "freeing it failed" in text
+
+    def test_a_helper_that_was_never_created_is_not_deleted(self, movies):
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        plex.create_collection.side_effect = BadRequest("(400) bad_request; http://pms/library/collections")
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), "New", profile, movies)
+
+        assert outcome == KEPT
+        plex.delete_owned_collection.assert_not_called()
+
+    def test_an_empty_row_keeps_its_name_rather_than_creating_an_empty_helper(self, movies):
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), "New", profile, movies, spare=None)
+
+        assert outcome == KEPT
+        plex.create_collection.assert_not_called()
 
     def test_the_row_still_gets_its_titles_when_plex_refuses_the_rename(
         self, engine_config: EngineConfig, movies, shows
@@ -2393,6 +2536,8 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         profile = make_profile()
         existing = self._existing(profile, Exception(self.CONFLICT))
         plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        # Something in this library really has the name: the one refusal that stays refused.
+        plex.collections_titled.side_effect = lambda title: [self._held(99887, title, movies.key)]
 
         diff, _ = deliver_rows(plex, profile, picks(), engine_config)
 
@@ -2401,6 +2546,56 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         assert diff.added == ["Movie 2"]
         assert diff.kept == ["Movie 1"]
         plex.set_items.assert_called_once()
+
+    def test_a_kept_name_is_what_the_run_reports(self, engine_config: EngineConfig, movies, shows):
+        """The run page and the ledger reported the name Plex refused, so SFLIX's run pages showed four
+        rows under names they did not have, and the reconcile looks a `{top_seed}` row up by that title."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing(profile, Exception(self.CONFLICT))
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.collections_titled.side_effect = lambda title: [self._held(99887, title, movies.key)]
+
+        breakdown: list[dict] = []
+        deliver_rows(plex, profile, picks(), engine_config, breakdown=breakdown)
+
+        assert [entry["row_title"] for entry in breakdown] == ["Old Name"]
+
+    def test_a_rebuild_that_fails_to_create_updates_the_old_row_under_its_old_name(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing(profile, Exception(self.CONFLICT))
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.collections_titled.side_effect = lambda title: [self._held(4242, title, shows.key)]
+        plex.create_collection.side_effect = BadRequest("(400) bad_request; http://pms/library/collections")
+
+        diff, _ = deliver_rows(plex, profile, picks(), engine_config)
+
+        plex.delete_owned_collection.assert_not_called()
+        plex.set_items.assert_called_once()
+        assert diff.added == ["Movie 2"]
+
+    def test_a_rebuild_replaces_the_old_row_with_one_under_the_twins_name(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing(profile, Exception(self.CONFLICT))
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.collections_titled.side_effect = lambda title: [self._held(4242, title, shows.key)]
+        rebuilt = MagicMock(ratingKey=6001, labels=[])
+        plex.create_collection.return_value = rebuilt
+
+        breakdown: list[dict] = []
+        deliver_rows(plex, profile, picks(), engine_config, breakdown=breakdown)
+
+        wanted = plex.create_collection.call_args.args[1]
+        assert wanted.endswith(row_marker(profile.plex_account_id)) and not wanted.startswith("Old Name")
+        plex.delete_owned_collection.assert_called_once_with(existing, LABEL_PREFIX)
+        (entry,) = breakdown
+        assert entry["rating_key"] == 6001 and entry["created"] is True
 
     def test_the_old_title_is_kept_so_nothing_becomes_visible_to_anyone_new(
         self, engine_config: EngineConfig, movies, shows

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -26,64 +27,205 @@ from shortlist.engine.models import (
 DEFAULT_ROW_NAME = "✨ Picked for You"
 
 
-def _rename_or_keep(collection, title: str, profile: UserProfile, section_title: str) -> None:
-    """Rename a row in place, keeping its old name if Plex refuses the new one.
+#: What `_rename_or_keep` did: the row has its new name, it kept its old one, or it has to be rebuilt to
+#: get the new one.
+RENAMED, KEPT, REBUILD = "renamed", "kept", "rebuild"
 
-    A Plex collection is keyed by TITLE within a library, so a rename onto a title that already
-    exists there answers 409 Conflict. An unguarded `editTitle` took the whole PERSON down with it —
-    recorded on a real server (run 4, 2026-08-15):
 
-        BadRequest: (409) conflict; …title.value=🎯 Because you watched Ted Lasso…&type=18
+def _rename_or_keep(
+    plex: PlexClient,
+    collection,
+    title: str,
+    profile: UserProfile,
+    section,
+    *,
+    label: str,
+    marker: str,
+    spare_item,
+) -> str:
+    """Rename a row in place. Returns RENAMED, KEPT (Plex refused and nothing could fix it), or REBUILD.
 
-    That user got no rows at all that night, over a name. A `{top_seed}` row renames itself whenever
-    the seed it is named after changes, so it is the one row whose title moves onto ground another
-    row of the same person's may already be standing on.
+    A collection's title is a row in Plex's server-wide `tags` table, and that row outlives the
+    collection. A rename answers 409 while ANY other row has the name, and a create with the name is
+    never refused, it reuses the row (tests/fixtures/pms_collection_title_tags.json). So a refusal means
+    one of three things holds the name:
 
-    Keeping the old title is the safe failure: it still carries this account's marker, so nothing
-    becomes visible to anyone new, and the row's MEMBERSHIP — the part that matters — is written by
-    the caller either way. A stale name for one night beats an empty row.
+    - An ORPHAN, left by a deleted collection. The pre-#119 rebuild deleted rows nightly, so a
+      `{top_seed}` row whose seed comes back meets one: on SFLIX four rows kept their old seed's name
+      every night while the run reported the new one. `_reclaim_orphaned_name` frees it for this row.
+    - The same person's row in ANOTHER library (a twin, e.g. two rows sharing a name under #121, or a
+      `{top_seed}` row borrowing its seed). Only a create can share that name: REBUILD.
+    - A collection in THIS library. Something else really has the name, so the row keeps its own.
+
+    An unguarded `editTitle` once took the whole PERSON down (run 4, 2026-08-15:
+    `BadRequest: (409) conflict; …title.value=🎯 Because you watched Ted Lasso…&type=18`), so every
+    path here ends with the row's membership still written by the caller. The old title is the safe
+    failure: it still carries this account's marker, so nothing becomes visible to anyone new.
     """
     try:
         collection.editTitle(title)
+        return RENAMED
     except Exception as exc:  # plexapi raises BadRequest; the status is only in the message
         # `startswith`, NOT `"409" in`. plexapi formats the message as
         # `f'({status}) {codename}; {url} {errtext}'` (`plexapi/server.py:752`), and for `editTitle`
         # that url carries `id=<ratingKey>` — so a substring test matches the COLLECTION'S OWN KEY.
         # Measured: a 500 on ratingKey 40953, a 401 on ratingKey 1409 and a 503 on ratingKey 24091
-        # were all swallowed, each logging "409 — a collection there already has that title", which
-        # is a lie about a failure that then went unreported. The status is always the leading
-        # token, so anchoring it is exact.
+        # were all swallowed, each logged as a title collision. The status is always the leading token.
         if not str(exc).startswith("(409)"):
             raise
-        # Name WHAT is squatting the title. "A collection already has that title" is untriageable on
-        # its own: the squatter is either this person's other row mid-cycle (self-healing, ignore),
-        # a row left behind by an interrupted run (the sweep clears it), or something a co-managing
-        # tool made (ours to leave alone, rule 4) — and only the third is a standing problem. The
-        # ratingKey is what makes it findable in Plex, where the title itself cannot be searched
-        # because it carries invisible marker characters. Best-effort: a failed lookup must never
-        # turn a survivable rename into a lost row, which is the whole point of this function.
-        squatter = ""
-        try:
-            match = next(
-                (c for c in collection.section().collections() if c.title == title),
-                None,
-            )
-            if match is not None:
-                squatter = (
-                    f" The title is held by ratingKey {match.ratingKey}"
-                    f"{' — also a Shortlist row' if has_marker(match.title) else ' — NOT a Shortlist row'}."
-                )
-        except Exception as lookup_error:  # diagnostics must never fail the delivery
-            squatter = f" (could not identify what holds it: {type(lookup_error).__name__})"
-        logger.warning(
-            "{}: Plex refused to rename '{}' to '{}' in '{}' (409 — a collection there already has "
-            "that title). Keeping the old name; the row's titles are still updated.{}",
+    # Best-effort: a failed lookup must never turn a survivable rename into a lost row.
+    try:
+        holders = [c for c in plex.collections_titled(title) if c.ratingKey != collection.ratingKey]
+    except Exception as lookup_error:
+        _log_kept(profile, collection, title, section, f"could not check what holds it ({type(lookup_error).__name__})")
+        return KEPT
+    here = [c for c in holders if str(getattr(c, "librarySectionID", "")) == str(section.key)]
+    if here:
+        # The ratingKey is what makes it findable in Plex: the title carries invisible marker characters.
+        owner = "also a Shortlist row" if has_marker(here[0].title) else "NOT a Shortlist row"
+        _log_kept(profile, collection, title, section, f"ratingKey {here[0].ratingKey} here has it, {owner}")
+        return KEPT
+    if holders:
+        logger.info(
+            "{}: '{}' in '{}' takes the name their row in another library has (ratingKey {}). Plex only lets a "
+            "new collection share a name, so this row is rebuilt under it.",
             profile.username,
-            log_title(collection.title),
             log_title(title),
-            section_title,
-            squatter,
+            section.title,
+            holders[0].ratingKey,
         )
+        return REBUILD
+    if _reclaim_orphaned_name(
+        plex, collection, title, profile, section, label=label, marker=marker, spare_item=spare_item
+    ):
+        return RENAMED
+    return KEPT
+
+
+def _reclaim_orphaned_name(
+    plex: PlexClient, collection, title: str, profile: UserProfile, section, *, label: str, marker: str, spare_item
+) -> bool:
+    """Free a name a deleted collection left behind and give it to this row. True when the row has it.
+
+    A create with the name takes over its orphaned tag row. Renaming that helper to a unique name moves
+    the tag row away, so nothing has the name any more and the row's own rename goes through. The row
+    keeps its ratingKey, items and every setting (measured on a real PMS: pms_collection_title_tags.json).
+    Never used for a name a live collection has: the helper would share that collection's tag row, and
+    renaming the helper would rename it too.
+
+    The helper is labelled in the same write a new row gets, so it is hidden from everyone the row is,
+    and it is deleted in a `finally` (plex-safety rule 7). Its unique name stays behind as an orphan
+    nothing will ever ask for.
+    """
+    if spare_item is None:
+        _log_kept(
+            profile, collection, title, section, "a deleted collection left the name behind, and the row is empty"
+        )
+        return False
+    helper = None
+    try:
+        helper = plex.create_collection(section, title, [spare_item])
+        plex.stored_label(helper, label, extra=LABEL_PREFIX)
+        helper.editTitle(f"Shortlist freed name {uuid.uuid4().hex[:12]}{marker}")
+        collection.editTitle(title)
+    except Exception as exc:
+        why = f"a deleted collection left the name behind, and freeing it failed ({type(exc).__name__})"
+        _log_kept(profile, collection, title, section, why)
+        return False
+    finally:
+        if helper is not None:
+            try:
+                plex.delete_owned_collection(helper, LABEL_PREFIX)
+            except Exception as exc:
+                logger.error(
+                    "{}: could not delete the helper collection (ratingKey {}) used to free a row name in '{}' "
+                    "({}). It carries their label, so no one else can see it. Delete it in Plex.",
+                    profile.username,
+                    getattr(helper, "ratingKey", "?"),
+                    section.title,
+                    type(exc).__name__,
+                )
+    logger.info(
+        "{}: '{}' in '{}' was refused because a deleted collection had left the name behind; freed it and "
+        "renamed the row",
+        profile.username,
+        log_title(title),
+        section.title,
+    )
+    return True
+
+
+def _rebuild_under_name(
+    plex: PlexClient,
+    section,
+    profile: UserProfile,
+    picks: list[Pick],
+    old,
+    *,
+    title: str,
+    label: str,
+    display: str,
+    label_prefix: str,
+    poster: PosterSpec | None,
+    artist: PosterArtist | None,
+    order_work: list[tuple] | None,
+    on_write: Callable[[dict], None] | None,
+) -> tuple[CollectionDiff, str, object] | None:
+    """Give a row a name its twin in another library already has, by creating it anew (owner decision
+    2026-09-14). None when the create fails, so the caller updates the old collection under its old name.
+
+    The one deliberate exception to #119's "always update in place": Plex lets a new collection share a
+    live name but refuses a rename onto it. The row gets a new ratingKey this once, so a tool keyed on the
+    old one loses its settings for this row. Created before the old one is deleted, so a failed create
+    costs a stale name, never the row.
+    """
+    try:
+        stored, collection, vanished = _create_labelled_collection(
+            plex,
+            section,
+            profile,
+            picks,
+            title=title,
+            label=label,
+            display=display,
+            poster=poster,
+            artist=artist,
+            order_work=order_work,
+            on_write=on_write,
+        )
+    except Exception as exc:
+        _log_kept(profile, old, title, section, f"rebuilding the row under it failed ({type(exc).__name__})")
+        return None
+    try:
+        plex.delete_owned_collection(old, label_prefix)
+    except Exception as exc:
+        logger.warning(
+            "{}: rebuilt the row as '{}' in '{}' but could not delete the old collection (ratingKey {}, {}). "
+            "It keeps their label, so no one else can see it.",
+            profile.username,
+            display,
+            section.title,
+            getattr(old, "ratingKey", "?"),
+            type(exc).__name__,
+        )
+    dead = set(vanished)
+    diff = CollectionDiff(
+        added=[p.title for p in picks if p.rating_key not in dead], collection_title=display, created=True
+    )
+    diff.rating_key = _rating_key(collection)
+    return diff, stored, collection
+
+
+def _log_kept(profile: UserProfile, collection, title: str, section, why: str) -> None:
+    logger.warning(
+        "{}: Plex refused to rename '{}' to '{}' in '{}' (409): {}. Keeping the old name; the row's titles "
+        "are still updated.",
+        profile.username,
+        log_title(collection.title),
+        log_title(title),
+        getattr(section, "title", "?"),
+        why,
+    )
 
 
 # Zero-width space / zero-width non-joiner. Both render as nothing.
@@ -1454,7 +1596,39 @@ def _deliver_one(
         return diff, label, collection
 
     if collection.title != title:
-        _rename_or_keep(collection, title, profile, section.title)
+        outcome = _rename_or_keep(
+            plex,
+            collection,
+            title,
+            profile,
+            section,
+            label=label,
+            marker=marker,
+            spare_item=existing_items[0] if existing_items else None,
+        )
+        if outcome == REBUILD:
+            rebuilt = _rebuild_under_name(
+                plex,
+                section,
+                profile,
+                picks,
+                collection,
+                title=title,
+                label=label,
+                display=display,
+                label_prefix=label_prefix,
+                poster=poster,
+                artist=artist,
+                order_work=order_work,
+                on_write=on_write,
+            )
+            if rebuilt is not None:
+                return rebuilt
+            outcome = KEPT
+        if outcome == KEPT:
+            # The run page and the ledger say what Plex holds: the reconcile finds a `{top_seed}` row by
+            # its recorded title, and "the run says X" must not be a name the row does not have.
+            diff.collection_title = strip_marker(collection.title)
 
     if not to_add_keys and to_remove_count == 0:
         # Membership already IS the wanted set — skip the add/remove/sortUpdate writes entirely. An

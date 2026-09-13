@@ -143,10 +143,26 @@ class FakeCollection:
     # tests/fixtures/pms_collection_field_edits.json for how each edit moves it.
     title_sort: str | None = None
     title_sort_locked: bool = False
+    #: The name of the `tags` row holding this collection's membership. Plex renames that row in place,
+    #: so a same-named twin in another library, which shares it, keeps its title while its tag moves.
+    #: None until the fake first writes it: a collection seeded straight into state is tagged as titled.
+    tag: str | None = None
 
     def __post_init__(self) -> None:
         if self.title_sort is None:
             self.title_sort = plex_sort_title(self.title)
+
+
+def tag_name(title: str) -> str:
+    """How Plex's `tags.tag` column compares names: `COLLATE NOCASE`, which folds ASCII letters only."""
+    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in title)
+
+
+def collection_tag(collection: FakeCollection) -> str:
+    return collection.tag if collection.tag is not None else tag_name(collection.title)
+
+
+RENAME_CONFLICT_BODY = "<html><head><title>Conflict</title></head><body><h1>409 Conflict</h1></body></html>"
 
 
 def plex_sort_title(title: str) -> str:
@@ -209,6 +225,9 @@ class FakePlexState:
     pms_url: str = "http://127.0.0.1:32400"  # set by the harness once the fake PMS has a port
     sections: dict[int, FakeSection] = field(default_factory=_default_sections)
     collections: dict[int, FakeCollection] = field(default_factory=dict)
+    #: Names a deleted collection left behind in Plex's `tags` table. Nothing removes them, a rename
+    #: onto one is refused, and a create with one takes it over (pms_collection_title_tags.json).
+    orphaned_titles: set[str] = field(default_factory=set)
     #: Managed-hub order per section — identifiers, Plex's own hubs and our collections in ONE list,
     #: because that is what `GET /hubs/sections/{id}/manage` returns and what `.../move` reorders.
     #: Shelf order used to be modelled as the insertion order of `collections`, which meant a
@@ -1150,6 +1169,15 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             collection = state.collections.get(int(raw_id)) if raw_id.isdigit() else None
             if collection is None:
                 continue
+            if query.get("title.value"):
+                # A title is a server-wide tag row: the rename is refused while any OTHER row carries the
+                # name, live in any library or orphaned by a delete (pms_collection_title_tags.json).
+                wanted, own = tag_name(query["title.value"]), collection_tag(collection)
+                taken = wanted in state.orphaned_titles or any(
+                    collection_tag(other) == wanted for other in state.collections.values()
+                )
+                if wanted != own and taken:
+                    return Response(RENAME_CONFLICT_BODY, status_code=409, media_type="text/html")
             if labels:
                 existing = {label.lower(): label for label in collection.labels}
                 collection.labels = [existing.get(v.lower(), state.store_label(v)) for v in labels]
@@ -1163,6 +1191,11 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
                 collection.title_sort = query["titleSort.value"] or collection.title
                 collection.title_sort_locked = query.get("titleSort.locked") == "1"
             if query.get("title.value"):
+                # Renamed IN PLACE: every collection on the row moves with it, a twin's title does not.
+                own, wanted = collection_tag(collection), tag_name(query["title.value"])
+                for other in state.collections.values():
+                    if collection_tag(other) == own:
+                        other.tag = wanted
                 collection.title = query["title.value"]
                 if not collection.title_sort_locked:
                     collection.title_sort = plex_sort_title(collection.title)
@@ -1186,6 +1219,8 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             # ends up holding a show-subtype collection that no share filter can touch.
             subtype=types.pop() if len(types) == 1 else "movie",
         )
+        # A create is never refused on its name: it takes over the tag row that name already has.
+        state.orphaned_titles.discard(collection_tag(collection))
         state.collections[collection.rating_key] = collection
         root = _container(size=1)
         _collection_xml(root, state, collection)
@@ -1288,6 +1323,10 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             ):
                 other.item_keys = [k for k in other.item_keys if k not in collection.item_keys]
         del state.collections[rating_key]
+        # The tag row outlives its last collection: the name stays taken for renames, not for creates.
+        tag = collection_tag(collection)
+        if not any(collection_tag(other) == tag for other in state.collections.values()):
+            state.orphaned_titles.add(tag)
         return Response(status_code=200)
 
     @app.get("/library/metadata/{rating_keys}")

@@ -1803,6 +1803,102 @@ def test_a_row_that_loses_most_of_its_titles_stays_the_same_plex_collection(fake
     assert set(movie_row.item_keys) == set(delivered), "the row does not hold the titles it was given"
 
 
+def _renaming_ctx(state, pms_url, tmp_path, rows, ledger=None) -> EngineContext:
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    return EngineContext(
+        config=EngineConfig(
+            row_size=8, min_history=5, candidates_pre_rank=40, max_seeds=12, rows=rows, rows_defined=True
+        ),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        delivered_keys=ledger or {},
+    )
+
+
+def _rows_of(state, account_id: int, section_id: int) -> dict[int, FakeCollection]:
+    marker = row_marker(account_id)
+    return {k: c for k, c in state.collections.items() if c.section_id == section_id and c.title.endswith(marker)}
+
+
+def _assert_breakdown_names_what_plex_holds(report: RunReport, state, account_id: int) -> None:
+    marker = row_marker(account_id)
+    for user_report in report.users:
+        for entry in user_report.breakdown:
+            collection = state.collections.get(entry.get("rating_key"))
+            assert collection is not None, f"{entry['row_title']} names ratingKey {entry.get('rating_key')}, not a row"
+            assert collection.title == entry["row_title"] + marker, "the run reports a name Plex does not have"
+
+
+def test_a_row_renamed_onto_a_deleted_collections_name_keeps_its_collection_and_gets_the_name(fakes, tmp_path):
+    """A real PMS keeps a deleted collection's name as a tag and refuses every rename onto it
+    (pms_collection_title_tags.json). On SFLIX that froze four `{top_seed}` rows on their old seed's
+    name night after night, while the run reported the new one. The row must come out renamed, as the
+    same collection, with nothing left behind."""
+    state, pms_url, _tmdb_app = fakes
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    marker = row_marker(sarah.plex_account_id)
+    before = [RowSpec(slug="gems", name_template="Hidden Gems", size=8, media="movie")]
+    ctx = _renaming_ctx(state, pms_url, tmp_path, before)
+    assert engine_run(ctx, [sarah]).ok
+    (row_key,) = _rows_of(state, sarah.plex_account_id, state.section_id)
+    # A collection that once carried the new name, deleted the way the old rebuild deleted rows.
+    section = ctx.plex.sections()[0]
+    gone = ctx.plex.create_collection(section, "Buried Treasure" + marker, [ctx.plex._server.fetchItem(101)])
+    gone.delete()
+    collections_before = set(state.collections)
+
+    after = [RowSpec(slug="gems", name_template="Buried Treasure", size=8, media="movie")]
+    ledger = {(sarah.slug, "gems", str(state.section_id)): row_key}
+    report = engine_run(_renaming_ctx(state, pms_url, tmp_path, after, ledger), [sarah])
+
+    assert report.ok
+    assert state.collections[row_key].title == "Buried Treasure" + marker
+    assert set(state.collections) == collections_before, "the row was recreated, or a helper was left behind"
+    assert state.collections[row_key].item_keys, "the renamed row lost its titles"
+    _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
+
+
+def test_a_row_renamed_onto_its_twin_rows_name_in_another_library_is_rebuilt_under_that_name(fakes, tmp_path):
+    """The one name Plex will not let a row take over by renaming: a LIVE collection of the same person
+    in another library already has it (issue #121 lets two rows share a name across libraries). Only
+    a create can use it, so the row is rebuilt once under the right name, and the twin is untouched."""
+    state, pms_url, _tmdb_app = fakes
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    marker = row_marker(sarah.plex_account_id)
+    before = [
+        RowSpec(slug="gems", name_template="Hidden Gems", size=8, media="movie"),
+        RowSpec(slug="gems_tv", name_template="Buried Treasure", size=8, media="show"),
+    ]
+    ctx = _renaming_ctx(state, pms_url, tmp_path, before)
+    assert engine_run(ctx, [sarah]).ok
+    (movie_key,) = _rows_of(state, sarah.plex_account_id, state.section_id)
+    (show_key,) = _rows_of(state, sarah.plex_account_id, state.show_section_id)
+    show_items = list(state.collections[show_key].item_keys)
+
+    after = [RowSpec(slug="gems", name_template="Buried Treasure", size=8, media="movie"), before[1]]
+    ledger = {
+        (sarah.slug, "gems", str(state.section_id)): movie_key,
+        (sarah.slug, "gems_tv", str(state.show_section_id)): show_key,
+    }
+    report = engine_run(_renaming_ctx(state, pms_url, tmp_path, after, ledger), [sarah])
+
+    assert report.ok
+    movie_rows = _rows_of(state, sarah.plex_account_id, state.section_id)
+    assert list(movie_rows) != [movie_key] and len(movie_rows) == 1, "expected exactly one rebuilt Movies row"
+    (rebuilt,) = movie_rows.values()
+    assert rebuilt.title == "Buried Treasure" + marker
+    assert rebuilt.item_keys, "the rebuilt row holds no titles"
+    assert f"shortlist_{sarah.slug}" in [label.lower() for label in rebuilt.labels], "the rebuilt row is unlabelled"
+    assert state.collections[show_key].title == "Buried Treasure" + marker, "the twin was renamed"
+    assert state.collections[show_key].item_keys == show_items, "the twin's titles changed"
+    _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
+
+
 def test_a_rows_description_and_sort_title_reach_plex_and_clearing_them_hands_back_only_ours(fakes, tmp_path):
     """Issue #120 through plexapi's real request shapes, with the fake following what a real PMS was
     measured doing (tests/fixtures/pms_collection_field_edits.json).

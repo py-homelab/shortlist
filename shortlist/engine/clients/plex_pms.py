@@ -98,6 +98,11 @@ def has_shortlist_marker(title: str) -> bool:
     return len(suffix) == 64 and all(c in _MARKER_CHARS for c in suffix)
 
 
+def _tag_name(title: str) -> str:
+    """A collection title as Plex's `tags.tag` column compares it: `COLLATE NOCASE` folds ASCII only."""
+    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in title)
+
+
 #: What `_watched_item` dates a row that carries no `lastViewedAt`. A show marked watched rather than
 #: played has none, so this is a real and common value, not a corrupt one — see `_dates_from_episodes`.
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -810,6 +815,18 @@ class PlexClient:
         if subtype:
             return subtype == section.type
         return all(item.type == section.type for item in collection.items())
+
+    def collections_titled(self, title: str) -> list[Collection]:
+        """Every collection on the server, in ANY library, whose title Plex treats as ``title``.
+
+        A collection's title is a row in Plex's server-wide `tags` table, compared `COLLATE NOCASE`
+        (ASCII letters only), so a rename is refused while any other collection anywhere carries the
+        name — not just one in the same library (tests/fixtures/pms_collection_title_tags.json).
+        """
+        wanted = _tag_name(title)
+        if self._sections_cache is None:
+            self._sections_cache = self._server.library.sections()
+        return [c for s in self._sections_cache for c in self._section_collections(s) if _tag_name(c.title) == wanted]
 
     def find_owned_collections(self, section: LibrarySection, wanted_label: str) -> list[Collection]:
         """Every collection in this section carrying `wanted_label` (case-insensitive).
