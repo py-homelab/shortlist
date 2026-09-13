@@ -301,6 +301,9 @@ PRIVATE_KEYS = {
     # clear it would be a way to silence exactly the warning that must not be silenceable.
     "watch.stream_connected_at",
     "watch.stream_down_since",
+    # Which release notes the owner has closed (`whats_new.py`). Only the dialog's own endpoint moves
+    # it, and only forwards: a generic write could mark a release read before anyone saw it.
+    "app.release_notes_seen",
 }
 
 # Dropped keys purged from the settings table on boot, so stale rows don't linger.

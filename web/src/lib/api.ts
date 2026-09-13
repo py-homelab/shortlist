@@ -9,6 +9,7 @@ import type {
   ApiTokenCreated,
   ApiTokenStatus,
   NotificationsPage,
+  WhatsNew,
   ArrOptions,
   SeerrOptions,
   Backup,
@@ -534,6 +535,16 @@ export const api = {
     request("/api/notifications/dismiss", {
       method: "POST",
       body: JSON.stringify({ id }),
+    }),
+
+  /** The release notes the owner has not read since upgrading (empty when there are none). */
+  getWhatsNew: (): Promise<WhatsNew> => request("/api/notifications/whats-new"),
+
+  /** Close the What's new dialog for good, up to the newest release it showed. */
+  markWhatsNewSeen: (version: string): Promise<{ ok: boolean }> =>
+    request("/api/notifications/whats-new/seen", {
+      method: "POST",
+      body: JSON.stringify({ version }),
     }),
 
   /** The plain-text diagnostics bundle for bug reports (secrets-free). */

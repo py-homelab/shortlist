@@ -74,6 +74,7 @@ export const queryKeys = {
   libraryCollections: (key: string) => ["library-collections", key] as const,
   ownedCollections: ["owned-collections"] as const,
   notifications: ["notifications"] as const,
+  whatsNew: ["whats-new"] as const,
   syncs: ["syncs"] as const,
   version: ["version"] as const,
   imageProvider: ["image-provider"] as const,
@@ -776,6 +777,25 @@ export function useDismissNotification() {
     mutationFn: (id: string) => api.dismissNotification(id),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: queryKeys.notifications }),
+  });
+}
+
+export function useWhatsNew() {
+  return useQuery({
+    queryKey: queryKeys.whatsNew,
+    queryFn: api.getWhatsNew,
+    // Once per page load. An upgrade restarts the server, and the app is reloaded to reach it.
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useMarkWhatsNewSeen() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (version: string) => api.markWhatsNewSeen(version),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: queryKeys.whatsNew }),
   });
 }
 

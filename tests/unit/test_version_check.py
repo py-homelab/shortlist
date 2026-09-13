@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from shortlist.server import version_check
 
+RELEASES_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "github_releases.json"
+
 
 @pytest.fixture(autouse=True)
 def _reset_cache():
     version_check._cache.update(at=None, value=None)
+    version_check._releases_cache.update(at=None, value=None)
     yield
     version_check._cache.update(at=None, value=None)
+    version_check._releases_cache.update(at=None, value=None)
 
 
 def _stub_latest(monkeypatch, value):
@@ -141,3 +146,71 @@ class TestVersionInfo:
             assert f"ARG {var}=" in dockerfile, f"the image must declare {var} as a build arg"
             assert f"{var}=${var}" in dockerfile, f"{var} must reach the runtime as an env var, not just a build arg"
             assert f"{var}=${{{{ github." in workflow, f"CI must pass {var} to the build"
+
+
+class _Response:
+    def __init__(self, payload: object, status_code: int = 200):
+        self._payload, self.status_code = payload, status_code
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self) -> object:
+        return self._payload
+
+
+def _recorded_releases() -> list[dict]:
+    return json.loads(RELEASES_FIXTURE.read_text())["releases"]
+
+
+class TestPublishedReleases:
+    """The notes the What's new dialog shows: GitHub's own release bodies, read from the recorded list."""
+
+    def test_reads_each_release_from_the_recorded_list(self, monkeypatch):
+        monkeypatch.setattr(version_check.httpx, "get", lambda *a, **k: _Response(_recorded_releases()))
+
+        releases = version_check.published_releases()
+
+        newest = next(r for r in releases if r["version"] == "1.8.0")
+        recorded = next(r for r in _recorded_releases() if r["tag_name"] == "v1.8.0")
+        assert newest == {
+            "version": "1.8.0",
+            "url": "https://github.com/stevezau/shortlist/releases/tag/v1.8.0",
+            "published_at": "2026-08-26T09:57:25Z",
+            "notes": recorded["body"],
+        }
+        assert {r["version"] for r in releases} == {"1.8.0", "1.7.0", "1.6.1", "1.3.0", "1.2.1"}
+
+    def test_skips_drafts_pre_releases_and_tags_that_are_not_versions(self, monkeypatch):
+        base = _recorded_releases()[0]
+        payload = [
+            {**base, "tag_name": "v9.0.0", "prerelease": True},
+            {**base, "tag_name": "v9.1.0", "draft": True},
+            {**base, "tag_name": "nightly"},
+            base,
+        ]
+        monkeypatch.setattr(version_check.httpx, "get", lambda *a, **k: _Response(payload))
+
+        assert [r["version"] for r in version_check.published_releases()] == ["1.8.0"]
+
+    def test_a_failed_fetch_is_an_empty_list_not_an_error(self, monkeypatch):
+        monkeypatch.setattr(version_check.httpx, "get", lambda *a, **k: _Response({"message": "rate limited"}, 403))
+
+        assert version_check.published_releases() == []
+
+    def test_is_cached_between_calls_and_retried_sooner_after_a_failure(self, monkeypatch):
+        calls = {"n": 0}
+
+        def counting(*_a, **_k):
+            calls["n"] += 1
+            return _Response(_recorded_releases())
+
+        monkeypatch.setattr(version_check.httpx, "get", counting)
+        version_check.published_releases()
+        version_check.published_releases()
+        assert calls["n"] == 1
+
+        version_check._releases_cache.update(at=datetime.now(UTC) - timedelta(minutes=31), value=None)
+        version_check.published_releases()
+        assert calls["n"] == 2  # a failure is retried after 30 minutes, not 6 hours

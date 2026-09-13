@@ -232,6 +232,10 @@ GET  /api/requests?wanted_by=&wanted_by= (the inbox, pending first then sent the
 ```
 GET  /api/events (SSE) · GET /api/events/log?scope=&limit=&before_id= (audit feed; `before_id` pages backwards — a cursor rather than an offset, since events are appended while you read)
 GET  /api/notifications -> {items[]} · POST /api/notifications/dismiss {id} (dismiss one alert)
+GET  /api/notifications/whats-new -> {version, releases[{version, url, published_at, notes}]} · POST /api/notifications/whats-new/seen {version}
+     The release notes the owner has not read since upgrading, newest first, taken from the GitHub releases. Empty on a fresh
+     install, on a downgrade, and once closed. `seen` records the newest release the dialog showed and never moves backwards;
+     a version newer than the running build is refused (422).
      One of them is "Playback tracking is offline", raised when the PMS notification socket has been unreachable for 45+ minutes.
      Not dismissable (like "Runs are paused"): silencing it would leave you believing a feature is running that isn't. It clears
      itself on reconnect and raises again on a new outage — being undismissable, it is never hidden in the first place.

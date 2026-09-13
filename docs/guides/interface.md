@@ -7,6 +7,10 @@ nav_order: 1
 
 Eight pages in the sidebar. This is what each one is for.
 
+After you update Shortlist, the next page you open shows **What's new**: the release notes for
+every version since you last read them. Close it and it stays closed, in every browser, until the
+next release.
+
 ## Dashboard
 
 The impact report: what Shortlist delivered versus what people actually watched, for a window you

@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+from typing import ClassVar
+
 import pytest
 from fastapi.testclient import TestClient
 
 from shortlist.server.api.settings import REDACTED_PLACEHOLDER
 from shortlist.server.auth import SESSION_COOKIE
+from shortlist.server.db.models import Setting
+from shortlist.server.main import create_app
 from shortlist.server.settings_store import SettingsStore
 from tests.conftest import plextv_user
 
@@ -250,6 +255,122 @@ class TestNotifications:
         assert "Shortlist debug bundle" in text and "db migration head:" in text
         assert "plex=True" in text  # connection reported as configured...
         assert "SUPERSECRETTOKEN" not in text  # ...but the token itself is never in the bundle
+
+
+class TestWhatsNew:
+    """The dialog that shows an owner the release notes once after an upgrade, and never again once closed."""
+
+    RELEASES: ClassVar[list[dict]] = [
+        {
+            "version": "1.8.0",
+            "url": "https://github.com/x/releases/tag/v1.8.0",
+            "published_at": "2026-08-26",
+            "notes": "## B",
+        },
+        {
+            "version": "1.7.0",
+            "url": "https://github.com/x/releases/tag/v1.7.0",
+            "published_at": "2026-08-18",
+            "notes": "## A",
+        },
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _releases(self, monkeypatch):
+        import shortlist
+        import shortlist.server.whats_new as whats_new
+
+        monkeypatch.setattr(shortlist, "__version__", "1.8.0")
+        monkeypatch.setattr(whats_new, "published_releases", lambda: self.RELEASES)
+
+    @staticmethod
+    def _upgraded_from(client: TestClient, version: str) -> None:
+        from shortlist.server.whats_new import SEEN_KEY
+
+        with client.app.state.sessions() as session:
+            SettingsStore(session).set(SEEN_KEY, version)
+            session.commit()
+
+    def test_a_fresh_install_has_nothing_to_announce_even_once_setup_is_finished(self, client: TestClient):
+        """The client fixture is a brand-new config dir, so its first boot saw an unfinished wizard.
+        Finishing setup afterwards must not turn that into "upgraded from an unknown version"."""
+        assert client.get("/api/notifications/whats-new").json() == {"version": "1.8.0", "releases": []}
+
+        with client.app.state.sessions() as session:
+            SettingsStore(session).set("setup.completed", True)
+            session.commit()
+        with self._restarted(client) as restarted:
+            assert restarted.get("/api/notifications/whats-new").json()["releases"] == []
+
+    def test_an_upgrade_serves_the_notes_for_every_release_since_the_last_one_read(self, client: TestClient):
+        self._upgraded_from(client, "1.6.1")
+
+        body = client.get("/api/notifications/whats-new").json()
+
+        assert body == {"version": "1.8.0", "releases": self.RELEASES}
+
+    def test_an_install_set_up_before_this_existed_is_shown_the_running_version_after_a_restart(
+        self, client: TestClient
+    ):
+        """The first boot of the upgraded build on a server whose setup was long finished."""
+        from shortlist.server.whats_new import SEEN_KEY
+
+        with client.app.state.sessions() as session:
+            store = SettingsStore(session)
+            store.set("setup.completed", True)
+            session.query(Setting).filter(Setting.key == SEEN_KEY).delete()
+            session.commit()
+
+        with self._restarted(client) as restarted:
+            releases = restarted.get("/api/notifications/whats-new").json()["releases"]
+
+        assert [r["version"] for r in releases] == ["1.8.0"]
+
+    def test_closing_it_stays_closed_after_a_refresh_and_a_restart(self, client: TestClient):
+        self._upgraded_from(client, "1.6.1")
+
+        assert client.post("/api/notifications/whats-new/seen", json={"version": "1.8.0"}).json() == {"ok": True}
+
+        assert client.get("/api/notifications/whats-new").json()["releases"] == []
+        with self._restarted(client) as restarted:
+            assert restarted.get("/api/notifications/whats-new").json()["releases"] == []
+
+    def test_the_next_upgrade_announces_itself_again(self, client: TestClient, monkeypatch):
+        import shortlist
+
+        monkeypatch.setattr(shortlist, "__version__", "1.7.0")
+        self._upgraded_from(client, "1.6.1")
+        client.post("/api/notifications/whats-new/seen", json={"version": "1.7.0"})
+        assert client.get("/api/notifications/whats-new").json()["releases"] == []
+
+        monkeypatch.setattr(shortlist, "__version__", "1.8.0")
+
+        with self._restarted(client) as restarted:
+            releases = restarted.get("/api/notifications/whats-new").json()["releases"]
+
+        assert [r["version"] for r in releases] == ["1.8.0"]
+
+    def test_a_version_newer_than_the_running_build_is_refused(self, client: TestClient):
+        self._upgraded_from(client, "1.6.1")
+
+        response = client.post("/api/notifications/whats-new/seen", json={"version": "9.9.9"})
+
+        assert response.status_code == 422
+        assert len(client.get("/api/notifications/whats-new").json()["releases"]) == 2
+
+    def test_whats_new_is_owner_only(self, client: TestClient):
+        client.cookies.delete(SESSION_COOKIE)
+
+        assert client.get("/api/notifications/whats-new").status_code == 401
+        assert client.post("/api/notifications/whats-new/seen", json={"version": "1.8.0"}).status_code == 401
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _restarted(client: TestClient):
+        """A second process on the same config dir — the owner's session cookie still signs in."""
+        app = create_app(config_dir=client.app.state.config_dir)
+        with TestClient(app, cookies=dict(client.cookies), headers=dict(client.headers)) as restarted:
+            yield restarted
 
 
 class TestSystemResponseShapes:

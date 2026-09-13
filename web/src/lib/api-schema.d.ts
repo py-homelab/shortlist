@@ -363,6 +363,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/notifications/whats-new": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Whats New
+         * @description The release notes the owner has not read since upgrading, for the What's new dialog.
+         */
+        get: operations["whats_new_api_notifications_whats_new_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/notifications/whats-new/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Whats New Seen
+         * @description Close the What's new dialog for good: record the version whose notes it showed.
+         */
+        post: operations["whats_new_seen_api_notifications_whats_new_seen_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/picks/{rating_key}/poster": {
         parameters: {
             query?: never;
@@ -4364,6 +4404,19 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** ReleaseNotesOut */
+        ReleaseNotesOut: {
+            /** Notes */
+            notes: string;
+            /** Published At */
+            published_at: string;
+            /** Url */
+            url: string;
+            /** Version */
+            version: string;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * RemovedOut
          * @description What `DELETE /users/{id}` dropped. `user_id` is still valid — the row is archived, not deleted.
@@ -5058,6 +5111,11 @@ export interface components {
             type: string;
         } & {
             [key: string]: unknown;
+        };
+        /** SeenRelease */
+        SeenRelease: {
+            /** Version */
+            version: string;
         };
         /** SeerrOptionsOut */
         SeerrOptionsOut: {
@@ -5934,6 +5992,15 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** WhatsNewOut */
+        WhatsNewOut: {
+            /** Releases */
+            releases: components["schemas"]["ReleaseNotesOut"][];
+            /** Version */
+            version: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** WizardState */
         WizardState: {
             /**
@@ -6524,6 +6591,59 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["Dismiss"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DismissedOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    whats_new_api_notifications_whats_new_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhatsNewOut"];
+                };
+            };
+        };
+    };
+    whats_new_seen_api_notifications_whats_new_seen_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SeenRelease"];
             };
         };
         responses: {

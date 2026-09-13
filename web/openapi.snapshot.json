@@ -4073,6 +4073,35 @@
         "title": "RejectedOut",
         "type": "object"
       },
+      "ReleaseNotesOut": {
+        "additionalProperties": true,
+        "properties": {
+          "notes": {
+            "title": "Notes",
+            "type": "string"
+          },
+          "published_at": {
+            "title": "Published At",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "url",
+          "published_at",
+          "notes"
+        ],
+        "title": "ReleaseNotesOut",
+        "type": "object"
+      },
       "RemovedOut": {
         "additionalProperties": true,
         "description": "What `DELETE /users/{id}` dropped. `user_id` is still valid \u2014 the row is archived, not deleted.",
@@ -5730,6 +5759,19 @@
           "next_run"
         ],
         "title": "ScheduleRowsOut",
+        "type": "object"
+      },
+      "SeenRelease": {
+        "properties": {
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "title": "SeenRelease",
         "type": "object"
       },
       "SeerrOptionsOut": {
@@ -7899,6 +7941,28 @@
         "title": "WatcherOut",
         "type": "object"
       },
+      "WhatsNewOut": {
+        "additionalProperties": true,
+        "properties": {
+          "releases": {
+            "items": {
+              "$ref": "#/components/schemas/ReleaseNotesOut"
+            },
+            "title": "Releases",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "releases"
+        ],
+        "title": "WhatsNewOut",
+        "type": "object"
+      },
       "WizardState": {
         "properties": {
           "completed": {
@@ -8764,6 +8828,70 @@
           }
         },
         "summary": "Dismiss",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/api/notifications/whats-new": {
+      "get": {
+        "description": "The release notes the owner has not read since upgrading, for the What's new dialog.",
+        "operationId": "whats_new_api_notifications_whats_new_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhatsNewOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Whats New",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/api/notifications/whats-new/seen": {
+      "post": {
+        "description": "Close the What's new dialog for good: record the version whose notes it showed.",
+        "operationId": "whats_new_seen_api_notifications_whats_new_seen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeenRelease"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DismissedOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Whats New Seen",
         "tags": [
           "notifications"
         ]

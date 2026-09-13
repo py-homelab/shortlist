@@ -396,6 +396,10 @@ export type AppNotification = Schemas["NotificationOut"];
  *  report one fact, so they dismiss as one. */
 export type NotificationsPage = Schemas["NotificationsOut"];
 
+/** `GET /api/notifications/whats-new` — the release notes the owner has not read since upgrading.
+ *  `version` is the running build; `releases` is newest first and empty when nothing is unread. */
+export type WhatsNew = Schemas["WhatsNewOut"];
+
 /** Report windows, in days. "all" is lifetime. */
 export type ReportWindow = Schemas["EffectivenessReportOut"]["window"];
 

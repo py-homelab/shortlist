@@ -26,6 +26,7 @@ import { HomeWordmark } from "@/components/brand";
 import { ActivityPill } from "@/components/layout/activity-pill";
 import { ActivityIndicator } from "@/components/layout/activity-indicator";
 import { NotificationBell } from "@/components/layout/notification-bell";
+import { WhatsNewDialog } from "@/components/layout/whats-new-dialog";
 import { SettingsSubNav } from "@/components/settings/settings-nav";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
@@ -268,6 +269,7 @@ export function AppShell() {
           ),
         }}
       />
+      <WhatsNewDialog />
       {/* Mobile top bar: wordmark + hamburger. Hidden once the sidebar appears at md. */}
       <header className="sticky top-0 z-30 flex items-center justify-between border-b bg-card/80 px-4 py-3 backdrop-blur md:hidden">
         <HomeWordmark />

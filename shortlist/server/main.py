@@ -21,7 +21,7 @@ from starlette.responses import FileResponse, HTMLResponse, Response
 
 import shortlist
 from shortlist.logging_config import configure_logging, normalize_level
-from shortlist.server import auth
+from shortlist.server import auth, whats_new
 from shortlist.server.api import (
     collections,
     events,
@@ -207,6 +207,8 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             healed = store.encrypt_plaintext_secrets()
             unreadable = store.undecryptable_secrets()
             store.seed_from_env(dict(os.environ))
+            # Before the wizard can finish, so a fresh install starts with nothing to announce.
+            whats_new.initialise(store, shortlist.__version__)
             # Configure logging from the DB setting (seeded from LOG_LEVEL on first boot). The
             # rotating file sink under /config/logs always captures DEBUG, so a quiet console still
             # leaves a full on-disk trail to diagnose a run after the fact.

@@ -8,6 +8,12 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- **See what changed after you update.** Shortlist told you when an update was out, but once you
+  had installed it, nothing said what was in it. Now the first page you open after an update shows
+  the release notes for every version since you last read them. If you skipped a few, you see all of
+  them. Close it and it stays closed, in every browser, until the next release. A new install
+  doesn't show it.
+
 - **Star on GitHub, or buy me a coffee.** The sidebar's "Support this project" link opened GitHub
   Sponsors, which only works if you have a GitHub account and a card to hand. It is now two links: a
   star, which is free and is how other Plex owners find Shortlist, and a Ko-fi coffee, which takes a
