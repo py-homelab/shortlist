@@ -2176,7 +2176,7 @@ class TestTheOwnerPrefixIsLoadBearing:
             labels=[SimpleNamespace(tag="Shortlist"), SimpleNamespace(tag="Shortlist_sarah")],
         )
         client._section_collections = lambda _section: [ours]
-        client.sections = lambda: [SimpleNamespace(title="Movies")]
+        client.sections = lambda: [SimpleNamespace(title="Movies", type="movie")]
 
         owned = client.owned_collections("shortlist")
 

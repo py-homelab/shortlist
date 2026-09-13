@@ -454,10 +454,15 @@ class TestBackupRestoreSaysWhatItChanges:
         # spelled out: a response model that dropped `privacy_note` would turn the one warning the
         # owner gets about a visibility change back into a silent restore.
         assert set(r.json()) == {"restored", "message", "privacy_note"}
+        # Queued, and audited when it is APPLIED at the next start, in the database it produced: written now,
+        # the audit would go into the database the restore is about to replace. The audit is pinned where a
+        # real restart happens: test_api_system.py::TestARestoreIsAppliedByTheRestartItAsksFor.
+        import json
+
+        queued = json.loads((client.app.state.config_dir / "restore-pending.json").read_text())
+        assert queued["backup"] == name
         with client.app.state.sessions() as session:
-            audit = session.query(Event).filter_by(scope="backup.restore").one()
-        assert audit.message["backup"] == name
-        assert audit.level == "warning"
+            assert session.query(Event).filter_by(scope="backup.restore").count() == 0
 
     def test_the_backup_list_names_each_file_with_its_size_and_age(self, client: TestClient):
         client.post("/api/system/backups", json={})

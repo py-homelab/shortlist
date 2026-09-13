@@ -996,7 +996,7 @@ class TestPlexClient:
         section.type = "movie"
         section.collections.return_value = [ours, kometa]
         mock_plex._server.library.sections.return_value = [section]
-        assert mock_plex.owned_collections("shortlist") == {"sarah": OwnedRow("Shortlist_sarah", [571285])}
+        assert mock_plex.owned_collections("shortlist") == {"sarah": OwnedRow("Shortlist_sarah", [571285], {"movie"})}
 
     def test_owned_collections_collects_a_users_row_from_every_library(self, mock_plex: PlexClient):
         """One user, one collection per library. Collapsing them to a single id once hid a real
@@ -1011,7 +1011,9 @@ class TestPlexClient:
         shows.collections.return_value = [show_row]
         mock_plex._server.library.sections.return_value = [movies, shows]
 
-        assert mock_plex.owned_collections("shortlist") == {"sarah": OwnedRow("Shortlist_sarah", [571285, 571290])}
+        assert mock_plex.owned_collections("shortlist") == {
+            "sarah": OwnedRow("Shortlist_sarah", [571285, 571290], {"movie", "show"})
+        }
 
     def test_section_collections_are_cached_within_a_run(self, mock_plex: PlexClient):
         # The section's collection list is otherwise re-pulled for every owned/find scan. Two reads
