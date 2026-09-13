@@ -566,11 +566,17 @@ class TestRequestMissing:
         assert (20, "show") in report.arr_present
 
     def test_show_without_tvdb_is_skipped_not_requested(self, monkeypatch):
+        """Approving one from the inbox still reaches the send, and the send is where it is skipped.
+
+        Driven through the approval path since the run stopped claiming these (see the test below):
+        that is now the only way such a show reaches `_request_one`.
+        """
         sonarr = FakeArr()
         monkeypatch.setattr(requests_mod, "SonarrClient", lambda *a, **k: sonarr)
-        demand = self._demand(MissingTitle(20, "show", MediaType.SHOW, 2020, rating=8.0, vote_count=500))
-        cfg = _cfg(sonarr=SONARR)
-        report = _request_missing(cfg, FakeTmdb({20: None}), demand, dry_run=False)
+        title = MissingTitle(20, "show", MediaType.SHOW, 2020, rating=8.0, vote_count=500)
+        report = requests_mod.request_titles_by_row(
+            {"r": _cfg(sonarr=SONARR)}, FakeTmdb({20: None}), [("r", title)], dry_run=False
+        )
         assert sonarr.series_calls == []
         assert report.outcomes[0].status == "skipped_no_tvdb"
         # The reason is what the operator READS on the Requests page, so it has to end their search
@@ -580,6 +586,68 @@ class TestRequestMissing:
         detail = report.outcomes[0].detail
         assert "TMDB has no TheTVDB id" in detail
         assert "add it in Sonarr yourself" in detail, f"the reason must say what to do, got: {detail!r}"
+
+    def test_a_show_without_a_tvdb_id_never_takes_an_auto_send_slot(self, monkeypatch):
+        """It used to win a slot, be skipped at the send, and land in neither `sent` nor `queued` — so
+        the next night it was the same qualifying title and won the slot again. In production one show
+        took a slot 15 nights running; over one week 25 of 40 slots went to shows Sonarr can never add.
+        """
+        radarr, sonarr = FakeArr(), FakeArr()
+        monkeypatch.setattr(requests_mod, "RadarrClient", lambda *a, **k: radarr)
+        monkeypatch.setattr(requests_mod, "SonarrClient", lambda *a, **k: sonarr)
+        demand = self._demand(
+            MissingTitle(20, "no tvdb show", MediaType.SHOW, 2020, rating=9.0, vote_count=900, demand=9),
+            MissingTitle(10, "film", MediaType.MOVIE, 2020, rating=8.0, vote_count=500, demand=2),
+        )
+        cfg = _cfg(radarr=RADARR, sonarr=SONARR, max_per_run=1)
+
+        report = _request_missing(cfg, FakeTmdb({20: None}), demand, dry_run=False)
+
+        assert [o.tmdb_id for o in report.outcomes] == [10]  # the one slot went to a title that can land
+        assert radarr.movie_calls == [(10, False)]
+        assert sonarr.series_calls == []
+        # Held in the inbox with its reason, rather than vanishing: the owner can still add it by hand.
+        [held] = report.queued
+        assert held.tmdb_id == 20
+        assert held.detail.startswith("no TheTVDB id"), held.detail
+        assert "add this show in Sonarr yourself" in held.detail
+
+    def test_a_movie_with_no_radarr_set_up_never_takes_an_auto_send_slot(self, monkeypatch):
+        """The same loop as the no-TheTVDB show, one step earlier: a movie on a server with no usable
+        Radarr was claimed, skipped as "Radarr not fully configured", recorded nowhere, and claimed
+        again the next night — taking the slot from a show Sonarr could have added."""
+        sonarr = FakeArr()
+        monkeypatch.setattr(requests_mod, "SonarrClient", lambda *a, **k: sonarr)
+        demand = self._demand(
+            MissingTitle(10, "film", MediaType.MOVIE, 2020, rating=9.0, vote_count=900, demand=9),
+            MissingTitle(20, "show", MediaType.SHOW, 2020, rating=8.0, vote_count=500, demand=2),
+        )
+        cfg = _cfg(sonarr=SONARR, max_per_run=1)
+
+        report = _request_missing(cfg, FakeTmdb({20: 7777}), demand, dry_run=False)
+
+        assert [o.tmdb_id for o in report.outcomes] == [20]
+        assert sonarr.series_calls == [(7777, False)]
+        [held] = report.queued
+        assert held.tmdb_id == 10
+        assert held.detail.startswith("Radarr isn't fully set up"), held.detail
+
+    def test_a_show_with_no_sonarr_set_up_is_held_for_that_not_for_its_tvdb_id(self, monkeypatch):
+        """The mirror cell. With no Sonarr, "add this show in Sonarr yourself" would be wrong advice."""
+        radarr = FakeArr()
+        monkeypatch.setattr(requests_mod, "RadarrClient", lambda *a, **k: radarr)
+        demand = self._demand(
+            MissingTitle(20, "show", MediaType.SHOW, 2020, rating=9.0, vote_count=900, demand=9),
+            MissingTitle(10, "film", MediaType.MOVIE, 2020, rating=8.0, vote_count=500, demand=2),
+        )
+        cfg = _cfg(radarr=RADARR, max_per_run=1)
+
+        report = _request_missing(cfg, FakeTmdb({20: None}), demand, dry_run=False)
+
+        assert radarr.movie_calls == [(10, False)]
+        [held] = report.queued
+        assert held.tmdb_id == 20
+        assert held.detail.startswith("Sonarr isn't fully set up"), held.detail
 
     def test_a_failed_tvdb_lookup_is_told_apart_from_a_missing_one(self, monkeypatch):
         """Same missing id, opposite advice — so the two must not share wording.
@@ -604,10 +672,13 @@ class TestRequestMissing:
         assert "add it in Sonarr" not in report.outcomes[0].detail
 
     def test_missing_target_for_media_type_is_skipped(self, monkeypatch):
-        # Movies wanted but only Sonarr configured -> skipped_no_target, never an error.
-        demand = self._demand(MissingTitle(10, "film", MediaType.MOVIE, 2020, rating=8.0, vote_count=500))
-        cfg = _cfg(sonarr=SONARR)
-        report = _request_missing(cfg, FakeTmdb(), demand, dry_run=False)
+        # Movies wanted but only Sonarr configured -> skipped_no_target, never an error. Driven through
+        # an approval: the run holds these back before the send (test above), so only a hand-approved
+        # title reaches this branch now.
+        title = MissingTitle(10, "film", MediaType.MOVIE, 2020, rating=8.0, vote_count=500)
+        report = requests_mod.request_titles_by_row(
+            {"r": _cfg(sonarr=SONARR)}, FakeTmdb(), [("r", title)], dry_run=False
+        )
         assert report.outcomes[0].status == "skipped_no_target"
         assert report.requested == 0
 
@@ -1783,10 +1854,14 @@ class TestOverseerrTarget:
     def _run(self, monkeypatch, fake: FakeSeerr, demand, **kw):
         monkeypatch.setattr(requests_mod, "SeerrClient", lambda *a, **k: fake)
         cfg = _cfg(overseerr=OVERSEERR, **kw.pop("cfg", {}))
-        return cfg, _request_missing(cfg, FakeTmdb(), demand, dry_run=kw.pop("dry_run", False), **kw)
+        # Every show has a TVDB id unless a test says otherwise, as nearly every real one does: Seerr
+        # needs one to deliver a show to Sonarr, so a show without one is held back on this route.
+        tvdb = {t.tmdb_id: 900_000 + t.tmdb_id for t in demand.values() if t.media_type is not MediaType.MOVIE}
+        tmdb = FakeTmdb(tvdb | kw.pop("tvdb", {}))
+        return cfg, _request_missing(cfg, tmdb, demand, dry_run=kw.pop("dry_run", False), **kw)
 
     def test_movies_and_shows_both_go_through_the_one_client(self, monkeypatch):
-        """The Arr route needs two apps and a TVDB crossing for shows; this one needs neither."""
+        """The Arr route needs two apps; this one takes both media types through one client."""
         fake = FakeSeerr()
         demand = self._demand(
             MissingTitle(603, "a movie", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3),
@@ -1816,6 +1891,35 @@ class TestOverseerrTarget:
         _, report = self._run(monkeypatch, fake, demand)
         assert fake.requests == []
         assert report.arr_present == {(1399, "show")}
+
+    def test_a_show_without_a_tvdb_id_is_held_back_on_this_route_too(self, monkeypatch):
+        """Asked by TMDB id, but delivered to Sonarr by TVDB id — and Seerr 3.4.1 DELETES a show request
+        it cannot map (`MediaRequestSubscriber.sendToSonarr`: no `external_ids.tvdb_id` -> remove the
+        media and the request, throw "TVDB ID not found"). Shortlist had already filed it as sent, so
+        the show vanished from both apps: The Vampire Lestat and Animaniacs, 2026-09-03."""
+        fake = FakeSeerr()
+        demand = self._demand(
+            MissingTitle(1399, "no tvdb show", MediaType.SHOW, 2011, rating=9.2, vote_count=900, demand=9),
+            MissingTitle(603, "a movie", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3),
+        )
+        _, report = self._run(monkeypatch, fake, demand, tvdb={1399: None}, cfg={"max_per_run": 1})
+        assert [t for t, _, _ in fake.requests] == [603]
+        [held] = report.queued
+        assert held.tmdb_id == 1399
+        assert held.detail.startswith("no TheTVDB id"), held.detail
+
+    def test_approving_a_show_without_a_tvdb_id_is_skipped_not_filed(self, monkeypatch):
+        """The inbox path reaches the send directly, so the send has to refuse it as well — filing it
+        would be marked sent here and deleted there."""
+        fake = FakeSeerr()
+        monkeypatch.setattr(requests_mod, "SeerrClient", lambda *a, **k: fake)
+        title = MissingTitle(1399, "no tvdb show", MediaType.SHOW, 2011, rating=9.2, vote_count=900)
+        report = requests_mod.request_titles_by_row(
+            {"r": _cfg(overseerr=OVERSEERR)}, FakeTmdb({1399: None}), [("r", title)], dry_run=False
+        )
+        assert fake.requests == []
+        assert [o.status for o in report.outcomes] == ["skipped_no_tvdb"]
+        assert "add it in Sonarr yourself" in report.outcomes[0].detail
 
     def test_a_failed_state_fetch_fails_open(self, monkeypatch):
         """Same contract as the Arr reconcile: a redundant request is a far smaller sin than

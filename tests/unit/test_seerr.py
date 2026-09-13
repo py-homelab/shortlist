@@ -529,11 +529,14 @@ class TestTheEngineDrivesTheRealClient:
 
 
 class _EngineTmdb:
-    """The TMDB surface `request_missing` touches. None of it is used on the Overseerr route — no
-    TVDB crossing exists there — but the enrichment pass still asks for art and a synopsis."""
+    """The TMDB surface `request_missing` touches on the Overseerr route.
+
+    A show's TVDB id IS read here, though it never goes on the wire: Seerr hands a show to Sonarr by
+    TVDB id and deletes a request it cannot map, so Shortlist holds back a show without one. This stub
+    used to raise on the lookup, pinning the assumption that the route never needs it."""
 
     def tvdb_id(self, tmdb_id: int, media_type) -> int | None:
-        raise AssertionError("the Overseerr route must never need a TVDB id")
+        return 900_000 + tmdb_id
 
     def imdb_id(self, tmdb_id: int, media_type) -> str | None:
         return None

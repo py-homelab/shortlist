@@ -201,6 +201,9 @@ QUEUE_REASON_PREFIXES = (
     "this row's own limit",
     "on an Arr exclusion list",
     "on the blocklist",  # the same fact, on the *seerr route
+    "Radarr isn't fully set up",
+    "Sonarr isn't fully set up",
+    "no TheTVDB id",
     "demand below",
     "rating below",
     "max_per_run",
@@ -396,7 +399,10 @@ def _gate_rows(
 
 
 def _auto_eligible(
-    cfg: RequestConfig, survivors: list[MissingTitle], blocked: Counter[str]
+    cfg: RequestConfig,
+    survivors: list[MissingTitle],
+    blocked: Counter[str],
+    no_tvdb: set[tuple[int, MediaType]] | None = None,
 ) -> tuple[list[MissingTitle], list[MissingTitle]]:
     """Split one row's qualifying titles into ``(eligible, held_back)`` on its auto-send bar.
 
@@ -407,13 +413,25 @@ def _auto_eligible(
     The run cap is deliberately NOT applied here: allocation decides who gets the slots, so no row can
     fill the cap before another has been considered. A held-back title keeps its reason ON itself —
     that is what the DB row and the run trace carry, and the only answer to "why didn't THIS one go?".
+
+    A title that can never land is held here, BEFORE allocation, rather than skipped at the send: a
+    skip is recorded nowhere, so the same title qualified again the next night and took a slot again.
+    That covers a media type with no usable Arr on the Arr route, and ``no_tvdb`` — the shows Sonarr
+    can never be sent (see :func:`_shows_without_tvdb`).
     """
     eligible: list[MissingTitle] = []
     held_back: list[MissingTitle] = []
     other_bar = other_language_bar(cfg)
+    via_arr = cfg.target != "overseerr"
     for m in survivors:  # already ranked best-first by the gate
         if not cfg.auto_send:
             reason = "auto-send is off"
+        elif via_arr and m.media_type is MediaType.MOVIE and cfg.radarr is None:
+            reason = "Radarr isn't fully set up — connect it and pick a quality profile and root folder"
+        elif via_arr and m.media_type is not MediaType.MOVIE and cfg.sonarr is None:
+            reason = "Sonarr isn't fully set up — connect it and pick a quality profile and root folder"
+        elif (m.tmdb_id, m.media_type) in (no_tvdb or set()):
+            reason = "no TheTVDB id on TMDB, and Sonarr needs one — add this show in Sonarr yourself"
         elif m.excluded:
             # Named for the route: the Arrs call it an import-exclusion list and a *seerr calls it a
             # blocklist, and a reason line that names the wrong one sends the owner to the wrong app
@@ -530,7 +548,10 @@ def request_missing(
         report.considered_by_row[slug] = len(survivors)
         cfg_by_row[slug] = cfg
         _enrich(tmdb, survivors)
-        eligible, held_back = _auto_eligible(cfg, survivors, blocked)
+        # Both routes end at Sonarr for a show: the *seerr passes it on by TVDB id, and deletes it when
+        # it has none (see `_request_one_seerr`).
+        no_tvdb = _shows_without_tvdb(tmdb, survivors) if cfg.target == "overseerr" or cfg.sonarr else set()
+        eligible, held_back = _auto_eligible(cfg, survivors, blocked, no_tvdb)
         report.queued.extend(held_back)
         auto_by_row.append((slug, eligible))
 
@@ -788,7 +809,7 @@ def _send_claims(
             # On the ROUTE, not on the target: a chosen-but-unconnected Overseerr must not fall
             # through to the Arr branch below and be explained in that branch's words.
             target = _cached_client(clients, clocks, cfg.overseerr, SeerrClient, min_write_interval)
-            outcomes.append(_request_one_seerr(title, target, dry_run=dry_run))
+            outcomes.append(_request_one_seerr(title, target, tmdb, dry_run=dry_run))
             continue
         radarr = _cached_client(clients, clocks, cfg.radarr, RadarrClient, min_write_interval)
         sonarr = _cached_client(clients, clocks, cfg.sonarr, SonarrClient, min_write_interval)
@@ -974,6 +995,25 @@ def _safe_id_pair(fetch) -> tuple[set[int], set[int]]:
         return set(), set()
 
 
+def _shows_without_tvdb(tmdb: TmdbClient, titles: list[MissingTitle]) -> set[tuple[int, MediaType]]:
+    """The shows TMDB answered for and has no TheTVDB id — which Sonarr can never be asked for.
+
+    Decided BEFORE allocation, not left to the send. A show skipped at the send landed in neither
+    `sent` nor `queued`, so the next night it was the same qualifying title and won a slot again: in
+    production one show took a slot 15 nights running, and over one week 25 of 40 slots went to shows
+    that could never be added.
+
+    A lookup that RAISES is deliberately not in the set. TMDB being down says nothing about the show,
+    so that one still goes to the send, which retries the lookup and records the failure as a failure.
+    The lookup is TMDB's cached external-ids payload, which `_enrich` has just read for the IMDb id.
+    """
+    return {
+        (m.tmdb_id, m.media_type)
+        for m in titles
+        if m.media_type is not MediaType.MOVIE and _tvdb_for_sonarr(m, tmdb)[1][0] == "skipped_no_tvdb"
+    }
+
+
 def _resolve_tvdb(tmdb: TmdbClient, m: MissingTitle) -> int | None:
     """A show's TVDB id, cached on the title so presence-check and send don't each look it up."""
     if m.tvdb_id is None:
@@ -1080,40 +1120,82 @@ def _gate_by_source(
     return [title for title, _, _ in scored]
 
 
-def _request_one_seerr(title: MissingTitle, seerr: SeerrClient | None, *, dry_run: bool) -> RequestOutcome:
+def _tvdb_for_sonarr(title: MissingTitle, tmdb: TmdbClient) -> tuple[int | None, tuple[str, str]]:
+    """A show's TheTVDB id for Sonarr, or ``(None, (status, detail))`` saying why it cannot be sent.
+
+    Both routes need this. The Arr route names the show to Sonarr by TVDB id itself; a *seerr is asked
+    by TMDB id but hands the show to Sonarr by TVDB id, and Seerr 3.4.1 DELETES a request it cannot map
+    (`MediaRequestSubscriber.sendToSonarr`: no `external_ids.tvdb_id` -> remove the media and the
+    request, throw "TVDB ID not found") — after Shortlist had already filed it as sent.
+
+    Reuses the id if the reconcile or the auto-send bar already resolved it this run.
+    """
+    if title.tvdb_id is not None:
+        return title.tvdb_id, ("", "")
+    try:
+        title.tvdb_id = tmdb.tvdb_id(title.tmdb_id, title.media_type)
+    except Exception as e:
+        # The TVDB lookup is a TMDB call, not an Arr one, so it raises RuntimeError/httpx errors rather
+        # than ArrError — caught here so one show's lookup hiccup becomes that title's outcome, never an
+        # escape that discards the whole pass's recorded outcomes.
+        logger.warning("TVDB lookup for {!r} failed: {}", title.title, e)
+        # Distinct from the skip below on purpose: THIS one is a lookup that failed (TMDB down, a
+        # timeout), so retrying may well work. The skip is a settled fact about the data and never will.
+        return None, ("error", "couldn't reach TMDB to look up this show's TheTVDB id — it may work next run")
+    if title.tvdb_id is None:
+        # Says what to DO, because nothing here can. Sonarr identifies shows by TheTVDB id and TMDB is
+        # where we look it up; when TMDB has not recorded one there is no way to name the show to
+        # Sonarr, and guessing is worse than skipping — the nearest title match for "The Haunting of
+        # Bly Manor" is "The Haunting", a different and much larger series.
+        #
+        # The old text was "no TheTVDB id for this show": true, and useless. It reads as a fault report
+        # to anyone who does not already know what a TVDB id is, so the reader cannot tell whether
+        # Shortlist is broken, their Sonarr is misconfigured, or this is simply how it is. None of
+        # those, and there is exactly one remedy.
+        return None, (
+            "skipped_no_tvdb",
+            "TMDB has no TheTVDB id for this show, and Sonarr needs one — add it in Sonarr yourself",
+        )
+    return title.tvdb_id, ("", "")
+
+
+def _request_one_seerr(
+    title: MissingTitle, seerr: SeerrClient | None, tmdb: TmdbClient, *, dry_run: bool
+) -> RequestOutcome:
     """``_request_one`` for an Overseerr/Jellyseerr target.
 
-    Much shorter than its Arr twin because the *seerr takes movies and shows through one endpoint,
-    both keyed by TMDB id — so there is no app to choose, no TVDB id to resolve, and therefore no
-    ``skipped_no_tvdb`` outcome to explain.
+    Shorter than its Arr twin because the *seerr takes movies and shows through one endpoint, both
+    keyed by TMDB id — so there is no app to choose. A show still needs a TheTVDB id, because the
+    *seerr needs one to pass it on to Sonarr (see :func:`_tvdb_for_sonarr`).
 
     ``seerr`` is None when the route is chosen but the instance is not connected — the same shape as
     ``_request_one``'s missing Arr, and it earns the same kind of skip rather than being explained in
     the other route's words.
     """
-    if seerr is None:
+
+    def outcome(status: str, detail: str, slug: str | None = None) -> RequestOutcome:
         return RequestOutcome(
             tmdb_id=title.tmdb_id,
             title=title.title,
             media_type=title.media_type,
-            status="skipped_no_target",
-            detail="Overseerr is the chosen request target but has no address or API key",
-            arr_slug=None,
+            status=status,
+            detail=detail,
+            arr_slug=slug,
         )
+
+    if seerr is None:
+        return outcome("skipped_no_target", "Overseerr is the chosen request target but has no address or API key")
+    if title.media_type is not MediaType.MOVIE:
+        tvdb_id, blocked = _tvdb_for_sonarr(title, tmdb)
+        if tvdb_id is None:
+            return outcome(*blocked)
     try:
         status, detail, slug = seerr.request_title(title.tmdb_id, title.media_type, dry_run=dry_run)
     except SeerrError as e:
         # A request failing is a footnote, never a run failure — the *seerr is optional plumbing.
         logger.warning("request for {!r} failed: {}", title.title, e)
         status, detail, slug = "error", str(e), None
-    return RequestOutcome(
-        tmdb_id=title.tmdb_id,
-        title=title.title,
-        media_type=title.media_type,
-        status=status,
-        detail=detail,
-        arr_slug=slug,
-    )
+    return outcome(status, detail, slug)
 
 
 def _request_one(
@@ -1151,31 +1233,9 @@ def _request_one(
         # whole pass's recorded outcomes (the run-level handler would otherwise lose the audit trail).
         if sonarr is None:
             return outcome("skipped_no_target", "Sonarr not fully configured (check quality profile and root folder)")
-        # Reuse the TVDB id if the arr-state check already resolved it this run; else look it up now.
-        tvdb_id = title.tvdb_id
+        tvdb_id, blocked = _tvdb_for_sonarr(title, tmdb)
         if tvdb_id is None:
-            try:
-                tvdb_id = tmdb.tvdb_id(title.tmdb_id, title.media_type)
-            except Exception as e:
-                logger.warning("TVDB lookup for {!r} failed: {}", title.title, e)
-                # Distinct from the skip below on purpose: THIS one is a lookup that failed (TMDB
-                # down, a timeout), so retrying may well work. The skip is a settled fact about the
-                # data and never will.
-                return outcome("error", "couldn't reach TMDB to look up this show's TheTVDB id — it may work next run")
-        if tvdb_id is None:
-            # Says what to DO, because nothing here can. Sonarr identifies shows by TheTVDB id and
-            # TMDB is where we look it up; when TMDB has not recorded one there is no way to name the
-            # show to Sonarr, and guessing is worse than skipping — the nearest title match for
-            # "The Haunting of Bly Manor" is "The Haunting", a different and much larger series.
-            #
-            # The old text was "no TheTVDB id for this show": true, and useless. It reads as a fault
-            # report to anyone who does not already know what a TVDB id is, so the reader cannot tell
-            # whether Shortlist is broken, their Sonarr is misconfigured, or this is simply how it is.
-            # None of those, and there is exactly one remedy.
-            return outcome(
-                "skipped_no_tvdb",
-                "TMDB has no TheTVDB id for this show, and Sonarr needs one — add it in Sonarr yourself",
-            )
+            return outcome(*blocked)
         status, detail, slug = sonarr.add_series(
             tvdb_id, dry_run=dry_run, extra_tags=title.tags, monitor=sonarr_monitor
         )

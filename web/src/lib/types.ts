@@ -554,7 +554,7 @@ export interface RunStats {
       considered: number;
       /** What the caps allocated to this row — the figure that answers "did my row limit bind". */
       claimed: number;
-      /** Of those, how many the Arr accepted; a claim can still be skipped (no TheTVDB id). */
+      /** Of those, how many the Arr accepted; a claim can still fail at the send (the Arr refused it). */
       sent: number;
     }
   >;

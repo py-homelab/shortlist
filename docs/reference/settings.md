@@ -357,7 +357,11 @@ failing open on error): a title Sonarr/Radarr already tracks is dropped, since i
 not imported into Plex yet. Matched on tmdbId for movies and tvdbId for shows (the candidate's TVDB
 id is resolved once and reused for the send). A title on an Arr import-exclusion list (usually a past
 delete) is kept but flagged (`excluded` on `GET /api/requests`) and never auto-sent, so the inbox can
-warn that approving it is a no-op until the exclusion is removed in the Arr. A sent title records the
+warn that approving it is a no-op until the exclusion is removed in the Arr. A title that could never
+land is not auto-sent either — it waits in the inbox with the reason, so it cannot take a
+`max_per_run` slot every night: a movie or show whose Radarr/Sonarr is not fully set up, and a show
+TMDB has no TVDB id for. The last applies on the Overseerr route too, because Overseerr hands shows to
+Sonarr by TVDB id and deletes a request it cannot map. A sent title records the
 Arr's `titleSlug` (`arr_slug` on `GET /api/requests`) so the Sent log deep-links straight to its
 Sonarr/Radarr page; each candidate also carries TMDB's `poster_path` (`"/abc.jpg"`, or `""` when
 TMDB has no artwork). A path and not a URL, because the image host and size buckets are TMDB's to
