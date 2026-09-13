@@ -11,6 +11,8 @@ from collections import defaultdict
 from datetime import tzinfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.base import BaseTrigger
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
@@ -87,13 +89,18 @@ def _weekday_number(token: str) -> int:
     return int(token)
 
 
-def crontab_trigger(expr: str, timezone: tzinfo | str | None = None) -> CronTrigger:
-    """A trigger for a standard five-field crontab, weekdays numbered the way cron numbers them.
+def crontab_trigger(expr: str, timezone: tzinfo | str | None = None) -> BaseTrigger:
+    """A trigger for a standard five-field crontab, read the way cron reads it.
 
-    Use this, never `CronTrigger.from_crontab`: APScheduler 3 counts weekdays from 0 = MONDAY where cron
-    counts from 0 = Sunday (its own docstring admits it; only 4.x fixes it), so `0 4 * * 1,4` ran on
-    Tuesday and Friday (issue #123). The day-of-week field is expanded here and handed over as day
-    NAMES, which APScheduler reads correctly.
+    Use this, never `CronTrigger.from_crontab`. APScheduler 3 departs from cron twice:
+
+    - It counts weekdays from 0 = MONDAY where cron counts from 0 = Sunday (its own docstring admits
+      it; only 4.x fixes it), so `0 4 * * 1,4` ran on Tuesday and Friday (issue #123). The day-of-week
+      field is expanded here and handed over as day NAMES, which APScheduler reads correctly.
+    - It requires the day of the month AND the weekday to match. Cron runs when EITHER does, if both
+      are restricted, so `0 4 1 * 1` means every Monday and every 1st, not a 1st that is a Monday. A
+      field starting with `*` is not a restriction (Vixie cron's DOM_STAR/DOW_STAR), so `*/2` still
+      combines with AND.
 
     Raises:
         ValueError: the expression is not a valid five-field cron.
@@ -102,6 +109,7 @@ def crontab_trigger(expr: str, timezone: tzinfo | str | None = None) -> CronTrig
     if len(fields) != 5:
         raise ValueError(f"Wrong number of fields; got {len(fields)}, expected 5")
     minute, hour, day, month, day_of_week = fields
+    either = not day.startswith("*") and not day_of_week.startswith("*")
     if day_of_week != "*":
         days: set[int] = set()
         for part in day_of_week.split(","):
@@ -111,7 +119,12 @@ def crontab_trigger(expr: str, timezone: tzinfo | str | None = None) -> CronTrig
             if span == "*":
                 first, last = 0, 6
             elif "-" in span:
-                first, last = (_weekday_number(bound) for bound in span.split("-", 1))
+                low, high = span.split("-", 1)
+                first, last = _weekday_number(low), _weekday_number(high)
+                # `sun` is 0, so a named range ending on it (`sat-sun`, `mon-sun`) ends on 7, the second
+                # Sunday. APScheduler's own names always allowed it, so schedules saved that way exist.
+                if high.lower() == "sun" and first > 0:
+                    last = 7
             else:
                 first = _weekday_number(span)
                 last = 6 if step else first
@@ -119,7 +132,12 @@ def crontab_trigger(expr: str, timezone: tzinfo | str | None = None) -> CronTrig
                 raise ValueError(f"invalid day-of-week range {part!r}")
             days.update(number % 7 for number in range(first, last + 1, int(step or 1)))  # 7 is Sunday too
         day_of_week = ",".join(_WEEKDAYS[number] for number in sorted(days))
-    return CronTrigger(minute=minute, hour=hour, day=day, month=month, day_of_week=day_of_week, timezone=timezone)
+    common = {"minute": minute, "hour": hour, "month": month, "timezone": timezone}
+    if either:
+        return OrTrigger(
+            [CronTrigger(day=day, day_of_week="*", **common), CronTrigger(day="*", day_of_week=day_of_week, **common)]
+        )
+    return CronTrigger(day=day, day_of_week=day_of_week, **common)
 
 
 def _job_id(cron: str) -> str:

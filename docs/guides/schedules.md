@@ -58,7 +58,9 @@ backup pickers on Jobs) takes either form:
 - **Plain English**: `every 30 minutes`, `every 4 hours`, `every 4 hours at 17 past`, `hourly`,
   `nightly at 3:30am`, `daily at 21:15`, `mondays at 9pm`, `weekdays at 6am`, `weekends at 10am`.
 - **A cron expression**, if you already think that way: five fields: minute, hour, day-of-month,
-  month, day-of-week. `0 */6 * * *` is every six hours; `0 4 * * 1` is Mondays at 4am.
+  month, day-of-week. `0 */6 * * *` is every six hours; `0 4 * * 1` is Mondays at 4am; `0 4 * * sat-sun`
+  is weekends at 4am. As in standard cron, when you set both a day of the month and a day of the week,
+  it runs on either: `0 4 1 * 1` is every Monday and the 1st of every month.
 
 Whichever you type, the line underneath tells you what it will actually do and what gets saved, and
 nothing saves until it parses. So a typo can't quietly leave you on the built-in default. Times are

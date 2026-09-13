@@ -17,6 +17,9 @@ describe("isValidCron", () => {
     "30 4 * * 0,6",
     "0 0 1 1 *",
     "0 12 * jan mon", // APScheduler accepts month/day names, so we must too
+    "0 4 * * sat-sun", // a named range may end on Sunday: the scheduler reads it as ending on 7
+    "0 4 * * mon-sun",
+    "0 4 1 * 1", // day of month and weekday together: the scheduler runs on either
   ])("accepts %s", (expression) => {
     expect(isValidCron(expression)).toBe(true);
   });
@@ -32,6 +35,11 @@ describe("isValidCron", () => {
     "every 4 hours",
     "*/0 * * * *", // a zero step is not a schedule
     "0 3 * * mon-fri-sat", // three-part range
+    // Reversed ranges: the scheduler refuses them, so saving one answered 422 after the box said valid.
+    "0 3 * * 5-2",
+    "0 3 * * sat-mon",
+    "0 3 20-10 * *",
+    "10-5 3 * * *",
   ])("rejects %s", (expression) => {
     expect(isValidCron(expression)).toBe(false);
   });

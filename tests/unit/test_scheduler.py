@@ -458,6 +458,13 @@ class TestCrontabWeekdays:
             ("0 4 * * */2", ["Tue", "Thu", "Sat", "Sun"]),
             ("0 4 * * mon,thu", ["Mon", "Thu", "Mon", "Thu"]),
             ("0 4 * * *", ["Mon", "Tue", "Wed", "Thu"]),
+            # A named range may END on Sunday. `sun` is 0, so read literally `sat-sun` is 6-0 and was
+            # refused, silently stopping a schedule APScheduler's own names had always accepted.
+            ("0 4 * * sat-sun", ["Sat", "Sun", "Sat", "Sun"]),
+            ("0 4 * * fri-sun", ["Fri", "Sat", "Sun", "Fri"]),
+            ("0 4 * * mon-sun", ["Mon", "Tue", "Wed", "Thu"]),
+            ("0 4 * * SAT-SUN", ["Sat", "Sun", "Sat", "Sun"]),
+            ("0 4 * * sun-sat", ["Mon", "Tue", "Wed", "Thu"]),
         ],
     )
     def test_weekdays_fire_on_the_day_cron_means_when_numbered_from_sunday(self, cron, expected):
@@ -474,7 +481,8 @@ class TestCrontabWeekdays:
         assert fired == expected
 
     @pytest.mark.parametrize(
-        "cron", ["0 4 * * 8", "0 4 * * 5-2", "0 4 * *", "0 4 * * funday", "0 4 * * 1/", "0 4 * * */0"]
+        "cron",
+        ["0 4 * * 8", "0 4 * * 5-2", "0 4 * *", "0 4 * * funday", "0 4 * * 1/", "0 4 * * */0", "0 4 * * sat-mon"],
     )
     def test_an_invalid_weekday_raises_value_error_when_parsed(self, cron):
         from shortlist.server.scheduler import crontab_trigger
@@ -486,3 +494,60 @@ class TestCrontabWeekdays:
         root = Path(__file__).resolve().parents[2] / "shortlist"
         offenders = [str(p) for p in root.rglob("*.py") if "from_crontab(" in p.read_text()]
         assert offenders == []
+
+
+class TestCrontabDayOfMonthAndWeekday:
+    """Cron runs a job when the day of the month OR the weekday matches, if both are restricted.
+    APScheduler requires both, so `0 4 1 * 1` ran only on a 1st that was a Monday (next: 2027-02-01),
+    not every Monday and every 1st. A field that starts with `*` is not a restriction (Vixie cron's
+    DOM_STAR/DOW_STAR), so `*/2` still combines with AND."""
+
+    @staticmethod
+    def _fires(cron: str, count: int) -> list[str]:
+        from datetime import UTC, datetime, timedelta
+
+        from shortlist.server.scheduler import crontab_trigger
+
+        trigger = crontab_trigger(cron, timezone=UTC)
+        now, previous, fired = datetime(2026, 9, 6, 12, tzinfo=UTC), None, []  # a Sunday, after 04:00
+        for _ in range(count):
+            previous = trigger.get_next_fire_time(previous, now)
+            fired.append(previous.strftime("%a %m-%d"))
+            now = previous + timedelta(seconds=1)
+        return fired
+
+    def test_both_restricted_fires_on_either(self):
+        assert self._fires("0 4 1 * 1", 6) == [
+            "Mon 09-07",
+            "Mon 09-14",
+            "Mon 09-21",
+            "Mon 09-28",
+            "Thu 10-01",
+            "Mon 10-05",
+        ]
+
+    def test_a_list_of_days_or_a_weekday_range(self):
+        assert self._fires("0 4 12,13 * sat-sun", 5) == [
+            "Sat 09-12",
+            "Sun 09-13",
+            "Sat 09-19",
+            "Sun 09-20",
+            "Sat 09-26",
+        ]
+
+    def test_a_starred_day_of_month_still_means_both(self):
+        """`*/2` is 1, 3, 5, … AND Monday — Mondays on odd dates only."""
+        assert self._fires("0 4 */2 * 1", 3) == ["Mon 09-07", "Mon 09-21", "Mon 10-05"]
+
+    def test_a_starred_weekday_still_means_both(self):
+        """`*/2` weekdays are Sun, Tue, Thu, Sat; with the 1st, only a 1st that falls on one of them."""
+        assert self._fires("0 4 1 * */2", 2) == ["Thu 10-01", "Sun 11-01"]
+
+    def test_only_a_day_of_month_fires_on_that_day(self):
+        assert self._fires("0 4 1 * *", 2) == ["Thu 10-01", "Sun 11-01"]
+
+    def test_an_invalid_day_of_month_still_raises_value_error(self):
+        from shortlist.server.scheduler import crontab_trigger
+
+        with pytest.raises(ValueError):
+            crontab_trigger("0 4 32 * 1")

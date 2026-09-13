@@ -69,18 +69,33 @@ function isValidField(
       return false;
     }
     if (range === "*") return true;
-    return range.split("-").length <= 2
-      ? range
-          .split("-")
-          .every(
-            (bound) =>
-              names.includes(bound.toLowerCase()) ||
-              (/^\d+$/.test(bound) &&
-                Number(bound) >= min &&
-                Number(bound) <= max),
-          )
-      : false;
+    const bounds = range.split("-");
+    if (bounds.length > 2) return false;
+    const values = bounds.map((bound) => boundValue(bound, min, max, names));
+    if (values.some((value) => value === null)) return false;
+    const [first = 0, last = first] = values as number[];
+    // The scheduler refuses a reversed range. A named one ending on Sunday is not reversed: the
+    // scheduler reads `sat-sun` as 6-7, Sunday's second number (server/scheduler.py crontab_trigger).
+    const end =
+      names === DOW_TOKENS && bounds[1]?.toLowerCase() === "sun" && first > 0
+        ? 7
+        : last;
+    return first <= end;
   });
+}
+
+/** One bound of a range as a number, or null when it is neither an allowed name nor in range. */
+function boundValue(
+  bound: string,
+  min: number,
+  max: number,
+  names: string[],
+): number | null {
+  const named = names.indexOf(bound.toLowerCase());
+  if (named >= 0) return named + min;
+  if (!/^\d+$/.test(bound)) return null;
+  const value = Number(bound);
+  return value >= min && value <= max ? value : null;
 }
 
 /** Whether a string is a five-field cron expression the scheduler will accept. */
