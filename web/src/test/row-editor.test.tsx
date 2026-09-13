@@ -1344,7 +1344,15 @@ describe("RowEditor — rating source is answerable where the order is chosen", 
 
 describe("RowEditor — every group is on screen, only the optional ones fold", () => {
   const groupNamed = (title: string) =>
-    screen.getByText(title).closest("details");
+    screen.getByText(title, { selector: "summary span span" }).closest("details");
+  const GROUPS = [
+    "How it looks on Plex",
+    "Who gets it",
+    "What goes in it",
+    "When it updates",
+    "Where people see it",
+    "Requests",
+  ];
 
   it("leaves the groups that decide what a row does open", () => {
     renderEditor(row());
@@ -1355,17 +1363,52 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
 
     // Open, because a page has room for them. As a modal these were collapsed to fit inside the
     // viewport cap — which is how the movies-and-TV seed warning ended up somewhere nobody looks.
-    for (const group of ["The basics", "What goes in it", "Where it appears"]) {
+    for (const group of GROUPS.slice(0, -1)) {
       expect(groupNamed(group)).toHaveAttribute("open");
     }
   });
 
-  it("folds only the groups most people never touch", () => {
+  it("folds only the group most people never touch", () => {
     renderEditor(row());
 
-    for (const group of ["Artwork", "Description and sort order", "Requests"]) {
-      expect(groupNamed(group)).not.toHaveAttribute("open");
-    }
+    expect(groupNamed("Requests")).not.toHaveAttribute("open");
+  });
+
+  it("asks its questions in order: how it looks, who gets it, what's in it, when it updates, where it shows", () => {
+    renderEditor(row());
+
+    const titles = Array.from(
+      document.querySelectorAll("details > summary span span:first-child"),
+    ).map((el) => el.textContent);
+    expect(titles).toEqual(GROUPS);
+  });
+
+  it("keeps everything people see about the row together at the top", () => {
+    // The name, description and poster used to be three groups apart — the last two folded near the
+    // bottom — so the settings that decide what someone sees on Plex were the hardest to find.
+    renderEditor(row());
+
+    const looks = groupNamed("How it looks on Plex")!;
+    expect(within(looks).getByLabelText("Name", { exact: true })).toBeInTheDocument();
+    expect(within(looks).getByLabelText("Description")).toBeInTheDocument();
+    expect(within(looks).getByRole("button", { name: "Plex default" })).toBeInTheDocument();
+    expect(within(looks).getByText("On Plex")).toBeInTheDocument();
+  });
+
+  it("puts each setting in the group that answers its question", () => {
+    renderEditor(row());
+
+    expect(within(groupNamed("What goes in it")!).getByText("How many titles")).toBeInTheDocument();
+    expect(
+      within(groupNamed("What goes in it")!).getByRole("button", { name: "Best match" }),
+    ).toBeInTheDocument();
+    expect(within(groupNamed("When it updates")!).getByText("Schedule")).toBeInTheDocument();
+    expect(
+      within(groupNamed("Where people see it")!).getByLabelText("Sort title prefix"),
+    ).toBeInTheDocument();
+    expect(
+      within(groupNamed("Where people see it")!).getByRole("button", { name: "Every day" }),
+    ).toBeInTheDocument();
   });
 
   it("a folded group still says what is inside it", () => {
@@ -1415,7 +1458,6 @@ describe("RowEditor — a typed row says so", () => {
   it("saves a description and sort title prefix, and shows what the row sorts as", async () => {
     renderEditor(row());
 
-    await userEvent.click(screen.getByText("Description and sort order"));
     await userEvent.type(screen.getByLabelText("Description"), "Picked nightly");
     await userEvent.type(screen.getByLabelText("Sort title prefix"), "!010_");
     expect(screen.getByText("!010_Hidden Gems")).toBeInTheDocument();
@@ -1427,13 +1469,18 @@ describe("RowEditor — a typed row says so", () => {
     expect(body.sort_title_prefix).toBe("!010_");
   });
 
-  it("says a closed description group is leaving Plex alone until one is set", () => {
+  it("previews the description on the Plex card as the sample person would see it", async () => {
     renderEditor(row());
-    expect(screen.getByText("Plex’s own description and sort order")).toBeInTheDocument();
 
-    cleanup();
-    renderEditor(row({ description: "Hi", sort_title_prefix: "01 " }));
-    expect(screen.getByText("Has a description · Sorts under “01 ”")).toBeInTheDocument();
+    await userEvent.type(
+      screen.getByLabelText("Description"),
+      "Picked for {{user}",
+    );
+
+    const looks = screen
+      .getByText("How it looks on Plex", { selector: "summary span span" })
+      .closest("details")!;
+    expect(within(looks).getByText("Picked for Sarah")).toBeInTheDocument();
   });
 
   it("offers the recently-finished cooldown only on a watch-it-again row", () => {

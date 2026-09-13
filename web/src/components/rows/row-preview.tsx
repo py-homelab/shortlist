@@ -2,7 +2,6 @@ import type { ReactNode } from "react";
 
 import { effectiveSources } from "@/components/rows/row-sources-field";
 import { showDaysSummary } from "@/lib/show-days";
-import { renderRowName } from "@/lib/format";
 import { sourceShortLabel } from "@/lib/sources";
 import type { CollectionInput, PlexLibrary, Settings, User } from "@/lib/types";
 
@@ -146,7 +145,8 @@ function Fact({ label, value }: { label: string; value: ReactNode }) {
  * what a row is.
  *
  * Deliberately not a Plex mock-up. A fake shelf of grey boxes would imply we know which titles land
- * in it, and we do not until the row runs.
+ * in it, and we do not until the row runs. *
+ * The row's name, description and poster are shown by `RowPlexCard`, beside the fields that set them.
  */
 export function RowPreview({
   input,
@@ -166,30 +166,6 @@ export function RowPreview({
   globalRefreshDays: number | null;
   globalWatchedPct: number | null;
 }) {
-  const template = input.name_template || input.name;
-  // The sample library has to match the row's media type, or a TV-only row previews as
-  // "More Movies to watch" — a name it can never produce, on the one panel whose job is to show the
-  // name it WILL produce.
-  const sampleLibrary = input.media === "show" ? "TV Shows" : "Movies";
-  const shown =
-    renderRowName(template, "Fargo", "Sarah", sampleLibrary) ||
-    "Picked for You";
-  // What actually varies depends on the row. A per-person row renders a different name for each
-  // person, from their own viewing; a SHARED row is one collection everybody sees, so only
-  // {library_name} moves — telling someone their shared row is named per person is simply untrue.
-  const perPerson = /\{(top_seed|user)\}/.test(template);
-  const perLibrary = template.includes("{library_name}");
-  const caption =
-    input.build === "shared"
-      ? perLibrary
-        ? "Example only — the real library name fills in, so each library gets its own."
-        : null
-      : perPerson
-        ? "Example only — each person gets their own name here, from their own viewing."
-        : perLibrary
-          ? "Example only — the real library name fills in, so each library gets its own."
-          : null;
-
   const sources = effectiveSources(input.candidate_sources, settings);
   const builtFrom = builtFromLine(input);
   const isSharedRow = input.build === "shared";
@@ -199,16 +175,6 @@ export function RowPreview({
   // sat a card's padding lower than the one beside it, which read as two unrelated things.
   return (
     <div className="space-y-4 rounded-lg border bg-card p-5">
-      <div className="rounded-md border bg-muted/30 p-4">
-        <p className="text-xs uppercase tracking-wide text-muted-foreground">
-          On Plex it reads
-        </p>
-        <p className="mt-1 break-words text-base font-medium">“{shown}”</p>
-        {caption && (
-          <p className="mt-2 text-xs text-muted-foreground">{caption}</p>
-        )}
-      </div>
-
       <dl className="divide-y">
         <Fact label="Who gets it" value={whoSeesIt(input, users)} />
         <Fact label="Built in" value={librariesLine(input, libraries)} />

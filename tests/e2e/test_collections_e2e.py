@@ -30,16 +30,6 @@ def _add_a_row(page: Page) -> None:
     expect(page.get_by_role("heading", name="Add a row")).to_be_visible()
 
 
-def _open_section(page: Page, name: str) -> None:
-    """Expand one of the row editor's collapsible groups.
-
-    Most groups are open on the editor PAGE — only the genuinely optional ones (artwork, request
-    tags) start closed, so this is for reaching into those. Clicking an already-open group would
-    close it, so callers must only pass a group that starts folded.
-    """
-    page.get_by_text(name, exact=True).click()
-
-
 def _saved_row(page: Page, name: str):
     """The card for a saved row on the /rows list.
 
@@ -98,7 +88,7 @@ def test_a_row_can_be_given_a_built_in_text_poster(page: Page, app: ShortlistApp
     # Re-open it and choose a built-in text poster — this needs no AI provider, so it works on any setup.
     page.get_by_role("button", name="Edit").last.click()
     expect(page.get_by_label("Name", exact=True)).to_have_value("Poster Row")
-    _open_section(page, "Artwork")
+    # The poster sits in the open "How it looks on Plex" group, beside the name it belongs to.
     page.get_by_role("button", name="Text", exact=True).click()
     page.get_by_label("Title text").fill("Weekend Picks")
     page.get_by_role("button", name="Save changes").click()
@@ -113,7 +103,7 @@ def test_a_row_can_be_given_a_built_in_text_poster(page: Page, app: ShortlistApp
 
 
 def test_a_row_can_be_given_a_description_and_sort_title_prefix(page: Page, app: ShortlistApp):
-    """Issue #120: both are saved from the editor's folded "Description and sort order" group."""
+    """Issue #120: the description is set beside the name, the prefix beside the row's placement."""
     _open_rows(page)
     _add_a_row(page)
     page.get_by_label("Name", exact=True).fill("Sorted Row")
@@ -122,7 +112,6 @@ def test_a_row_can_be_given_a_description_and_sort_title_prefix(page: Page, app:
 
     page.get_by_role("button", name="Edit").last.click()
     expect(page.get_by_label("Name", exact=True)).to_have_value("Sorted Row")
-    _open_section(page, "Description and sort order")
     page.get_by_label("Description", exact=True).fill("Picked for {user}")
     page.get_by_label("Sort title prefix").fill("!010_")
     expect(page.get_by_text("!010_Sorted Row")).to_be_visible()

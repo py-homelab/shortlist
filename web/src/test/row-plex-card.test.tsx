@@ -1,0 +1,65 @@
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+
+import { RowPlexCard } from "@/components/rows/row-plex-card";
+import { blankInput } from "@/lib/collections";
+import type { CollectionInput } from "@/lib/types";
+
+function input(patch: Partial<CollectionInput> = {}): CollectionInput {
+  return { ...blankInput(), name: "Hidden Gems", ...patch };
+}
+
+describe("RowPlexCard", () => {
+  it("fills the name and description in for the sample person, keeping the description's line breaks", () => {
+    render(
+      <RowPlexCard
+        input={input({
+          name_template: "{user}'s {library_name} picks",
+          description: "Picked for {user}.\nFrom {library_name}.",
+        })}
+        collectionId={null}
+        hasImage={false}
+      />,
+    );
+
+    expect(screen.getByText("“Sarah's Movies picks”")).toBeInTheDocument();
+    // A {library_name} title collapses its whitespace; a description must not.
+    const description = screen.getByText(/Picked for Sarah\./);
+    expect(description.textContent).toBe("Picked for Sarah.\nFrom Movies.");
+    expect(screen.getByText(/each person gets their own name/i)).toBeInTheDocument();
+  });
+
+  it("says Plex keeps its own artwork when the row sets no poster", () => {
+    render(<RowPlexCard input={input()} collectionId={1} hasImage />);
+
+    expect(screen.getByText("Plex’s own artwork")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("shows the uploaded image only once there is one", () => {
+    const upload = input({ poster: { mode: "upload", title: "", subtitle: "", style: "" } });
+    const { unmount } = render(<RowPlexCard input={upload} collectionId={7} hasImage={false} />);
+    expect(screen.getByText("No image uploaded yet")).toBeInTheDocument();
+    unmount();
+
+    render(<RowPlexCard input={upload} collectionId={7} hasImage />);
+    expect(screen.getByRole("img", { name: "This row's poster" })).toHaveAttribute(
+      "src",
+      expect.stringContaining("/collections/7/poster/image"),
+    );
+  });
+
+  it("shows a text poster's own words, filled in, rather than inventing a picture", () => {
+    render(
+      <RowPlexCard
+        input={input({ poster: { mode: "text", title: "{user}'s Picks", subtitle: "From {library_name}", style: "" } })}
+        collectionId={null}
+        hasImage={false}
+      />,
+    );
+
+    expect(screen.getByText("Sarah's Picks")).toBeInTheDocument();
+    expect(screen.getByText("From Movies")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+});

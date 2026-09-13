@@ -269,7 +269,7 @@ Looking for a specific setting or API endpoint? That's [Reference](https://short
 
 ## A row disappeared, or you want rows to take turns
 
-A row can be given its own days: **Rows → the row → When it appears → Only on these days.** On the
+A row can be given its own days: **Rows → the row → Where people see it → Only on these days.** On the
 days it is off, the row is hidden rather than deleted — it keeps its titles, so it comes straight
 back on its next day without being built again.
 
@@ -972,7 +972,7 @@ still reorders the shelf, so the two options above still apply.
 
 ## Row posters
 
-Each row can have its own artwork on Plex. In the **Row editor** → **Artwork**, pick one of:
+Each row can have its own artwork on Plex. In the **Row editor** → **How it looks on Plex** → **Poster**, pick one of:
 
 - **Plex default** — leave Plex's own collection artwork alone (the default). Switching a row _back_
   to this after it had a custom poster reverts the artwork on Plex on save.
@@ -990,13 +990,14 @@ user. Posters are cosmetic. A poster that can't be made never blocks a row from 
 
 ## Description and sort order
 
-Each row can also set two of its Plex collection's own fields. In the **Row editor** →
-**Description and sort order**:
+Each row can also set two of its Plex collection's own fields in the **Row editor**:
 
-- **Description** — the summary Plex shows when someone opens the row. It fills in `{user}`,
-  `{library_name}` and `{top_seed}` the same way the row's name does, so every person's copy can say
-  something about them. A `{top_seed}` description for someone with nothing watched is left empty.
-- **Sort title prefix** — text put in front of the row's name to make its Plex sort title, such as
+- **Description**, under **How it looks on Plex** — the summary Plex shows when someone opens the
+  row. It fills in `{user}`, `{library_name}` and `{top_seed}` the same way the row's name does, so
+  every person's copy can say something about them. A `{top_seed}` description for someone with
+  nothing watched is left empty. The **On Plex** card beside it shows the name, description and
+  poster filled in for a sample person.
+- **Sort title prefix**, under **Where people see it** — text put in front of the row's name to make its Plex sort title, such as
   `!010_`. It decides where the row sorts in the library's **Collections** tab (`!` sorts before
   letters). It does not move the row on Home or the Recommended shelf; that is
   [Row placement](#row-placement-recommended-shelf). The prefix always goes in front of the row's
