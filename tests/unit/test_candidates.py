@@ -1091,6 +1091,47 @@ class TestGatherStats:
         assert stats.tokens_by_source == {"llm_web": 99}
         assert stats.exa_searches == 1  # the search request itself, billed per search
 
+    def test_native_web_records_no_tokens_when_the_call_fails_after_an_earlier_one(self, mock_tmdb):
+        mock_tmdb.genre_names.return_value = {}
+
+        class _C:
+            supports_native_web_search = True
+            # Left over from this thread's PREVIOUS person. Every provider's error path returns without
+            # touching `last_tokens` (pinned in test_curator.py), so reading it after a failed call used
+            # to bill that earlier call a second time.
+            last_tokens = 7800
+
+            def recommend_web(self, profile, seeds, k):
+                return []  # the provider's own degrade-on-error shape
+
+        stats = GatherStats()
+        gather_candidates(mock_tmdb, [seed(1)], sources=["llm_web"], curator=_C(), profile=web_profile(), stats=stats)
+        assert stats.tokens_by_source == {}
+
+    def test_exa_path_records_no_tokens_when_the_completion_fails_after_an_earlier_one(self, mock_tmdb):
+        mock_tmdb.genre_names.return_value = {}
+        search = _FakeSearch([make_result("Best of 2021", "Exa Pick")])
+
+        class _C:
+            supports_native_web_search = False
+            last_tokens = 7800  # stale, as above
+
+            def complete(self, system, user):
+                return ""  # degrade-on-error
+
+        stats = GatherStats()
+        gather_candidates(
+            mock_tmdb,
+            [seed(1)],
+            sources=["llm_web"],
+            curator=_C(),
+            profile=web_profile(),
+            search=search,
+            web_search_mode="exa",
+            stats=stats,
+        )
+        assert stats.tokens_by_source == {}
+
     def test_tmdb_only_sources_record_no_ai_cost(self, mock_tmdb):
         mock_tmdb.suggestions.side_effect = lambda tid, mt: _ranked(
             [{"id": 1, "title": "S", "genre_ids": [], "vote_average": 7.0}]

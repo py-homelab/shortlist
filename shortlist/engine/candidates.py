@@ -119,6 +119,17 @@ class GatherStats:
             self.tokens_by_source[source] = self.tokens_by_source.get(source, 0) + n
 
 
+def _clear_last_tokens(curator) -> None:
+    """Zero this thread's token count before an LLM call, so a call that FAILS reads back 0.
+
+    Every provider's error path returns without writing ``last_tokens`` — and the per-thread value is
+    whatever this worker thread's previous call left there, usually another person's. Read after a
+    failed call, it billed that earlier call a second time.
+    """
+    if hasattr(curator, "last_tokens"):
+        curator.last_tokens = 0
+
+
 def _web_search_capable(curator, search, mode: str) -> bool:
     """Whether the ``llm_web`` source can actually run for this curator + search backend under ``mode``.
 
@@ -178,6 +189,7 @@ def web_recommendations(
     elif not getattr(curator, "supports_native_web_search", False):
         return []
     else:
+        _clear_last_tokens(curator)
         recs = curator.recommend_web(profile, seeds, k)
         stats.add_tokens("llm_web", getattr(curator, "last_tokens", 0))
     recs = _drop_watched_proposals(recs, seeds, profile, web_trace)
@@ -348,6 +360,7 @@ def _web_via_search(
     # snippets something must still read, and native search IS the model.
     if not getattr(curator, "can_complete", True):
         return _titles_as_proposals(candidates, web_trace, reason="no AI provider configured")
+    _clear_last_tokens(curator)
     titles = parse_web_titles(curator.complete(system, user), k)
     stats.add_tokens("llm_web", getattr(curator, "last_tokens", 0))
     # Same fallback for a model that answered with nothing usable — rate-limited, timed out, or
