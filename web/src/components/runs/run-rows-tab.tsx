@@ -20,6 +20,7 @@ import {
   groupRunByRow,
   libraryLabel,
   rowSummary,
+  rowTimeMs,
   type RunRowGroup,
   type RunRowPerson,
 } from "@/lib/run-rows";
@@ -177,6 +178,7 @@ function RowCard({
   const [picked, setPicked] = useState(inThisRow ? (focusUser ?? "") : "");
   const shared = group.shared;
   const libraries = libraryLabel(group);
+  const time = rowTimeMs(group);
   // Nothing has reported for this row yet — a queued run, or one still on an earlier row. Saying
   // "0 of 46 built" there reads as a failure rather than as not-started-yet.
   const notStarted = group.people.length === 0 && !shared && !run.finished_at;
@@ -227,9 +229,17 @@ function RowCard({
             <span className="text-xs text-muted-foreground">
               {group.kind === "shared" ? "Shared" : "Per-person"} ·{" "}
               {notStarted ? "waiting to build" : rowSummary(group)}
-              {shared?.duration_ms
-                ? ` · ${formatDuration(shared.duration_ms)}`
-                : ""}
+              {time !== null && (
+                <span
+                  title={
+                    shared
+                      ? "How long this shared row took to build."
+                      : "Every person's time on this row, added up. People are built a few at a time, so this can be longer than the run itself. Time spent waiting for someone else's Plex write is not counted."
+                  }
+                >
+                  {` · ${formatDuration(time)}${shared ? "" : " in total"}`}
+                </span>
+              )}
             </span>
           </span>
         </button>

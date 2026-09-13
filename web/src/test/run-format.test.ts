@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   currentPhase,
+  inFlight,
   errorBucket,
   webSearchSummary,
   friendlyError,
@@ -500,5 +501,50 @@ describe("run polling fallback", () => {
     expect(runsListRefetchIntervalMs(undefined)).toBe(false);
     expect(runsListRefetchIntervalMs([])).toBe(false);
     expect(runsListRefetchIntervalMs([[]])).toBe(false);
+  });
+});
+
+describe("inFlight — who the run is on right now, and what it is doing for each", () => {
+  function runWithPending(slugs: string[], finished: string[]): RunDetail {
+    return {
+      stats: { expected_users: slugs.map((slug) => ({ slug })) },
+      users: slugs.map((slug) => ({
+        slug,
+        username: slug,
+        display_name: slug === "sam" ? "Samantha" : "",
+        status: finished.includes(slug) ? "ok" : "pending",
+      })),
+      shared_rows: [],
+    } as unknown as RunDetail;
+  }
+
+  it("lists each started, unfinished person with their latest line as a sentence", () => {
+    const people = inFlight(runWithPending(["sam", "mike", "zoe", "ann"], ["ann"]), [
+      entry({ user: "sam", stage: "queued" }),
+      entry({ user: "mike", stage: "queued" }),
+      entry({ user: "zoe", stage: "queued" }),
+      entry({ user: "sam", stage: "delivering" }),
+      entry({
+        user: "sam",
+        stage: "delivering",
+        counts: { row: "Picked", library: "TV Shows", adding: 1, removing: 0 },
+      }),
+      entry({ user: "mike", stage: "curating", counts: { row: "Picked" } }),
+      entry({ user: "ann", stage: "delivering", counts: { row: "Picked", library: "Movies", creating: 2 } }),
+    ]);
+    // zoe is still queued — not started, so not "in progress"; ann has finished.
+    expect(people).toEqual([
+      { slug: "mike", name: "mike", text: "curating with AI — Picked" },
+      { slug: "sam", name: "Samantha", text: "writing the row to Plex — Picked · TV Shows · adding 1 title" },
+    ]);
+  });
+
+  it("names no shared row or library subject as a person", () => {
+    expect(
+      inFlight(runWithPending(["sam"], []), [
+        entry({ user: "Movies", stage: "indexing" }),
+        entry({ user: "shared_popular", stage: "delivering", counts: { creating: 5 } }),
+      ]),
+    ).toEqual([]);
   });
 });

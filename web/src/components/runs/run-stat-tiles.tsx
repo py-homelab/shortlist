@@ -167,8 +167,12 @@ export function RunStatTiles({ run }: { run: RunDetail }) {
           icon={Sparkles}
           label="AI tokens"
           value={tokens.toLocaleString()}
-          hint={stepInline ? `${stepInline} tokens` : "curate + AI sources"}
-          title="Total AI tokens this run cost, split by what the AI did. Turn AI sources off in Settings → Finding titles to lower it."
+          hint={stepInline ? `${stepInline} · sent + received` : "sent + received"}
+          // The owner asked whether this includes cached tokens. It is each call's input and output
+          // tokens as the provider reported them: Anthropic's `input_tokens` excludes cache reads and
+          // writes (and Shortlist sets no cache_control, so both are 0); OpenAI's `total_tokens` and
+          // Gemini's `total_token_count` count cached input inside the prompt figure.
+          title="Input and output tokens the AI provider reported for each call this run, added up — what it bills on. With Claude nothing is cached, so this is every token sent and received. OpenAI and Gemini count input they served from their own prompt cache in here too, and bill that part at a discount. The 7-day web-search cache saves web searches, not tokens. Turn AI sources off in Settings → Finding titles to lower it."
         />
       )}
       {showExa && (

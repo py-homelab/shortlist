@@ -363,7 +363,24 @@ describe("RunDetailPage — grouped by library", () => {
     await expandRows();
 
     expect((await screen.findAllByText("9,000"))[0]).toBeInTheDocument();
-    expect(screen.getByText("curate + AI sources")).toBeInTheDocument();
+    // "curate + AI sources" named a curate step that no longer exists, and said nothing about what
+    // was counted. The owner asked whether the figure included cached tokens.
+    expect(screen.getByText("sent + received")).toBeInTheDocument();
+  });
+
+  it("says what the AI-token figure counts, cache included", async () => {
+    const r = run([]);
+    r.stats = { users_ok: 1, users_error: 0, llm_tokens: 9000, llm_tokens_by_step: { llm_web: 9000 } };
+    getRun.mockResolvedValue(r);
+
+    renderDetail("");
+
+    await expandRows();
+
+    expect(await screen.findByText("web search 9,000 · sent + received")).toBeInTheDocument();
+    const tile = screen.getByText("AI tokens").closest("[title]");
+    expect(tile?.getAttribute("title")).toMatch(/input and output tokens/i);
+    expect(tile?.getAttribute("title")).toMatch(/cache/i);
   });
 
   it("renders the row title for the SELECTED library, not the first one", async () => {
@@ -719,6 +736,57 @@ describe("RunDetailPage — grouped by library", () => {
     expect(
       await screen.findByText("curating with AI — Picked…"),
     ).toBeInTheDocument();
+  });
+
+  it("says what the run is doing for each person still in progress", async () => {
+    // "43 of 46 people done" with "samantharobinson527 — writing the row to Plex" in the sidebar for
+    // minutes: neither said which row, which library, or whether it was waiting on someone else.
+    const base = run([]);
+    const pending = (slug: string, display_name: string) => ({
+      ...base.users[0]!,
+      slug,
+      username: slug,
+      display_name,
+      status: "pending",
+    });
+    getRun.mockResolvedValue({
+      ...base,
+      finished_at: null,
+      status: "running",
+      stats: {
+        ...base.stats,
+        expected_users: [{ slug: "moohouse" }, { slug: "sam" }, { slug: "mike" }],
+      },
+      users: [base.users[0]!, pending("sam", "Samantha"), pending("mike", "")],
+    });
+    getRunLog.mockResolvedValue(
+      [
+        { user: "sam", stage: "queued" },
+        { user: "mike", stage: "queued" },
+        { user: "moohouse", stage: "done" },
+        { user: "mike", stage: "delivering", counts: { row: "Picked", picks: 20 } },
+        { user: "sam", stage: "delivering", counts: { row: "Picked", picks: 20 } },
+        {
+          user: "sam",
+          stage: "delivering",
+          counts: { row: "Because you watched Dune", library: "TV Shows", adding: 3, removing: 2 },
+        },
+      ].map((line, seq) => ({
+        seq,
+        ts: "2026-08-17T03:30:00Z",
+        run_id: 2,
+        counts: {},
+        ...line,
+      })),
+    );
+
+    renderDetail("");
+
+    const list = await screen.findByRole("list", { name: "In progress" });
+    expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "mike — waiting for Plex — Picked",
+      "Samantha — writing the row to Plex — Because you watched Dune · TV Shows · adding 3 titles · removing 2 titles",
+    ]);
   });
 
   it("falls back to the flat pick list for legacy runs with no breakdown", async () => {

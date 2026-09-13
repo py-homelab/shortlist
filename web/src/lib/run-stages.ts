@@ -178,3 +178,31 @@ export function progressLabel(counts: Record<string, unknown>): string | null {
   if (typeof done !== "number" || typeof total !== "number") return null;
   return `${done}/${total}`;
 }
+
+/** A row name as the engine sent it. The pre-write `delivering` and `curating` lines carry the row's
+ *  TEMPLATE, not its rendered title, so "{top_seed}" is elided rather than shown as code. */
+function rowName(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\{\w+\}/g, "…") : "";
+}
+
+/**
+ * A person's latest log line as one status sentence — what the run is doing for them right now.
+ *
+ * `delivering` arrives twice per row. First with just the row, BEFORE the write lock: every person's
+ * Plex writes queue on that lock, and the row's current membership is read under it, so that line
+ * means "waiting for Plex". Calling it "writing the row to Plex" is what left one name beside those
+ * words in the sidebar for minutes. Then, once the change is known, with the `library` and what it
+ * is adding/removing/creating — that one really is the write, and it is spelled out.
+ */
+export function describeStage(
+  stage: string,
+  counts: Record<string, number | string> = {},
+): string {
+  const label = STAGE_LABELS[stage] ?? stage;
+  if (stage === "delivering" && counts.library) {
+    return `${label} — ${describeCounts(counts)}`;
+  }
+  const row = rowName(counts.row);
+  const lead = stage === "delivering" ? "waiting for Plex" : label;
+  return row ? `${lead} — ${row}` : lead;
+}

@@ -223,7 +223,7 @@ function RunRow({ run }: { run: Run }) {
             </span>
           )}
           {(run.stats.llm_tokens ?? 0) > 0 && (
-            <span title="AI tokens this run cost">
+            <span title="AI input + output tokens this run, as the provider reported them">
               · {run.stats.llm_tokens!.toLocaleString()} tokens
             </span>
           )}

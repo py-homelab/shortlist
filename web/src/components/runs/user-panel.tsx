@@ -1,13 +1,14 @@
 import { Check, CircleSlash, Clock, Copy, Telescope } from "lucide-react";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import { Link } from "react-router";
 
+import { ImdbGlyph, TmdbGlyph, TraktGlyph } from "@/components/brand-glyphs";
 import { PickList } from "@/components/pick-list";
 import { TitlePoster } from "@/components/title-poster";
 import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
 import { provenanceLabel } from "@/lib/pick-provenance";
-import { titleLinks } from "@/lib/title-links";
+import { type TitleLink, titleLinks } from "@/lib/title-links";
 import {
   friendlyError,
   rankClass,
@@ -18,7 +19,7 @@ import {
 import { formatDuration, runStatusLabel, runStatusVariant } from "@/lib/format";
 import { Badge } from "@/components/ui/badge";
 import { githubIssueSnippet } from "@/lib/github";
-import { describeCounts, STAGE_LABELS } from "@/lib/run-stages";
+import { describeStage } from "@/lib/run-stages";
 import { useCopy } from "@/lib/use-copy";
 import { cn } from "@/lib/utils";
 import type {
@@ -123,6 +124,13 @@ function matchQuality(pick: Pick): string {
   return quality ?? "";
 }
 
+/** Each look-it-up link's brand mark — the same glyphs the requests inbox puts on the same links. */
+const LINK_GLYPH: Record<TitleLink["label"], (props: { className?: string }) => ReactNode> = {
+  TMDB: TmdbGlyph,
+  IMDb: ImdbGlyph,
+  Trakt: TraktGlyph,
+};
+
 /** One ranked pick: rank, a status dot (green = new this run), title + reason, and where it
  *  came from. */
 function PickLine({ pick, isNew }: { pick: Pick; isNew: boolean }) {
@@ -179,17 +187,21 @@ function PickLine({ pick, isNew }: { pick: Pick; isNew: boolean }) {
                 .filter(Boolean)
                 .join(" · ")}
             </span>
-            {links.map((link) => (
-              <a
-                key={link.label}
-                href={link.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
-              >
-                {link.label}
-              </a>
-            ))}
+            {links.map((link) => {
+              const Glyph = LINK_GLYPH[link.label];
+              return (
+                <a
+                  key={link.label}
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 self-center hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
+                >
+                  <Glyph className="h-3.5 w-3.5 shrink-0 rounded-[2px]" />
+                  {link.label}
+                </a>
+              );
+            })}
           </span>
         )}
       </span>
@@ -545,17 +557,10 @@ function UserPanelBody({
     // Show the latest stage from the live log for this user.
     const userLog = liveLog?.filter((e) => e.user === result.slug);
     const latest = userLog?.at(-1);
-    const stageLabel = latest
-      ? (STAGE_LABELS[latest.stage] ?? latest.stage)
-      : null;
-    // The full counts only for a row's pending write ("Picked · TV Shows · adding 10 titles"). Earlier
-    // stages' tallies are noise in a one-line status, so they name just the row.
-    const counts = latest?.counts ?? {};
-    const detail = counts.library ? describeCounts(counts) : counts.row;
     return (
       <p className="text-sm text-muted-foreground">
-        {stageLabel
-          ? `${stageLabel}${detail ? ` — ${detail}` : ""}…`
+        {latest
+          ? `${describeStage(latest.stage, latest.counts ?? {})}…`
           : "Working on this person…"}
       </p>
     );

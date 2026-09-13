@@ -1,5 +1,6 @@
 import type { RunDetail, RunLogEntry } from "@/lib/types";
 import {
+  describeStage,
   isServerStage,
   isTailStage,
   progressLabel,
@@ -221,6 +222,33 @@ function peopleProgress(
     (user) => roster.has(user.slug) && user.status !== "pending",
   ).length;
   return { done, total: roster.size };
+}
+
+/** One person the run is working on right now, and what it is doing for them. */
+export type InFlightPerson = { slug: string; name: string; text: string };
+
+/** Everyone started but not finished, each with their latest line as a sentence — sorted by name.
+ *
+ *  "43 of 46 people done" says how far the run has got, not what it is doing, and a run's last three
+ *  people are exactly when the owner is watching and wondering why it is slow. Roster-filtered like
+ *  `peopleProgress`, so a library index or a shared row is never mistaken for a person. */
+export function inFlight(run: RunDetail, entries: RunLogEntry[]): InFlightPerson[] {
+  const roster = rosterOf(run);
+  const latest = new Map<string, RunLogEntry>();
+  for (const entry of entries) {
+    if (roster.has(entry.user) && entry.stage !== "queued") latest.set(entry.user, entry);
+  }
+  return run.users
+    .filter((user) => user.status === "pending" && latest.has(user.slug))
+    .map((user) => {
+      const entry = latest.get(user.slug)!;
+      return {
+        slug: user.slug,
+        name: user.display_name || user.username || user.slug,
+        text: describeStage(entry.stage, entry.counts ?? {}),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** The stage the run is in RIGHT NOW, phrased for the header.

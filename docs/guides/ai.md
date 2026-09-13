@@ -149,5 +149,10 @@ cheapest-to-priciest levers:
 **Seeing where the tokens go.** Every run records its AI cost, so there is no guessing. Open a run
 (Runs → click a run) and you'll see the **total AI tokens** for that run, then a per-person breakdown
 by what the AI did, plus any **web searches**. Those are counted separately, since a search is
-billed (or rate-limited) per request rather than per token. The runs list shows each run's token total at a glance. Use it to spot
+billed (or rate-limited) per request rather than per token.
+
+The token figure is input plus output, as your AI provider reported each call, which is what it
+bills on. With Claude nothing is cached, so it is every token sent and received. OpenAI and Gemini
+include any input they served from their own prompt cache, which they bill at a discount. The 7-day
+web-search cache saves searches, not tokens. The runs list shows each run's token total at a glance. Use it to spot
 which people cost the most, then tune with the levers above.

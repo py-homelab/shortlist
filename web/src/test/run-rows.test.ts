@@ -5,6 +5,7 @@ import {
   rowCounts,
   rowDisplayName,
   rowSummary,
+  rowTimeMs,
 } from "@/lib/run-rows";
 import type { RunDetail, RunUserResult } from "@/lib/types";
 
@@ -436,5 +437,50 @@ describe("people are visible before they finish", () => {
     // Alex reported; Bea is still waiting. Nobody appears twice.
     expect(groups[0]!.people).toHaveLength(2);
     expect(rowSummary(groups[0]!)).toBe("building — 1 of 2 people done");
+  });
+});
+
+describe("rowTimeMs — every row card states its time, not only a shared one", () => {
+  const person = (cost: { duration_ms: number; blocked_ms: number } | null, built: boolean | null = true) =>
+    ({ cost, built }) as never;
+
+  it("adds up each person's own work on a per-person row, leaving out time spent waiting on others", () => {
+    const group = {
+      kind: "per_person",
+      pending: 0,
+      shared: null,
+      people: [person({ duration_ms: 12000, blocked_ms: 2000 }), person({ duration_ms: 5000, blocked_ms: 0 })],
+    } as never;
+    expect(rowTimeMs(group)).toBe(15000);
+  });
+
+  it("does not count a person the row was never built for", () => {
+    const group = {
+      kind: "per_person",
+      pending: 0,
+      shared: null,
+      people: [person({ duration_ms: 12000, blocked_ms: 0 }), person({ duration_ms: 40, blocked_ms: 0 }, false)],
+    } as never;
+    expect(rowTimeMs(group)).toBe(12000);
+  });
+
+  it("says nothing while people are still pending — a partial sum would read as the row's time", () => {
+    const group = {
+      kind: "per_person",
+      pending: 1,
+      shared: null,
+      people: [person({ duration_ms: 12000, blocked_ms: 0 }), person(null)],
+    } as never;
+    expect(rowTimeMs(group)).toBeNull();
+  });
+
+  it("says nothing on a legacy run that never measured a row", () => {
+    const group = { kind: "per_person", pending: 0, shared: null, people: [person(null, null)] } as never;
+    expect(rowTimeMs(group)).toBeNull();
+  });
+
+  it("uses a shared row's own build time", () => {
+    const group = { kind: "shared", pending: 0, people: [], shared: { duration_ms: 570 } } as never;
+    expect(rowTimeMs(group)).toBe(570);
   });
 });
