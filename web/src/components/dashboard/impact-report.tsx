@@ -184,6 +184,8 @@ function Verdict({
   reportWindow: ReportWindow;
 }) {
   const share = overall.viewing_share;
+  const windowSuffix =
+    reportWindow === "all" ? "since their rows started" : WINDOW_PHRASE[reportWindow];
   const gaveUp = overall.dropped + overall.bounced;
   const reach =
     coverage.users_enabled > 0
@@ -239,15 +241,15 @@ function Verdict({
                   It was a denominator nobody could divide by: `watched` is windowed on when the
                   watch happened, `delivered` on when the pick was CREATED, so the ratio the sentence
                   invited ("15,069 delivered, 38 finished") was never a rate of anything. The
-                  rate that can be read sits immediately below as "Of what people watched, in their
-                  Shortlist row", and reach is on the same card as "N of M people". A
+                  rate that can be read sits immediately below as "Watched from Shortlist rows", and
+                  reach is on the same card as "N of M people". A
                   five-figure count with no action attached to it only crowded both out. */}
             </p>
           </div>
 
           <div className="grid gap-4">
             <Rate
-              label="Of what people watched, in their Shortlist row"
+              label="Watched from Shortlist rows"
               // The dashboard's rate. It replaced "picks watched while their row still showed them",
               // which divided by every title ever SHOWN — mostly titles nobody will watch — and so sat
               // under 1% whether Shortlist worked or not (71 of 10,898 on a real server). What a row
@@ -257,7 +259,7 @@ function Verdict({
               fill={share.watched > 0 ? (share.from_rows / share.watched) * 100 : 0}
               detail={
                 share.watched > 0
-                  ? `${share.from_rows.toLocaleString()} of ${share.watched.toLocaleString()} titles watched ${reportWindow === "all" ? "since their rows started" : `in ${WINDOW_PHRASE[reportWindow]}`}`
+                  ? `${share.from_rows.toLocaleString()} of the ${share.watched.toLocaleString()} titles people watched were in their rows · ${windowSuffix}`
                   : undefined
               }
             >
@@ -274,10 +276,14 @@ function Verdict({
               )}
             </Rate>
             <Rate
-              label="People who watched something"
+              // "a pick", not "something": this counts people who watched a title FROM THEIR ROWS, and
+              // beside a share of titles "watched something" read as the same measure twice. The detail
+              // lines are what tell the pair apart — the first counts titles, this one counts people.
+              label="People who watched a pick"
               value={`${coverage.users_watched} of ${coverage.users_enabled}`}
               fill={reach}
               tone="success"
+              detail={`watched at least one title from their rows · ${windowSuffix}`}
             />
           </div>
         </div>

@@ -215,7 +215,7 @@ describe("ImpactReport", () => {
     renderReport();
 
     expect(await screen.findByText(/watched · the last/i)).toBeTruthy();
-    expect(screen.getByText(/People who watched something/)).toBeTruthy();
+    expect(screen.getByText("People who watched a pick")).toBeTruthy();
     expect(screen.getByText("1 of 2")).toBeTruthy();
     // Each requests figure in its OWN slot. `/sent ·/` matched the label regardless of which number
     // sat beside it, and the fixture had two of the three equal — so any figure could appear in any
@@ -1101,8 +1101,23 @@ describe("ImpactReport — the engagement split", () => {
     renderReport();
 
     expect(await screen.findByText("15.3%")).toBeTruthy();
-    expect(screen.getByText("82 of 537 titles watched in the last 30 days")).toBeTruthy();
+    expect(screen.getByText("Watched from Shortlist rows")).toBeTruthy();
+    expect(
+      screen.getByText("82 of the 537 titles people watched were in their rows · the last 30 days"),
+    ).toBeTruthy();
     expect(screen.queryByText(/Picks watched while their row still showed them/)).toBeNull();
+  });
+
+  it("tells the two rates apart: a share of TITLES, then a count of PEOPLE", async () => {
+    // Side by side, "Of what people watched, in their Shortlist row 18.2%" and "People who watched
+    // something 34 of 46" read as two takes on one number. The owner could not tell them apart.
+    renderReport();
+
+    expect(await screen.findByText("People who watched a pick")).toBeTruthy();
+    expect(
+      screen.getByText("watched at least one title from their rows · the last 30 days"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/People who watched something/)).toBeNull();
   });
 
   it("never reports a real share as zero", async () => {

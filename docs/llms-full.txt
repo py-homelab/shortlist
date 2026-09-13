@@ -629,12 +629,14 @@ It counts only what Shortlist watched happen live, so it starts empty and fills 
 watch tracking is running. A title nobody has played since then is in neither count — unknown is not
 the same as zero.
 
-**People watching** — how many people watched at least one pick, out of everyone currently enabled.
+**People who watched a pick** — how many people watched at least one title from their rows in the
+window, out of everyone currently enabled. It counts people; **Watched from Shortlist rows** counts
+titles.
 
 **Avg to watch** — average days from a title first being recommended to it first being watched, over
 titles first watched in the window. Lower is better, and the change arrow is coloured accordingly.
 
-**Of what people watched, in their Shortlist row** — the one percentage. Of the titles people watched
+**Watched from Shortlist rows** — the one percentage. Of the titles people watched
 in the window, the share a Shortlist row of theirs was showing when they watched it. Each person
 counts from their first pick, so viewing from before they had a row is left out, and people with no
 picks yet aren't counted. It says the rows are in front of what people choose, not that a row made the
