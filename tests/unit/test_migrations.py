@@ -1429,3 +1429,51 @@ class TestRequestLanguagePreference0085:
         rows = self._columns(tmp_path, "collections")
         assert not ({"req_language_mode", "req_preferred_languages", "req_min_rating_other"} & set(rows))
         assert "language" not in self._columns(tmp_path, "request_candidates")
+
+
+class TestRowDescriptionAndSortPrefix0091:
+    """0091 adds a row's Plex summary + sort-title prefix, and the ledger's record of what was written.
+
+    "" on the row columns is "leave that field on Plex alone", and NULL on the ledger columns is "Shortlist
+    wrote nothing" — so an upgrade changes nothing on Plex, including a value agregarr put on a row.
+    """
+
+    @staticmethod
+    def _columns(config_dir: Path, table: str) -> dict[str, tuple[bool, str | None]]:
+        """column -> (NOT NULL, default)."""
+        con = sqlite3.connect(config_dir / "shortlist.db")
+        try:
+            return {r[1]: (bool(r[3]), r[4]) for r in con.execute(f"PRAGMA table_info({table})")}
+        finally:
+            con.close()
+
+    def test_every_existing_row_is_hands_off_and_no_collection_has_a_record(self, tmp_path: Path):
+        run_migrations(tmp_path)
+        rows = self._columns(tmp_path, "collections")
+        assert rows["description"] == (True, "''")
+        assert rows["sort_title_prefix"] == (True, "''")
+        ledger = self._columns(tmp_path, "deliveries")
+        assert ledger["summary_written"][0] is False, "NULL is how the ledger says Shortlist wrote nothing"
+        assert ledger["title_sort_written"][0] is False
+        con = sqlite3.connect(tmp_path / "shortlist.db")
+        try:
+            seeded = con.execute("SELECT description, sort_title_prefix FROM collections").fetchall()
+        finally:
+            con.close()
+        assert seeded, "expected the seeded default row"
+        assert set(seeded) == {("", "")}
+
+    def test_running_it_again_over_an_already_migrated_database_is_a_no_op(self, tmp_path: Path):
+        """Stamped back with the columns left in place — see TestRequestLanguagePreference0085 for why
+        the stamp is what gives this teeth."""
+        run_migrations(tmp_path)
+        command.stamp(_alembic(tmp_path), "0090")
+        run_migrations(tmp_path)
+        assert "sort_title_prefix" in self._columns(tmp_path, "collections")
+        assert "title_sort_written" in self._columns(tmp_path, "deliveries")
+
+    def test_the_downgrade_removes_them_again(self, tmp_path: Path):
+        run_migrations(tmp_path)
+        command.downgrade(_alembic(tmp_path), "0090")
+        assert not ({"description", "sort_title_prefix"} & set(self._columns(tmp_path, "collections")))
+        assert not ({"summary_written", "title_sort_written"} & set(self._columns(tmp_path, "deliveries")))

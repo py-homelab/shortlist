@@ -1,0 +1,121 @@
+{
+  "_why": [
+    "Issue #120 lets a row set its collection's summary and sort title. Five things about Plex decide how",
+    "that has to be written, and none of them was recorded, so they were measured on a throwaway",
+    "collection before any code was written (unmarked, no shortlist_* label, deleted in a finally).",
+    "",
+    "1. A LOCKED titleSort survives a title edit and a membership write. So a row that is renamed (or a",
+    "   {top_seed} row, which renames itself) keeps its OLD sort title until Shortlist writes the new one.",
+    "2. An UNLOCKED custom titleSort is overwritten by the next title edit. So Shortlist must lock it.",
+    "3. Blanking and unlocking titleSort makes Plex rebuild it from the FULL title, leading emoji kept.",
+    "   Plex's own derivation (on create, and on every later title edit) drops the leading emoji. So a",
+    "   revert that sends no title leaves `✨ X` sorting as `✨ X` until the row's next rename. The revert",
+    "   deliberately does NOT re-send the title to get the canonical form: rows are found by title, and",
+    "   the title a plexapi object holds is stale after a rename, so re-sending it could undo one.",
+    "4. The summary is stored byte-exact — newline, trailing spaces, '&', '<' and emoji all round-trip —",
+    "   so comparing Plex's value with the wanted one before writing is safe.",
+    "5. A field edit leaves labels alone, and costs ~0.01-0.09s even on this server's slowest library,",
+    "   where a label write took 21.9s and a membership write 17.1s. Both fields go in ONE PUT."
+  ],
+  "recorded": "2026-09-13",
+  "pms_version": "1.43.4.10903-e5521bd8c",
+  "library": "TV Shows (4,980 shows, ~120k episodes — the library every membership write is slow on)",
+  "request": "PUT /library/sections/{key}/all?type=18&id={ratingKey}&summary.value=…&summary.locked=1&titleSort.value=…&titleSort.locked=1  (plexapi Collection.edit(**fields))",
+  "written_summary": "Line one — ✨ picked for you\nLine two & <more>  ",
+  "steps": [
+    {
+      "step": "created",
+      "title": "✨ zz Probe 120",
+      "titleSort": " zz Probe 120",
+      "summary": "",
+      "locked": [],
+      "seconds": 14.57
+    },
+    {
+      "step": "addLabel",
+      "locked": ["label"],
+      "seconds": 21.85
+    },
+    {
+      "step": "summary + titleSort '!010_✨ zz Probe 120', both locked, one PUT",
+      "title": "✨ zz Probe 120",
+      "titleSort": "!010_✨ zz Probe 120",
+      "summary_byte_exact": true,
+      "locked": ["label", "summary", "titleSort"],
+      "labels_intact": true,
+      "seconds": 0.09
+    },
+    {
+      "step": "identical summary re-sent",
+      "seconds": 0.01
+    },
+    {
+      "step": "editTitle('✨ zz Probe 120 Renamed') with titleSort LOCKED",
+      "title": "✨ zz Probe 120 Renamed",
+      "titleSort": "!010_✨ zz Probe 120",
+      "summary_byte_exact": true,
+      "locked": ["label", "summary", "title", "titleSort"],
+      "seconds": 0.01
+    },
+    {
+      "step": "summary.value='' summary.locked=0 titleSort.value='' titleSort.locked=0",
+      "title": "✨ zz Probe 120 Renamed",
+      "titleSort": "✨ zz Probe 120 Renamed",
+      "summary": "",
+      "locked": ["label", "title"],
+      "seconds": 0.02
+    },
+    {
+      "step": "editTitle('✨ zz Probe 120') with titleSort UNLOCKED",
+      "title": "✨ zz Probe 120",
+      "titleSort": " zz Probe 120",
+      "locked": ["label", "title"],
+      "seconds": 0.01
+    },
+    {
+      "step": "titleSort.value='!010_✨ zz Probe 120' titleSort.locked=0",
+      "titleSort": "!010_✨ zz Probe 120",
+      "locked": ["label", "title"],
+      "seconds": 0.01
+    },
+    {
+      "step": "editTitle('✨ zz Probe 120 Renamed') with that custom titleSort UNLOCKED",
+      "title": "✨ zz Probe 120 Renamed",
+      "titleSort": " zz Probe 120 Renamed",
+      "locked": ["label", "title"],
+      "seconds": 0.01
+    },
+    {
+      "step": "titleSort '!010_✨ zz Probe 120 Renamed' locked, then addItems",
+      "titleSort": "!010_✨ zz Probe 120 Renamed",
+      "locked": ["label", "title", "titleSort"],
+      "seconds": 17.12
+    },
+    {
+      "step": "deleted",
+      "seconds": 17.6
+    }
+  ],
+  "second_probe": [
+    {
+      "step": "created; titleSort '!010_✨ zz Probe 120' locked",
+      "titleSort": "!010_✨ zz Probe 120",
+      "locked": ["titleSort"]
+    },
+    {
+      "step": "titleSort.value='' titleSort.locked=0 title.value='✨ zz Probe 120' in ONE PUT",
+      "titleSort": " zz Probe 120",
+      "locked": []
+    },
+    {
+      "step": "relocked, then titleSort.value='' titleSort.locked=0 alone",
+      "titleSort": "✨ zz Probe 120",
+      "locked": []
+    },
+    {
+      "step": "then editTitle to the SAME title",
+      "titleSort": " zz Probe 120",
+      "locked": ["title"]
+    }
+  ]
+}

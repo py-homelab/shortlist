@@ -2976,6 +2976,12 @@ export interface components {
              */
             defer_rename: boolean;
             /**
+             * Description
+             * @description The collection's Plex summary; takes {user}, {library_name} and {top_seed}. Empty leaves the summary on Plex alone.
+             * @default
+             */
+            description: string;
+            /**
              * Dry Run
              * @default false
              */
@@ -3135,6 +3141,12 @@ export interface components {
              */
             sort_order: number;
             /**
+             * Sort Title Prefix
+             * @description Put before the row's name to make its Plex sort title, e.g. '!010_'. Orders the row in the library's Collections tab, not on Home. Empty leaves the sort title alone.
+             * @default
+             */
+            sort_title_prefix: string;
+            /**
              * Unstarted Only
              * @default false
              */
@@ -3169,6 +3181,8 @@ export interface components {
              * @enum {unknown}
              */
             cold_start: "popular" | "skip" | null;
+            /** Description */
+            description: string;
             /** Dry Run */
             dry_run?: boolean | null;
             /** Enabled */
@@ -3311,6 +3325,8 @@ export interface components {
             slug: string;
             /** Sort Order */
             sort_order: number;
+            /** Sort Title Prefix */
+            sort_title_prefix: string;
             /** Unstarted Only */
             unstarted_only: boolean;
             /** Watched Pct */

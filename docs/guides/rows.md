@@ -321,3 +321,29 @@ Each row can have its own artwork on Plex. In the **Row editor** → **Artwork**
 Hit **Preview** to see a sample before saving. Generated images are made once and reused across
 runs (they refresh when you change the text or style), so posters don't slow a run down or cost per
 user. Posters are cosmetic. A poster that can't be made never blocks a row from building.
+
+## Description and sort order
+
+Each row can also set two of its Plex collection's own fields. In the **Row editor** →
+**Description and sort order**:
+
+- **Description** — the summary Plex shows when someone opens the row. It fills in `{user}`,
+  `{library_name}` and `{top_seed}` the same way the row's name does, so every person's copy can say
+  something about them. A `{top_seed}` description for someone with nothing watched is left empty.
+- **Sort title prefix** — text put in front of the row's name to make its Plex sort title, such as
+  `!010_`. It decides where the row sorts in the library's **Collections** tab (`!` sorts before
+  letters). It does not move the row on Home or the Recommended shelf; that is
+  [Row placement](#row-placement-recommended-shelf). The prefix always goes in front of the row's
+  current name, so a renamed row, or one named after `{top_seed}`, keeps sorting under it.
+
+Both are empty by default, and empty means Shortlist leaves that field on Plex alone. Changes reach
+Plex the next time the row runs, and replace whatever that field held — including a value another
+tool set. Clearing a field hands it back to Plex: no description, and a sort title Plex builds from
+the row's name. That only happens where Plex still holds the value Shortlist wrote; if someone changed
+it in Plex or another tool since, it is left alone. A value another tool had before Shortlist set the
+field is not brought back.
+
+Set each field in one tool only. Agregarr and Kometa can set a collection's summary and sort title
+too, and two tools setting the same field overwrite each other on every sync. If Shortlist sets them,
+leave them unset for Shortlist's rows in the other tool. Agregarr can skip Shortlist's rows entirely
+if you add the `shortlist` label to its excluded labels.

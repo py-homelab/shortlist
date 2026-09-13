@@ -20,6 +20,7 @@ from shortlist.engine.models import (
     PosterSpec,
     RowSpec,
     UserProfile,
+    WrittenDetails,
 )
 
 DEFAULT_ROW_NAME = "✨ Picked for You"
@@ -299,6 +300,129 @@ def apply_poster(
         logger.warning("{}: couldn't set the poster ({})", profile.username, type(exc).__name__)
 
 
+def render_description(template: str, profile: UserProfile, picks: list[Pick], library_name: str) -> str:
+    """Fill a row description's placeholders for the collection it lands on. **"" means none.**
+
+    The same placeholders and the same refusal as a row name — a `{top_seed}` with nothing watched gives
+    no description rather than a sentence about a watch that never happened (issue #84). But NOT
+    `_fill`: that collapses whitespace around `{library_name}`, which is right for a one-line title and
+    would flatten a description typed over several lines.
+    """
+    top_seed = top_seed_of(picks)
+    if not template.strip() or ("{top_seed}" in template and not top_seed):
+        return ""
+    return (
+        template.replace("{top_seed}", top_seed)
+        .replace("{user}", profile.display_name)
+        .replace("{library_name}", library_name)
+        .strip()
+    )
+
+
+def _field_change(wanted: str, current: str | None, written: str | None) -> tuple[str, str | None]:
+    """What one text field needs: ``("set" | "cleared" | "", the value to record afterwards)``.
+
+    A wanted value is set unless Plex already holds it. An empty one hands back only what Shortlist
+    wrote, and only while Plex still holds exactly that: anything else was put there since, by a person
+    or another tool, and is theirs. The record is forgotten either way.
+    """
+    if wanted:
+        return ("" if current == wanted else "set"), wanted
+    if written is not None and current == written:
+        return "cleared", None
+    return "", None
+
+
+def apply_row_details(
+    plex: PlexClient,
+    collection,
+    spec: RowSpec,
+    profile: UserProfile,
+    picks: list[Pick],
+    *,
+    display: str,
+    library_name: str,
+    written: WrittenDetails,
+    dry_run: bool,
+) -> tuple[WrittenDetails, dict[str, str]]:
+    """Put a row's description and sort-title prefix on its Plex collection (issue #120).
+
+    Cosmetic and privacy-neutral — it never touches a label, a filter or promotion — and it NEVER raises
+    into delivery: a failed write leaves the collection as it was and keeps the old ledger record.
+
+    An empty field is hands-off, which is what keeps a value set in agregarr or Kometa intact: the
+    collection is not even read unless this row sets a field, or the ledger says Shortlist once did.
+
+    Args:
+        plex: The Plex client.
+        collection: This row's collection in the library, or None in a dry run that would create it.
+        spec: The row, carrying ``description`` and ``sort_title_prefix``.
+        profile: Whose collection this is; fills ``{user}`` in the description.
+        picks: The picks the row's title is named from (``seed_source``), for ``{top_seed}``.
+        display: The row's name as delivered, marker-stripped — the sort title is prefix + this.
+        library_name: The delivering library's name, for ``{library_name}``.
+        written: What the ledger says Shortlist last wrote to this collection.
+        dry_run: Log the would-be change instead of writing it.
+
+    Returns:
+        The ledger record after this call, and ``{"description"|"sort_title": "set"|"cleared"}`` for
+        every field changed (or that would be, in a dry run).
+    """
+    prefix = spec.sort_title_prefix if spec.sort_title_prefix.strip() else ""
+    if not (spec.description.strip() or prefix or written.summary is not None or written.title_sort is not None):
+        return written, {}
+    try:
+        wanted = {
+            "summary": render_description(spec.description, profile, picks, library_name),
+            "titleSort": f"{prefix}{display}" if prefix else "",
+        }
+        clearing = collection is not None and (
+            (written.summary is not None and not wanted["summary"])
+            or (written.title_sort is not None and not wanted["titleSort"])
+        )
+        # A clear compares against what Plex holds NOW. The cached listing was read at the top of the
+        # run, possibly hours ago, and a value somebody set since then is theirs to keep.
+        current = plex.reread_collection(collection) if clearing else collection
+        summary_change, summary_after = _field_change(
+            wanted["summary"], getattr(current, "summary", None), written.summary
+        )
+        sort_change, sort_after = _field_change(
+            wanted["titleSort"], getattr(current, "titleSort", None), written.title_sort
+        )
+        after = WrittenDetails(summary=summary_after, title_sort=sort_after)
+        # None hands a field back to Plex (blank + unlock). No title is ever sent with it: rows are found
+        # by title, and the one this object holds is stale after a rename.
+        fields = {
+            name: (wanted[name] if change == "set" else None)
+            for name, change in (("summary", summary_change), ("titleSort", sort_change))
+            if change
+        }
+        changes = {
+            name: change for name, change in (("description", summary_change), ("sort_title", sort_change)) if change
+        }
+        if not fields:
+            return after, {}
+        if dry_run:
+            logger.info(
+                "[dry-run] {}: would set this row's {} in '{}' (None = hand back to Plex)",
+                profile.username,
+                fields,
+                library_name,
+            )
+            return written, changes
+        plex.edit_collection_fields(collection, fields)
+    except Exception as exc:  # cosmetic: a description must never break delivery
+        logger.warning(
+            "{}: couldn't update this row's description/sort title in '{}' ({})",
+            profile.username,
+            library_name,
+            type(exc).__name__,  # the type only — a PMS error message can carry a tokened URL
+        )
+        return written, {}
+    logger.info("{}: set this row's {} in '{}' (None = handed back to Plex)", profile.username, fields, library_name)
+    return after, changes
+
+
 def resolve_row_template(spec: RowSpec, profile: UserProfile, config: EngineConfig) -> str:
     """The row-name template to render, most-specific wins: the row's own template, else the user's
     per-user override, else the global default.
@@ -411,6 +535,7 @@ def deliver_rows(
     order_work: list[tuple] | None = None,
     on_write: Callable[[dict], None] | None = None,
     on_label_stored: Callable[[], None] | None = None,
+    written_details: dict[str, WrittenDetails] | None = None,
 ) -> tuple[CollectionDiff, str | None]:
     """Deliver one row's picks as one collection per targeted library. Returns (diff, stored label).
 
@@ -428,6 +553,10 @@ def deliver_rows(
     `on_label_stored` is called each time a library's label lands in `stored_labels` — after that library's
     write (including its browse-hide and poster) returns, before the next library is written. That is when
     a person's first row can be excluded (`pipeline._deliver_phase`).
+
+    `written_details` is {section key -> what Shortlist last wrote to that collection's summary and sort
+    title}, from the ledger; each breakdown entry reports the record after this run. Empty is safe: a
+    cleared field then hands nothing back.
 
     `stored_labels` and `diff` are caller-owned accumulators, written the moment the PMS confirms
     each library's row. A user gets a row per library, so delivery can half-succeed: if the second
@@ -500,7 +629,7 @@ def deliver_rows(
         # row, which points straight at removeItems (one DELETE per item) on a full-turnover row. The
         # PMS timing adapter breaks each of those calls down further (perf diag 2026-07-19).
         _one_start = time.monotonic()
-        one, stored = _deliver_one(
+        one, stored, collection = _deliver_one(
             plex,
             section,
             profile,
@@ -540,51 +669,51 @@ def deliver_rows(
         combined.created = combined.created or one.created
         # Per-(row, library) breakdown for the UI: what changed in THIS library and its own picks,
         # so a run shows "added X to Movies, Y to TV" rather than one merged list.
+        entry: dict | None = None
         if breakdown is not None:
-            breakdown.append(
-                {
-                    "row_slug": spec.slug,
-                    "row_title": one.collection_title,
-                    # The ledger's handle on this collection. Everything else in this entry describes
-                    # what CHANGED; this says WHICH Plex object it changed, which is the one thing a
-                    # later reconcile cannot recompute — a `{top_seed}` title is different every run.
-                    "rating_key": one.rating_key,
-                    "library_key": str(section.key),
-                    "library_title": getattr(section, "title", str(section.key)),
-                    "added": list(one.added),
-                    "removed": list(one.removed),
-                    "kept": list(one.kept),
-                    "deleted": list(one.deleted),
-                    "created": one.created,
-                    "picks": [
-                        {
-                            "rank": p.rank,
-                            "title": p.title,
-                            # The run page draws each pick's artwork from this key. Without it every
-                            # pick on the one screen built to review a run showed a placeholder tile
-                            # — the same shape as the bug that made the flat pick list do it, and
-                            # invisible for the same reason: a missing poster looks like a title
-                            # with no artwork rather than like a field nobody filled in.
-                            "rating_key": p.rating_key,
-                            "reason": p.reason,
-                            "seed_title": p.seed_title,
-                            "tmdb_id": p.tmdb_id,
-                            "media_type": p.media_type.value,
-                            # The run page renders THIS blob, not the picks table — so provenance
-                            # has to be here too, or "why was this picked?" is unanswerable on the
-                            # one screen built to answer it.
-                            "sources": list(p.sources),
-                            "affinity": p.affinity,
-                            # Release year and TMDB score, for the same reason as provenance above:
-                            # the run page renders this blob, and "is this an old title, and is it
-                            # any good?" is the first thing asked of a row that looks wrong.
-                            "year": p.year,
-                            "rating": p.rating,
-                        }
-                        for p in this_section
-                    ],
-                }
-            )
+            entry = {
+                "row_slug": spec.slug,
+                "row_title": one.collection_title,
+                # The ledger's handle on this collection. Everything else in this entry describes
+                # what CHANGED; this says WHICH Plex object it changed, which is the one thing a
+                # later reconcile cannot recompute — a `{top_seed}` title is different every run.
+                "rating_key": one.rating_key,
+                "library_key": str(section.key),
+                "library_title": getattr(section, "title", str(section.key)),
+                "added": list(one.added),
+                "removed": list(one.removed),
+                "kept": list(one.kept),
+                "deleted": list(one.deleted),
+                "created": one.created,
+                "picks": [
+                    {
+                        "rank": p.rank,
+                        "title": p.title,
+                        # The run page draws each pick's artwork from this key. Without it every
+                        # pick on the one screen built to review a run showed a placeholder tile
+                        # — the same shape as the bug that made the flat pick list do it, and
+                        # invisible for the same reason: a missing poster looks like a title
+                        # with no artwork rather than like a field nobody filled in.
+                        "rating_key": p.rating_key,
+                        "reason": p.reason,
+                        "seed_title": p.seed_title,
+                        "tmdb_id": p.tmdb_id,
+                        "media_type": p.media_type.value,
+                        # The run page renders THIS blob, not the picks table — so provenance
+                        # has to be here too, or "why was this picked?" is unanswerable on the
+                        # one screen built to answer it.
+                        "sources": list(p.sources),
+                        "affinity": p.affinity,
+                        # Release year and TMDB score, for the same reason as provenance above:
+                        # the run page renders this blob, and "is this an old title, and is it
+                        # any good?" is the first thing asked of a row that looks wrong.
+                        "year": p.year,
+                        "rating": p.rating,
+                    }
+                    for p in this_section
+                ],
+            }
+            breakdown.append(entry)
         # Recorded the instant the PMS confirms the label — if the NEXT library blows up, this
         # row still gets excluded on every other user's share this run.
         #
@@ -599,6 +728,25 @@ def deliver_rows(
             stored_labels[stored_key] = stored
             if on_label_stored is not None:
                 on_label_stored()
+        # AFTER the first-row exclude above, never before it: a person's first row is hidden from
+        # everyone else before anything cosmetic is written to it (plex-safety rule 1). Named from the
+        # same picks `_deliver_one` named the title from, so `{top_seed}` agrees with the title.
+        if one.collection_title:
+            record, changes = apply_row_details(
+                plex,
+                collection,
+                spec,
+                profile,
+                seed_source(this_section, picks),
+                display=one.collection_title,
+                library_name=getattr(section, "title", "") or "",
+                written=(written_details or {}).get(str(section.key), WrittenDetails()),
+                dry_run=dry_run,
+            )
+            if entry is not None:
+                entry["summary_written"] = record.summary
+                entry["title_sort_written"] = record.title_sort
+                entry["details_changed"] = changes
 
     return combined, stored
 
@@ -985,15 +1133,15 @@ def _create_labelled_collection(
     artist: PosterArtist | None = None,
     order_work: list[tuple] | None = None,
     on_write: Callable[[dict], None] | None = None,
-) -> tuple[str, int, list[int]]:
+) -> tuple[str, object, list[int]]:
     """Create the collection, apply its label, and delete it if the label doesn't stick.
 
     A collection with no shortlist_* label is invisible to every lookup we have — all of them key off
     that prefix — so nothing would ever find it again, no filter could hide it, and it would be
     visible to everyone forever. Create and label must therefore succeed together or not at all.
-    Returns the stored (Plex title-cased) label, the new collection's ratingKey — the ledger's handle
-    on it, and the only one that survives a title the next run renders differently — and the ratingKeys
-    of picks that had vanished from Plex, which the new collection does not hold.
+    Returns the stored (Plex title-cased) label, the new collection — whose ratingKey is the ledger's
+    handle on it, and the only one that survives a title the next run renders differently — and the
+    ratingKeys of picks that had vanished from Plex, which the new collection does not hold.
     """
     items, vanished = plex.fetch_items([p.rating_key for p in picks])
     if vanished:
@@ -1065,7 +1213,7 @@ def _create_labelled_collection(
         len(picks),
         stored,
     )
-    return stored, _rating_key(collection), vanished
+    return stored, collection, vanished
 
 
 def _find_this_rows_collection(
@@ -1175,7 +1323,7 @@ def _deliver_one(
     artist: PosterArtist | None = None,
     order_work: list[tuple] | None = None,
     on_write: Callable[[dict], None] | None = None,
-) -> tuple[CollectionDiff, str]:
+) -> tuple[CollectionDiff, str, object | None]:
     """Upsert one library's collection to exactly `picks`, in order. Returns (diff, stored_label).
 
     Finds this row's existing collection via `_find_this_rows_collection` (title match, then the
@@ -1227,7 +1375,7 @@ def _deliver_one(
             profile.username,
             getattr(section, "title", "?"),
         )
-        return CollectionDiff(), ""
+        return CollectionDiff(), "", None
     # What Plex is told to call it: the same thing, plus an invisible marker that makes it unique
     # in this library. Without it, every user's row is the same collection tag and holds everyone's
     # picks. Users see `display`; only the PMS ever sees the marker.
@@ -1250,8 +1398,8 @@ def _deliver_one(
                 len(picks),
             )
             apply_poster(plex, None, poster, profile, picks, library_name=section.title, artist=artist, dry_run=True)
-            return diff, label
-        stored, diff.rating_key, vanished = _create_labelled_collection(
+            return diff, label, None
+        stored, collection, vanished = _create_labelled_collection(
             plex,
             section,
             profile,
@@ -1264,13 +1412,14 @@ def _deliver_one(
             order_work=order_work,
             on_write=on_write,
         )
+        diff.rating_key = _rating_key(collection)
         if vanished:
             # Deleted from Plex between the picks being made and the row being created. The row holds
             # the survivors, so the diff must name only those — otherwise the run reports having
             # delivered a title the row does not contain (plex-safety rule 10).
             dead = set(vanished)
             diff.added = [p.title for p in picks if p.rating_key not in dead]
-        return diff, stored
+        return diff, stored, collection
 
     existing_items = collection.items()  # ONE read of current membership, reused for the diff AND set_items
     wanted_keys = [p.rating_key for p in picks]
@@ -1302,7 +1451,7 @@ def _deliver_one(
             len(diff.kept),
         )
         apply_poster(plex, collection, poster, profile, picks, library_name=section.title, artist=artist, dry_run=True)
-        return diff, label
+        return diff, label, collection
 
     if collection.title != title:
         _rename_or_keep(collection, title, profile, section.title)
@@ -1325,7 +1474,7 @@ def _deliver_one(
             section.title,
             len(picks),
         )
-        return diff, stored
+        return diff, stored, collection
 
     # Fetch ONLY the items being added (the delta), not all N picks — most are already in the
     # collection on a steady run, so this is a handful of items instead of the whole row. An empty
@@ -1386,7 +1535,7 @@ def _deliver_one(
             section.title,
         )
         plex.delete_owned_collection(collection, label_prefix)
-        stored, diff.rating_key, vanished = _create_labelled_collection(
+        stored, collection, vanished = _create_labelled_collection(
             plex,
             section,
             profile,
@@ -1399,10 +1548,11 @@ def _deliver_one(
             order_work=order_work,
             on_write=on_write,
         )
+        diff.rating_key = _rating_key(collection)
         if vanished:
             dead = set(vanished)
             diff.added = [p.title for p in picks if p.rating_key not in dead]
-        return diff, stored
+        return diff, stored, collection
     if order_work is not None:
         order_work.append((collection, wanted_keys))
     apply_poster(plex, collection, poster, profile, picks, library_name=section.title, artist=artist, dry_run=False)
@@ -1416,7 +1566,7 @@ def _deliver_one(
     logger.info(
         "{}: delivered '{}' to '{}' ({} items, label {})", profile.username, display, section.title, len(picks), stored
     )
-    return diff, stored
+    return diff, stored, collection
 
 
 def _confirm_orphan_twice(plex: PlexClient, collection, delay_s: float) -> bool:

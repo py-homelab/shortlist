@@ -24,7 +24,7 @@ from shortlist.engine.clients.tmdb import Cache, NullCache, TmdbClient
 from shortlist.engine.clients.trakt import TraktClient
 from shortlist.engine.curator import Curator
 from shortlist.engine.history import HistorySource
-from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport
+from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport, WrittenDetails
 from shortlist.engine.privacy import SnapshotStore
 
 
@@ -62,6 +62,9 @@ class EngineContext:
     # Empty for direct engine runs and for rows delivered before the ledger existed — the count-based
     # fallback still covers those.
     delivered_keys: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    # Same key -> what Shortlist last wrote to that collection's summary and sort title. Empty (direct
+    # engine runs, rows delivered before issue #120) only means clearing a field reverts nothing.
+    delivered_details: dict[tuple[str, str, str], WrittenDetails] = field(default_factory=dict)
     # Build a PMS client that sees the server AS one user, or None when no token can be had. Used to
     # CHECK what an account Plex refuses a hide-list for can actually see, rather than assume. None on
     # direct engine runs, where the check is simply skipped.

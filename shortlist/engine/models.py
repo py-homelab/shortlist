@@ -531,6 +531,14 @@ class RowSpec:
     hub_anchors: dict[str, HubAnchor] = field(default_factory=dict)
     # Optional custom poster for this row's Plex collection(s). None -> leave Plex's own artwork alone.
     poster: PosterSpec | None = None
+    # The collection's Plex SUMMARY, with the same placeholders as the name (issue #120). "" -> Shortlist
+    # leaves the summary alone, so a value another tool (agregarr, Kometa) put there survives.
+    description: str = ""
+    # Put before the row's name to make its Plex SORT TITLE (issue #120), e.g. "!010_". It orders the
+    # row in the library's Collections tab only — Home and the Recommended shelf go by hub position,
+    # which is `hub_anchors`. "" -> the sort title is left alone. Always prefix + the CURRENT name, so
+    # a renamed or `{top_seed}` row goes on sorting under the prefix.
+    sort_title_prefix: str = ""
 
     @property
     def _effective_friends_placement(self) -> str:
@@ -1265,6 +1273,19 @@ class StageCounts:
     in_library: int = 0
     pre_ranked: int = 0
     picks: int = 0
+
+
+@dataclass(frozen=True)
+class WrittenDetails:
+    """What Shortlist last wrote to one collection's summary and sort title, from the delivery ledger.
+
+    None means Shortlist has no value there, which is the only thing that makes clearing a row's field
+    safe: the revert touches a field only while Plex still holds exactly what Shortlist wrote, so a
+    value somebody set by hand or with another tool is never wiped (issue #120).
+    """
+
+    summary: str | None = None
+    title_sort: str | None = None
 
 
 @dataclass

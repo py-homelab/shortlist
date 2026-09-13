@@ -102,6 +102,12 @@ def _record_deliveries(session: Session, user_slug: str, breakdown: list[dict]) 
             session.add(row)
         row.rating_key = rating_key
         row.title = entry.get("row_title") or ""
+        # Absent on an entry delivery never reached the description step with (and on legacy breakdowns):
+        # keep the record rather than forget a value Plex may still hold.
+        if "summary_written" in entry:
+            row.summary_written = entry["summary_written"]
+        if "title_sort_written" in entry:
+            row.title_sort_written = entry["title_sort_written"]
         row.updated_at = datetime.now(UTC)
 
 

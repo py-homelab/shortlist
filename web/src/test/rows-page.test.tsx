@@ -41,6 +41,8 @@ const SUBSET_ROW: Collection = {
   sort_order: 0,
   name_template: "",
   fallback_name: "",
+  description: "",
+  sort_title_prefix: "",
   min_watchers: 2,
   request_tag: "",
   candidate_sources: [],

@@ -1443,6 +1443,34 @@ class PlexClient:
 
         _retry_idempotent(_op, label=f"resetPoster {collection.title!r}")
 
+    def edit_collection_fields(self, collection: Collection, fields: dict[str, str | None]) -> None:
+        """Set or hand back text fields on one of our collections, all in ONE PUT (issue #120).
+
+        ``fields`` maps a Plex field name (``summary``, ``titleSort``) to the value to lock in, or to None
+        to blank and unlock it so Plex manages it again. Locked, because an unlocked custom sort title
+        is overwritten by the next title edit; and a blank unlocked one is rebuilt by Plex from the title
+        (tests/fixtures/pms_collection_field_edits.json).
+
+        ``Collection.edit`` rather than plexapi's batch mode on purpose: an object left in batch mode by
+        a failure QUEUES every later edit instead of sending it — including a label write, which would
+        then silently never reach Plex.
+        """
+        params: dict[str, str | int] = {}
+        for name, value in fields.items():
+            params[f"{name}.value"] = value or ""
+            params[f"{name}.locked"] = 0 if value is None else 1
+        _retry_idempotent(lambda: collection.edit(**params), label=f"edit fields {log_title(collection.title)!r}")
+
+    def reread_collection(self, collection: Collection) -> Collection:
+        """A FRESH copy of one of our collections, read from the PMS now — for a decision the run's
+        cached listing is too old to make (issue #120: whether a field still holds what Shortlist wrote).
+
+        A separate object on purpose, never ``collection.reload()``: reloading the cached object would
+        overwrite its labels with whatever this read returns, and a read that comes back without
+        ``<Label>`` children would drop the row out of every later lookup this run (plex-safety rule 4).
+        """
+        return self._server.fetchItem(collection.key)  # a GET: the session's own Retry covers it
+
     def delete_owned_collection(self, collection: Collection, label_prefix: str) -> None:
         """Delete a collection only if it is provably ours (Kometa coexistence, plex-safety rule 4).
 

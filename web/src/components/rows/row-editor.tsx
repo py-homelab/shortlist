@@ -9,6 +9,7 @@ import { GlobalDefaultToggle } from "@/components/rows/global-default-row";
 import { LibraryPicker } from "@/components/rows/library-picker";
 import { PlacementToggles } from "@/components/rows/placement-toggles";
 import { PosterField } from "@/components/rows/poster-field";
+import { RowPlexDetailsField } from "@/components/rows/row-plex-details-field";
 import { RowScheduleField } from "@/components/rows/row-schedule-field";
 import { RowShowDaysField } from "@/components/rows/row-show-days-field";
 import { showDaysSummary } from "@/lib/show-days";
@@ -340,6 +341,15 @@ export function RowEditor({
         generate: "AI image",
       } as Record<string, string>
     )[input.poster.mode] ?? "Plex’s own artwork";
+  const detailsSummary =
+    [
+      input.description.trim() ? "Has a description" : "",
+      input.sort_title_prefix.trim()
+        ? `Sorts under “${input.sort_title_prefix}”`
+        : "",
+    ]
+      .filter(Boolean)
+      .join(" · ") || "Plex’s own description and sort order";
   // Whether this row's TITLE claims a particular watch. Mirrors the engine's `_names_a_seed`, and
   // decides whether the cycle window is worth offering.
   const namesASeed = (input.name_template || input.name).includes("{top_seed}");
@@ -1284,6 +1294,20 @@ export function RowEditor({
               onChange={(poster) => set({ poster })}
               collectionId={collection?.id ?? null}
               hasImage={collection?.poster?.has_image ?? false}
+            />
+          </SettingsGroup>
+
+          <SettingsGroup
+            title="Description and sort order"
+            description="What Plex says about the row, and where it sorts in the Collections tab. Optional."
+            summary={detailsSummary}
+            defaultOpen={false}
+          >
+            <RowPlexDetailsField
+              description={input.description}
+              sortTitlePrefix={input.sort_title_prefix}
+              rowName={input.name_template || input.name}
+              onChange={set}
             />
           </SettingsGroup>
 

@@ -137,6 +137,23 @@ class FakeCollection:
     promoted_recommended: bool = False
     promoted_own_home: bool = False
     promoted_shared_home: bool = False
+    summary: str = ""
+    summary_locked: bool = False
+    # None -> derived from the title at creation, as Plex does. See `plex_sort_title` and
+    # tests/fixtures/pms_collection_field_edits.json for how each edit moves it.
+    title_sort: str | None = None
+    title_sort_locked: bool = False
+
+    def __post_init__(self) -> None:
+        if self.title_sort is None:
+            self.title_sort = plex_sort_title(self.title)
+
+
+def plex_sort_title(title: str) -> str:
+    """The sort title a real PMS derives from a collection title: leading symbols dropped, the space
+    after them kept (`✨ Movies Picked for You` -> ` Movies Picked for You`). Measured, not a spec —
+    only the leading-emoji case is recorded (pms_collection_field_edits.json, pms_collections_listing.json)."""
+    return re.sub(r"^[^\w\s]+", "", title)
 
 
 @dataclass
@@ -778,6 +795,10 @@ def _collection_xml(
         type="collection",
         subtype=collection.subtype,
         title=collection.title,
+        titleSort=collection.title_sort,
+        # Always present in a real listing, empty or not (pms_collections_listing.json). Leaving it off
+        # would make plexapi re-read the collection behind `collection.summary`.
+        summary=collection.summary,
         smart="0",
         collectionMode=collection.mode,
         collectionSort=collection.sort,
@@ -790,6 +811,10 @@ def _collection_xml(
     if labels:
         for i, tag in enumerate(collection.labels, start=1):
             _el(directory, "Label", id=i, tag=tag)
+        # Lock state, like labels, is served only on the per-collection read (pms_collections_listing.json).
+        for name, locked in (("summary", collection.summary_locked), ("titleSort", collection.title_sort_locked)):
+            if locked:
+                _el(directory, "Field", locked="1", name=name)
     # plexapi's editAdvanced (modeUpdate/sortUpdate) reads these to validate enum values.
     preferences = SubElement(directory, "Preferences")
     for setting_id, default, value, enums in (
@@ -1118,7 +1143,7 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
 
     @app.put("/library/sections/{section_id}/all")
     def section_edit(section_id: int, request: Request) -> Response:
-        """plexapi's tag/field edit endpoint (addLabel, editTitle): type=18&id=...&label[0].tag.tag=..."""
+        """plexapi's tag/field edit endpoint (addLabel, editTitle, edit): type=18&id=...&label[0].tag.tag=..."""
         query = request.query_params
         labels = [value for key, value in query.multi_items() if _LABEL_PARAM.match(key)]
         for raw_id in (query.get("id") or "").split(","):
@@ -1128,8 +1153,19 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             if labels:
                 existing = {label.lower(): label for label in collection.labels}
                 collection.labels = [existing.get(v.lower(), state.store_label(v)) for v in labels]
+            if "summary.value" in query:
+                collection.summary = query["summary.value"]
+                collection.summary_locked = query.get("summary.locked") == "1"
+            # titleSort BEFORE title: a PUT that unlocks the sort title and sends a title gets the
+            # title's derived sort title, exactly as a real PMS does (pms_collection_field_edits.json).
+            if "titleSort.value" in query:
+                # A blank value is not stored blank: Plex rebuilds it from the FULL title, emoji kept.
+                collection.title_sort = query["titleSort.value"] or collection.title
+                collection.title_sort_locked = query.get("titleSort.locked") == "1"
             if query.get("title.value"):
                 collection.title = query["title.value"]
+                if not collection.title_sort_locked:
+                    collection.title_sort = plex_sort_title(collection.title)
         return Response(status_code=200)
 
     @app.post("/library/collections")

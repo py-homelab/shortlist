@@ -345,6 +345,33 @@ class TestBuildContext:
         assert ctx.delivered_keys[("sarah", "picked", "1")] == 9001
         assert ctx.delivered_keys[("sarah", "gems", "2")] == 9002
 
+    def test_what_was_written_to_a_summary_and_sort_title_reaches_the_engine_under_the_same_key(
+        self, service, sessions, configured
+    ):
+        """Issue #120's DB→engine wiring, as the literal tuple — `rows._written_details` unpacks it the
+        way it unpacks `delivered_keys`. A collection with no record is absent: nothing to hand back."""
+        from shortlist.engine.models import WrittenDetails
+        from shortlist.server.db.models import Delivery
+
+        with sessions() as session:
+            session.add(User(plex_account_id=1, username="sarah", slug="sarah", enabled=True))
+            session.add(
+                Delivery(
+                    collection_slug="gems",
+                    user_slug="sarah",
+                    library_key="2",
+                    rating_key=9002,
+                    summary_written="Hi",
+                    title_sort_written=None,
+                )
+            )
+            session.add(Delivery(collection_slug="picked", user_slug="sarah", library_key="1", rating_key=9001))
+            session.commit()
+
+        ctx = service.build_context(dry_run=True)
+
+        assert ctx.delivered_details == {("sarah", "gems", "2"): WrittenDetails(summary="Hi", title_sort=None)}
+
     def test_a_ratingkey_two_rows_claim_is_dropped_rather_than_arbitrated(self, service, sessions, configured):
         """The safety valve that makes a bad ledger self-heal. Two rows naming one collection is
         reachable if a run died between the delete and the persist of a repair that recreates a row — and
@@ -2370,6 +2397,16 @@ class TestRowVisibilitySchedule:
 
         assert spec.placement == "both"
         assert spec.placement_friends == "both"
+
+    def test_a_rows_description_and_sort_title_prefix_reach_the_engine(
+        self, service, sessions, configured, monkeypatch
+    ):
+        """Issue #120. Passed through verbatim — including a prefix's trailing space, which is part of it."""
+        self._row(sessions, description="Picked for {user}", sort_title_prefix="01 ")
+
+        spec = self._spec(service, monkeypatch, self.MONDAY)
+
+        assert (spec.description, spec.sort_title_prefix) == ("Picked for {user}", "01 ")
 
     def test_a_row_with_no_schedule_is_untouched(self, service, sessions, configured, monkeypatch):
         """Every row carries [] after the migration. If this ever resolves to anything but the

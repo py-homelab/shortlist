@@ -625,6 +625,13 @@
             "title": "Defer Rename",
             "type": "boolean"
           },
+          "description": {
+            "default": "",
+            "description": "The collection's Plex summary; takes {user}, {library_name} and {top_seed}. Empty leaves the summary on Plex alone.",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
           "dry_run": {
             "default": false,
             "title": "Dry Run",
@@ -1082,6 +1089,13 @@
             "title": "Sort Order",
             "type": "integer"
           },
+          "sort_title_prefix": {
+            "default": "",
+            "description": "Put before the row's name to make its Plex sort title, e.g. '!010_'. Orders the row in the library's Collections tab, not on Home. Empty leaves the sort title alone.",
+            "maxLength": 64,
+            "title": "Sort Title Prefix",
+            "type": "string"
+          },
           "unstarted_only": {
             "default": false,
             "title": "Unstarted Only",
@@ -1159,6 +1173,10 @@
               null
             ],
             "title": "Cold Start"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
           },
           "dry_run": {
             "anyOf": [
@@ -1617,6 +1635,10 @@
             "title": "Sort Order",
             "type": "integer"
           },
+          "sort_title_prefix": {
+            "title": "Sort Title Prefix",
+            "type": "string"
+          },
           "unstarted_only": {
             "title": "Unstarted Only",
             "type": "boolean"
@@ -1648,6 +1670,8 @@
           "sort_order",
           "name_template",
           "fallback_name",
+          "description",
+          "sort_title_prefix",
           "min_watchers",
           "request_tag",
           "candidate_sources",

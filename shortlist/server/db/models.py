@@ -306,6 +306,12 @@ class Collection(Base):
     # {"mode": "upload"|"generate", "title", "subtitle", "style"}. No image bytes live here — an
     # uploaded/generated image is stored in the `poster_assets` table, keyed by collection id / prompt.
     poster: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The collection's Plex summary, with the row name's placeholders (issue #120). "" -> Shortlist leaves
+    # the summary on Plex alone, so a value another tool set survives.
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False, server_default="")
+    # Put before the row's name to make its Plex sort title, e.g. "!010_" — orders the row in the
+    # library's Collections tab, not on Home. "" -> the sort title is left alone.
+    sort_title_prefix: Mapped[str] = mapped_column(String(64), default="", nullable=False, server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -645,6 +651,11 @@ class Delivery(Base):
     # recorded title to stop ANOTHER row's removal, rename or poster reset matching it in that library
     # (issue #121). It narrows a match and never selects a collection — but blanking it drops that guard.
     title: Mapped[str] = mapped_column(String(512), default="")
+    # What Shortlist last wrote to this collection's summary and sort title; NULL = nothing (issue #120).
+    # Clearing a row's field hands a value back only while Plex still holds exactly this, so a value a
+    # person or another tool put there since is never wiped.
+    summary_written: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    title_sort_written: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

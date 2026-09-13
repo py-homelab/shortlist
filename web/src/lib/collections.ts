@@ -30,6 +30,9 @@ export function blankInput(): CollectionInput {
     sort_order: 0,
     name_template: "",
     fallback_name: "",
+    // Empty = leave that field on Plex alone (issue #120).
+    description: "",
+    sort_title_prefix: "",
     min_watchers: 2,
     request_tag: "",
     candidate_sources: [],
@@ -91,6 +94,8 @@ export function toInput(collection: Collection): CollectionInput {
     sort_order: collection.sort_order,
     name_template: collection.name_template,
     fallback_name: collection.fallback_name ?? "",
+    description: collection.description ?? "",
+    sort_title_prefix: collection.sort_title_prefix ?? "",
     min_watchers: collection.min_watchers,
     request_tag: collection.request_tag,
     candidate_sources: collection.candidate_sources,

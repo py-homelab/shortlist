@@ -119,10 +119,13 @@ collections           id · slug · name · build(per_person|shared) · audience
                       · size · media(movie|show|both) · library_keys JSON · name_template · min_watchers
                       · placement / placement_friends (both|home|library|off) · pin_top BOOL · hub_anchor JSON
                       · poster JSON · candidate_sources JSON · watched_pct · refresh_days · recency · recent_count · max_seeds · pick_order
+                      · description · sort_title_prefix  ("" = leave that Plex field alone; issue #120)
 collection_audience   collection_id FK · user_id FK          (a `subset` row's members)
 collection_user_overrides  collection_id FK · user_id FK · muted BOOL · row_size · history_depth
 poster_assets         id · collection_id FK · kind(upload|preview) · bytes · created_at
 deliveries            collection_slug · user_slug · library_key  (composite PK) · rating_key · title · updated_at
+                      · summary_written · title_sort_written  (what Shortlist last wrote; NULL = nothing — a cleared
+                        field hands back only a value Plex still holds exactly as written)
                       ← the DELIVERY LEDGER: which Plex collection is which row, for whom, in which
                         library. Written per delivery, read by every on-demand reconcile. Keyed by SLUG
                         not FK on purpose — the row it describes is usually the one being deleted.

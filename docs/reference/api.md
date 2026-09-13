@@ -177,6 +177,13 @@ GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first
      in that library (favourites by their Plex rating, then titles close to tonight's taste, then longest unseen), and its candidate pool supplies
      only the unseen top-up — the same pool a 0% row uses, so the two share one gather.
      `rewatch_cooldown_days` (int 0–365, default 30) leaves out anything finished within that many days, on a rewatch row only; 0 disables it.
+     `description` (string, max 2000, default "") is the collection's Plex summary, filled per collection with `{user}`/`{library_name}`/`{top_seed}`.
+     `sort_title_prefix` (string, max 64, default "") makes the collection's Plex sort title prefix + the row's current name; it orders the
+     library's Collections tab, not Home. "" on either leaves that field on Plex alone, and whitespace alone is stored as "". Both reach Plex on the
+     row's next run, written locked, replacing whatever the field held. Clearing one (or a `{top_seed}` description rendering empty) blanks and
+     unlocks the field, but only while Plex still holds exactly what Shortlist wrote — the delivery ledger records it
+     (`deliveries.summary_written` / `title_sort_written`) — so a value a person or another tool set SINCE is never wiped. A value from before
+     Shortlist set the field is not restored.
      `unstarted_only` (bool, default false; accepted on any row that can hold shows) drops every series the person has started, however little of it.
      It only changes anything on a row whose `watched_pct` is ABOVE 0: such a row caps FINISHED titles and so still admits a series someone is three
      episodes into, and this is what makes "a series to start" literally true there. At `watched_pct` 0 the row already excludes started series (see

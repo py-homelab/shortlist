@@ -29,7 +29,7 @@ from shortlist.engine.clients.plextv import PlexTvClient
 from shortlist.engine.clients.tmdb import TmdbClient
 from shortlist.engine.context import EngineContext
 from shortlist.engine.curator import NullCurator
-from shortlist.engine.delivery import row_marker
+from shortlist.engine.delivery import row_marker, strip_marker
 from shortlist.engine.history import ShareTokenWatchSource
 from shortlist.engine.models import (
     EngineConfig,
@@ -37,8 +37,10 @@ from shortlist.engine.models import (
     MediaType,
     RowOverride,
     RowSpec,
+    RunReport,
     UserProfile,
     UserType,
+    WrittenDetails,
 )
 from shortlist.engine.pipeline import run as engine_run
 from shortlist.engine.privacy import allowed_shortlist_labels, shortlist_labels_in, unhidden_rows_on_home
@@ -701,6 +703,59 @@ def test_shared_row_is_public_built_from_aggregate_and_never_excluded(fakes, tmp
         "a shared row must never surface one person's title as its seed"
     )
     assert all(pick.seed_title is None for pick in shared_report.picks)
+
+
+def test_a_shared_rows_description_is_set_and_then_handed_back(fakes, tmp_path):
+    """Issue #120 on the shared-row path, which has its own delivery call and its own persist.
+
+    The ledger is keyed by the report's own slug — exactly what `_persist_shared_row_report` stores — so
+    if the engine ever looked a shared row's record up under a different owner, run 2 would find nothing
+    to hand back and the description would stay on Plex for good.
+    """
+    state, pms_url, _tmdb_app = fakes
+    _watch(state, 202, 301)  # mike shares show 301 with sarah -> it clears the 2-watcher floor
+    shared = RowSpec(
+        slug="popular", name_template="Popular on this server", size=6, shared=True, description="Loved by {user}"
+    )
+
+    def run(row: RowSpec, delivered_details: dict) -> RunReport:
+        plex = PlexClient(pms_url, state.owner_token)
+        plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+        ctx = EngineContext(
+            config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12, rows=[row]),
+            plex=plex,
+            plextv=plextv,
+            tmdb=TmdbClient("test-key"),
+            history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+            curator=NullCurator(),
+            snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+            delivered_details=delivered_details,
+        )
+        users = [
+            UserProfile(username=u.username, plex_account_id=u.id, user_type=UserType.SHARED)
+            for u in plextv.list_users()
+            if not u.restriction_profile
+        ]
+        report = engine_run(ctx, users)
+        assert report.ok, [(u.username, u.error) for u in report.users]
+        return report
+
+    first = run(shared, {})
+
+    shared_report = next(r for r in first.users if r.slug == "shared_popular")
+    rows = [state.collections[entry["rating_key"]] for entry in shared_report.breakdown]
+    assert rows, "the shared row was not delivered"
+    assert all((row.summary, row.summary_locked) == ("Loved by Everyone", True) for row in rows)
+    ledger = {
+        (shared_report.slug, entry["row_slug"], entry["library_key"]): WrittenDetails(
+            entry["summary_written"], entry["title_sort_written"]
+        )
+        for entry in shared_report.breakdown
+    }
+
+    run(replace(shared, description=""), ledger)
+
+    assert all((row.summary, row.summary_locked) == ("", False) for row in rows)
 
 
 def test_a_solo_watched_title_never_reaches_a_shared_row(fakes, tmp_path):
@@ -1746,6 +1801,71 @@ def test_a_row_that_loses_most_of_its_titles_stays_the_same_plex_collection(fake
     assert state.collections.get(movie_row.rating_key) is movie_row, "the row was deleted and recreated"
     assert set(state.collections) == before, "a new collection was created for a row that already existed"
     assert set(movie_row.item_keys) == set(delivered), "the row does not hold the titles it was given"
+
+
+def test_a_rows_description_and_sort_title_reach_plex_and_clearing_them_hands_back_only_ours(fakes, tmp_path):
+    """Issue #120 through plexapi's real request shapes, with the fake following what a real PMS was
+    measured doing (tests/fixtures/pms_collection_field_edits.json).
+
+    Run 1 sets both fields; the ledger records what was written. Between runs a person edits one
+    collection's summary in Plex. Run 2 clears both fields: every value Shortlist wrote is handed back,
+    and the hand-edited summary is not.
+    """
+    state, pms_url, _tmdb_app = fakes
+    spec = RowSpec(
+        slug="picked",
+        name_template="✨ {library_name} Picked for You",
+        size=12,
+        description="Picked for {user}",
+        sort_title_prefix="!010_",
+    )
+
+    def run(row: RowSpec, delivered_details: dict) -> RunReport:
+        plex = PlexClient(pms_url, state.owner_token)  # a client per run, as the server builds one
+        plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+        ctx = EngineContext(
+            config=EngineConfig(
+                row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12, rows=[row], rows_defined=True
+            ),
+            plex=plex,
+            plextv=plextv,
+            tmdb=TmdbClient("test-key"),
+            history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+            curator=NullCurator(),
+            snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+            delivered_details=delivered_details,
+        )
+        report = engine_run(ctx, [UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)])
+        assert report.ok
+        return report
+
+    first = run(spec, {})
+
+    rows = [state.collections[entry["rating_key"]] for entry in first.users[0].breakdown]
+    assert len(rows) >= 2, "sarah needs a row in both libraries for the hand-edit to have a control"
+    for row in rows:
+        assert (row.summary, row.summary_locked) == ("Picked for sarah", True)
+        assert (row.title_sort, row.title_sort_locked) == ("!010_" + strip_marker(row.title), True)
+        assert row.labels, "a field edit must never cost the row its label"
+    ledger = {
+        ("sarah", entry["row_slug"], entry["library_key"]): WrittenDetails(
+            entry["summary_written"], entry["title_sort_written"]
+        )
+        for entry in first.users[0].breakdown
+    }
+    hand_edited, *untouched = rows
+    hand_edited.summary = "Written by hand in Plex"
+
+    second = run(replace(spec, description="", sort_title_prefix=""), ledger)
+
+    assert (hand_edited.summary, hand_edited.summary_locked) == ("Written by hand in Plex", True)
+    for row in untouched:
+        assert (row.summary, row.summary_locked) == ("", False)
+    for row in rows:
+        # Blank + unlock, with no title sent: Plex rebuilds it from the full title, emoji kept.
+        assert (row.title_sort, row.title_sort_locked) == (row.title, False)
+    assert all(entry["summary_written"] is None for entry in second.users[0].breakdown)
+    assert all(entry["title_sort_written"] is None for entry in second.users[0].breakdown)
 
 
 def test_a_new_row_is_already_hidden_from_library_browse_before_it_is_promoted(fakes, tmp_path, monkeypatch):

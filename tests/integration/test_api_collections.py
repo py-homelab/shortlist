@@ -24,6 +24,8 @@ COLLECTION_KEYS = {
     "id",
     "slug",
     "name",
+    "description",
+    "sort_title_prefix",
     "last_run_id",
     "build",
     "audience",
@@ -378,6 +380,43 @@ class TestCollectionsSeed:
             specs = builder._build_rows(session, SettingsStore(session, client.app.state.secrets))
         assert next(s for s in specs if s.slug == "old_favourites").rewatch_cooldown_days == 90
         assert next(s for s in specs if s.slug == "anything_goes").rewatch_cooldown_days == 0
+
+    def test_description_and_sort_title_prefix_round_trip_and_reach_the_spec(self, client: TestClient):
+        """Issue #120. Empty by default — "leave that field on Plex alone" — so a row created without them
+        never touches a summary or sort title another tool set."""
+        from shortlist.server.services.context_builder import ContextBuilder
+        from shortlist.server.services.sse import EventBus
+
+        plain = client.post("/api/collections", json={"name": "Hidden Gems"})
+        assert plain.status_code == 201
+        assert (plain.json()["description"], plain.json()["sort_title_prefix"]) == ("", "")
+        made = client.post(
+            "/api/collections",
+            json={"name": "Deep Cuts", "description": "Picked for {user}", "sort_title_prefix": "!010_"},
+        )
+        assert made.status_code == 201, made.text
+        assert (made.json()["description"], made.json()["sort_title_prefix"]) == ("Picked for {user}", "!010_")
+        assert client.post("/api/collections", json={"name": "X", "sort_title_prefix": "!" * 65}).status_code == 422
+        assert client.post("/api/collections", json={"name": "X", "description": "d" * 2001}).status_code == 422
+
+        # A trailing space is part of how a prefix sorts, so it is kept; whitespace alone is no value.
+        patched = client.patch(
+            f"/api/collections/{plain.json()['id']}",
+            json={"name": "Hidden Gems", "description": "   ", "sort_title_prefix": "01 "},
+        )
+        assert patched.status_code == 200, patched.text
+        assert (patched.json()["description"], patched.json()["sort_title_prefix"]) == ("", "01 ")
+        cleared = client.patch(
+            f"/api/collections/{made.json()['id']}",
+            json={"name": "Deep Cuts", "description": "", "sort_title_prefix": ""},
+        )
+        assert (cleared.json()["description"], cleared.json()["sort_title_prefix"]) == ("", "")
+
+        builder = ContextBuilder(client.app.state.sessions, client.app.state.secrets, EventBus())
+        with client.app.state.sessions() as session:
+            specs = builder._build_rows(session, SettingsStore(session, client.app.state.secrets))
+        gems = next(s for s in specs if s.slug == "hidden_gems")
+        assert (gems.description, gems.sort_title_prefix) == ("", "01 ")
 
     def test_per_row_recency_round_trips_and_reaches_the_spec(self, client: TestClient):
         from shortlist.server.services.context_builder import ContextBuilder

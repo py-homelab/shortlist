@@ -239,6 +239,7 @@ Eight short pages instead of one long one. If you know what you want to do, star
 | Change the order titles appear in                | [The order titles appear in](https://shortlistapp.dev/guides/rows/#the-order-titles-appear-in) |
 | Move a row to the top of the shelf               | [Row placement](https://shortlistapp.dev/guides/rows/#row-placement-recommended-shelf)         |
 | Give a row its own artwork                       | [Row posters](https://shortlistapp.dev/guides/rows/#row-posters)                               |
+| Give a row a description, or sort it in Collections | [Description and sort order](https://shortlistapp.dev/guides/rows/#description-and-sort-order) |
 | Change where the suggestions come from           | [What goes in a row](https://shortlistapp.dev/guides/picks/)                                   |
 | Stop one film skewing someone's picks            | [Blocking a seed](https://shortlistapp.dev/guides/picks/#blocking-a-seed)                      |
 | Change how often a row's picks CHANGE            | [What goes in a row](https://shortlistapp.dev/guides/picks/)                                   |
@@ -255,7 +256,7 @@ Eight short pages instead of one long one. If you know what you want to do, star
 | Page                                                     | What's in it                                                                |
 | -------------------------------------------------------- | --------------------------------------------------------------------------- |
 | [The web interface](https://shortlistapp.dev/guides/interface/)                 | What every page does, and what each dashboard figure means                  |
-| [Rows and templates](https://shortlistapp.dev/guides/rows/)                     | Starting from a template, naming, ordering, where a row shows, posters      |
+| [Rows and templates](https://shortlistapp.dev/guides/rows/)                     | Starting from a template, naming, ordering, where a row shows, posters, descriptions |
 | [What goes in a row](https://shortlistapp.dev/guides/picks/)                    | Recommendation sources, rebuild cadence, per-row and per-person overrides   |
 | [Schedules and runs](https://shortlistapp.dev/guides/schedules/)                | Each row's own schedule, custom schedules, the jobs worth knowing about     |
 | [AI and cost](https://shortlistapp.dev/guides/ai/)                              | What AI does, which search backend to pick, how to keep the bill down       |
@@ -984,6 +985,32 @@ Each row can have its own artwork on Plex. In the **Row editor** → **Artwork**
 Hit **Preview** to see a sample before saving. Generated images are made once and reused across
 runs (they refresh when you change the text or style), so posters don't slow a run down or cost per
 user. Posters are cosmetic. A poster that can't be made never blocks a row from building.
+
+## Description and sort order
+
+Each row can also set two of its Plex collection's own fields. In the **Row editor** →
+**Description and sort order**:
+
+- **Description** — the summary Plex shows when someone opens the row. It fills in `{user}`,
+  `{library_name}` and `{top_seed}` the same way the row's name does, so every person's copy can say
+  something about them. A `{top_seed}` description for someone with nothing watched is left empty.
+- **Sort title prefix** — text put in front of the row's name to make its Plex sort title, such as
+  `!010_`. It decides where the row sorts in the library's **Collections** tab (`!` sorts before
+  letters). It does not move the row on Home or the Recommended shelf; that is
+  [Row placement](#row-placement-recommended-shelf). The prefix always goes in front of the row's
+  current name, so a renamed row, or one named after `{top_seed}`, keeps sorting under it.
+
+Both are empty by default, and empty means Shortlist leaves that field on Plex alone. Changes reach
+Plex the next time the row runs, and replace whatever that field held — including a value another
+tool set. Clearing a field hands it back to Plex: no description, and a sort title Plex builds from
+the row's name. That only happens where Plex still holds the value Shortlist wrote; if someone changed
+it in Plex or another tool since, it is left alone. A value another tool had before Shortlist set the
+field is not brought back.
+
+Set each field in one tool only. Agregarr and Kometa can set a collection's summary and sort title
+too, and two tools setting the same field overwrite each other on every sync. If Shortlist sets them,
+leave them unset for Shortlist's rows in the other tool. Agregarr can skip Shortlist's rows entirely
+if you add the `shortlist` label to its excluded labels.
 
 ---
 
@@ -2660,6 +2687,13 @@ GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first
      in that library (favourites by their Plex rating, then titles close to tonight's taste, then longest unseen), and its candidate pool supplies
      only the unseen top-up — the same pool a 0% row uses, so the two share one gather.
      `rewatch_cooldown_days` (int 0–365, default 30) leaves out anything finished within that many days, on a rewatch row only; 0 disables it.
+     `description` (string, max 2000, default "") is the collection's Plex summary, filled per collection with `{user}`/`{library_name}`/`{top_seed}`.
+     `sort_title_prefix` (string, max 64, default "") makes the collection's Plex sort title prefix + the row's current name; it orders the
+     library's Collections tab, not Home. "" on either leaves that field on Plex alone, and whitespace alone is stored as "". Both reach Plex on the
+     row's next run, written locked, replacing whatever the field held. Clearing one (or a `{top_seed}` description rendering empty) blanks and
+     unlocks the field, but only while Plex still holds exactly what Shortlist wrote — the delivery ledger records it
+     (`deliveries.summary_written` / `title_sort_written`) — so a value a person or another tool set SINCE is never wiped. A value from before
+     Shortlist set the field is not restored.
      `unstarted_only` (bool, default false; accepted on any row that can hold shows) drops every series the person has started, however little of it.
      It only changes anything on a row whose `watched_pct` is ABOVE 0: such a row caps FINISHED titles and so still admits a series someone is three
      episodes into, and this is what makes "a series to start" literally true there. At `watched_pct` 0 the row already excludes started series (see

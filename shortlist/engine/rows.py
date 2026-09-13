@@ -50,6 +50,7 @@ from shortlist.engine.models import (
     UserRunReport,
     UserType,
     WatchedItem,
+    WrittenDetails,
 )
 
 
@@ -2813,6 +2814,16 @@ def _build_section_picks(
     return section_picks
 
 
+def _written_details(ctx: EngineContext, owner_slug: str, row_slug: str) -> dict[str, WrittenDetails]:
+    """{section key -> what Shortlist last wrote to that collection's summary and sort title} for one
+    row and owner (a person's slug, or a shared row's), from the delivery ledger."""
+    return {
+        section_key: record
+        for (owner, row, section_key), record in ctx.delivered_details.items()
+        if owner == owner_slug and row == row_slug
+    }
+
+
 def _deliver_row(
     policy: RowPolicy,
     spec: RowSpec,
@@ -2920,6 +2931,7 @@ def _deliver_row(
                 on_write=lambda counts: _emit(ctx, user.slug, "delivering", counts),
                 # Inside this lock hold, before the row's next library is written.
                 on_label_stored=on_first_row,
+                written_details=_written_details(ctx, user.slug, spec.slug),
             )
             logger.debug(
                 "{}: row '{}' delivery — waited {:.1f}s for write-lock, wrote {} librar(ies) in {:.1f}s",
@@ -3497,6 +3509,7 @@ def _shared_row(
         breakdown=user_report.breakdown,
         order_work=order_work,
         on_write=lambda counts: _emit(ctx, slug, "delivering", counts),
+        written_details=_written_details(ctx, slug, spec.slug),
     )
     return agg if picks else None
 

@@ -55,6 +55,8 @@ function row(patch: Partial<Collection> = {}): Collection {
     sort_order: 0,
     name_template: "",
     fallback_name: "",
+    description: "",
+    sort_title_prefix: "",
     min_watchers: 2,
     request_tag: "",
     candidate_sources: [],
@@ -1358,10 +1360,10 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
     }
   });
 
-  it("folds only the two groups most people never touch", () => {
+  it("folds only the groups most people never touch", () => {
     renderEditor(row());
 
-    for (const group of ["Artwork", "Requests"]) {
+    for (const group of ["Artwork", "Description and sort order", "Requests"]) {
       expect(groupNamed(group)).not.toHaveAttribute("open");
     }
   });
@@ -1408,6 +1410,30 @@ describe("RowEditor — a typed row says so", () => {
     cleanup();
     renderEditor(row({ media: "both", library_keys: [] }));
     expect(screen.getByText(/every library/)).toBeInTheDocument();
+  });
+
+  it("saves a description and sort title prefix, and shows what the row sorts as", async () => {
+    renderEditor(row());
+
+    await userEvent.click(screen.getByText("Description and sort order"));
+    await userEvent.type(screen.getByLabelText("Description"), "Picked nightly");
+    await userEvent.type(screen.getByLabelText("Sort title prefix"), "!010_");
+    expect(screen.getByText("!010_Hidden Gems")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(-1)?.[1] as Collection;
+    expect(body.description).toBe("Picked nightly");
+    expect(body.sort_title_prefix).toBe("!010_");
+  });
+
+  it("says a closed description group is leaving Plex alone until one is set", () => {
+    renderEditor(row());
+    expect(screen.getByText("Plex’s own description and sort order")).toBeInTheDocument();
+
+    cleanup();
+    renderEditor(row({ description: "Hi", sort_title_prefix: "01 " }));
+    expect(screen.getByText("Has a description · Sorts under “01 ”")).toBeInTheDocument();
   });
 
   it("offers the recently-finished cooldown only on a watch-it-again row", () => {

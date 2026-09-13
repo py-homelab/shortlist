@@ -218,3 +218,34 @@ class TestPicksCarryTheBuiltAtStamp:
             stored = session.query(PickRow).one()
             assert stored.built_at is not None, "the stamp was dropped on the way into the database"
             assert stored.built_at.replace(tzinfo=stored.built_at.tzinfo or UTC) == built
+
+
+class TestTheLedgerRecordsWhatWasWrittenToASummaryAndSortTitle:
+    """Issue #120. The ledger's record is what lets clearing a row's field hand back ONLY what Shortlist
+    wrote — so the persist must forget a record the run cleared, and must keep one a run never reached."""
+
+    def _entry(self, **details) -> dict:
+        return {"row_slug": "gems", "library_key": "1", "rating_key": 42, "row_title": "Gems", **details}
+
+    def test_a_record_the_run_wrote_is_stored_and_one_it_cleared_is_forgotten(self, sessions):
+        from shortlist.server.db.models import Delivery
+        from shortlist.server.services.run_persistence import _record_deliveries
+
+        with sessions() as session:
+            _record_deliveries(session, "sarah", [self._entry(summary_written="Hi", title_sort_written="!1_Gems")])
+            row = session.get(Delivery, ("gems", "sarah", "1"))
+            assert (row.summary_written, row.title_sort_written) == ("Hi", "!1_Gems")
+
+            _record_deliveries(session, "sarah", [self._entry(summary_written=None, title_sort_written=None)])
+            assert (row.summary_written, row.title_sort_written) == (None, None)
+
+    def test_an_entry_without_the_keys_keeps_the_record(self, sessions):
+        """A legacy breakdown, or a library delivery never reached the description step for, says
+        nothing about what Plex holds — forgetting would strand a value Shortlist really wrote."""
+        from shortlist.server.db.models import Delivery
+        from shortlist.server.services.run_persistence import _record_deliveries
+
+        with sessions() as session:
+            _record_deliveries(session, "sarah", [self._entry(summary_written="Hi", title_sort_written=None)])
+            _record_deliveries(session, "sarah", [self._entry()])
+            assert session.get(Delivery, ("gems", "sarah", "1")).summary_written == "Hi"

@@ -112,6 +112,27 @@ def test_a_row_can_be_given_a_built_in_text_poster(page: Page, app: ShortlistApp
     assert image.headers["content-type"].startswith("image/")
 
 
+def test_a_row_can_be_given_a_description_and_sort_title_prefix(page: Page, app: ShortlistApp):
+    """Issue #120: both are saved from the editor's folded "Description and sort order" group."""
+    _open_rows(page)
+    _add_a_row(page)
+    page.get_by_label("Name", exact=True).fill("Sorted Row")
+    page.get_by_role("button", name="Add row").click()
+    expect(_saved_row(page, "Sorted Row")).to_be_visible(timeout=LOAD)
+
+    page.get_by_role("button", name="Edit").last.click()
+    expect(page.get_by_label("Name", exact=True)).to_have_value("Sorted Row")
+    _open_section(page, "Description and sort order")
+    page.get_by_label("Description", exact=True).fill("Picked for {user}")
+    page.get_by_label("Sort title prefix").fill("!010_")
+    expect(page.get_by_text("!010_Sorted Row")).to_be_visible()
+    page.get_by_role("button", name="Save changes").click()
+    expect(page).to_have_url(re.compile(r"/rows$"), timeout=LOAD)
+
+    saved = next(c for c in app.api("GET", "/api/collections").json() if c["name"] == "Sorted Row")
+    assert (saved["description"], saved["sort_title_prefix"]) == ("Picked for {user}", "!010_")
+
+
 def test_the_default_rows_name_can_be_edited_and_updates_the_global_template(page: Page, app: ShortlistApp):
     """The default row's name field used to be disabled (name came only from Settings → Defaults).
     It's now editable inline, and saving it writes the shared `row.name_template` setting."""

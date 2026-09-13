@@ -271,6 +271,26 @@ class CollectionIn(BaseModel):
     # the default, which is the top of the shelf.
     hub_anchor: dict[str, HubAnchorIn] = Field(default_factory=dict)
     poster: PosterIn = Field(default_factory=PosterIn)
+    # The collection's Plex summary and sort title (issue #120). "" leaves that field on Plex alone.
+    description: str = Field(
+        default="",
+        max_length=2000,
+        description="The collection's Plex summary; takes {user}, {library_name} and {top_seed}. "
+        "Empty leaves the summary on Plex alone.",
+    )
+    sort_title_prefix: str = Field(
+        default="",
+        max_length=64,
+        description="Put before the row's name to make its Plex sort title, e.g. '!010_'. Orders the row "
+        "in the library's Collections tab, not on Home. Empty leaves the sort title alone.",
+    )
+
+    @field_validator("description", "sort_title_prefix")
+    @classmethod
+    def _blank_is_empty(cls, value: str) -> str:
+        """Whitespace alone is no value. Anything else is kept verbatim — a prefix's trailing space
+        (`01 `) is part of how it sorts."""
+        return value if value.strip() else ""
 
     @field_validator("show_days")
     @classmethod
@@ -335,6 +355,8 @@ class CollectionOut(PassthroughModel):
     sort_order: int
     name_template: str
     fallback_name: str
+    description: str
+    sort_title_prefix: str
     min_watchers: int
     request_tag: str
     candidate_sources: list[str]
@@ -735,6 +757,8 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
         # Neutralising it here rather than in a migration keeps one place responsible for the rule.
         "name_template": "" if collection.slug == DEFAULT_SLUG else collection.name_template,
         "fallback_name": collection.fallback_name or "",
+        "description": collection.description or "",
+        "sort_title_prefix": collection.sort_title_prefix or "",
         "min_watchers": collection.min_watchers,
         "request_tag": collection.request_tag or "",
         "candidate_sources": list(collection.candidate_sources or []),
@@ -1015,6 +1039,8 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             hub_anchor={k: v.model_dump() for k, v in body.hub_anchor.items()},
             library_keys=body.library_keys,
             poster=body.poster.model_dump(),
+            description=body.description,
+            sort_title_prefix=body.sort_title_prefix,
         )
         session.add(collection)
         session.flush()
@@ -1037,6 +1063,9 @@ _PATCHABLE_COLUMNS = (
     "sort_order",
     "name_template",
     "fallback_name",
+    # Reach Plex on the row's next run, like its poster — they owe Plex nothing at save time.
+    "description",
+    "sort_title_prefix",
     "min_watchers",
     "request_tag",
     "candidate_sources",

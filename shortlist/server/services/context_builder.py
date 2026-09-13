@@ -44,6 +44,7 @@ from shortlist.engine.models import (
     SeerrTarget,
     UserProfile,
     UserType,
+    WrittenDetails,
     is_human_rating,
     normalise_languages,
     row_language_mode_or_inherit,
@@ -423,6 +424,7 @@ class ContextBuilder:
             previous = self._previous_picks(session)
             previous_recipes = self._previous_recipes(previous)
             delivered_keys = self._delivered_keys(session)
+            delivered_details = self._delivered_details(session)
             # Opted-out accounts: with hide_shared_from_disabled, even public shared rows are hidden
             # from them, so disabling a user removes them from Shortlist entirely.
             disabled_account_ids = {u.plex_account_id for u in session.query(User).filter_by(enabled=False).all()}
@@ -494,6 +496,7 @@ class ContextBuilder:
                 previous_picks=previous,
                 previous_recipes=previous_recipes,
                 delivered_keys=delivered_keys,
+                delivered_details=delivered_details,
                 pms_for_user=_pms_for_user,
                 # Same token `_pms_for_user` builds its client from — including the canary fallback
                 # for a Home profile that was never separately shared.
@@ -796,6 +799,19 @@ class ContextBuilder:
                 len(rows) - len(keys),
             )
         return keys
+
+    def _delivered_details(self, session: Session) -> dict[tuple[str, str, str], WrittenDetails]:
+        """What Shortlist last wrote to each collection's summary and sort title, keyed like
+        `_delivered_keys`. Only collections carrying a record: the rest have nothing to hand back."""
+        rows = session.query(Delivery).filter(
+            (Delivery.summary_written.isnot(None)) | (Delivery.title_sort_written.isnot(None))
+        )
+        return {
+            (row.user_slug, row.collection_slug, row.library_key): WrittenDetails(
+                summary=row.summary_written, title_sort=row.title_sort_written
+            )
+            for row in rows
+        }
 
     def _previous_picks(self, session: Session) -> dict[tuple[str, str, str], list[Pick]]:
         """Each row+library's picks from the run that last built it, keyed (user_slug, row_slug, section_key).
@@ -1122,6 +1138,8 @@ class ContextBuilder:
                     library_keys=[str(k) for k in (collection.library_keys or [])],
                     poster=self._build_poster(session, collection),
                     request_overrides=row_request_overrides(collection),
+                    description=collection.description or "",
+                    sort_title_prefix=collection.sort_title_prefix or "",
                 )
             )
         return specs
