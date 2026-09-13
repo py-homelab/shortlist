@@ -125,10 +125,13 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   running: "Running",
 };
 
+/** Keyed on the server's own trigger words (`Run.trigger`). */
 const TRIGGER_LABELS: Record<string, string> = {
+  schedule: "Scheduled",
   manual: "Manual",
-  scheduled: "Scheduled",
-  cron: "Scheduled",
+  wizard: "Setup",
+  // A scheduled run a restart cut short, finished for the people it never reached.
+  resume: "Resumed after a restart",
 };
 
 /** A run/user status as a person reads it — never the raw enum ("cold_start" → "Cold start"). */

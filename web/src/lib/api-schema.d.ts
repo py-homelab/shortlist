@@ -1935,7 +1935,13 @@ export interface paths {
         put?: never;
         /**
          * Restore Backup Endpoint
-         * @description Restore from a named backup. The app will need to be restarted after.
+         * @description Queue a restore from a named backup. It is applied when the app next starts.
+         *
+         *     Not applied here: the running app has the database open, and swapping the file under its pooled
+         *     connections let the shutdown checkpoint write the old database back over the restored one, so the
+         *     restart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the
+         *     pre-restore copy there (so it holds everything written until the restart), and audits it in the
+         *     database it restored.
          *
          *     A restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a
          *     copy taken before a shared row's audience was narrowed puts the wider audience back, and the
@@ -1943,8 +1949,7 @@ export interface paths {
          *     that were hiding that row. That is correct for the config being restored, and it is exactly the
          *     kind of change an operator does not expect from a button labelled "restore".
          *
-         *     So it is stated, in the response and in the audit trail (rule 10), rather than left to be
-         *     discovered on someone's Home screen.
+         *     So it is stated, in the response, rather than left to be discovered on someone's Home screen.
          */
         post: operations["restore_backup_endpoint_api_system_backups_restore_post"];
         delete?: never;
@@ -4750,7 +4755,7 @@ export interface components {
              * Trigger
              * @enum {string}
              */
-            trigger: "schedule" | "manual" | "wizard";
+            trigger: "schedule" | "manual" | "wizard" | "resume";
             /** Users */
             users: components["schemas"]["RunUserOut"][];
         } & {
@@ -4928,7 +4933,7 @@ export interface components {
              * Trigger
              * @enum {string}
              */
-            trigger: "schedule" | "manual" | "wizard";
+            trigger: "schedule" | "manual" | "wizard" | "resume";
         } & {
             [key: string]: unknown;
         };

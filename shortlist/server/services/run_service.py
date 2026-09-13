@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from shortlist.engine.context import EngineContext
 from shortlist.engine.pipeline import run as engine_run
-from shortlist.server.db.models import Collection, Run
+from shortlist.server.db.models import Collection, Run, RunUser, User
 from shortlist.server.safe_mode import force_dry_run
 from shortlist.server.services import jobs, notify, run_persistence
 from shortlist.server.services.context_builder import ContextBuilder
@@ -38,6 +38,45 @@ from shortlist.server.services.watch_sync import WatchSync
 
 # HIT_WINDOW_DAYS moved to `run_persistence` with the hit-rate reconcile that owns it, and is
 # re-exported above because `services/report_service.py` imports it from here.
+
+
+#: How long after it started a scheduled run cut short by a restart is still worth finishing. Past this a
+#: daily row's next scheduled run is closer than the rebuild would be.
+RESUME_WITHIN = timedelta(hours=20)
+
+
+def missed_by_restart(session: Session, run: Run, now: datetime) -> tuple[list[int], list[int]] | None:
+    """``(user ids, collection ids)`` a scheduled run cut short by a restart never built, or None.
+
+    Owner decision 2026-09-14: finish it once, for only the people it had not reached. Only a SCHEDULED
+    run qualifies (a run someone started by hand is theirs to start again), never a dry run, and never
+    the resumed run itself, so a restart loop cannot re-curate the server over and over. People and rows
+    switched off since are left out. Shared rows are not rebuilt: a run scoped to some people never
+    builds them (`EngineConfig.users_scoped`), and they rebuild on the next full run.
+
+    Args:
+        session: an open session.
+        run: a run the previous process died inside, still carrying its `stats`.
+        now: the boot time.
+    """
+    if run.trigger != "schedule" or run.dry_run or run.started_at is None:
+        return None
+    started = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=UTC)
+    if now - started > RESUME_WITHIN:
+        return None
+    stats = run.stats if isinstance(run.stats, dict) else {}
+    user_slugs = [u.get("slug") for u in stats.get("expected_users") or [] if isinstance(u, dict)]
+    row_slugs = [r.get("slug") for r in stats.get("expected_rows") or [] if isinstance(r, dict)]
+    reached = {user_id for (user_id,) in session.query(RunUser.user_id).filter(RunUser.run_id == run.id)}
+    users = sorted(
+        user_id
+        for (user_id,) in session.query(User.id).filter(User.slug.in_(user_slugs), User.enabled.is_(True))
+        if user_id not in reached
+    )
+    rows = sorted(
+        row_id for (row_id,) in session.query(Collection.id).filter(Collection.slug.in_(row_slugs), Collection.enabled)
+    )
+    return (users, rows) if users and rows else None
 
 
 class RunService:

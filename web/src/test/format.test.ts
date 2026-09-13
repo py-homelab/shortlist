@@ -14,6 +14,7 @@ import {
   formatDate,
   timeAgo,
   timeFromCron,
+  triggerLabel,
   weekStarting,
 } from "@/lib/format";
 
@@ -323,5 +324,18 @@ describe("timeAgo — the bucket boundaries", () => {
   it("flips from hours to days at exactly one day", () => {
     expect(at(23 * 3600)).toBe("23h ago");
     expect(at(24 * 3600)).toBe("1d ago");
+  });
+});
+
+describe("triggerLabel", () => {
+  // The server's own words. The map was keyed on "scheduled" and "cron", which no run carries, so every
+  // nightly run read as a bare lowercase "schedule".
+  it.each([
+    ["schedule", "Scheduled"],
+    ["manual", "Manual"],
+    ["wizard", "Setup"],
+    ["resume", "Resumed after a restart"],
+  ])("says %s as %s", (trigger, label) => {
+    expect(triggerLabel(trigger)).toBe(label);
   });
 });

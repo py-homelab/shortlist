@@ -50,6 +50,14 @@ anything else, or **Off** to only run that row by hand. New rows default to nigh
 on upgrade, existing rows keep whatever your old global schedule was. Rows that share a cron run
 together. To skip a person entirely, pause them on their detail page.
 
+**A scheduled run cut short by a restart is finished once.** If the container restarts part-way
+through a scheduled run (an auto-updater such as Watchtower replacing it, a host reboot), Shortlist
+starts a run as soon as it is back up for the people that run never reached, on the same rows. It
+shows on Runs as **Resumed after a restart**. It happens once: a resumed run that is itself cut short
+is not resumed again, and neither is a run you started by hand or one more than 20 hours old. Shared
+rows rebuild on the next full run. To avoid the interruption in the first place, schedule your
+auto-updater for after your rows finish.
+
 ### Writing a custom schedule
 
 Every **Custom** schedule box in Shortlist (a row's schedule, and the watch-history, user-sync and

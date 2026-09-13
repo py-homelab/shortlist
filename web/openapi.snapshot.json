@@ -4926,7 +4926,8 @@
             "enum": [
               "schedule",
               "manual",
-              "wizard"
+              "wizard",
+              "resume"
             ],
             "title": "Trigger",
             "type": "string"
@@ -5311,7 +5312,8 @@
             "enum": [
               "schedule",
               "manual",
-              "wizard"
+              "wizard",
+              "resume"
             ],
             "title": "Trigger",
             "type": "string"
@@ -11283,7 +11285,7 @@
     },
     "/api/system/backups/restore": {
       "post": {
-        "description": "Restore from a named backup. The app will need to be restarted after.\n\nA restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a\ncopy taken before a shared row's audience was narrowed puts the wider audience back, and the\nshared-exclude prune \u2014 the only un-hiding path Shortlist has \u2014 then removes the `label!=` excludes\nthat were hiding that row. That is correct for the config being restored, and it is exactly the\nkind of change an operator does not expect from a button labelled \"restore\".\n\nSo it is stated, in the response and in the audit trail (rule 10), rather than left to be\ndiscovered on someone's Home screen.",
+        "description": "Queue a restore from a named backup. It is applied when the app next starts.\n\nNot applied here: the running app has the database open, and swapping the file under its pooled\nconnections let the shutdown checkpoint write the old database back over the restored one, so the\nrestart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the\npre-restore copy there (so it holds everything written until the restart), and audits it in the\ndatabase it restored.\n\nA restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a\ncopy taken before a shared row's audience was narrowed puts the wider audience back, and the\nshared-exclude prune \u2014 the only un-hiding path Shortlist has \u2014 then removes the `label!=` excludes\nthat were hiding that row. That is correct for the config being restored, and it is exactly the\nkind of change an operator does not expect from a button labelled \"restore\".\n\nSo it is stated, in the response, rather than left to be discovered on someone's Home screen.",
         "operationId": "restore_backup_endpoint_api_system_backups_restore_post",
         "requestBody": {
           "content": {

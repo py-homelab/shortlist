@@ -45,7 +45,7 @@ from shortlist.server.db.models import Event, Run, Server
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.scheduler import build_scheduler
 from shortlist.server.services import backup as backups
-from shortlist.server.services.run_service import RunService
+from shortlist.server.services.run_service import RunService, missed_by_restart
 from shortlist.server.services.secrets import SecretBox
 from shortlist.server.services.sse import EventBus
 from shortlist.server.services.watch_stream import WatchStream
@@ -261,9 +261,11 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 config_dir / "logs" / "shortlist.log",
             )
             stale = session.query(Run).filter(Run.status.in_(("queued", "running"))).all()
+            booted_at = datetime.now(UTC)
+            unfinished = [plan for run in stale if (plan := missed_by_restart(session, run, booted_at))]
             for run in stale:
                 run.status = "aborted"
-                run.finished_at = datetime.now(UTC)
+                run.finished_at = booted_at
             if stale:
                 logger.warning("aborted {} orphaned run(s) from a previous process", len(stale))
             session.commit()
@@ -287,14 +289,27 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             with contextlib.suppress(Exception):
                 enqueue(sessions, "privacy.sync", {})
                 logger.warning(
-                    "{} run(s) were interrupted by a restart — queued a privacy sync to make the "
-                    "server consistent; rows rebuild on the next scheduled run",
+                    "{} run(s) were interrupted by a restart — queued a privacy sync to make the server consistent",
                     crashed_runs,
                 )
 
         scheduler = build_scheduler(app)
         scheduler.start()
         app.state.scheduler = scheduler
+
+        # A scheduled run a restart cut short is finished once, for the people it never reached — an
+        # auto-updater replacing the container mid-run otherwise costs them a day (see `missed_by_restart`).
+        for user_ids, collection_ids in unfinished:
+            try:
+                await app.state.run_service.start_run(
+                    trigger="resume", dry_run=False, user_ids=user_ids, collection_ids=collection_ids
+                )
+                logger.warning(
+                    "a scheduled run was cut short by a restart — rebuilding the {} person(s) it never reached",
+                    len(user_ids),
+                )
+            except Exception:
+                logger.exception("could not start the run that finishes an interrupted scheduled run")
 
         # The live playback listener. A long-lived socket rather than a scheduled job, because the
         # thing it captures — someone STARTING something and giving up — exists nowhere else: Plex's

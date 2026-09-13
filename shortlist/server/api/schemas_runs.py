@@ -113,7 +113,7 @@ class RunSummaryOut(PassthroughModel):
     #: wizard's first run also goes through) are ever written; `wizard` is carried because the column
     #: has always documented it, and a Literal that is a strict SUPERSET of what the code emits can
     #: only over-describe the schema, while one that is too narrow 500s the whole Runs page.
-    trigger: Literal["schedule", "manual", "wizard"]
+    trigger: Literal["schedule", "manual", "wizard", "resume"]
     #: Not optional: `runs.started_at` is NOT NULL (migration 0001) and carries an ORM-side `utcnow`
     #: default, so every run row has one. It read `str | None` only because `iso_utc` is typed that
     #: way — the serializer's signature, not this column's.
