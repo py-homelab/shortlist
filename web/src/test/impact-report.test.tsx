@@ -246,12 +246,13 @@ describe("ImpactReport", () => {
     expect(screen.queryByText("sarah")).toBeNull();
     // The feed times the WATCH, not the finish — a series finished weeks after it was started would
     // otherwise be filed under the wrong day.
-    // Under a day heading the line gives the clock time, not "5h ago" beside "Yesterday".
+    // How long ago, at a glance — the owner preferred it to a clock time. The exact time is on hover.
     const clock = (iso: string) =>
       new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
     const watch = REPORT.recent[0]!;
-    expect(screen.getByText(clock(watch.watched_at!))).toBeTruthy();
-    expect(screen.queryByText(clock(watch.finished_at!))).toBeNull();
+    const when = screen.getByText("5h ago");
+    expect(when).toHaveAttribute("title", clock(watch.watched_at!));
+    expect(screen.queryByText("1h ago")).toBeNull();
     // Counts, labelled — never "3 of 6". They are two different sets (watched-in-window vs
     // delivered-in-window), so a fraction makes "4 of 0" reachable when delivery paused.
     // Counts, labelled — never "3 of 6". Two different sets (watched-in-window vs

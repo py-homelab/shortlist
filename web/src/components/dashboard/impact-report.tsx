@@ -1312,15 +1312,15 @@ function RecentlyWatched({
           </div>
         </div>
         <div className="col-start-2 flex items-center justify-between gap-3 sm:col-start-auto sm:flex-col sm:items-end sm:justify-center sm:gap-1.5">
-          {/* The clock time: the day heading above already says when, and "8h ago" beside
-              "Yesterday" read as a contradiction. How long ago stays one hover away. */}
+          {/* How long ago — the owner prefers "1h ago" at a glance to a clock time. The exact time
+              is one hover away, and the day heading above still files it under its day. */}
           {w.watched_at && (
             <time
               dateTime={w.watched_at}
-              title={timeAgo(w.watched_at)}
+              title={new Date(w.watched_at).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
               className="whitespace-nowrap text-xs tabular-nums text-muted-foreground"
             >
-              {new Date(w.watched_at).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
+              {timeAgo(w.watched_at)}
             </time>
           )}
           <TitleLinkIcons title={w} />
