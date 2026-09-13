@@ -233,14 +233,16 @@ def read_sharing_status(
         ours: dict[str, list[str]] = {}
         theirs: list[str] = []
         # Our labels Plex actually APPLIES, not merely stores (#116): one behind a `|` is ORed away.
-        # Our labels Plex applies in EVERY field that carries them: a label enforced in TV must not vouch for
-        # the Movies filter that ORs the same label away (#116's own shape). A field Plex cannot read
-        # applies nothing at all.
+        # Our labels Plex applies in EVERY restricted field: a label enforced in TV must not vouch for the
+        # Movies filter that ORs the same label away (#116's own shape). A field Plex cannot read applies
+        # nothing at all, and neither does one holding none of our labels: every run merges the excludes
+        # into both, so an empty one was cleared or never reached, and that account sees every row there.
         enforced_per_field: list[set[str]] = []
         unreadable = False
-        for name in ("filterMovies", "filterTelevision"):
+        for name in privacy.RESTRICTED_FILTER_FIELDS:
             raw = account.filters.get(name) or ""
             if not raw:
+                enforced_per_field.append(set())
                 continue
             try:
                 conditions = privacy.parse_filter(raw)
@@ -248,13 +250,14 @@ def read_sharing_status(
                 # A filter we cannot parse is reported verbatim rather than mis-attributed — the
                 # engine refuses to rewrite one too.
                 theirs.append(f"{name}: {raw} (unparseable)")
+                enforced_per_field.append(set())
                 continue
             candidates = {unquote(v).lower() for c in conditions for v in c.values if is_our_label(v)}
             # A raw `&` inside a value: Plex cannot read this filter at all (measured), so nothing in it is
             # hidden however it parses here — and no run will fix it until the label is renamed.
             if privacy.plex_cannot_read(raw):
                 unreadable = True
-            elif candidates:
+            else:
                 enforced_per_field.append(candidates - privacy.unenforced_excludes(raw, candidates))
             for condition in conditions:
                 mine = [v for v in condition.values if is_our_label(v)]

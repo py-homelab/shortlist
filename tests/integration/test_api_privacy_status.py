@@ -53,6 +53,12 @@ def _roster(monkeypatch, filters_by_user: dict[str, dict[str, str]], ids: dict[s
     )
 
 
+def _stored_everywhere(value: str) -> dict[str, str]:
+    """An account's filters as a run leaves them: every run merges the excludes into BOTH restricted
+    fields, so a filter that is only right for Movies is not a synced account, it is one leaking TV rows."""
+    return {"filterMovies": value, "filterTelevision": value}
+
+
 def _rows_on_plex(monkeypatch, slugs: list[str], *, marked_but_unlabelled: int = 0) -> None:
     """The per-person rows that exist on the PMS right now.
 
@@ -221,7 +227,7 @@ class TestTheVerdictIsAlwaysALiveRead:
         _rows_on_plex(monkeypatch, ["sarah", "mike", "dan"])
         _roster(
             monkeypatch,
-            {"sarah": {"filterMovies": "label!=shortlist_mike,shortlist_dan"}, "dan": {"filterMovies": ""}},
+            {"sarah": _stored_everywhere("label!=shortlist_mike,shortlist_dan"), "dan": {"filterMovies": ""}},
             ids={"sarah": 1000, "dan": 1002},
         )
 
@@ -286,6 +292,31 @@ class TestTheVerdictIsAlwaysALiveRead:
         assert sarah["missing"] == ["shortlist_mike"]
         assert sarah["hides"] == []
 
+    @pytest.mark.parametrize("tv_filter", ["", "contentRating!=R", None], ids=["empty", "owner-only", "absent"])
+    def test_a_field_with_none_of_our_excludes_hides_nothing_there(self, client: TestClient, monkeypatch, tv_filter):
+        """Every run merges the excludes into BOTH filters, so a filter holding none of them is one the owner
+        cleared or no run has reached, and that account sees every TV row. Skipping such a field let the
+        Movies filter alone report the account as hiding everything (architecture review 2026-09-14)."""
+        _seed_users(
+            client,
+            [
+                {"slug": "sarah", "plex_account_id": 1000, "enabled": True},
+                {"slug": "mike", "plex_account_id": 1001, "enabled": True},
+            ],
+        )
+        _rows_on_plex(monkeypatch, ["sarah", "mike"])
+        filters = {"filterMovies": "label!=shortlist_mike"}
+        if tv_filter is not None:
+            filters["filterTelevision"] = tv_filter
+        _roster(monkeypatch, {"sarah": filters}, ids={"sarah": 1000})
+
+        body = client.get("/api/privacy/status").json()
+
+        sarah = next(a for a in body["accounts"] if a["slug"] == "sarah")
+        assert sarah["missing"] == ["shortlist_mike"]
+        assert sarah["state"] == "missing"
+        assert sarah["hides"] == []
+
     def test_one_unreadable_field_leaves_nothing_counted_as_hidden(self, client: TestClient, monkeypatch):
         _seed_users(
             client,
@@ -346,7 +377,7 @@ class TestTheThingsItRefusesToClaim:
             ],
         )
         _rows_on_plex(monkeypatch, ["steve", "sarah"])
-        _roster(monkeypatch, {"sarah": {"filterMovies": "label!=shortlist_steve"}}, ids={"sarah": 1000})
+        _roster(monkeypatch, {"sarah": _stored_everywhere("label!=shortlist_steve")}, ids={"sarah": 1000})
 
         body = client.get("/api/privacy/status").json()
 
@@ -458,7 +489,7 @@ class TestEnforcement:
         )
         _rows_on_plex(monkeypatch, ["sarah", "mike"])
         # Everything is stored correctly. That is exactly the point.
-        _roster(monkeypatch, {"sarah": {"filterMovies": "label!=shortlist_mike"}}, ids={"sarah": 1000})
+        _roster(monkeypatch, {"sarah": _stored_everywhere("label!=shortlist_mike")}, ids={"sarah": 1000})
 
         body = client.get("/api/privacy/status").json()
 
@@ -523,7 +554,7 @@ class TestEnforcement:
         )
         _rows_on_plex(monkeypatch, ["sarah", "mike", "dan"])
         # Carries mike's exclude, missing dan's — enough to pass the engine's `any()` gate.
-        _roster(monkeypatch, {"sarah": {"filterMovies": "label!=shortlist_mike"}}, ids={"sarah": 1000})
+        _roster(monkeypatch, {"sarah": _stored_everywhere("label!=shortlist_mike")}, ids={"sarah": 1000})
 
         body = client.get("/api/privacy/status").json()
 
