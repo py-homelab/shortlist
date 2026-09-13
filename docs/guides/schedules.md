@@ -30,9 +30,12 @@ Two jobs are worth knowing about there:
   watched set, and any credit it was giving a pick is withdrawn with it. The one thing that stays
   deliberately rare is sweeping a library that has disappeared from your server: that acts on a
   single answer from Plex about everybody at once, so it runs weekly rather than nightly.
-- **Privacy sync** runs nightly (05:15 by default). It re-merges every account's share filter and
-  builds, delivers and promotes nothing. So it can only ever make your server _more_ private. It is
-  the cheapest safety net against drift.
+- **Privacy sync** runs every 30 minutes by default. It re-merges every account's share filter and
+  builds, delivers and promotes nothing. So it can only ever make your server _more_ private. It reads
+  the list of accounts from Plex each time, so someone you have just shared your server with stops
+  seeing other people's rows within half an hour. A pass that changes nothing takes seconds, and is
+  kept out of the **Recent** list; a failed one still shows there. It is the cheapest safety net
+  against drift.
 - **Check and fix rows on Plex** runs nightly at **05:45**, after the rows build and after the privacy pass, so it
   checks the state those actually left behind. Drift is the failure nobody notices: a row left on the
   wrong shelf stays there until somebody happens to look, so the thing that repairs it is on by

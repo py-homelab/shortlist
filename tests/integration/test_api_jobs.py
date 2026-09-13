@@ -846,7 +846,7 @@ class TestRoutineJobsCanBeExcluded:
         from shortlist.server.db.models import Job
 
         with client.app.state.sessions() as session:
-            session.add(Job(kind="privacy.sync", status="done", payload={}, result={}))
+            session.add(Job(kind="sync.users", status="done", payload={}, result={}))
             session.add(Job(kind="watch.reconcile", status="failed", payload={}, result={}, error="boom"))
             # Buried under enough successful reconciles that a newest-page fetch cannot reach either.
             for _ in range(40):
@@ -862,8 +862,23 @@ class TestRoutineJobsCanBeExcluded:
 
         assert [(j["kind"], j["status"]) for j in rows] == [
             ("watch.reconcile", "failed"),
-            ("privacy.sync", "done"),
+            ("sync.users", "done"),
         ]
+
+    def test_a_privacy_sync_that_worked_stays_out_of_recent_but_one_that_failed_does_not(self, client: TestClient):
+        """It runs every 30 minutes by default, and a clean pass changes nothing anyone needs telling
+        about — 48 a day would own the header's Recent list. A failed one means rows may be visible to
+        the wrong people, so it is exactly what Recent is for."""
+        from shortlist.server.db.models import Job
+
+        with client.app.state.sessions() as session:
+            session.add(Job(kind="privacy.sync", status="failed", payload={}, result={}, error="plex.tv 503"))
+            session.add(Job(kind="privacy.sync", status="done", payload={}, result={}))
+            session.commit()
+
+        rows = client.get("/api/system/jobs", params={"limit": 30, "exclude_routine": "true"}).json()
+
+        assert [(j["kind"], j["status"]) for j in rows] == [("privacy.sync", "failed")]
 
     def test_the_jobs_page_still_sees_every_one(self, client: TestClient):
         """The flag is opt-in per caller. The Jobs page is where you go to look AT reconciles, so it
@@ -883,4 +898,4 @@ class TestRoutineJobsCanBeExcluded:
         job kind from the operator's feed by accident — the feed exists to say something happened."""
         from shortlist.server.services import jobs as jobs_service
 
-        assert jobs_service.routine_kinds() == ("watch.reconcile",)
+        assert jobs_service.routine_kinds() == ("privacy.sync", "watch.reconcile")

@@ -207,12 +207,16 @@ CATALOG: tuple[JobKind, ...] = (
             "\n\nIt does NOT move your rows around the Recommended shelf — the nightly run does that, "
             "and so does Check and fix rows on Plex. This pass only ever changes who can see a row, "
             "never where it sits."
-            "\n\nRuns at 05:15 by default, after the two syncs above, so it works from a list of "
-            "people that has just been refreshed."
+            "\n\nRuns every 30 minutes by default. It reads the list of accounts from Plex each time, "
+            "so someone you have just shared your server with stops seeing other people's rows within "
+            "half an hour. A pass that changes nothing is not listed under Recent."
         ),
         manual=True,
         schedule_job_id="privacy-sync",
         schedule_setting="privacy.sync_cron",
+        # Every 30 minutes by default: a clean pass is not news, and 48 a day would own Recent. A failed
+        # one still shows — it means rows may be visible to people they should not be.
+        routine=True,
         trigger=(
             "Also runs on its own whenever something changes who should see what: someone switched "
             "on or off, a row's audience changed, or a new account turning up on your server."

@@ -44,15 +44,17 @@ DEFAULT_CRONS: dict[str, str] = {
     "sync.users_cron": "47 4 * * *",
     # 03:00 — before any syncs or row runs.
     "backup.cron": "0 3 * * *",
-    # 05:15 — after the watch (04:17) and user (04:47) syncs, so it merges filters for a roster that
-    # has already been refreshed. Only ever makes the server MORE private, so a daily pass costs nothing.
-    "privacy.sync_cron": "15 5 * * *",
+    # Every 30 minutes. It reads the plex.tv account list itself, so this is how soon an account newly
+    # shared with the server stops seeing everyone's rows in the Collections tab — once a day left that
+    # open for up to 24 hours. Only ever makes the server MORE private; a clean pass takes ~20s and
+    # writes nothing (measured on a 48-account server: 320 passes in a week, 2 filter writes).
+    "privacy.sync_cron": "*/30 * * * *",
     # 00:00 exactly, and deliberately NOT offset off the hour like the others: this is the one
     # schedule whose whole meaning is "the day changed" (issue #102). A row set to Mondays that
     # turned over at 00:17 would be wrong for the first seventeen minutes of every day it owns, and
     # a Sunday row would linger into Monday — the thing the screen promises is the calendar day.
     "rows.visibility_cron": "0 0 * * *",
-    # 05:45 — after the rows build (03:30), the syncs, and the privacy pass (05:15), so it checks the
+    # 05:45 — after the rows build (03:30), the syncs, and the 05:30 privacy pass, so it checks the
     # state those actually left behind. Still turn-off-able: clearing the box stores "" and
     # `blank_means_off` keeps it off rather than falling back to this.
     "sync.check_cron": "45 5 * * *",

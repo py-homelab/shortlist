@@ -259,8 +259,23 @@ class TestPrivacySyncSchedule:
             minute, hour = cron.split()[:2]
             return int(hour) * 60 + int(minute)
 
-        others = {key: minutes(cron) for key, cron in DEFAULT_CRONS.items() if key != "maintenance.prune_cron"}
+        def daily(cron: str) -> bool:
+            minute, hour = cron.split()[:2]
+            return minute.isdigit() and hour.isdigit()
+
+        # A schedule that repeats through the day (the privacy sync, every 30 minutes) has no "after".
+        others = {
+            key: minutes(cron) for key, cron in DEFAULT_CRONS.items() if key != "maintenance.prune_cron" and daily(cron)
+        }
         assert minutes(DEFAULT_CRONS["maintenance.prune_cron"]) > max(others.values()), others
+
+    def test_the_privacy_sync_runs_every_30_minutes_out_of_the_box(self, app):
+        """It also reads the plex.tv account list, so it is what hides everyone's rows from an account
+        newly shared with the server. Once a day left such an account able to browse every row in the
+        Collections tab for up to 24 hours; a clean pass takes ~20s and writes nothing."""
+        from shortlist.server.scheduler import DEFAULT_CRONS
+
+        assert DEFAULT_CRONS["privacy.sync_cron"] == "*/30 * * * *"
 
     def test_the_drift_check_runs_nightly_out_of_the_box(self, app):
         """Drift is the failure nobody notices — a row left on the wrong shelf stays there until
