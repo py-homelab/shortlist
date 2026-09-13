@@ -360,6 +360,26 @@ describe("RowEditor — the default row's name", () => {
     expect(screen.getByRole("button", { name: /Rename/ })).toBeEnabled();
   });
 
+  it("lists the {} placeholders beside an existing row's name, before and after you type", async () => {
+    // Only a NEW row's name box said {user}/{library_name}/{top_seed} could be used. An existing row's
+    // said "Renaming rewrites this row on Plex…" and nothing else, so the placeholders were invisible
+    // exactly where a rename is typed.
+    renderEditor(defaultRow());
+    // The hint is one sentence built from several spans, so match the paragraph as a whole.
+    const hint = () =>
+      screen.getByText(
+        (_, el) => el?.tagName === "P" && /for the Plex library the row lands in/.test(el.textContent ?? ""),
+      );
+    expect(hint()).toHaveTextContent("{user}");
+    expect(hint()).toHaveTextContent("{top_seed}");
+    expect(screen.getByText(/Renaming rewrites this row on Plex/)).toBeInTheDocument();
+
+    await userEvent.type(screen.getByDisplayValue("✨ {library_name} Picked for You"), "!");
+
+    expect(await screen.findByRole("status")).toHaveTextContent(/Not applied yet/i);
+    expect(hint()).toHaveTextContent("{library_name}");
+  });
+
   it("keeps Rename disabled until the name actually changes", async () => {
     // Enabled on an unchanged name it offered to rewrite every collection on Plex, for every
     // person, to the name they already had — minutes of writes for no change at all.

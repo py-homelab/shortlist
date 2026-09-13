@@ -578,6 +578,10 @@ export function RowEditor({
                           Rename…
                         </Button>
                       </div>
+                      {/* The same placeholder list a new row's name box shows. Renaming is where a
+                          name is actually typed for an existing row, and without it the box read as
+                          plain text — nothing said {user} or {library_name} would work here. */}
+                      <TemplateVarsHint />
                       {renamePending ? (
                         <p role="status" className="text-sm text-warning">
                           Not applied yet &mdash; press <strong>Rename</strong> to
