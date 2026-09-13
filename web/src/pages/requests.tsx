@@ -1,10 +1,13 @@
 import {
+  ArrowUpDown,
   Clapperboard,
   ExternalLink,
   Inbox,
   Loader2,
   RotateCcw,
+  Search,
   Send,
+  SlidersHorizontal,
   Star,
   Trash2,
   TriangleAlert,
@@ -797,6 +800,107 @@ function FilterSelect<T extends string>({
   );
 }
 
+/** Waiting / Sent / Rejected. Tabs, not a row of buttons: they are separate lists, and the refinements
+ *  under them are what narrow a list. The count is a pill beside the name; the accessible name keeps
+ *  it in brackets ("Sent (23)") so it is read as one phrase. */
+function RequestTabs({
+  value,
+  tabs,
+  onChange,
+  idBase,
+}: {
+  value: RequestView;
+  tabs: { value: RequestView; label: string; count: number }[];
+  onChange: (next: RequestView) => void;
+  /** Prefix for each tab's id (`<idBase>-<value>`) and the panel's (`<idBase>-panel`). */
+  idBase: string;
+}) {
+  // The ARIA tabs pattern: one tab in the Tab order (the selected one), arrows move between them.
+  const move = (from: number, step: number | "first" | "last") => {
+    const next =
+      step === "first" ? 0 : step === "last" ? tabs.length - 1 : (from + step + tabs.length) % tabs.length;
+    const tab = tabs[next];
+    if (!tab) return;
+    onChange(tab.value);
+    document.getElementById(`${idBase}-${tab.value}`)?.focus();
+  };
+  const KEY_STEP: Record<string, number | "first" | "last"> = {
+    ArrowRight: 1,
+    ArrowLeft: -1,
+    Home: "first",
+    End: "last",
+  };
+  return (
+    <div role="tablist" aria-label="Which requests to show" className="flex gap-6 border-b">
+      {tabs.map((tab, index) => {
+        const selected = tab.value === value;
+        return (
+          <button
+            key={tab.value}
+            id={`${idBase}-${tab.value}`}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            aria-controls={`${idBase}-panel`}
+            tabIndex={selected ? 0 : -1}
+            aria-label={tab.count ? `${tab.label} (${tab.count})` : tab.label}
+            onClick={() => onChange(tab.value)}
+            onKeyDown={(e) => {
+              const step = KEY_STEP[e.key];
+              if (step === undefined) return;
+              e.preventDefault();
+              move(index, step);
+            }}
+            className={cn(
+              "-mb-px inline-flex items-center gap-2 border-b-2 pb-2.5 pt-1 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              selected
+                ? "border-primary font-medium text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {tab.label}
+            {tab.count > 0 && (
+              <span
+                className={cn(
+                  "rounded-full px-2 text-xs tabular-nums",
+                  selected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+                )}
+              >
+                {tab.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** One active refinement, removable in place. */
+function FilterChip({
+  label,
+  removeLabel,
+  onRemove,
+}: {
+  label: string;
+  removeLabel: string;
+  onRemove: () => void;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 py-0.5 pl-2.5 pr-1 text-xs font-medium text-primary">
+      {label}
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={removeLabel}
+        className="grid h-4 w-4 place-items-center rounded-full hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <X className="h-3 w-3" aria-hidden="true" />
+      </button>
+    </span>
+  );
+}
+
 /** One person offered by the "Wanted by" filter, and how many titles on this tab they wanted.
  *  `name` is the Plex username stored in `wanters` — the key everything filters on, so two people
  *  who happen to answer to the same display name stay separate; `label` is what the chip shows. */
@@ -853,12 +957,20 @@ function PeopleFilter({
   people,
   selected,
   onToggle,
+  query,
+  onQuery,
+  offerPeople,
 }: {
   people: PersonOption[];
   selected: Set<string>;
   onToggle: (name: string) => void;
+  /** The typed text, owned by the page: it also narrows the list to titles, or wanters, matching it. */
+  query: string;
+  onQuery: (text: string) => void;
+  /** False when one person wanted everything — picking them would hide nothing, so no list is offered. */
+  offerPeople: boolean;
 }) {
-  const [query, setQuery] = useState("");
+  const setQuery = onQuery;
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const labelId = useId();
@@ -884,44 +996,31 @@ function PeopleFilter({
   };
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-      <span id={labelId} className="text-xs text-muted-foreground">
-        Wanted by
+    // One search for the two things people look for: a title by its name, or the titles someone
+    // wanted. Typing narrows the list at once (see `applyQuery`); picking a name from the list makes it
+    // a chip, which asks the SERVER for every title of theirs rather than only this loaded page.
+    <div className="relative min-w-[12rem] flex-1">
+      <span id={labelId} className="sr-only">
+        Search titles, or pick who wanted them
       </span>
-
-      {chosen.map((person) => (
-        <span
-          key={person.name}
-          className="inline-flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground"
-        >
-          {person.count ? `${person.label} (${person.count})` : person.label}
-          <button
-            type="button"
-            onClick={() => onToggle(person.name)}
-            aria-label={`Stop filtering by ${person.label}`}
-            className="rounded-sm opacity-70 hover:opacity-100 focus-visible:opacity-100"
-          >
-            <X className="h-3 w-3" aria-hidden="true" />
-          </button>
-        </span>
-      ))}
-
-      <div className="relative">
+      <Search
+        className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+        aria-hidden="true"
+      />
+      <div>
         <Input
           type="search"
           role="combobox"
-          aria-expanded={open}
+          aria-expanded={open && offerPeople}
           aria-controls={listId}
           aria-labelledby={labelId}
           aria-autocomplete="list"
           aria-activedescendant={
-            open && visible[active] ? `${listId}-${active}` : undefined
+            open && offerPeople && visible[active] ? `${listId}-${active}` : undefined
           }
           autoComplete="off"
-          className="h-8 w-48 text-sm"
-          placeholder={
-            chosen.length ? "Add another person…" : "Search for a person…"
-          }
+          className="h-9 w-full pl-8 text-sm"
+          placeholder="Search titles or people"
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
@@ -944,7 +1043,7 @@ function PeopleFilter({
                 const next = i + step;
                 return next < 0 ? visible.length - 1 : next % visible.length;
               });
-            } else if (e.key === "Enter" && open && visible[active]) {
+            } else if (e.key === "Enter" && open && offerPeople && visible[active]) {
               e.preventDefault();
               pick(visible[active].name);
             } else if (e.key === "Escape") {
@@ -958,7 +1057,7 @@ function PeopleFilter({
           }}
         />
 
-        {open && (
+        {open && offerPeople && (
           <ul
             id={listId}
             role="listbox"
@@ -1126,6 +1225,12 @@ export function RequestsPage() {
   const [minVotes, setMinVotes] = useState("0");
   // Whose requests to show. Empty = everyone's, so the page opens unfiltered.
   const [people, setPeople] = useState<Set<string>>(new Set());
+  // Free text from the search: narrows the list to titles, or wanters, containing it.
+  const [query, setQuery] = useState("");
+  // The rating and vote floors live behind one Filters button rather than as two always-on dropdowns.
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const filtersId = useId();
+  const tabsId = useId();
 
   const togglePerson = (name: string) =>
     setPeople((prev) => {
@@ -1139,6 +1244,7 @@ export function RequestsPage() {
     setMinRating("0");
     setMinVotes("0");
     setPeople(new Set());
+    setQuery("");
   };
 
   const toggle = (id: number) =>
@@ -1228,8 +1334,21 @@ export function RequestsPage() {
     list: T[],
   ): T[] =>
     list.filter((r) => r.rating >= ratingFloor && r.vote_count >= votesFloor);
+  // The search's free text. Matches the title, and the people who wanted it by username or by the name
+  // the Users page shows — so "sarah" finds her titles before she is picked as a chip.
+  const needle = query.trim().toLowerCase();
+  const applyQuery = (list: RequestCandidate[]): RequestCandidate[] =>
+    !needle
+      ? list
+      : list.filter(
+          (r) =>
+            r.title.toLowerCase().includes(needle) ||
+            (r.wanters ?? []).some(
+              (w) => w.toLowerCase().includes(needle) || nameOf(w).toLowerCase().includes(needle),
+            ),
+        );
   const narrow = (list: RequestCandidate[]) =>
-    sortRequests(applyThresholds(applyPeople(applyMedia(list))), sort);
+    sortRequests(applyQuery(applyThresholds(applyPeople(applyMedia(list)))), sort);
   // Built from the server's answer, not from `pending`/`sent`/`rejected` — those stay the loaded
   // page, because the tab counts and the "Wanted by" roster have to keep describing the whole inbox
   // rather than the slice a picked name narrowed it to.
@@ -1261,7 +1380,8 @@ export function RequestsPage() {
   // "nothing clears these filters" note. The media split is excluded on purpose: it only renders
   // when both types are present, so it can never be the reason a list is empty.
   const filtered =
-    minRating !== "0" || minVotes !== "0" || activePeople.size > 0;
+    minRating !== "0" || minVotes !== "0" || activePeople.size > 0 || needle !== "";
+  const floorsSet = (minRating !== "0" ? 1 : 0) + (minVotes !== "0" ? 1 : 0);
 
   // Only visible pending rows are selectable, so an id lingering in the set after a send/reject or a
   // filter change is harmless, but scoping to what's shown keeps the count honest.
@@ -1394,21 +1514,12 @@ export function RequestsPage() {
                 // Tabs, not a long stack: with a big queue the send log used to sit far below the
                 // fold and read as missing. Waiting + Sent are always offered; Rejected appears
                 // only once something's been rejected.
-                const tabs: { value: RequestView; label: string }[] = [
-                  {
-                    value: "waiting",
-                    label: `Waiting${pending.length ? ` (${pending.length})` : ""}`,
-                  },
-                  {
-                    value: "sent",
-                    label: `Sent${sent.length ? ` (${sent.length})` : ""}`,
-                  },
+                const tabs: { value: RequestView; label: string; count: number }[] = [
+                  { value: "waiting", label: "Waiting", count: pending.length },
+                  { value: "sent", label: "Sent", count: sent.length },
                 ];
                 if (rejected.length > 0) {
-                  tabs.push({
-                    value: "rejected",
-                    label: `Rejected (${rejected.length})`,
-                  });
+                  tabs.push({ value: "rejected", label: "Rejected", count: rejected.length });
                 }
 
                 // The Movies/Shows split, scoped to the active tab's list — only offered when that list
@@ -1442,13 +1553,15 @@ export function RequestsPage() {
                   <div className="space-y-6">
                     {!requestsEnabled && <RequestsOffBanner />}
 
-                    {/* Two levels, not one row of fifteen chips: the tab strip decides WHAT you are
-                        looking at and keeps the primary highlight; the refinements below it narrow
-                        that list and stay quiet. */}
+                    {/* Three layers, top to bottom: WHICH list (tabs), how to narrow it (one toolbar), and
+                        what is narrowing it right now (removable chips). It used to be six stacked rows
+                        before the first title — two sets of buttons, three dropdowns, a person search,
+                        and two paragraphs, one of them repeating the page subtitle. */}
                     <div className="space-y-3">
-                      <Segmented
+                      <RequestTabs
+                        idBase={tabsId}
                         value={active}
-                        options={tabs}
+                        tabs={tabs}
                         // Switching tabs clears every refinement so a stale "Movies" (or a name
                         // nobody on this tab carries) can't hide the list with no visible control
                         // to reset it.
@@ -1457,76 +1570,139 @@ export function RequestsPage() {
                           setMedia("all");
                           clearFilters();
                         }}
-                        ariaLabel="Which requests to show"
                       />
+                      <div
+                        role="tabpanel"
+                        id={`${tabsId}-panel`}
+                        aria-labelledby={`${tabsId}-${active}`}
+                        className="space-y-3"
+                      >
                       {(showMediaFilter || activeFull.length > 1) && (
-                        <div className="space-y-2 border-b pb-3">
-                          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                            {showMediaFilter && (
-                              <Segmented
-                                value={media}
-                                onChange={setMedia}
-                                ariaLabel="Filter by library"
-                                options={[
-                                  {
-                                    value: "all",
-                                    label: `All (${activeFull.length})`,
-                                  },
-                                  {
-                                    value: "movie",
-                                    label: `Movies (${movieCount})`,
-                                  },
-                                  {
-                                    value: "show",
-                                    label: `Shows (${showCount})`,
-                                  },
-                                ]}
-                              />
-                            )}
-                            {activeFull.length > 1 && (
-                              <>
-                                <FilterSelect
-                                  label="Sort"
-                                  value={sort}
-                                  onChange={setSort}
-                                  options={SORT_OPTIONS}
-                                />
-                                <FilterSelect
-                                  label="Rating"
-                                  value={minRating}
-                                  onChange={setMinRating}
-                                  options={RATING_OPTIONS}
-                                />
-                                <FilterSelect
-                                  label="Votes"
-                                  value={minVotes}
-                                  onChange={setMinVotes}
-                                  options={VOTES_OPTIONS}
-                                />
-                                {filtered && (
-                                  <button
-                                    type="button"
-                                    onClick={clearFilters}
-                                    className="text-xs text-primary underline-offset-4 hover:underline focus-visible:underline"
-                                  >
-                                    Clear filters
-                                  </button>
-                                )}
-                              </>
-                            )}
-                          </div>
-                          {/* One person wanting everything is no filter at all, so the names only
-                              appear once there are at least two to choose between — and only
-                              alongside the other refinements, so "Clear filters" is always there
-                              to undo them together. */}
-                          {activeFull.length > 1 &&
-                            peopleOptions.length > 1 && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          {showMediaFilter && (
+                            <Segmented
+                              value={media}
+                              onChange={setMedia}
+                              ariaLabel="Filter by library"
+                              options={[
+                                { value: "all", label: `All (${activeFull.length})` },
+                                { value: "movie", label: `Movies (${movieCount})` },
+                                { value: "show", label: `Shows (${showCount})` },
+                              ]}
+                            />
+                          )}
+                          {activeFull.length > 1 && (
+                            <>
                               <PeopleFilter
                                 people={peopleChips}
                                 selected={activePeople}
                                 onToggle={togglePerson}
+                                query={query}
+                                onQuery={setQuery}
+                                // One person wanting everything is no filter at all, so their name is
+                                // not offered — the search still finds titles.
+                                offerPeople={peopleOptions.length > 1}
                               />
-                            )}
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9"
+                                aria-expanded={filtersOpen}
+                                aria-controls={filtersId}
+                                onClick={() => setFiltersOpen((open) => !open)}
+                              >
+                                <SlidersHorizontal aria-hidden="true" />
+                                Filters
+                                {floorsSet > 0 && (
+                                  <span className="rounded-full bg-primary px-1.5 text-[11px] font-bold tabular-nums text-primary-foreground">
+                                    {floorsSet}
+                                  </span>
+                                )}
+                              </Button>
+                              <span className="relative inline-flex items-center">
+                                <ArrowUpDown
+                                  className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+                                  aria-hidden="true"
+                                />
+                                <select
+                                  aria-label="Sort"
+                                  value={sort}
+                                  onChange={(e) => setSort(e.target.value as RequestSort)}
+                                  className="h-9 rounded-md border bg-background pl-8 pr-2 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                >
+                                  {SORT_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </select>
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {filtersOpen && activeFull.length > 1 && (
+                        <div
+                          id={filtersId}
+                          className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-md border bg-card px-3 py-2"
+                        >
+                          <FilterSelect
+                            label="Rating"
+                            value={minRating}
+                            onChange={setMinRating}
+                            options={RATING_OPTIONS}
+                          />
+                          <FilterSelect
+                            label="Votes"
+                            value={minVotes}
+                            onChange={setMinVotes}
+                            options={VOTES_OPTIONS}
+                          />
+                        </div>
+                      )}
+                      {/* Whenever ANYTHING is narrowing the list — even with one title left, when the
+                          toolbar is no longer drawn. A search that emptied the list with no control
+                          left to undo it pointed at a "Clear filters" that did not exist. */}
+                      {filtered && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          {needle && (
+                            <FilterChip
+                              label={`“${query.trim()}”`}
+                              removeLabel="Clear the search"
+                              onRemove={() => setQuery("")}
+                            />
+                          )}
+                          {peopleChips
+                            .filter((person) => activePeople.has(person.name))
+                            .map((person) => (
+                              <FilterChip
+                                key={person.name}
+                                label={person.count ? `${person.label} (${person.count})` : person.label}
+                                removeLabel={`Stop filtering by ${person.label}`}
+                                onRemove={() => togglePerson(person.name)}
+                              />
+                            ))}
+                          {minRating !== "0" && (
+                            <FilterChip
+                              label={`Rating ${RATING_OPTIONS.find((o) => o.value === minRating)?.label ?? minRating}`}
+                              removeLabel={`Remove the Rating ${RATING_OPTIONS.find((o) => o.value === minRating)?.label ?? minRating} filter`}
+                              onRemove={() => setMinRating("0")}
+                            />
+                          )}
+                          {minVotes !== "0" && (
+                            <FilterChip
+                              label={`Votes ${VOTES_OPTIONS.find((o) => o.value === minVotes)?.label ?? minVotes}`}
+                              removeLabel={`Remove the Votes ${VOTES_OPTIONS.find((o) => o.value === minVotes)?.label ?? minVotes} filter`}
+                              onRemove={() => setMinVotes("0")}
+                            />
+                          )}
+                          <button
+                            type="button"
+                            onClick={clearFilters}
+                            className="text-xs text-primary underline-offset-4 hover:underline focus-visible:underline"
+                          >
+                            Clear filters
+                          </button>
                         </div>
                       )}
                       {/* Only when the cap is actually in play — otherwise it is a note about a
@@ -1536,27 +1712,31 @@ export function RequestsPage() {
                           {capNote}
                         </p>
                       )}
-                    </div>
 
                     {active === "waiting" &&
                       (pending.length > 0 ? (
                         <section className="space-y-3">
-                          {/* What the tab strip never said: the tabs are three STATES, and only this
-                              one is asking for a decision. Traceable — `persist_request_queue` drops
-                              a pending row the library now holds, and a title only leaves Waiting
-                              when it is sent, rejected or deleted. */}
-                          <p className="text-sm text-muted-foreground">
-                            Titles Shortlist wanted for your people that your
-                            library doesn&rsquo;t have. Nothing here has been
-                            sent &mdash; send the ones you want, or reject the
-                            rest.
-                          </p>
-
-                          <div className="flex flex-wrap items-center justify-between gap-3">
+                          {/* The action bar. Quiet until something is ticked, then it lights up and says
+                              what it will act on. The Delete-vs-Reject difference rides along as one
+                              short line — the two both clear the list but do opposite things next run,
+                              so it must never be a guess or hover-only. */}
+                          <div
+                            className={cn(
+                              "flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border px-3 py-2",
+                              selectedPending.length > 0
+                                ? "border-primary/45 bg-primary/10"
+                                : "bg-card",
+                            )}
+                          >
                             <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
                               <input
                                 type="checkbox"
                                 checked={allChecked}
+                                // Some ticked but not all: a half-tick, so "3 selected" beside an empty
+                                // box does not read as nothing selected.
+                                ref={(box) => {
+                                  if (box) box.indeterminate = selectedPending.length > 0 && !allChecked;
+                                }}
                                 disabled={!requestsEnabled}
                                 onChange={toggleAll}
                                 className="h-4 w-4 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
@@ -1574,7 +1754,7 @@ export function RequestsPage() {
                             <div
                               role="group"
                               aria-label="Actions for the selected titles"
-                              className="flex items-center gap-2"
+                              className="flex flex-wrap items-center gap-2"
                             >
                               <Button
                                 size="sm"
@@ -1635,21 +1815,22 @@ export function RequestsPage() {
                                 Reject
                               </Button>
                             </div>
+                            <p className="ml-auto text-xs text-muted-foreground">
+                              <strong className="font-medium text-foreground">Delete</strong>{" "}
+                              can come back on a later run &middot;{" "}
+                              <strong className="font-medium text-foreground">Reject</strong>{" "}
+                              blocks it for good
+                            </p>
+                            {selectedPending.length > 0 && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setSelected(new Set())}
+                              >
+                                Clear selection
+                              </Button>
+                            )}
                           </div>
-
-                          {/* Always visible (not just on hover) so the Delete-vs-Reject difference is
-                              never a guess — the two both clear the list but do opposite things next run. */}
-                          <p className="text-xs text-muted-foreground">
-                            <strong className="font-medium text-foreground">
-                              Delete
-                            </strong>{" "}
-                            removes a title for now &mdash; it can return on a
-                            later run if it&rsquo;s still wanted.{" "}
-                            <strong className="font-medium text-foreground">
-                              Reject
-                            </strong>{" "}
-                            blocks it for good &mdash; it won&rsquo;t come back.
-                          </p>
 
                           {(send.isError || reject.isError || del.isError) && (
                             <p
@@ -1836,6 +2017,8 @@ export function RequestsPage() {
                         )}
                       </section>
                     )}
+                      </div>
+                    </div>
                   </div>
                 );
               }}

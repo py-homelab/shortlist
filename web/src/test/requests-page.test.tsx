@@ -138,10 +138,17 @@ function renderPage(initialEntry = "/requests") {
  * box with a list. Tests go through the same two steps a person does: open the box, click the name.
  */
 async function pickPerson(name: string) {
-  await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+  await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
   await userEvent.click(
     await screen.findByRole("option", { name: new RegExp(`^${name},`) }),
   );
+}
+
+/** Open the Filters panel, where the rating and vote floors live. Idempotent: a panel already open
+ *  (a filter is set) stays open. */
+async function openFilters() {
+  const button = screen.getByRole("button", { name: /^Filters/ });
+  if (button.getAttribute("aria-expanded") !== "true") await userEvent.click(button);
 }
 
 /** The bulk toolbar, which acts on the ticked rows. Every action name it carries — Send, Delete,
@@ -227,7 +234,7 @@ describe("RequestsPage", () => {
     // The inbox opens on Waiting; the sent title lives behind the "Sent" tab (labelled with its count).
     expect(await screen.findByText("Dune: Part Two")).toBeTruthy();
     expect(screen.queryByText("Shogun")).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Sent (1)" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sent (1)" }));
     expect(screen.getByText("Shogun")).toBeTruthy();
     // The log is its own section, and each entry carries the app's answer (the outcome).
     expect(
@@ -248,7 +255,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     await userEvent.click(screen.getByRole("button", { name: /^Clear$/i }));
     await waitFor(() => expect(clearRequests).toHaveBeenCalledWith([2]));
@@ -272,7 +279,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     const open = screen.getByRole("link", { name: /Open in Sonarr/i });
     expect((open as HTMLAnchorElement).href).toBe(
@@ -297,7 +304,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     const open = screen.getByRole("link", { name: /Open in Sonarr/i });
     expect((open as HTMLAnchorElement).href).toBe("https://tv.stevez0.com/");
@@ -320,7 +327,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     const open = screen.getByRole("link", { name: /Open in Radarr/i });
     expect((open as HTMLAnchorElement).href).toBe(
@@ -336,7 +343,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await screen.findByText("Dune: Part Two");
-    await userEvent.click(screen.getByRole("button", { name: "Sent" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sent" }));
     expect(
       screen.getByRole("heading", { name: "Sent to Radarr & Sonarr" }),
     ).toBeTruthy();
@@ -374,7 +381,7 @@ describe("RequestsPage", () => {
     renderPage("/requests?tab=dismissed");
     expect(await screen.findByText("Old Reject")).toBeTruthy();
     expect(screen.queryByText("Dune: Part Two")).toBeNull();
-    expect(screen.getByRole("button", { name: "Rejected (1)" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Rejected (1)" })).toBeTruthy();
   });
 
   it("falls back to Waiting when the deep-linked tab has no items to show", async () => {
@@ -386,7 +393,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage("/requests?tab=rejected");
     expect(await screen.findByText("Dune: Part Two")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /^Rejected/ })).toBeNull();
+    expect(screen.queryByRole("tab", { name: /^Rejected/ })).toBeNull();
   });
 
   it("splits the waiting queue by library (Movies / Shows) when both are present", async () => {
@@ -432,6 +439,7 @@ describe("RequestsPage", () => {
     await screen.findByText("Acclaimed");
     expect(screen.getByText("Middling")).toBeTruthy();
     // Raise the floor to 8+ — the 5.2 title drops out, the 9.1 stays.
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Rating"), "8+");
     expect(screen.getByText("Acclaimed")).toBeTruthy();
     expect(screen.queryByText("Middling")).toBeNull();
@@ -451,6 +459,7 @@ describe("RequestsPage", () => {
     await screen.findByText("Well Attested");
     expect(screen.getByText("Barely Rated")).toBeTruthy();
     // A high score on 12 votes is noise — the 500+ floor drops it.
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Votes"), "500+");
     expect(screen.getByText("Well Attested")).toBeTruthy();
     expect(screen.queryByText("Barely Rated")).toBeNull();
@@ -502,6 +511,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await screen.findByText("Middling");
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Rating"), "9+");
     expect(screen.queryByText("Middling")).toBeNull();
     // Not a blank panel: it says how many are waiting and how to get them back.
@@ -722,6 +732,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage("/requests?tab=sent");
     await screen.findByText("Sent Low");
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Rating"), "9+");
     // NOT "Nothing sent yet" — two titles are on file and one control brings them back.
     expect(screen.queryByText(/Nothing sent yet/i)).toBeNull();
@@ -738,8 +749,28 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await screen.findByText("One");
-    // Filtering to the only person there is would hide nothing, so the control isn't drawn.
-    expect(screen.queryByRole("button", { name: /^Sarah/ })).toBeNull();
+    // Filtering to the only person there is would hide nothing, so no list of names is offered — the
+    // search box still finds titles.
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("option", { name: /^Sarah/ })).toBeNull();
+  });
+
+  it("does not pick a person with Enter when no list of names is offered", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "One", wanters: ["Sarah"] }),
+      candidate({ id: 2, tmdb_id: 200, title: "Two", wanters: ["Sarah"] }),
+    ]);
+    renderPage();
+    await screen.findByText("One");
+
+    const box = screen.getByRole("combobox", { name: /who wanted them/i });
+    // "sa" matches Sarah, so without the guard Enter would pick her and clear the box.
+    await userEvent.type(box, "sa{Enter}");
+
+    expect(screen.queryByRole("button", { name: "Stop filtering by Sarah" })).toBeNull();
+    expect(box).toHaveValue("sa");
+    expect(box).toHaveAttribute("aria-expanded", "false");
   });
 
   it("drops a name from the filter once nothing on the tab carries it", async () => {
@@ -774,7 +805,7 @@ describe("RequestsPage", () => {
     );
     await userEvent.click(toolbar().getByRole("button", { name: /^Delete/i }));
     await waitFor(() => expect(screen.getByText("Mike Pick")).toBeTruthy());
-    expect(screen.queryByRole("button", { name: /^Sarah/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop filtering by Sarah" })).toBeNull();
   });
 
   it("offers no library split when the queue is a single media type", async () => {
@@ -802,7 +833,7 @@ describe("RequestsPage", () => {
     renderPage();
     await screen.findByText("Dune: Part Two");
     expect(screen.queryByText("Old Reject")).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Rejected (1)" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Rejected (1)" }));
     expect(screen.getByText("Old Reject")).toBeTruthy();
   });
 
@@ -983,7 +1014,7 @@ describe("RequestsPage", () => {
     await screen.findByText("Sarah Pick");
     // The chip reads as the person, not as their login...
     // The option reads as the person, not as their login...
-    await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
     expect(await screen.findByRole("option", { name: /^Sarah,/ })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /sarah_p89/ })).toBeNull();
 
@@ -1019,7 +1050,7 @@ describe("RequestsPage", () => {
     renderPage();
     await screen.findByText("Sarah Pick");
 
-    await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
     const list = await screen.findByRole("listbox");
 
     // Pete wanted none of the loaded titles, but he is still there to pick...
@@ -1060,9 +1091,9 @@ describe("RequestsPage", () => {
     renderPage();
     await screen.findByText("Sarah Pick");
 
-    await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
     await userEvent.type(
-      screen.getByRole("combobox", { name: /Wanted by/i }),
+      screen.getByRole("combobox", { name: /who wanted them/i }),
       "p89",
     );
 
@@ -1124,7 +1155,7 @@ describe("RequestsPage", () => {
     renderPage();
     // No pending title to findByText, so wait on the tab itself before interacting.
     await userEvent.click(
-      await screen.findByRole("button", { name: "Rejected (1)" }),
+      await screen.findByRole("tab", { name: "Rejected (1)" }),
     );
     await userEvent.click(screen.getByRole("button", { name: /Allow again/i }));
     // Restore (back to pending) — NOT delete: the item must reappear in Waiting, not vanish.
@@ -1144,7 +1175,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Rejected (2)" }),
+      await screen.findByRole("tab", { name: "Rejected (2)" }),
     );
     await userEvent.click(
       screen.getByRole("button", { name: /Allow all again/i }),
@@ -1392,6 +1423,142 @@ describe("RequestsPage", () => {
  * fetched ONCE with no polling and nothing ever invalidated it, so two of those three were states
  * you could sit in indefinitely with no way to tell which you were in.
  */
+describe("RequestsPage — the header", () => {
+  // Six stacked rows sat above the first title: two sets of buttons, three dropdowns, a person search,
+  // a paragraph repeating the page subtitle, and a second paragraph explaining Delete and Reject.
+  beforeEach(() => {
+    listRequests.mockReset();
+    getSettings.mockResolvedValue({ "requests.enabled": true });
+    getUsers.mockResolvedValue([]);
+    getArrStatus.mockResolvedValue({ statuses: {}, radarr: "off", sonarr: "off" });
+  });
+
+  const twoWaitingOneSent = () =>
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Acclaimed", rating: 9.1, wanters: ["sarah"] }),
+      candidate({ id: 2, tmdb_id: 200, title: "Middling", rating: 5.2, wanters: ["mike"] }),
+      candidate({ id: 3, tmdb_id: 300, title: "Sent One", status: "sent", wanters: ["ann"] }),
+    ]);
+
+  it("shows Waiting and Sent as tabs, since they are two lists rather than two filters", async () => {
+    twoWaitingOneSent();
+    renderPage();
+
+    const tabs = await screen.findByRole("tablist", { name: "Which requests to show" });
+    const waiting = within(tabs).getByRole("tab", { name: "Waiting (2)" });
+    expect(waiting).toHaveAttribute("aria-selected", "true");
+    await userEvent.click(within(tabs).getByRole("tab", { name: "Sent (1)" }));
+    expect(within(tabs).getByRole("tab", { name: "Sent (1)" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByText("Sent One")).toBeTruthy();
+  });
+
+  it("finds a title by typing its name in the search", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    await userEvent.type(screen.getByRole("combobox", { name: /who wanted them/i }), "accl");
+
+    expect(screen.getByText("Acclaimed")).toBeTruthy();
+    expect(screen.queryByText("Middling")).toBeNull();
+  });
+
+  it("finds titles by who wanted them in the same search", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    await userEvent.type(screen.getByRole("combobox", { name: /who wanted them/i }), "mike");
+
+    expect(screen.getByText("Middling")).toBeTruthy();
+    expect(screen.queryByText("Acclaimed")).toBeNull();
+  });
+
+  it("keeps rating and votes behind one Filters button, and shows an active floor as a removable chip", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+    expect(screen.queryByLabelText("Rating")).toBeNull();
+
+    await openFilters();
+    await userEvent.selectOptions(screen.getByLabelText("Rating"), "8+");
+
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("1");
+    expect(screen.queryByText("Middling")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Remove the Rating 8+ filter" }));
+    expect(screen.getByText("Middling")).toBeTruthy();
+  });
+
+  it("shows the typed search as a chip, so it can be cleared even once the search box is gone", async () => {
+    // Search "dune", send Dune, and Arrival is the only title left: with one title the toolbar is not
+    // drawn, but the text still filtered — an empty list pointing at a "Clear filters" that did not exist.
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Dune" }),
+      candidate({ id: 2, tmdb_id: 200, title: "Arrival" }),
+    ]);
+    renderPage();
+    await screen.findByText("Arrival");
+    await userEvent.type(screen.getByRole("combobox", { name: /who wanted them/i }), "dune");
+    expect(screen.getByText("“dune”")).toBeTruthy();
+
+    listRequests.mockResolvedValue([candidate({ id: 2, tmdb_id: 200, title: "Arrival" })]);
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Dune" }));
+    await userEvent.click(toolbar().getByRole("button", { name: /^Delete/i }));
+
+    await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
+    await userEvent.click(screen.getByRole("button", { name: "Clear the search" }));
+    expect(await screen.findByText("Arrival")).toBeTruthy();
+  });
+
+  it("keeps the Delete and Reject difference on screen while titles are selected", async () => {
+    // That is exactly when the bulk buttons act — the difference must not be hover-only then.
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Acclaimed" }));
+
+    expect(screen.getByRole("button", { name: "Clear selection" })).toBeTruthy();
+    expect(screen.getByText(/blocks it for good/)).toBeTruthy();
+  });
+
+  it("moves between tabs with the arrow keys, and labels the panel by its tab", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    const waiting = await screen.findByRole("tab", { name: "Waiting (2)" });
+    expect(waiting).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("tab", { name: "Sent (1)" })).toHaveAttribute("tabindex", "-1");
+
+    waiting.focus();
+    await userEvent.keyboard("{ArrowRight}");
+
+    const sentTab = screen.getByRole("tab", { name: "Sent (1)" });
+    expect(sentTab).toHaveAttribute("aria-selected", "true");
+    expect(sentTab).toHaveFocus();
+    expect(screen.getByRole("tabpanel", { name: "Sent (1)" })).toBeTruthy();
+  });
+
+  it("does not repeat the page subtitle above the list", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    expect(screen.queryByText(/Titles Shortlist wanted for your people/)).toBeNull();
+  });
+
+  it("turns the select-all row into an action bar that can clear the selection", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Acclaimed" }));
+
+    expect(screen.getByText("1 selected")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect(screen.getByText("2 waiting")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Clear selection" })).toBeNull();
+  });
+});
+
 describe("RequestsPage — what Sonarr/Radarr has", () => {
   beforeEach(() => {
     listRequests.mockReset();
@@ -1593,7 +1760,7 @@ describe("RequestsPage — what Sonarr/Radarr has", () => {
     expect(document.body.textContent).not.toMatch(/Radarr|Sonarr/);
     expect(document.body.textContent).toMatch(/Overseerr/);
 
-    await userEvent.click(screen.getByRole("button", { name: /^Sent/ }));
+    await userEvent.click(screen.getByRole("tab", { name: /^Sent/ }));
     expect(await screen.findByText("Shogun")).toBeInTheDocument();
     expect(document.body.textContent).not.toMatch(/Radarr|Sonarr/);
     expect(document.body.textContent).toMatch(/Sent to Overseerr/);
@@ -1621,7 +1788,7 @@ describe("RequestsPage — what Sonarr/Radarr has", () => {
     expect(document.body.textContent).toMatch(/Radarr/);
     expect(document.body.textContent).not.toMatch(/Overseerr/);
 
-    await userEvent.click(screen.getByRole("button", { name: /^Sent/ }));
+    await userEvent.click(screen.getByRole("tab", { name: /^Sent/ }));
     expect(await screen.findByText("Shogun")).toBeInTheDocument();
     expect(document.body.textContent).toMatch(/Sent to Radarr/);
     expect(document.body.textContent).not.toMatch(/Overseerr/);
