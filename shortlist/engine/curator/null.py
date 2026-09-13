@@ -10,6 +10,7 @@ class NullCurator:
     # Every real curator leaves this at its `getattr(..., True)` default; only this one says no.
     can_complete = False
     last_tokens = 0  # no LLM call, so callers can read this uniformly without a getattr fallback
+    last_output_tokens = 0
 
     def complete(self, system: str, user: str) -> str:
         """No model to call.

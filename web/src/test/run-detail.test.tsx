@@ -368,6 +368,24 @@ describe("RunDetailPage — grouped by library", () => {
     expect(screen.getByText("sent + received")).toBeInTheDocument();
   });
 
+  it("splits the AI tokens into input and output, which are billed at different rates", async () => {
+    const r = run([]);
+    r.stats = {
+      users_ok: 1,
+      users_error: 0,
+      llm_tokens: 360699,
+      llm_output_tokens: 60699,
+      llm_tokens_by_step: { llm_web: 360699 },
+    };
+    getRun.mockResolvedValue(r);
+
+    renderDetail("");
+
+    await expandRows();
+
+    expect(await screen.findByText("300,000 in · 60,699 out")).toBeInTheDocument();
+  });
+
   it("says what the AI-token figure counts, cache included", async () => {
     const r = run([]);
     r.stats = { users_ok: 1, users_error: 0, llm_tokens: 9000, llm_tokens_by_step: { llm_web: 9000 } };

@@ -46,6 +46,7 @@ class GoogleCurator:
     name = "google"
     supports_native_web_search = True  # Gemini's Google Search grounding tool (see recommend_web)
     last_tokens = ThreadLocalTokens()  # per-thread, so parallel per-user web search doesn't race
+    last_output_tokens = ThreadLocalTokens()
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL, timeout: float = 60.0):
         try:
@@ -139,6 +140,7 @@ class GoogleCurator:
                 return []
         usage = getattr(r, "usage_metadata", None)
         self.last_tokens = getattr(usage, "total_token_count", 0) or 0
+        self.last_output_tokens = _output_tokens(usage)
         if not _searched(r):
             # INFO, not WARNING, and no longer "these titles are stale". Re-measured 2026-09-03 under
             # the year-anchored prompt: Gemini still issues no search queries for this task, but the
@@ -183,7 +185,14 @@ class GoogleCurator:
             return ""
         usage = getattr(r, "usage_metadata", None)
         self.last_tokens = getattr(usage, "total_token_count", 0) or 0
+        self.last_output_tokens = _output_tokens(usage)
         return r.text or ""
+
+
+def _output_tokens(usage: object) -> int:
+    """The billed-as-output share of a Gemini call: the reply plus any thinking tokens, which Google
+    bills at the output rate but reports in a count of their own."""
+    return (getattr(usage, "candidates_token_count", 0) or 0) + (getattr(usage, "thoughts_token_count", 0) or 0)
 
 
 def _searched(response: object) -> bool:

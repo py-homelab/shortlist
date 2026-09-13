@@ -1340,6 +1340,7 @@ def _record_gather(
     for source, tokens in stats.tokens_by_source.items():
         report.llm_tokens += tokens
         _add_step_tokens(report, source, tokens)
+    report.llm_output_tokens += stats.output_tokens
     report.exa_searches += stats.exa_searches
     report.exa_cache_hits += stats.exa_cache_hits
     if stats.trace:

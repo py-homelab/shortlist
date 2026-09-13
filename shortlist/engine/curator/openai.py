@@ -72,6 +72,7 @@ class OpenAICurator:
     name = "openai"
     supports_native_web_search = True  # Responses API web_search tool (see recommend_web)
     last_tokens = ThreadLocalTokens()  # per-thread, so parallel per-user web search doesn't race
+    last_output_tokens = ThreadLocalTokens()
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL, timeout: float = 60.0, base_url: str | None = None):
         try:
@@ -140,6 +141,8 @@ class OpenAICurator:
         usage = getattr(r, "usage", None)
         if usage is not None:
             self.last_tokens = getattr(usage, "total_tokens", 0) or 0
+            # Responses API: `output_tokens` already includes any reasoning tokens.
+            self.last_output_tokens = getattr(usage, "output_tokens", 0) or 0
         return parse_web_titles(getattr(r, "output_text", "") or "", k)
 
     def _web_search_call(self, system: str, user: str, *, with_schema: bool):
@@ -192,4 +195,5 @@ class OpenAICurator:
         usage = getattr(r, "usage", None)
         if usage is not None:
             self.last_tokens = getattr(usage, "total_tokens", 0) or 0
+            self.last_output_tokens = getattr(usage, "completion_tokens", 0) or 0
         return r.choices[0].message.content or ""

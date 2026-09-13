@@ -104,6 +104,9 @@ class GatherStats:
     """
 
     tokens_by_source: dict[str, int] = field(default_factory=dict)
+    # The output share of those tokens. Providers bill output at several times the input rate (5x on
+    # Claude Haiku), so one total hides where the money goes.
+    output_tokens: int = 0
     exa_searches: int = 0
     exa_cache_hits: int = 0
     # A diagnostic record of WHAT each source queried and returned this gather — the raw material of
@@ -113,10 +116,12 @@ class GatherStats:
     # "web": {mode, searches, rag_system, rag_user, proposed, resolved}}.
     trace: dict = field(default_factory=dict)
 
-    def add_tokens(self, source: str, n: int) -> None:
-        """Add a source's token spend (a no-op for 0, e.g. NullCurator or a skipped call)."""
+    def add_tokens(self, source: str, n: int, output: int = 0) -> None:
+        """Add a source's token spend, `output` of it being output (a no-op for 0, e.g. NullCurator or a
+        skipped call)."""
         if n:
             self.tokens_by_source[source] = self.tokens_by_source.get(source, 0) + n
+            self.output_tokens += output
 
 
 def _clear_last_tokens(curator) -> None:
@@ -128,6 +133,8 @@ def _clear_last_tokens(curator) -> None:
     """
     if hasattr(curator, "last_tokens"):
         curator.last_tokens = 0
+    if hasattr(curator, "last_output_tokens"):
+        curator.last_output_tokens = 0
 
 
 def _web_search_capable(curator, search, mode: str) -> bool:
@@ -191,7 +198,7 @@ def web_recommendations(
     else:
         _clear_last_tokens(curator)
         recs = curator.recommend_web(profile, seeds, k)
-        stats.add_tokens("llm_web", getattr(curator, "last_tokens", 0))
+        stats.add_tokens("llm_web", getattr(curator, "last_tokens", 0), getattr(curator, "last_output_tokens", 0))
     recs = _drop_watched_proposals(recs, seeds, profile, web_trace)
     # Cap here, not before the filter: the keyless path hands back every extracted title so that
     # dropping watched ones eats into the surplus rather than into the row. A no-op for the model
@@ -362,7 +369,7 @@ def _web_via_search(
         return _titles_as_proposals(candidates, web_trace, reason="no AI provider configured")
     _clear_last_tokens(curator)
     titles = parse_web_titles(curator.complete(system, user), k)
-    stats.add_tokens("llm_web", getattr(curator, "last_tokens", 0))
+    stats.add_tokens("llm_web", getattr(curator, "last_tokens", 0), getattr(curator, "last_output_tokens", 0))
     # Same fallback for a model that answered with nothing usable — rate-limited, timed out, or
     # replying in prose. Degrading to Exa's own extraction beats losing the searches we just paid for.
     if not titles and candidates:

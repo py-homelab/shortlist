@@ -30,6 +30,7 @@ class AnthropicCurator:
     name = "anthropic"
     supports_native_web_search = True  # Claude's web_search server tool (see recommend_web)
     last_tokens = ThreadLocalTokens()  # per-thread, so parallel per-user web search doesn't race
+    last_output_tokens = ThreadLocalTokens()
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL, timeout: float = 60.0):
         try:
@@ -96,6 +97,7 @@ class AnthropicCurator:
             logger.warning("llm_web (anthropic): {}", e)
             return []
         self.last_tokens = response.usage.input_tokens + response.usage.output_tokens
+        self.last_output_tokens = response.usage.output_tokens
         # The model may emit several text blocks around its searches; the JSON list is in the last one.
         text = "".join(b.text for b in response.content if b.type == "text")
         return parse_web_titles(text, k)
@@ -115,4 +117,5 @@ class AnthropicCurator:
             logger.warning("complete (anthropic): {}", e)
             return ""
         self.last_tokens = response.usage.input_tokens + response.usage.output_tokens
+        self.last_output_tokens = response.usage.output_tokens
         return "".join(b.text for b in response.content if b.type == "text")

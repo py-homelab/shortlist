@@ -556,6 +556,9 @@ export interface RunStats {
   >;
   /** Total AI tokens this run cost (curate + the AI candidate sources). Absent on legacy runs. */
   llm_tokens?: number;
+  /** The output share of `llm_tokens`, billed at a higher rate than input. Absent on runs before it was
+   *  measured. */
+  llm_output_tokens?: number;
   /** That total split by where it went: { curate, llm_web, llm_library }. */
   llm_tokens_by_step?: Record<string, number>;
   /** External web searches run this run, whichever backend ran them (Exa or SearXNG). Counted per

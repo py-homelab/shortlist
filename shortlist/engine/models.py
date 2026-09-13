@@ -1336,6 +1336,9 @@ class UserRunReport:
     # Total AI tokens this user cost this run — the llm_web source (web-search title discovery) is
     # the only thing that spends them now.
     llm_tokens: int = 0
+    # The output share of `llm_tokens`. Billed at several times the input rate, so the run page shows
+    # the two apart rather than one total that hides where the money went.
+    llm_output_tokens: int = 0
     # The same total split by WHERE it went: {"llm_web": N}. Lets the UI answer "what did the AI
     # actually spend tokens on" per person, not just a lump sum.
     llm_tokens_by_step: dict[str, int] = field(default_factory=dict)

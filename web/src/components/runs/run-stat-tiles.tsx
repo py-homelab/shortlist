@@ -88,6 +88,16 @@ export function RunStatTiles({ run }: { run: RunDetail }) {
   // "web search 467,463 · final picks 52,625 tokens" — the trailing unit makes clear these are token
   // counts, not the (separate) Exa search count shown in its own tile below.
   const stepInline = tokenStepBreakdown(s.llm_tokens_by_step);
+  // In and out rather than one total when the run measured both: output is billed at several times the
+  // input rate (5x on Claude Haiku), so a total alone cannot say where the money went. A run recorded
+  // before the split was measured keeps the older wording.
+  const output = s.llm_output_tokens;
+  const tokenHint =
+    output != null && output <= tokens
+      ? `${(tokens - output).toLocaleString()} in · ${output.toLocaleString()} out`
+      : stepInline
+        ? `${stepInline} · sent + received`
+        : "sent + received";
   // The two AI tiles are conditional, so the track count has to be too. Hard-coding six left a
   // no-AI run's four tiles filling two-thirds of the row with a third of it blank, which reads as
   // something that failed to load. Full class strings — Tailwind cannot see an interpolated one.
@@ -167,12 +177,12 @@ export function RunStatTiles({ run }: { run: RunDetail }) {
           icon={Sparkles}
           label="AI tokens"
           value={tokens.toLocaleString()}
-          hint={stepInline ? `${stepInline} · sent + received` : "sent + received"}
+          hint={tokenHint}
           // The owner asked whether this includes cached tokens. It is each call's input and output
           // tokens as the provider reported them: Anthropic's `input_tokens` excludes cache reads and
           // writes (and Shortlist sets no cache_control, so both are 0); OpenAI's `total_tokens` and
           // Gemini's `total_token_count` count cached input inside the prompt figure.
-          title="Input and output tokens the AI provider reported for each call this run, added up — what it bills on. With Claude nothing is cached, so this is every token sent and received. OpenAI and Gemini count input they served from their own prompt cache in here too, and bill that part at a discount. The 7-day web-search cache saves web searches, not tokens. Turn AI sources off in Settings → Finding titles to lower it."
+          title="Input and output tokens the AI provider reported for each call this run, added up — what it bills on, shown as input and output because output costs several times more. With Claude nothing is cached, so this is every token sent and received. OpenAI and Gemini count input they served from their own prompt cache in here too, and bill that part at a discount. The 7-day web-search cache saves web searches, not tokens. Turn AI sources off in Settings → Finding titles to lower it."
         />
       )}
       {showExa && (

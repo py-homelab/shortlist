@@ -1695,6 +1695,9 @@ def _finalize_run(
         "requests_examined": report.requests.examined if report.requests else 0,
         "requests_lookups": report.requests.lookups_spent if report.requests else 0,
         "llm_tokens": sum(u.llm_tokens for u in report.users),
+        # The output share of that total, which the provider bills at a higher rate. Absent on runs
+        # recorded before it was measured — the UI then shows the total alone.
+        "llm_output_tokens": sum(u.llm_output_tokens for u in report.users),
         "llm_tokens_by_step": tokens_by_step,
         "exa_searches": sum(u.exa_searches for u in report.users),
         # Cache hits served from the shared 14-day web-search cache. Reported so the UI can read

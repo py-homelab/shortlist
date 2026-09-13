@@ -2559,6 +2559,7 @@ class TestPerRowOverrides:
                 # Set BY the call, as every real provider does. A value left over from before the call
                 # is exactly what a failed call reads back, and it is no longer billed.
                 self.last_tokens = 50
+                self.last_output_tokens = 5
                 return [{"title": "Web Pick", "year": 2020, "media": "movie"}]
 
         ctx.curator = _WebCurator()
@@ -2583,6 +2584,7 @@ class TestPerRowOverrides:
         assert u.llm_tokens == 50
         # Tokens are attributed to the SOURCE that spent them (llm_web), not a curate step.
         assert u.llm_tokens_by_step == {"llm_web": 50}
+        assert u.llm_output_tokens == 5
         assert u.exa_searches == 0  # native web search, no external Exa backend
         # No per-row LLM spend anymore: breakdown entries carry no token key.
         assert u.breakdown and all("llm_tokens" not in e for e in u.breakdown)

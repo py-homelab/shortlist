@@ -243,6 +243,7 @@ class TestRunExecution:
             "requests_examined": 0,
             "requests_lookups": 0,
             "llm_tokens": 0,
+            "llm_output_tokens": 0,
             "llm_tokens_by_step": {},
             "exa_searches": 0,
             "exa_cache_hits": 0,
@@ -523,6 +524,7 @@ class TestRunExecution:
             diff=CollectionDiff(added=["Dune"]),
             duration_s=0.5,
             llm_tokens=120,
+            llm_output_tokens=20,
             trace={"gathers": [{"source": "popular"}]},
             breakdown=[{"row_slug": "popular", "row_title": "👥 Popular on SFLIX", "library_key": "1"}],
         )
@@ -543,6 +545,9 @@ class TestRunExecution:
             assert row.status == "ok"
             assert row.trace == {"gathers": [{"source": "popular"}]}, "the trace is the whole point"
             assert row.llm_tokens == 120
+            # The run's output share, summed like its total: output is billed at several times the input rate.
+            assert run.stats["llm_tokens"] == 120
+            assert run.stats["llm_output_tokens"] == 20
             assert [p["title"] for p in row.picks] == ["Dune"], "its picks are on the row — never in `picks`"
             assert session.query(PickRow).filter_by(run_id=run.id).count() == 0, (
                 "PickRow.user_id is RESTRICT-keyed to a real account; a shared row must not invent one"

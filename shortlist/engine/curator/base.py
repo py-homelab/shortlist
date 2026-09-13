@@ -50,9 +50,11 @@ class Curator(Protocol):
     # ``recommend_web``. False for local/offline providers (Ollama) and NullCurator — they can still
     # power the ``llm_web`` source via an external search provider (Exa) feeding ``complete``.
     supports_native_web_search: bool
-    # Output-token count from THIS thread's most recent web-search call, for per-run accounting. A
+    # Total (input + output) tokens from THIS thread's most recent LLM call, for per-run accounting. A
     # ThreadLocalTokens descriptor on the network providers; a plain 0 on NullCurator (no LLM call).
     last_tokens: int
+    # The output share of `last_tokens` — billed at a higher rate than input, so reported apart.
+    last_output_tokens: int
 
     def complete(self, system: str, user: str) -> str:
         """Plain text completion — no tools, no schema. Powers the external-search ``llm_web`` path,

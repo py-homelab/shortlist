@@ -1051,11 +1051,14 @@ class TestGatherStats:
 
             def recommend_web(self, profile, seeds, k):
                 self.last_tokens = 321
+                self.last_output_tokens = 21
                 return [{"title": "Native Pick", "year": 2020, "media": "movie"}]
 
         stats = GatherStats()
         gather_candidates(mock_tmdb, [seed(1)], sources=["llm_web"], curator=_C(), profile=web_profile(), stats=stats)
         assert stats.tokens_by_source == {"llm_web": 321}
+        # Output is the part of that total billed at the higher rate, so it is kept apart.
+        assert stats.output_tokens == 21
         assert stats.exa_searches == 0  # the native tool doesn't use Exa
 
     def test_exa_path_counts_a_search_and_its_completion_tokens(self, mock_tmdb):
@@ -1075,6 +1078,7 @@ class TestGatherStats:
 
             def complete(self, system, user):
                 self.last_tokens = 99
+                self.last_output_tokens = 9
                 return '[{"title": "Exa Pick", "year": 2021, "media": "movie"}]'
 
         stats = GatherStats()
@@ -1089,6 +1093,7 @@ class TestGatherStats:
             stats=stats,
         )
         assert stats.tokens_by_source == {"llm_web": 99}
+        assert stats.output_tokens == 9
         assert stats.exa_searches == 1  # the search request itself, billed per search
 
     def test_native_web_records_no_tokens_when_the_call_fails_after_an_earlier_one(self, mock_tmdb):
@@ -1100,6 +1105,7 @@ class TestGatherStats:
             # touching `last_tokens` (pinned in test_curator.py), so reading it after a failed call used
             # to bill that earlier call a second time.
             last_tokens = 7800
+            last_output_tokens = 600
 
             def recommend_web(self, profile, seeds, k):
                 return []  # the provider's own degrade-on-error shape
@@ -1107,6 +1113,7 @@ class TestGatherStats:
         stats = GatherStats()
         gather_candidates(mock_tmdb, [seed(1)], sources=["llm_web"], curator=_C(), profile=web_profile(), stats=stats)
         assert stats.tokens_by_source == {}
+        assert stats.output_tokens == 0
 
     def test_exa_path_records_no_tokens_when_the_completion_fails_after_an_earlier_one(self, mock_tmdb):
         mock_tmdb.genre_names.return_value = {}
