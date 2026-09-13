@@ -2023,6 +2023,82 @@ class TestNoTwoRowsShareATitle:
         assert first["id"]
 
 
+class TestADeletedRowsSlugIsNotHandedToANewRow:
+    """A row's slug is its identity in every history table — last run's picks, the delivery ledger,
+    shared-row picks and watch credits, and which row a queued request belongs to. Deleting a row
+    frees the slug in `collections` only, so a new row with the same name took it over and inherited
+    all of that: seen live on 2026-09-13, a re-created row's first run redelivered the deleted row's
+    five picks as "not due to rebuild"."""
+
+    def _history(self, session, kind: str, slug: str) -> None:
+        from shortlist.server.db.models import (
+            Delivery,
+            PickRow,
+            RequestCandidate,
+            Run,
+            RunSharedRow,
+            SharedRowWatch,
+        )
+
+        user = session.query(User).first() or User(plex_account_id=4242, username="sarah", slug="sarah")
+        session.add(user)
+        run = Run(trigger="manual", status="ok")
+        session.add(run)
+        session.flush()
+        session.add(
+            {
+                "picks": lambda: PickRow(
+                    run_id=run.id,
+                    user_id=user.id,
+                    tmdb_id=1,
+                    media_type="movie",
+                    rating_key=10,
+                    rank=1,
+                    collection_slug=slug,
+                    section_key="1",
+                ),
+                "deliveries": lambda: Delivery(
+                    collection_slug=slug, user_slug=user.slug, library_key="1", rating_key=10
+                ),
+                "run_shared_rows": lambda: RunSharedRow(run_id=run.id, collection_slug=slug),
+                "shared_row_watches": lambda: SharedRowWatch(
+                    user_id=user.id, collection_slug=slug, tmdb_id=1, media_type="movie"
+                ),
+                "request_candidates": lambda: RequestCandidate(tmdb_id=1, media_type="movie", title="T", row_slug=slug),
+            }[kind]()
+        )
+        session.commit()
+
+    @pytest.mark.parametrize(
+        "kind", ["picks", "deliveries", "run_shared_rows", "shared_row_watches", "request_candidates"]
+    )
+    def test_a_slug_history_still_names_is_not_reused(self, client: TestClient, kind: str):
+        from shortlist.server.db.models import Collection
+
+        first = client.post("/api/collections", json={"name": "Hidden Gems"}).json()
+        assert first["slug"] == "hidden_gems"
+        with client.app.state.sessions() as session:
+            self._history(session, kind, "hidden_gems")
+            session.delete(session.get(Collection, first["id"]))
+            session.commit()
+
+        again = client.post("/api/collections", json={"name": "Hidden Gems"}).json()
+
+        assert again["slug"] != "hidden_gems", f"the new row inherited the deleted row's {kind}"
+
+    def test_a_slug_nothing_remembers_is_still_used_as_is(self, client: TestClient):
+        from shortlist.server.db.models import Collection
+
+        first = client.post("/api/collections", json={"name": "Hidden Gems"}).json()
+        with client.app.state.sessions() as session:
+            session.delete(session.get(Collection, first["id"]))
+            session.commit()
+
+        again = client.post("/api/collections", json={"name": "Hidden Gems"}).json()
+
+        assert again["slug"] == "hidden_gems"
+
+
 class TestTheSameTitleInDifferentLibraries:
     """Issue #121: two rows may share a title when they can never build in the same library.
 

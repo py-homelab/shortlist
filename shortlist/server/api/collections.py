@@ -47,7 +47,18 @@ from shortlist.server.api.row_changes import (
 )
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
-from shortlist.server.db.models import DEFAULT_SLUG, Collection, CollectionAudience, Event, PickRow, User
+from shortlist.server.db.models import (
+    DEFAULT_SLUG,
+    Collection,
+    CollectionAudience,
+    Delivery,
+    Event,
+    PickRow,
+    RequestCandidate,
+    RunSharedRow,
+    SharedRowWatch,
+    User,
+)
 from shortlist.server.scheduler import crontab_trigger, rebuild_schedule
 from shortlist.server.services import collection_reconcile as reconcile
 from shortlist.server.services import jobs, poster_service, report_service
@@ -841,8 +852,28 @@ def _reject_duplicate_name(
 
 
 def _unique_slug(session, base: str) -> str:
+    """A slug no row has now AND no history still names.
+
+    The slug is a row's identity in every history table, and deleting a row frees it in `collections`
+    alone. A new row that took it over inherited the deleted row's last picks (redelivered as "not due
+    to rebuild"), its delivery ledger, its shared-row picks and watch credits, and its queued requests —
+    seen live on 2026-09-13. Retention pruning eventually frees such a slug, once nothing is left to
+    inherit.
+    """
     base = base if base not in RESERVED_SLUGS else f"{base}_row"
-    return dedupe_slug(base, lambda slug: session.query(Collection).filter_by(slug=slug).first() is not None)
+    columns = (
+        Collection.slug,
+        PickRow.collection_slug,
+        Delivery.collection_slug,
+        RunSharedRow.collection_slug,
+        SharedRowWatch.collection_slug,
+        RequestCandidate.row_slug,
+    )
+
+    def is_taken(slug: str) -> bool:
+        return any(session.query(column).filter(column == slug).first() is not None for column in columns)
+
+    return dedupe_slug(base, is_taken)
 
 
 def _set_audience(session, collection: Collection, body: CollectionIn) -> None:
