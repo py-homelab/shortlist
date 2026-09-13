@@ -982,7 +982,16 @@ class TestRunsApi:
             "watched",
             "finished",
         }
-        assert set(body["top_titles"][0]) == {"tmdb_id", "media_type", "title", "watchers"}
+        # A title shown as a title: poster key, year and the first few watchers ride with the count.
+        assert set(body["top_titles"][0]) == {
+            "tmdb_id",
+            "media_type",
+            "title",
+            "watchers",
+            "rating_key",
+            "year",
+            "watcher_sample",
+        }
         assert set(body["recent"][0]) == {
             # Null once someone has left the server: the watch stays on record, so the line still
             # renders — it just has nowhere to send you.
@@ -991,6 +1000,10 @@ class TestRunsApi:
             "display_name",
             "title",
             "media_type",
+            # For the poster and the look-up links.
+            "tmdb_id",
+            "rating_key",
+            "year",
             "row",
             "library",
             "seed_title",

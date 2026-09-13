@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -143,7 +143,18 @@ const REPORT: EffectivenessReport = {
   },
   ...EMPTY,
   top_titles: [
-    { tmdb_id: 1, media_type: "movie", title: "Dune: Part Two", watchers: 3 },
+    {
+      tmdb_id: 693134,
+      media_type: "movie",
+      title: "Dune: Part Two",
+      watchers: 3,
+      rating_key: 7007,
+      year: 2024,
+      watcher_sample: [
+        { id: 42, name: "Sarah H" },
+        { id: 43, name: "Mike" },
+      ],
+    },
   ],
   trend: [{ week: "2026-28", watched: 4, finished: 3 }],
   per_user: [
@@ -191,6 +202,9 @@ const REPORT: EffectivenessReport = {
       display_name: "Sarah H",
       title: "Dune: Part Two",
       media_type: "movie",
+      tmdb_id: 693134,
+      rating_key: 7007,
+      year: 2024,
       row: "✨ Movies Picked for You",
       library: "Movies",
       seed_title: "Arrival",
@@ -220,11 +234,10 @@ describe("ImpactReport", () => {
     // Each requests figure in its OWN slot. `/sent ·/` matched the label regardless of which number
     // sat beside it, and the fixture had two of the three equal — so any figure could appear in any
     // slot (mutation audit 2026-08-25). The three are now distinct and each is named.
-    const requestsLine =
-      screen.getByText(/awaiting approval/).textContent ?? "";
-    expect(requestsLine).toMatch(/21\s*sent/);
-    expect(requestsLine).toMatch(/23\s*watched since/);
-    expect(requestsLine).toMatch(/22\s*awaiting approval/);
+    expect(screen.getByTestId("requests-sent")).toHaveTextContent(/^21\s*sent$/);
+    expect(screen.getByTestId("requests-watched")).toHaveTextContent(/^23\s*watched since$/);
+    expect(screen.getByTestId("requests-pending")).toHaveTextContent(/^22\s*awaiting approval$/);
+    expect(screen.getByRole("link", { name: /Review 22 waiting/ })).toHaveAttribute("href", "/requests");
     expect(
       screen.getByRole("link", { name: /full send log/i }),
     ).toHaveAttribute("href", "/requests?tab=sent"); // deep-links to the send-log tab
@@ -233,8 +246,12 @@ describe("ImpactReport", () => {
     expect(screen.queryByText("sarah")).toBeNull();
     // The feed times the WATCH, not the finish — a series finished weeks after it was started would
     // otherwise be filed under the wrong day.
-    expect(screen.getByText(/· 5h ago/)).toBeTruthy();
-    expect(screen.queryByText(/· 1h ago/)).toBeNull();
+    // Under a day heading the line gives the clock time, not "5h ago" beside "Yesterday".
+    const clock = (iso: string) =>
+      new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const watch = REPORT.recent[0]!;
+    expect(screen.getByText(clock(watch.watched_at!))).toBeTruthy();
+    expect(screen.queryByText(clock(watch.finished_at!))).toBeNull();
     // Counts, labelled — never "3 of 6". They are two different sets (watched-in-window vs
     // delivered-in-window), so a fraction makes "4 of 0" reachable when delivery paused.
     // Counts, labelled — never "3 of 6". Two different sets (watched-in-window vs
@@ -998,6 +1015,79 @@ describe("ImpactReport — recently watched", () => {
 
     expect(await screen.findByText(/newest watch/i)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Show .* more/i })).toBeNull();
+  });
+});
+
+describe("ImpactReport — titles shown as titles", () => {
+  beforeEach(() => {
+    getReport.mockReset();
+    getReport.mockResolvedValue(REPORT);
+    getDeletedRows.mockReset();
+    getDeletedRows.mockResolvedValue([]);
+  });
+
+  it("shows Most watched as posters with rank, year, watchers and look-up links", async () => {
+    // It was a bare "Ted Lasso · 10 watchers" list: nothing said what a title was, and nothing let
+    // you look one up.
+    renderReport();
+
+    const shelf = await screen.findByRole("list", { name: "Most watched" });
+    const item = within(shelf).getAllByRole("listitem")[0]!;
+    expect(item.querySelector("img")?.getAttribute("src")).toBe("/api/picks/7007/poster");
+    expect(item).toHaveTextContent("1");
+    expect(item).toHaveTextContent("Dune: Part Two");
+    expect(item).toHaveTextContent("2024");
+    expect(item).toHaveTextContent("3 watchers");
+    // Faces for the first few watchers, named for screen readers and on hover.
+    expect(within(item).getByTitle("Sarah H")).toBeTruthy();
+    expect(within(item).getByTitle("Mike")).toBeTruthy();
+    expect(within(item).getByRole("link", { name: "Dune: Part Two on TMDB" })).toHaveAttribute(
+      "href",
+      "https://www.themoviedb.org/movie/693134",
+    );
+    expect(within(item).getByRole("link", { name: "Dune: Part Two on IMDb" })).toBeTruthy();
+    expect(within(item).getByRole("link", { name: "Dune: Part Two on Trakt" })).toBeTruthy();
+  });
+
+  it("gives each recent watch its poster and look-up links, grouped under its day", async () => {
+    // Local midday, and a watch two hours before it: "Today" in every timezone. Against the real clock
+    // a watch "5 hours ago" is Yesterday between midnight and 5am, so this failed for part of every day.
+    const midday = new Date();
+    midday.setHours(12, 0, 0, 0);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(midday);
+    getReport.mockResolvedValue({
+      ...REPORT,
+      recent: [
+        {
+          ...REPORT.recent[0]!,
+          watched_at: new Date(midday.getTime() - 2 * 3600_000).toISOString(),
+          finished_at: null,
+        },
+      ],
+    });
+    renderReport();
+
+    const feed = await screen.findByRole("list", { name: "Recently watched from Shortlist" });
+    vi.useRealTimers();
+    expect(within(feed).getByText("Today")).toBeTruthy();
+    const line = within(feed).getByText("Dune: Part Two").closest("li")!;
+    expect(line.querySelector("img")?.getAttribute("src")).toBe("/api/picks/7007/poster");
+    expect(line).toHaveTextContent("2024");
+    expect(within(line).getByRole("link", { name: "Dune: Part Two on TMDB" })).toBeTruthy();
+  });
+
+  it("stacks Requests under Worth a look, and gives the two long lists the full width below", async () => {
+    // "Recently watched" runs to twenty lines, so a Requests card beside it floated over a column of
+    // empty space. Beside the tall By-person list, under Worth a look, it fills a gap instead.
+    renderReport();
+
+    await screen.findByRole("list", { name: "Recently watched from Shortlist" });
+    const order = screen
+      .getAllByRole("heading")
+      .map((h) => h.textContent)
+      .filter((t) => ["Worth a look", "Requests", "Most watched", "Recently watched from Shortlist"].includes(t ?? ""));
+    expect(order).toEqual(["Worth a look", "Requests", "Most watched", "Recently watched from Shortlist"]);
   });
 });
 

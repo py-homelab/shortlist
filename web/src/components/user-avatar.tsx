@@ -12,6 +12,7 @@ const TINTS = [
 ] as const;
 
 const SIZES = {
+  xs: "h-5 w-5 text-[9px]",
   sm: "h-7 w-7 text-xs",
   md: "h-9 w-9 text-sm",
   lg: "h-12 w-12 text-base",
@@ -25,7 +26,13 @@ function tintFor(name: string): string {
 }
 
 function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
+  // Bracketed notes and punctuation are not the name: Plex display names read like
+  // "Joe - Richard's Mate (P)", which used to give "J(" — a bracket where a letter belongs.
+  const parts = name
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, " ")
+    .split(/\s+/)
+    .map((part) => part.replace(/[^\p{L}\p{N}]/gu, ""))
+    .filter(Boolean);
   if (parts.length === 0) return "?";
   const first = parts[0] ?? "";
   if (parts.length === 1) return first.slice(0, 2).toUpperCase() || "?";
@@ -38,14 +45,18 @@ export function UserAvatar({
   name,
   size = "md",
   className,
+  labelled = false,
 }: {
   name: string;
   size?: keyof typeof SIZES;
   className?: string;
+  /** When the face stands alone with no name beside it (a stack of watchers), it must name itself:
+   *  on hover, and to a screen reader. Beside a written name it stays decorative. */
+  labelled?: boolean;
 }) {
   return (
     <span
-      aria-hidden="true"
+      {...(labelled ? { role: "img", "aria-label": name, title: name } : { "aria-hidden": true })}
       className={cn(
         "inline-grid shrink-0 place-items-center rounded-full font-semibold",
         SIZES[size],

@@ -4328,18 +4328,24 @@ export interface components {
             library: string;
             /** Media Type */
             media_type: string;
+            /** Rating Key */
+            rating_key: number;
             /** Row */
             row: string;
             /** Seed Title */
             seed_title: string;
             /** Title */
             title: string;
+            /** Tmdb Id */
+            tmdb_id: number;
             /** User Id */
             user_id: number | null;
             /** Username */
             username: string;
             /** Watched At */
             watched_at: string | null;
+            /** Year */
+            year: number | null;
         } & {
             [key: string]: unknown;
         };
@@ -5313,12 +5319,18 @@ export interface components {
         TopTitleOut: {
             /** Media Type */
             media_type: string;
+            /** Rating Key */
+            rating_key: number;
             /** Title */
             title: string;
             /** Tmdb Id */
             tmdb_id: number;
+            /** Watcher Sample */
+            watcher_sample: components["schemas"]["WatcherOut"][];
             /** Watchers */
             watchers: number;
+            /** Year */
+            year: number | null;
         } & {
             [key: string]: unknown;
         };
@@ -5910,6 +5922,15 @@ export interface components {
             watched_at: string;
             /** Year */
             year: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** WatcherOut */
+        WatcherOut: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
         } & {
             [key: string]: unknown;
         };

@@ -1,14 +1,14 @@
 import { Check, CircleSlash, Clock, Copy, Telescope } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router";
 
-import { ImdbGlyph, TmdbGlyph, TraktGlyph } from "@/components/brand-glyphs";
 import { PickList } from "@/components/pick-list";
+import { TitleLinkIcons } from "@/components/title-link-icons";
 import { TitlePoster } from "@/components/title-poster";
 import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
 import { provenanceLabel } from "@/lib/pick-provenance";
-import { type TitleLink, titleLinks } from "@/lib/title-links";
+import { titleLinks } from "@/lib/title-links";
 import {
   friendlyError,
   rankClass,
@@ -124,13 +124,6 @@ function matchQuality(pick: Pick): string {
   return quality ?? "";
 }
 
-/** Each look-it-up link's brand mark — the same glyphs the requests inbox puts on the same links. */
-const LINK_GLYPH: Record<TitleLink["label"], (props: { className?: string }) => ReactNode> = {
-  TMDB: TmdbGlyph,
-  IMDb: ImdbGlyph,
-  Trakt: TraktGlyph,
-};
-
 /** One ranked pick: rank, a status dot (green = new this run), title + reason, and where it
  *  came from. */
 function PickLine({ pick, isNew }: { pick: Pick; isNew: boolean }) {
@@ -187,21 +180,7 @@ function PickLine({ pick, isNew }: { pick: Pick; isNew: boolean }) {
                 .filter(Boolean)
                 .join(" · ")}
             </span>
-            {links.map((link) => {
-              const Glyph = LINK_GLYPH[link.label];
-              return (
-                <a
-                  key={link.label}
-                  href={link.href}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 self-center hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
-                >
-                  <Glyph className="h-3.5 w-3.5 shrink-0 rounded-[2px]" />
-                  {link.label}
-                </a>
-              );
-            })}
+            <TitleLinkIcons title={pick} labelled />
           </span>
         )}
       </span>

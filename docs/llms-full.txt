@@ -658,6 +658,16 @@ removes those picks from every total that counts them, here and on each person's
 undone. Rows that still exist are never affected, whichever slug is named: Shortlist recomputes what is
 eligible on the server rather than trusting the request.
 
+**Requests** sits under **Worth a look**: how many titles were sent to be downloaded in the window,
+how many of those were watched since, and how many are waiting for your approval, with a link to each.
+
+**Most watched** is a shelf of posters: the titles with the most watchers in the window, each with its
+rank, year, the newest few people who watched it, and links to look it up on TMDB, IMDb and Trakt.
+
+**Recently watched from Shortlist** lists the newest watches under the day they happened. Each line
+leads with the poster and title, says whether it was **Watched** (a film), **Started** or **Finished**
+(a series), and names the person and the row it came from, with the same look-up links at the end.
+
 **Watches per week** is always the long view: the last 16 weeks, whatever window is
 selected. Each column is split: the solid part is what got finished, the faded part what is still
 going. A past week's solid part can GROW later, when someone finally finishes a series they started

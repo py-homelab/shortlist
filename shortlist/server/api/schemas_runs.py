@@ -338,11 +338,21 @@ class PerRowOut(PassthroughModel):
     finished: int
 
 
+class WatcherOut(PassthroughModel):
+    id: int
+    name: str
+
+
 class TopTitleOut(PassthroughModel):
     tmdb_id: int
     media_type: str
     title: str
     watchers: int
+    #: Plex's key for the poster; 0 when no delivery or watch history ever matched it to the library.
+    rating_key: int
+    year: int | None
+    #: The newest three people who watched it in the window, for faces beside `watchers`.
+    watcher_sample: list[WatcherOut]
 
 
 class RecentWatchOut(PassthroughModel):
@@ -352,6 +362,11 @@ class RecentWatchOut(PassthroughModel):
     display_name: str
     title: str
     media_type: str
+    #: For the look-up links (TMDB, IMDb, Trakt).
+    tmdb_id: int
+    #: Plex's key for the poster; 0 when nothing on record matched it to the library.
+    rating_key: int
+    year: int | None
     row: str
     library: str
     seed_title: str

@@ -3982,6 +3982,10 @@
             "title": "Media Type",
             "type": "string"
           },
+          "rating_key": {
+            "title": "Rating Key",
+            "type": "integer"
+          },
           "row": {
             "title": "Row",
             "type": "string"
@@ -3993,6 +3997,10 @@
           "title": {
             "title": "Title",
             "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
           },
           "user_id": {
             "anyOf": [
@@ -4019,6 +4027,17 @@
               }
             ],
             "title": "Watched At"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
           }
         },
         "required": [
@@ -4027,6 +4046,9 @@
           "display_name",
           "title",
           "media_type",
+          "tmdb_id",
+          "rating_key",
+          "year",
           "row",
           "library",
           "seed_title",
@@ -6286,6 +6308,10 @@
             "title": "Media Type",
             "type": "string"
           },
+          "rating_key": {
+            "title": "Rating Key",
+            "type": "integer"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -6294,16 +6320,37 @@
             "title": "Tmdb Id",
             "type": "integer"
           },
+          "watcher_sample": {
+            "items": {
+              "$ref": "#/components/schemas/WatcherOut"
+            },
+            "title": "Watcher Sample",
+            "type": "array"
+          },
           "watchers": {
             "title": "Watchers",
             "type": "integer"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
           }
         },
         "required": [
           "tmdb_id",
           "media_type",
           "title",
-          "watchers"
+          "watchers",
+          "rating_key",
+          "year",
+          "watcher_sample"
         ],
         "title": "TopTitleOut",
         "type": "object"
@@ -7831,6 +7878,25 @@
           "user_rating"
         ],
         "title": "WatchedTitleOut",
+        "type": "object"
+      },
+      "WatcherOut": {
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WatcherOut",
         "type": "object"
       },
       "WizardState": {

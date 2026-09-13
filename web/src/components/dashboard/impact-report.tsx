@@ -1,9 +1,12 @@
-import { RefreshCw, Send, Trash2 } from "lucide-react";
+import { RefreshCw, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router";
 
 import { NeedsALook, WHY_GAVE_UP } from "@/components/dashboard/engagement";
 import { QueryBoundary } from "@/components/query-boundary";
+import { TitleLinkIcons } from "@/components/title-link-icons";
+import { TitlePoster } from "@/components/title-poster";
+import { UserAvatar } from "@/components/user-avatar";
 import { Why } from "@/components/why";
 import { Segmented } from "@/components/segmented";
 import { Badge } from "@/components/ui/badge";
@@ -1065,66 +1068,25 @@ function ReportBody({
       </div>
 
       {/* Beside the people, because its first line is about them: how many were given picks and
-          watched none. Every other line points at a row or a person elsewhere on this page. */}
+          watched none. Every other line points at a row or a person elsewhere on this page.
+
+          Requests stacks UNDER it, in the same column. By person is the tallest list on the page, so
+          this column always had room to spare, and both cards are short summaries. Beside "Recently
+          watched" (twenty lines) the Requests card used to float over a column of empty space. */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
         <ByPerson people={report.per_user} reportWindow={reportWindow} />
-        <NeedsALook report={report} reportWindow={reportWindow} />
+        <div className="grid min-w-0 content-start gap-4">
+          <NeedsALook report={report} reportWindow={reportWindow} />
+          {(requests.sent > 0 || requests.pending > 0) && (
+            <RequestsSummary requests={requests} reportWindow={reportWindow} />
+          )}
+        </div>
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
-        {report.top_titles.length > 0 && (
-          <Section
-            title="Most watched"
-            hint={`Most watchers first · ${WINDOW_PHRASE[reportWindow]}`}
-          >
-            <ul className="space-y-1 text-sm">
-              {report.top_titles.map((t) => (
-                <li
-                  key={`${t.tmdb_id}-${t.media_type}`}
-                  className="flex items-center justify-between gap-3"
-                >
-                  <span className="truncate">{t.title}</span>
-                  <span className="shrink-0 text-muted-foreground">
-                    {t.watchers} {t.watchers === 1 ? "watcher" : "watchers"}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </Section>
-        )}
-
-        {requests.sent > 0 && (
-          <Section
-            title="Requests"
-            // App-neutral on purpose — see run-stat-tiles: the route is a setting this card cannot see.
-            hint={`Sent to be downloaded in ${WINDOW_PHRASE[reportWindow]}.`}
-          >
-            <div className="flex items-center gap-2 text-sm">
-              <Send className="h-4 w-4 text-muted-foreground" aria-hidden />
-              <span>
-                <span className="font-medium text-foreground">
-                  {requests.sent}
-                </span>{" "}
-                sent ·{" "}
-                <span className="font-medium text-foreground">
-                  {requests.watched_after_sent}
-                </span>{" "}
-                watched since ·{" "}
-                <span className="font-medium text-foreground">
-                  {requests.pending}
-                </span>{" "}
-                awaiting approval
-              </span>
-            </div>
-            <Link
-              to="/requests?tab=sent"
-              className="text-xs text-primary underline-offset-4 hover:underline"
-            >
-              View the full send log →
-            </Link>
-          </Section>
-        )}
-      </div>
+      {/* The two lists that grow get the full width, so their length never strands a card beside them. */}
+      {report.top_titles.length > 0 && (
+        <MostWatched titles={report.top_titles} reportWindow={reportWindow} />
+      )}
 
       {report.recent.length > 0 && <RecentlyWatched recent={report.recent} />}
 
@@ -1133,6 +1095,121 @@ function ReportBody({
           report above is aggregate, and making the dashboard wait on both would delay the numbers
           that are ready. */}
     </div>
+  );
+}
+
+/** Sent, watched since, and waiting on you — each figure in its own tile, so none can sit in another's slot. */
+function RequestsSummary({
+  requests,
+  reportWindow,
+}: {
+  requests: EffectivenessReport["requests"];
+  reportWindow: ReportWindow;
+}) {
+  const tiles: { key: string; value: number; label: string; strong?: boolean }[] = [
+    { key: "sent", value: requests.sent, label: "sent" },
+    { key: "watched", value: requests.watched_after_sent, label: "watched since" },
+    { key: "pending", value: requests.pending, label: "awaiting approval", strong: requests.pending > 0 },
+  ];
+  return (
+    <Section
+      title="Requests"
+      // App-neutral on purpose — see run-stat-tiles: the route is a setting this card cannot see.
+      hint={`Sent to be downloaded in ${WINDOW_PHRASE[reportWindow]}.`}
+    >
+      <dl className="grid grid-cols-3 gap-2">
+        {tiles.map((tile) => (
+          <div key={tile.key} className="rounded-md bg-elevated px-3 py-2" data-testid={`requests-${tile.key}`}>
+            <dd
+              className={cn(
+                "text-xl font-semibold tabular-nums",
+                tile.strong ? "text-primary" : "text-foreground",
+              )}
+            >
+              {tile.value}
+            </dd>
+            <dt className="text-xs text-muted-foreground">{tile.label}</dt>
+          </div>
+        ))}
+      </dl>
+      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+        {requests.pending > 0 && (
+          <Link to="/requests" className="text-primary underline-offset-4 hover:underline">
+            Review {requests.pending} waiting →
+          </Link>
+        )}
+        <Link to="/requests?tab=sent" className="text-primary underline-offset-4 hover:underline">
+          View the full send log →
+        </Link>
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * The titles landing best, as a shelf of posters — the same thing Plex shows, so it reads at a glance.
+ *
+ * It used to be a bare "Ted Lasso · 10 watchers" list: nothing said what a title was, and nothing let
+ * you look one up. Each title now carries its rank, poster, year, the newest few faces beside its
+ * watcher count, and the TMDB/IMDb/Trakt links. Eight across on a wide screen; on a phone the shelf
+ * scrolls sideways rather than stacking eight posters into one very tall column.
+ */
+function MostWatched({
+  titles,
+  reportWindow,
+}: {
+  titles: EffectivenessReport["top_titles"];
+  reportWindow: ReportWindow;
+}) {
+  return (
+    <Section title="Most watched" hint={`Most watchers first · ${WINDOW_PHRASE[reportWindow]}`}>
+      <ul
+        aria-label="Most watched"
+        className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-2 sm:mx-0 sm:grid sm:grid-cols-4 sm:overflow-visible sm:px-0 sm:pb-0 lg:grid-cols-8"
+      >
+        {titles.map((t, i) => (
+          <li key={`${t.tmdb_id}-${t.media_type}`} className="grid w-[104px] shrink-0 content-start gap-1.5 sm:w-auto">
+            <div className="relative">
+              <TitlePoster
+                ratingKey={t.rating_key}
+                className="aspect-[2/3] h-auto w-full rounded-md sm:h-auto sm:w-full"
+              />
+              <span
+                className={cn(
+                  "absolute left-1.5 top-1.5 rounded px-1.5 text-[11px] font-bold tabular-nums",
+                  i === 0 ? "bg-primary text-primary-foreground" : "bg-black/65 text-primary",
+                )}
+              >
+                {i + 1}
+              </span>
+            </div>
+            <p className="truncate text-sm font-medium text-foreground" title={t.title}>
+              {t.title}
+            </p>
+            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-muted-foreground">
+              {t.watcher_sample.length > 0 && (
+                <span className="flex -space-x-1">
+                  {t.watcher_sample.map((w) => (
+                    <UserAvatar key={w.id} name={w.name} size="xs" labelled className="ring-2 ring-card" />
+                  ))}
+                </span>
+              )}
+              <span className="whitespace-nowrap tabular-nums">
+                {t.watchers} {t.watchers === 1 ? "watcher" : "watchers"}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              {t.year != null ? (
+                <span className="text-xs tabular-nums text-muted-foreground">{t.year}</span>
+              ) : (
+                <span />
+              )}
+              <TitleLinkIcons title={t} />
+            </div>
+          </li>
+        ))}
+      </ul>
+    </Section>
   );
 }
 
@@ -1156,8 +1233,30 @@ function watchVerb(watch: EffectivenessReport["recent"][number]): string {
   return watch.finished_at ? "finished" : "started";
 }
 
+/** "Today", "Yesterday", else "Fri 12 Sep" — the heading a run of watches is filed under. */
+function dayLabel(iso: string | null, now: Date = new Date()): string {
+  if (!iso) return "Earlier";
+  const day = new Date(iso);
+  const midnight = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((midnight(now) - midnight(day)) / 86_400_000);
+  if (days <= 0) return "Today";
+  if (days === 1) return "Yesterday";
+  return day.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+}
+
+const VERB_BADGE: Record<string, string> = {
+  finished: "bg-success/15 text-success",
+  started: "bg-primary/15 text-primary",
+  watched: "bg-secondary text-secondary-foreground",
+};
+
 /**
- * The newest watches, newest first.
+ * The newest watches, newest first, filed under their day.
+ *
+ * Each line used to be one run of text — person, verb, title, row, time — so the title, which is the
+ * news, sat in the middle of a sentence. It now leads with the poster and title, says finished /
+ * started / watched as a badge, puts who and which row on the line under it, and keeps the time and
+ * the look-up links at the end. A day heading replaces "8h ago" as the thing that orders the list.
  *
  * The extras used to be `slice(0, 12)` and nothing else: the server sends up to 20, so eight of
  * them were dropped on the floor with no count, no disclosure and nothing on screen admitting the
@@ -1171,36 +1270,86 @@ function RecentlyWatched({
   const line = (
     w: EffectivenessReport["recent"][number],
     i: number,
-  ): React.ReactNode => (
-    <li
-      // watched_at (when present) is a stable, unique-enough identity for this list;
-      // falling back to the index only for the rare entry missing it.
-      key={`${w.username}-${w.title}-${w.watched_at ?? i}`}
-      className="flex flex-wrap items-baseline gap-x-2 text-muted-foreground"
-    >
-      {/* Linked when there is somebody to link to. `user_id` is null once they have left the
-          server — the watch stays on record, so the line still renders, it just becomes plain text
-          rather than a link to a page that would 404. */}
-      {w.user_id !== null ? (
-        <Link
-          to={`/users/${w.user_id}?tab=watched`}
-          className="rounded-sm font-medium text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-        >
-          {w.display_name || w.username}
-        </Link>
-      ) : (
-        <span className="font-medium text-foreground">
-          {w.display_name || w.username}
-        </span>
-      )}
-      {watchVerb(w)}
-      <span className="text-foreground">{w.title}</span>
-      <Badge variant="secondary" className="font-normal">
-        {w.row}
-      </Badge>
-      {w.watched_at && <span>· {timeAgo(w.watched_at)}</span>}
-    </li>
-  );
+  ): React.ReactNode => {
+    const verb = watchVerb(w);
+    const name = w.display_name || w.username;
+    return (
+      <li
+        // watched_at (when present) is a stable, unique-enough identity for this list;
+        // falling back to the index only for the rare entry missing it.
+        key={`${w.username}-${w.title}-${w.watched_at ?? i}`}
+        className="grid grid-cols-[40px_minmax(0,1fr)] items-center gap-x-3 gap-y-1.5 py-2 sm:grid-cols-[40px_minmax(0,1fr)_auto]"
+      >
+        <TitlePoster ratingKey={w.rating_key} className="row-span-2 sm:row-span-1" />
+        <div className="min-w-0 space-y-1">
+          <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-sm">
+            <span className="font-medium text-foreground">{w.title}</span>
+            {w.year != null && (
+              <span className="text-xs tabular-nums text-muted-foreground">{w.year}</span>
+            )}
+            <span className={cn("rounded-full px-2 text-[11px] font-semibold capitalize", VERB_BADGE[verb])}>
+              {verb}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
+            <UserAvatar name={name} size="xs" />
+            {/* Linked when there is somebody to link to. `user_id` is null once they have left the
+                server — the watch stays on record, so the line still renders, it just becomes plain
+                text rather than a link to a page that would 404. */}
+            {w.user_id !== null ? (
+              <Link
+                to={`/users/${w.user_id}?tab=watched`}
+                className="rounded-sm font-medium text-foreground underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                {name}
+              </Link>
+            ) : (
+              <span className="font-medium text-foreground">{name}</span>
+            )}
+            <Badge variant="secondary" className="max-w-full truncate font-normal">
+              {w.row}
+            </Badge>
+          </div>
+        </div>
+        <div className="col-start-2 flex items-center justify-between gap-3 sm:col-start-auto sm:flex-col sm:items-end sm:justify-center sm:gap-1.5">
+          {/* The clock time: the day heading above already says when, and "8h ago" beside
+              "Yesterday" read as a contradiction. How long ago stays one hover away. */}
+          {w.watched_at && (
+            <time
+              dateTime={w.watched_at}
+              title={timeAgo(w.watched_at)}
+              className="whitespace-nowrap text-xs tabular-nums text-muted-foreground"
+            >
+              {new Date(w.watched_at).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}
+            </time>
+          )}
+          <TitleLinkIcons title={w} />
+        </div>
+      </li>
+    );
+  };
+
+  const grouped = (watches: EffectivenessReport["recent"], label: string) => {
+    const days: { day: string; watches: EffectivenessReport["recent"] }[] = [];
+    for (const w of watches) {
+      const day = dayLabel(w.watched_at);
+      const last = days.at(-1);
+      if (last && last.day === day) last.watches.push(w);
+      else days.push({ day, watches: [w] });
+    }
+    return (
+      <ul aria-label={label} className="space-y-1">
+        {days.map(({ day, watches: dayWatches }) => (
+          <li key={day}>
+            <h3 className="pb-1 pt-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80">
+              {day}
+            </h3>
+            <ul className="divide-y divide-border/40">{dayWatches.map(line)}</ul>
+          </li>
+        ))}
+      </ul>
+    );
+  };
 
   const shown = recent.slice(0, RECENT_SHOWN);
   const rest = recent.slice(RECENT_SHOWN);
@@ -1212,13 +1361,13 @@ function RecentlyWatched({
       // history of what people watched — and the dashboard has no other place that number appears.
       hint={`The ${recent.length === 1 ? "newest watch" : `newest ${recent.length} watches`}. Older ones are on each person's page.`}
     >
-      <ul className="space-y-1 text-sm">{shown.map(line)}</ul>
+      {grouped(shown, "Recently watched from Shortlist")}
       {rest.length > 0 && (
         <Disclosure
           label={`Show ${rest.length} more`}
           openLabel={`Hide ${rest.length} more`}
         >
-          <ul className="space-y-1 text-sm">{rest.map(line)}</ul>
+          {grouped(rest, "Older recent watches")}
         </Disclosure>
       )}
     </Section>
