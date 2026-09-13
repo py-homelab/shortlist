@@ -229,3 +229,38 @@ class TestViewingShare:
         watched(sessions, user_id=1, tmdb_id=None, days_ago=5, rating_key=12, title="Home Video", section_key="4")
 
         assert share(sessions)["watched"] == 2
+
+    @pytest.mark.parametrize("window", ["7", "30", "90", "all"])
+    def test_a_series_started_from_a_row_before_the_window_still_counts_while_they_watch_it(self, sessions, window):
+        """Both sides must be the same title-in-window. `watched` is dated by the LATEST view, which moves
+        with every new episode, while the credit is stamped once, on the first watch. Windowing the
+        credit dropped a series someone started from their row 40 days ago and is still watching out of
+        "from rows" on the 7- and 30-day windows, and only there."""
+        pick(sessions, user_id=1, tmdb_id=100, watched_days_ago=40, delivered_days_ago=55, media_type="show")
+        watched(sessions, user_id=1, tmdb_id=100, days_ago=2, media_type="show", section_key="2")
+        watched(sessions, user_id=1, tmdb_id=200, days_ago=3)
+
+        assert share(sessions, window) == {"watched": 2, "from_rows": 1, "rate": 0.5}
+
+    def test_a_film_from_their_row_rewatched_in_the_window_counts_as_from_the_row(self, sessions):
+        pick(sessions, user_id=1, tmdb_id=2, watched_days_ago=50)
+        watched(sessions, user_id=1, tmdb_id=2, days_ago=4)
+
+        assert share(sessions, "7") == {"watched": 1, "from_rows": 1, "rate": 1.0}
+
+    def test_a_shared_row_credit_before_the_window_counts_for_a_title_watched_in_it(self, sessions):
+        pick(sessions, user_id=1, tmdb_id=9, watched_days_ago=None)
+        watched(sessions, user_id=1, tmdb_id=1, days_ago=5, media_type="show", section_key="2")
+        with sessions() as session:
+            session.add(
+                SharedRowWatch(
+                    user_id=1,
+                    collection_slug="popular",
+                    tmdb_id=1,
+                    media_type="show",
+                    watched_at=NOW - timedelta(days=45),
+                )
+            )
+            session.commit()
+
+        assert share(sessions) == {"watched": 1, "from_rows": 1, "rate": 1.0}

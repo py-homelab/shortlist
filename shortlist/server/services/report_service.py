@@ -345,8 +345,13 @@ def _viewing_share(session: Session, since: datetime | None) -> dict:
     missed on both sides.
 
     `from_rows` is taken INSIDE `watched`: a pick the live listener credited before the nightly sync has
-    recorded the watch would otherwise count as more than all of it. It reads as "was in their row when
-    they watched it", not as proof the row caused the watch.
+    recorded the watch would otherwise count as more than all of it. It reads as "a title their row gave
+    them", not as proof the row caused this particular watch.
+
+    The credit is NOT windowed, only the watch is. A title counts on both sides when it was watched in
+    the window, and `watched` dates it by its LATEST view, which moves with every new episode, while the
+    credit is stamped once, on the first watch. Windowing the credit too dropped a series someone started
+    from their row before the window, and is still watching, out of "from rows" on the short windows only.
     """
     enabled = [uid for (uid,) in session.query(User.id).filter(User.enabled.is_(True))]
     first = {
@@ -374,13 +379,13 @@ def _viewing_share(session: Session, since: datetime | None) -> dict:
     credited = {
         (uid, media, tmdb_id)
         for uid, media, tmdb_id in session.query(PickRow.user_id, PickRow.media_type, PickRow.tmdb_id).filter(
-            PickRow.user_id.in_(list(start_for)), *_watched_in(earliest)
+            PickRow.user_id.in_(list(start_for)), PickRow.watched_at.isnot(None)
         )
     } | {
         (uid, media, tmdb_id)
         for uid, media, tmdb_id in session.query(
             SharedRowWatch.user_id, SharedRowWatch.media_type, SharedRowWatch.tmdb_id
-        ).filter(SharedRowWatch.user_id.in_(list(start_for)), *_shared_watched_in(earliest))
+        ).filter(SharedRowWatch.user_id.in_(list(start_for)), SharedRowWatch.watched_at.isnot(None))
     }
     from_rows = len(watched & credited)
     return {"watched": len(watched), "from_rows": from_rows, "rate": _rate(from_rows, len(watched))}
