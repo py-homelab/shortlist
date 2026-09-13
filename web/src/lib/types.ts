@@ -847,6 +847,7 @@ export type TraceFate =
   | "not_in_your_libraries"
   | "excluded_genre"
   | "lost_ranking_cutoff"
+  | "hidden_by_their_restrictions"
   | "not_returned";
 
 /** The services POST /api/settings/test/{service} accepts (a path parameter typed `str`). */

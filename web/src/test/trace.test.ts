@@ -290,6 +290,9 @@ describe("plain-English trace helpers", () => {
     expect(fateLabel("excluded_genre")).toBe("excluded genre");
     expect(fateLabel("lost_ranking_cutoff")).toBe("lost the ranking cut");
     expect(fateLabel("not_returned")).toBe("found by another source");
+    expect(fateLabel("hidden_by_their_restrictions")).toBe(
+      "hidden by their Plex restrictions",
+    );
   });
 
   it("sourceRole describes each source's real query shape", () => {

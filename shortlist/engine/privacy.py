@@ -450,6 +450,206 @@ def remove_label_excludes(raw: str, labels: set[str]) -> str:
     return serialize_filter(out)
 
 
+def _allow_groups(conditions: list[FilterCondition]) -> list[list[int]]:
+    """Condition indices per `&`-separated group of `|`-separated alternatives.
+
+    How a real PMS groups a filter: `(A|B)&C` — `|` binds tighter than `&`. Measured 2026-09-13
+    (`tests/fixtures/pms_share_filter_allow_lists.json`): `contentRating=XYZNOPE&label=recommended|
+    contentRating=G` showed 0 movies, where left-to-right would have shown 401.
+    """
+    groups: list[list[int]] = []
+    for i, condition in enumerate(conditions):
+        if i == 0 or condition.sep == "&":
+            groups.append([i])
+        else:
+            groups[-1].append(i)
+    return groups
+
+
+def _drop_condition(conditions: list[FilterCondition], i: int) -> list[FilterCondition]:
+    """`conditions` without condition `i`, its neighbours still grouped as they were (see `_allow_groups`).
+
+    A side of the dropped condition that was `&` was a group boundary, so the gap it leaves stays one.
+    """
+    rest = conditions[:i] + conditions[i + 1 :]
+    if 0 < i < len(conditions) - 1:
+        joined = "&" if "&" in (conditions[i].sep, conditions[i + 1].sep) else "|"
+        rest[i] = replace(rest[i], sep=joined)
+    return rest
+
+
+def _is_allow(condition: FilterCondition) -> bool:
+    return condition.op == "="
+
+
+def _admits(condition: FilterCondition, row_labels: tuple[str, ...]) -> bool:
+    """Does this condition hold for a Shortlist row — a collection with these labels and no content rating?"""
+    if condition.field != "label":
+        return condition.op == "!="
+    hit = any(_same_value(value, label) for value in condition.values for label in row_labels)
+    return hit if condition.op == "=" else not hit
+
+
+def allowed_shortlist_labels(raw: str, label_prefix: str = LABEL_PREFIX) -> set[str]:
+    """The Shortlist labels this filter ALLOWS (``label=`` values) — what `admit_own_rows` writes."""
+    return {
+        v
+        for c in parse_filter(raw)
+        if c.field == "label" and _is_allow(c)
+        for v in c.values
+        if _is_ours(v, label_prefix)
+    }
+
+
+def admit_own_rows(raw: str, own_label: str, *, show: bool, label_prefix: str = LABEL_PREFIX) -> str:
+    """Let an account whose owner set an "allow only" list see its OWN Shortlist rows (#115).
+
+    An allow list shows only what it names. A Shortlist row is a collection carrying `shortlist_<slug>`
+    and the constant `shortlist` label, with no content rating — so `label=Kids` or `contentRating=G`
+    hides a person's own rows from them. With `show`, the row's label is added as one more alternative in
+    every allow group that would otherwise hide it: into the group's `label=` clause when it has one, else
+    as `|label=<own>` after the group. Measured on a real server: the rows then show on Home and in the
+    library, holding exactly the items the allow list admits, and a label added to only one of two ANDed
+    allow groups leaves the row hidden (`tests/fixtures/pms_share_filter_allow_lists.json`).
+
+    Touches `own_label` and nothing else. Every other allow value is the owner's (rule 3) — Shortlist never
+    wrote one before #115, so a shared row or a sibling's row in an allow list is a choice they made — and
+    stays byte-identical; the excludes still decide which rows show. Of `own_label`, it converges: added
+    where a group needs it, taken out of a clause where no allow condition of the owner's is left beside
+    it (Plex Web re-saves what its form shows, so an owner who removes "Kids" but not our label would
+    otherwise leave "allow only this person's rows" — the whole library hidden), and taken out entirely
+    without `show`, handing back the owner's filter byte for byte.
+
+    Args:
+        raw: The account's share filter, BEFORE `merge_label_excludes` (see `plan_share_filter`).
+        own_label: The label this account's rows carry (`shortlist_<slug>`, any case).
+        show: Whether the account has rows to show. False takes `own_label` back out.
+        label_prefix: The label prefix Shortlist owns.
+
+    Returns:
+        The new filter, or `raw` itself (the same object) when nothing needs to change.
+
+    Raises:
+        AmbiguousFilterError: A raw `&` sits inside a value — Plex itself cannot read the filter.
+    """
+    conditions = parse_filter(raw)
+    literal = _literal_ampersand_values(conditions)
+    if literal:
+        raise AmbiguousFilterError(
+            f"{', '.join(repr(unquote(v)) for v in literal)} has an '&' in it, which Plex can't read in a restriction"
+        )
+    _, house_value_sep = _house_style(conditions)
+
+    def mine(value: str) -> bool:
+        return _same_value(value, own_label)
+
+    def repair_pending(index: int) -> bool:
+        """Whether this condition's group still holds one of OUR excludes behind a `|`. Dropping a whole
+        clause there regroups what `merge_label_excludes` has yet to lift out — review 2026-09-13 found
+        that switching an owner's own exclude off — so the drop waits for `plan_share_filter`'s next pass."""
+        group = next(g for g in _allow_groups(conditions) if index in g)
+        return len(group) > 1 and any(
+            _is_exclude(conditions[j]) and any(_is_ours(v, label_prefix) for v in conditions[j].values) for j in group
+        )
+
+    def owners_allow(condition: FilterCondition) -> bool:
+        return _is_allow(condition) and not all(mine(value) for value in condition.values)
+
+    if not show:
+        i = 0
+        while i < len(conditions):
+            condition = conditions[i]
+            if condition.field == "label" and _is_allow(condition):
+                remainder = _without_values(condition, mine)
+                if remainder is None:
+                    if repair_pending(i):
+                        i += 1
+                        continue
+                    conditions = _drop_condition(conditions, i)
+                    continue
+                conditions[i] = remainder
+            i += 1
+    else:
+        for group in reversed(_allow_groups(conditions)):
+            if any(owners_allow(conditions[j]) for j in group):
+                continue
+            for j in reversed(group):
+                if (
+                    conditions[j].field == "label"
+                    and _is_allow(conditions[j])
+                    and all(mine(v) for v in conditions[j].values)
+                    and not repair_pending(j)
+                ):
+                    conditions = _drop_condition(conditions, j)
+        row_labels = (own_label, label_prefix)
+        for group in reversed(_allow_groups(conditions)):
+            if any(_admits(conditions[j], row_labels) for j in group) or not any(
+                owners_allow(conditions[j]) for j in group
+            ):
+                continue
+            clause = next((j for j in group if conditions[j].field == "label" and _is_allow(conditions[j])), None)
+            if clause is None:
+                conditions.insert(group[-1] + 1, FilterCondition("label", "=", (own_label,), sep="|"))
+                continue
+            cond = conditions[clause]
+            existing = cond._padded_seps()
+            fill = cond.value_seps[-1] if cond.value_seps else house_value_sep
+            grown = (*cond.values, own_label)
+            conditions[clause] = replace(
+                cond, values=grown, value_seps=existing + (fill,) * (len(grown) - 1 - len(existing))
+            )
+
+    admitted = serialize_filter(conditions)
+    return raw if admitted == raw else admitted
+
+
+#: How many admit→merge passes one write may take. A filter the pre-#116 merge left behind needs the
+#: merge to lift our `|`-joined exclude out of a group before that group can be judged for the own row.
+_PLAN_PASSES = 4
+
+
+def plan_share_filter(
+    current: str,
+    wanted: set[str],
+    *,
+    own_row_label: str | None,
+    show: bool,
+    label_prefix: str = LABEL_PREFIX,
+) -> str:
+    """The filter one account should carry: its own rows admitted (#115), everyone else's excluded (#116).
+
+    Admit FIRST, then merge. `merge_label_excludes` trusts no exclude a `|` follows, so an own-row `|`
+    inserted behind an exclude it had just placed would make it move that exclude again the next night.
+    Repeated until nothing changes, so a filter the old merge damaged is settled in ONE write rather
+    than a write a night with the person's row hidden in between.
+
+    Args:
+        current: The account's filter as plex.tv holds it now.
+        wanted: The Shortlist labels this account must not see.
+        own_row_label: The label this account's rows carry, or None to leave the allow list alone.
+        show: Whether those rows exist (see `admit_own_rows`).
+        label_prefix: The label prefix Shortlist owns.
+
+    Returns:
+        The planned filter, or `current` itself when nothing needs to change.
+
+    Raises:
+        AmbiguousFilterError, FilterParseError: As `merge_label_excludes` / `admit_own_rows`.
+    """
+    planned = current
+    for _ in range(_PLAN_PASSES):
+        admitted = (
+            planned
+            if own_row_label is None
+            else admit_own_rows(planned, own_row_label, show=show, label_prefix=label_prefix)
+        )
+        merged = merge_label_excludes(admitted, wanted, label_prefix=label_prefix)
+        if merged == planned:
+            break
+        planned = merged
+    return current if planned == current else planned
+
+
 def shortlist_labels_in(raw: str, label_prefix: str) -> set[str]:
     """Return the shortlist-owned labels currently excluded in a filter string.
 
@@ -550,6 +750,9 @@ def sync_user_restrictions(
     snapshots: SnapshotStore,
     *,
     own_label: str | None = None,
+    # The label this account's rows WOULD carry (`shortlist_<slug>`), known even when it has none, so a
+    # row that is gone takes its allow label with it (#115). None: the caller does not know the slug.
+    own_row_label: str | None = None,
     label_prefix: str = LABEL_PREFIX,
     shared_labels: dict[str, set[int] | None] | None = None,
     hide_all_shared: bool = False,
@@ -758,11 +961,19 @@ def sync_user_restrictions(
             if stale_shared or excluded_from_self or dead_private:
                 prunable.add(lbl)
 
+    # The label this account's own rows carry, for its allow list (#115). Taken back out only when the
+    # server's collections were COMPLETELY enumerated: a row missing from a read we cannot vouch for is
+    # not evidence it is gone, and removing the allow label would hide it until the next pass.
+    admit_label = own_label or own_row_label
+    if own_label is None and not collections_known:
+        admit_label = None
     desired_fields = {}
     for fieldname in RESTRICTED_FILTER_FIELDS:
         current = remote.filters[fieldname]
         try:
-            merged = merge_label_excludes(current, wanted, label_prefix=label_prefix)
+            merged = plan_share_filter(
+                current, wanted, own_row_label=admit_label, show=own_label is not None, label_prefix=label_prefix
+            )
         except AmbiguousFilterError as e:
             # Per field: the other one may be perfectly readable, and leaving it unwritten would promote
             # rows that field could hide (review 2026-09-13). Without a `refused` sink, refuse outright.
@@ -896,6 +1107,9 @@ def clear_our_excludes(
                 moved = None
             if moved is not None:
                 cleaned = remove_label_excludes(moved, ours) if ours else moved
+        # Allow values are NOT touched here, the account's own row label (#115) included. The owner may
+        # have typed it — Shortlist wrote none before #115, and the "leave alone" warning practically
+        # suggests it — and keeping it hides nothing from anyone: it only lets this person see their row.
         if cleaned != current:
             changed[fieldname] = (current, cleaned)
     if not changed:
@@ -930,6 +1144,12 @@ def summarise_filter_diff(diff: dict[str, tuple[str, str]], label_prefix: str) -
         was = shortlist_labels_in(before, label_prefix)
         now = shortlist_labels_in(after, label_prefix)
         added, removed = sorted(now - was), sorted(was - now)
+        allowed_before = allowed_shortlist_labels(before, label_prefix)
+        allowed_after = allowed_shortlist_labels(after, label_prefix)
+        if allowed_before != allowed_after:
+            parts.append(f"{fieldname} own row {'allowed' if allowed_after else 'no longer allowed'}")
+            if not added and not removed:
+                continue
         if not added and not removed:
             if now and unenforced_excludes(before, now) and not unenforced_excludes(after, now):
                 parts.append(f"{fieldname} excludes moved to where Plex applies them")

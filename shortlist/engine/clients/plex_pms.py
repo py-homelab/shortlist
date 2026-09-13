@@ -1499,6 +1499,41 @@ class PlexClient:
             )
         return items, missing
 
+    #: Keys per batch read. A ratingKey list rides in the URL path, so it is kept well short of URL limits.
+    _VISIBLE_BATCH = 50
+
+    def visible_to(self, token: str, rating_keys: list[int]) -> set[int]:
+        """Which of these library items the account holding `token` can see (#115).
+
+        Read AS that account: ``GET /library/metadata/{k1,k2,...}`` with its own server token. Recorded on
+        a real PMS (`tests/fixtures/pms_share_filter_allow_lists.json`, ``read_as_account``): items its
+        share filter hides are simply absent from a 200, and a batch holding none it can see is a 404.
+
+        Args:
+            token: The account's server token (plex-safety rule 9: never logged).
+            rating_keys: Library items to check.
+
+        Returns:
+            The subset of `rating_keys` the account can see.
+
+        Raises:
+            Whatever the read raises for anything but a 404 — an expired token must never read as
+            "nothing visible", which would empty that person's rows.
+        """
+        visible: set[int] = set()
+        for start in range(0, len(rating_keys), self._VISIBLE_BATCH):
+            batch = rating_keys[start : start + self._VISIBLE_BATCH]
+            r = http_retry.get(
+                self._server.url(f"/library/metadata/{','.join(str(k) for k in batch)}", includeToken=False),
+                headers={"X-Plex-Token": token, "Accept": "application/json"},
+                timeout=self._timeout,
+            )
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            visible.update(int(m["ratingKey"]) for m in r.json().get("MediaContainer", {}).get("Metadata", []) or [])
+        return visible & set(rating_keys)
+
     def user_hubs(self, canary_token: str, path: str = "/hubs") -> list[dict]:
         """Fetch hubs AS another user (for visibility checks). Uses that user's server token, not the owner's."""
         r = http_retry.get(

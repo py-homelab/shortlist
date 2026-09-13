@@ -575,6 +575,7 @@ def _exclude_first_rows(
                 stored_labels,
                 ctx.snapshots,
                 own_label=stored_labels.get(own_slug) if own_slug else None,
+                own_row_label=f"{LABEL_PREFIX}_{own_slug}" if own_slug else None,
                 label_prefix=LABEL_PREFIX,
                 shared_labels=shared_labels,
                 hide_all_shared=(
@@ -976,6 +977,7 @@ def _privacy_sync_phase(
                 stored_labels,
                 ctx.snapshots,
                 own_label=stored_labels.get(own_slug) if own_slug else None,
+                own_row_label=f"{LABEL_PREFIX}_{own_slug}" if own_slug else None,
                 label_prefix=LABEL_PREFIX,
                 shared_labels=shared_labels,
                 collections_known=collections_known,

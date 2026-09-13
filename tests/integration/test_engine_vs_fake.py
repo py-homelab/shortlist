@@ -41,7 +41,7 @@ from shortlist.engine.models import (
     UserType,
 )
 from shortlist.engine.pipeline import run as engine_run
-from shortlist.engine.privacy import shortlist_labels_in, unhidden_rows_on_home
+from shortlist.engine.privacy import allowed_shortlist_labels, shortlist_labels_in, unhidden_rows_on_home
 from tests.fakes.fake_plex import (
     FakeCollection,
     FakeHistoryEntry,
@@ -3186,3 +3186,89 @@ def test_an_anchor_the_owner_switched_off_in_plex_is_reported_not_silently_skipp
     # And the shelf really carries Plex's own hubs, so this was not asserted against a shelf of ours.
     titles = [getattr(h, "title", "") for h in plex.sections()[0].managedHubs()]
     assert "Recently Added" in titles and "By Genre" in titles, titles
+
+
+def test_an_allow_list_account_gets_a_full_row_it_can_see_and_nobody_elses(fakes, tmp_path):
+    """#115 end to end. sarah's owner restricted her to G-rated movies and TV-Y shows. Before, Shortlist
+    picked from the whole library, so Plex hid most of her row — and her row itself, which carries no
+    rating. Now her picks come only from what she can see, and her own row label joins her allow list,
+    while mike's row stays hidden from her."""
+    state, pms_url, _tmdb_app = fakes
+    for key, movie in state.movies.items():
+        movie.content_rating = "G" if key % 2 == 0 else "PG-13"
+    for key, show in state.shows.items():
+        show.content_rating = "TV-Y" if key % 2 == 0 else "TV-MA"
+    state.users[201].filters["filterMovies"] = "contentRating=G"
+    state.users[201].filters["filterTelevision"] = "contentRating=TV-Y"
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        token_for_user=lambda profile: f"server-{profile.plex_account_id}",
+    )
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    mike = UserProfile(username="mike", plex_account_id=202, user_type=UserType.SHARED)
+
+    report = engine_run(ctx, [sarah, mike])
+
+    assert report.ok
+    owned = plex.owned_collections()
+    sarah_rows = set(owned["sarah"].rating_keys)
+    assert sarah_rows, "sarah should still get rows"
+    for key in sarah_rows:
+        members = [state.item(k) for k in state.members(state.collections[key])]
+        assert members, f"row {key} is empty"
+        hidden = [m.title for m in members if not state.admits_item(state.users[201], m)]
+        assert not hidden, f"sarah's row {key} holds titles her restrictions hide: {hidden}"
+    for fieldname in ("filterMovies", "filterTelevision"):
+        assert allowed_shortlist_labels(state.users[201].filters[fieldname]) == {owned["sarah"].label}
+    on_her_home = {collection_id_from_hub(h) for h in plex.user_hubs("server-201")}
+    assert sarah_rows <= on_her_home, "her own rows must show despite her allow list"
+    assert not (set(owned["mike"].rating_keys) & on_her_home), "mike's row must stay hidden from her"
+    # mike has no restrictions: nothing about his filter or his picks changes.
+    assert allowed_shortlist_labels(state.users[202].filters["filterTelevision"]) == set()
+
+    settled = {k: dict(state.users[201].filters) for k in (201,)}
+    engine_run(ctx, [sarah, mike])
+    assert dict(state.users[201].filters) == settled[201], "a second night rewrote her filter"
+
+
+def test_a_cold_start_allow_list_account_gets_only_titles_it_can_see(fakes, tmp_path):
+    """The cold path builds from the library's top-rated titles and returns before the warm path's checks.
+    jess has no history, and her owner restricted her to G-rated movies and TV-Y shows."""
+    state, pms_url, _tmdb_app = fakes
+    for key, movie in state.movies.items():
+        movie.content_rating = "G" if key % 2 == 0 else "PG-13"
+    for key, show in state.shows.items():
+        show.content_rating = "TV-Y" if key % 2 == 0 else "TV-MA"
+    state.users[203].filters["filterMovies"] = "contentRating=G"
+    state.users[203].filters["filterTelevision"] = "contentRating=TV-Y"
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=6, min_history=5, candidates_pre_rank=40, max_seeds=12, cold_start="popular"),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        token_for_user=lambda profile: f"server-{profile.plex_account_id}",
+    )
+    jess = UserProfile(username="jess", plex_account_id=203, user_type=UserType.MANAGED)
+
+    report = engine_run(ctx, [jess])
+
+    assert report.ok
+    rows = set(plex.owned_collections()["jess"].rating_keys)
+    assert rows
+    for key in rows:
+        members = [state.item(k) for k in state.members(state.collections[key])]
+        assert members, f"row {key} is empty"
+        assert all(state.admits_item(state.users[203], m) for m in members), [m.title for m in members]

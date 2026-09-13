@@ -51,6 +51,25 @@ violate them.
    Presence is not proof: every "is this row hidden" check asks `unenforced_excludes`, never "is the
    label in the string".
 
+   **One allow value of ours, and only this one (#115).** An account whose owner set an "allow only"
+   list cannot see ITS OWN rows — a row carries only its `shortlist_<slug>` label and no rating. So
+   `privacy.admit_own_rows` adds that account's OWN row label as one more alternative in each allow
+   group (`label=Kids` → `label=Kids,shortlist_me`; `contentRating=G` → `contentRating=G|label=shortlist_me`).
+   A PMS groups a filter as `&`-separated groups of `|`-separated alternatives
+   (`tests/fixtures/pms_share_filter_allow_lists.json`), and a label added to only one of two ANDed allow
+   groups leaves the row hidden, so it goes into every group that would hide the row. It touches that one
+   label and NOTHING else: every other allow value — a shared row's label, a sibling's row — is the
+   owner's (Shortlist wrote none before #115) and stays byte-identical. Our label is never left standing
+   alone in a clause (Plex Web re-saves what its form shows, so an owner who removes "Kids" but not our
+   label would otherwise hide the whole library). `privacy.plan_share_filter` admits BEFORE merging and
+   repeats until nothing changes, so the merge's `&` placement is never followed by a `|` of ours and a
+   filter the pre-#116 merge damaged settles in one write. The label comes out when the row is gone —
+   only on a COMPLETE collections enumeration, never on a read we cannot vouch for. "Leave sharing
+   alone" (`clear_our_excludes`) does NOT touch allow values, own label included: the owner may have
+   typed it, and it hides nothing from anyone. A renamed person's OLD label stays in their allow list
+   (it is no longer theirs to recognise); it shows them nothing, because the excludes still hide every
+   row that is not theirs, and uninstall restores the snapshot.
+
    The same rule governs the one write that goes the other way. `users.manage_sharing=0` ("leave this
    account's Plex sharing alone", discussion #92) makes the run REMOVE our excludes from that one
    account rather than merge into it — `privacy.clear_our_excludes`, which takes out exactly the

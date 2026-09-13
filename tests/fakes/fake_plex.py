@@ -59,6 +59,41 @@ class FakeMovie:
     grandparent_rating_key: int | None = None
     parent_index: int = 0  # season number
     index: int = 0  # episode number within the season
+    #: What a share filter reads off an item. Empty by default, which every existing test assumes: no
+    #: rating and no labels, so only an allow list can hide the item.
+    content_rating: str = ""
+    labels: list[str] = field(default_factory=list)
+
+
+def share_filter_admits(raw: str, labels, content_rating: str) -> bool:
+    """Whether a share filter lets an account see a thing with these labels and this content rating.
+
+    Grouped the way a real PMS was measured to (`pms_share_filter_allow_lists.json`): `&`-separated
+    groups of `|`-separated alternatives, `(A|B)&C`. `|` binds tighter — `contentRating=XYZNOPE&
+    label=recommended|contentRating=G` showed nothing, where left-to-right would have shown every G
+    movie. A field the thing has no value for fails `=` and passes `!=`, which is why an unrated
+    collection passes `contentRating!=R` (#116). A literal `&` inside a label raises here; a real PMS
+    answers that account's Home with a 500.
+    """
+    if not raw:
+        return True
+    have = {
+        "label": {unquote(label).casefold() for label in labels},
+        "contentRating": {content_rating.casefold()} if content_rating else set(),
+    }
+    for group in raw.split("&"):
+        alternatives = []
+        for condition in group.split("|"):
+            match = re.match(r"^([A-Za-z]+)(!=|=)(.*)$", condition)
+            if match is None:
+                raise ValueError(f"fake PMS cannot read share filter condition {condition!r}")
+            field_name, op, rest = match.groups()
+            values = {unquote(v).casefold() for v in re.split(r"%2C|%2c|,", rest) if v}
+            hit = bool(have.get(field_name, set()) & values)
+            alternatives.append(hit if op == "=" else not hit)
+        if not any(alternatives):
+            return False
+    return True
 
 
 @dataclass
@@ -116,6 +151,9 @@ class FakeUser:
     protected: bool = False
     uuid: str = ""
     filters: dict[str, str] = field(default_factory=lambda: dict.fromkeys(FILTER_FIELDS, ""))
+    #: Library keys this account is shared. None = every library, which every existing test assumes. A
+    #: library it is not shared reads like a filtered one (`pms_share_filter_allow_lists.json`).
+    shared_sections: set[int] | None = None
 
     def __post_init__(self) -> None:
         # DERIVED, not a free field: plex.tv reports `restricted="1"` for EVERY Plex Home account,
@@ -439,43 +477,26 @@ class FakePlexState:
     def sees(self, user: FakeUser | None, collection: FakeCollection) -> bool:
         """Whether a real PMS would show this account `collection`, given its share filter.
 
-        Evaluated the way a real server was measured to (`pms_share_filter_boolean_semantics.json`):
-        `&` is AND, `|` is OR, read left to right — the recording rules out `&` binding tighter. A
-        collection carries labels and no content rating, so `contentRating!=X` is TRUE for it, which is
-        exactly why `contentRating!=X|label!=ours` hid nothing on a real server (#116).
-
         `filterMovies` applies to movie libraries and `filterTelevision` to TV. The owner (`None`) has
-        no filter, and an off-type collection is matched by neither (see `filterable`).
-
-        Limits, so nobody leans on it past them: it groups left to right only, and the recording cannot
-        tell that from `|` binding tighter — the property tests in `test_privacy_filter_semantics.py`
-        cover both, this does not. And a literal `&` inside a label raises here, where a real PMS
-        answers that account's Home with a 500.
+        no filter, and an off-type collection is matched by neither (see `filterable`). A collection
+        carries labels and no content rating — see `share_filter_admits` for how the filter is read.
         """
         if user is None or not self.filterable(collection):
             return True
         fieldname = "filterMovies" if self.section_type(collection.section_id) == "movie" else "filterTelevision"
-        raw = user.filters.get(fieldname) or ""
-        if not raw:
+        return share_filter_admits(user.filters.get(fieldname) or "", collection.labels, "")
+
+    def admits_item(self, user: FakeUser | None, item: FakeMovie) -> bool:
+        """Whether this account's share filter lets it see one library item (recorded: a batch read AS a
+        restricted account leaves out what its filter hides)."""
+        if user is None:
             return True
-        attributes = {"label": {label.casefold() for label in collection.labels}}
-        chunks = re.split(r"([|&])", raw)
-        visible = True
-        for i in range(0, len(chunks), 2):
-            match = re.match(r"^([A-Za-z]+)(!=|=)(.*)$", chunks[i])
-            if match is None:
-                raise ValueError(f"fake PMS cannot read share filter condition {chunks[i]!r}")
-            field_name, op, rest = match.groups()
-            values = {unquote(v).casefold() for v in re.split(r"%2C|%2c|,", rest) if v}
-            hit = bool(attributes.get(field_name, set()) & values)
-            holds = hit if op == "=" else not hit
-            if i == 0:
-                visible = holds
-            elif chunks[i - 1] == "&":
-                visible = visible and holds
-            else:
-                visible = visible or holds
-        return visible
+        section = self.section_of(item.rating_key)
+        if section is not None and user.shared_sections is not None and section.key not in user.shared_sections:
+            return False
+        kind = section.type if section else ("movie" if item.media_type == "movie" else "show")
+        fieldname = "filterMovies" if kind == "movie" else "filterTelevision"
+        return share_filter_admits(user.filters.get(fieldname) or "", item.labels, item.content_rating)
 
 
 #: The demo library the docs screenshots are taken against. Real titles, because every one of
@@ -1149,14 +1170,32 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
         return _xml(root)
 
     @app.get("/library/collections/{rating_key}/children")
-    @app.get("/library/metadata/{rating_key}/children")
     def collection_children(rating_key: int) -> Response:
+        # NOT filtered by the caller's share filter — recorded: a real PMS served every member of a row
+        # the account could not see on this path (`pms_share_filter_allow_lists.json`).
         collection = _collection(rating_key)
         members = state.members(collection)  # shared with any same-titled collection in this library
         root = _container(size=len(members), totalSize=len(members))
         for key in members:
             if (item := state.item(key)) is not None:
                 _movie_xml(root, state, item)
+        return _xml(root)
+
+    @app.get("/library/metadata/{rating_key}/children")
+    def metadata_children(rating_key: int, request: Request) -> Response:
+        # Filtered, like a real PMS: 404 for a row the account cannot see, else only the items it can.
+        user = state.user_for_token(request.headers.get("X-Plex-Token", ""))
+        collection = _collection(rating_key)
+        if not state.sees(user, collection):
+            raise HTTPException(status_code=404, detail=f"no collection {rating_key}")
+        members = [
+            item
+            for key in state.members(collection)
+            if (item := state.item(key)) is not None and state.admits_item(user, item)
+        ]
+        root = _container(size=len(members), totalSize=len(members))
+        for item in members:
+            _movie_xml(root, state, item)
         return _xml(root)
 
     @app.put("/library/collections/{rating_key}/items")
@@ -1216,20 +1255,31 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
         return Response(status_code=200)
 
     @app.get("/library/metadata/{rating_keys}")
-    def metadata(rating_keys: str) -> Response:
+    def metadata(rating_keys: str, request: Request) -> Response:
+        # Read AS a shared account, the batch leaves out what its share filter hides, and 404s when that
+        # is everything — the same shape as a batch of deleted keys (`pms_share_filter_allow_lists.json`).
+        user = state.user_for_token(request.headers.get("X-Plex-Token", ""))
         root = _container(librarySectionID=state.section_id)
         found = 0
         for raw in rating_keys.split(","):
             key = int(raw)
             if (item := state.item(key)) is not None:
+                if not state.admits_item(user, item):
+                    continue
                 _movie_xml(root, state, item)
                 found += 1
             elif key in state.collections:
+                if not state.sees(user, state.collections[key]):
+                    continue
                 _collection_xml(root, state, state.collections[key])
                 found += 1
         if not found:
             raise HTTPException(status_code=404, detail=f"no items for {rating_keys}")
         root.set("size", str(found))
+        if "json" in request.headers.get("Accept", ""):
+            # A real PMS answers in JSON when asked (recorded: `pms_metadata_batch_partial.json`).
+            metadata = [dict(child.attrib) for child in root]
+            return JSONResponse({"MediaContainer": {"size": found, "Metadata": metadata}})
         return _xml(root)
 
     @app.get("/library/metadata/{rating_key}/thumb/{stamp}")

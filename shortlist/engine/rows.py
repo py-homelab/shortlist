@@ -1007,7 +1007,7 @@ def _stamp_disposition(
     things are written onto ``gather_stats.trace``:
 
     * a per-source ``disposition`` tally: ``{kept, already_watched, not_in_your_libraries,
-      excluded_genre, lost_ranking_cutoff}`` counts, and
+      excluded_genre, hidden_by_their_restrictions, lost_ranking_cutoff}`` counts, and
     * a ``fate``/``fate_reason`` on each already-recorded per-seed return, keyed by tmdb_id, and
     * the numbers that DECIDED that fate — the title's year, its rating, and the release-date weight
       applied to it. Without them the trace could say a title lost the cut but never why, so "it
@@ -1112,6 +1112,38 @@ def _with_resolved_rating_key(ctx: EngineContext, pick: Pick) -> Pick:
     return replace(pick, rating_key=resolved) if resolved else pick
 
 
+def _visible_candidates(
+    ctx: EngineContext, candidates: list[Candidate], visible: Callable[[list[int]], set[int] | None]
+) -> tuple[list[Candidate], list[Candidate]]:
+    """``(kept, hidden)``: candidates with at least one copy this person can see, and the rest (#115).
+
+    EVERY copy, not the candidate's own ratingKey. The pool's key comes from the union library index,
+    which keeps whichever library was indexed last — so a title in both "Movies" and "4K Movies"
+    carries the 4K key, and a person shared only "Movies" would read it as hidden (recorded: an unshared
+    library's items read exactly like filtered ones). The delivery loop re-checks each library's own copy.
+    Nothing is dropped when the check could not be made.
+    """
+    kinds = {
+        section.key: (MediaType.MOVIE if section.type == "movie" else MediaType.SHOW)
+        for section in ctx.delivery_sections
+    }
+
+    def copies(c: Candidate) -> set[int]:
+        keys = {c.rating_key} if c.rating_key is not None else set()
+        for section_key, index in ctx.section_index.items():
+            if kinds.get(section_key) is c.media_type and c.tmdb_id in index:
+                keys.add(index[c.tmdb_id])
+        return keys
+
+    by_candidate = [(c, copies(c)) for c in candidates]
+    seen = visible(sorted({k for _, keys in by_candidate for k in keys}))
+    if seen is None:
+        return list(candidates), []
+    kept = [c for c, keys in by_candidate if keys & seen]
+    hidden = [c for c, keys in by_candidate if not keys & seen]
+    return kept, hidden
+
+
 def _candidate_pool(
     ctx: EngineContext,
     seeds: list,
@@ -1124,6 +1156,7 @@ def _candidate_pool(
     watched_exclusions: set[tuple[int, MediaType]] | None = None,
     recent_count: int | None = None,
     recency: float = 0.0,
+    visible: Callable[[list[int]], set[int] | None] | None = None,
 ) -> tuple[tuple[list[Candidate], list[Candidate], list[Candidate]], candidates_mod.GatherStats]:
     """Gather TMDB candidates for ``seeds`` and intersect them with the library.
 
@@ -1175,6 +1208,12 @@ def _candidate_pool(
         dropped=dropped,
     )
     in_library = _media_filter(valid, media)
+    # What this PERSON can see, BEFORE the pre-rank cut (#115). A pick their Plex restrictions hide is
+    # invisible in their row, so an allow-list account was handed rows Plex emptied. Checked here, ahead
+    # of the cut, so the cut fills from titles they can actually watch. None = could not be checked.
+    if visible is not None and in_library:
+        in_library, hidden = _visible_candidates(ctx, in_library, visible)
+        dropped.extend((c, "hidden_by_their_restrictions") for c in hidden)
     # Measure genre avoidance BEFORE the cut, so the dial can rescue or demote a title across the
     # truncation boundary rather than only reordering whatever already survived — the same reason
     # `recency` participates in the cut. A no-op unless the owner turned the dial up, and the
@@ -1766,6 +1805,58 @@ class RowPolicy:
     # Set by the first failed TMDB genre lookup for a rewatch row; every later title is then kept out
     # without asking (`_in_excluded_genre`).
     genres_unreadable: bool = False
+    # ratingKey -> can this person see it (`visible`). Memoised across their rows: one read per title.
+    visibility: dict[int, bool] = field(default_factory=dict)
+    # Set by the first read that fails; the rest of this person's run then picks as it always did.
+    visibility_unreadable: bool = False
+    # Their server token, fetched once: for a managed account every fetch is a fresh plex.tv exchange.
+    visibility_token: str | None = None
+
+    @property
+    def can_check_visibility(self) -> bool:
+        """Whether `visible` can answer for this person at all (not the owner, a token source, no failure)."""
+        return (
+            self.user.user_type is not UserType.OWNER
+            and self.ctx.token_for_user is not None
+            and not self.visibility_unreadable
+        )
+
+    def visible(self, rating_keys: list[int]) -> set[int] | None:
+        """Which of these library items this person's Plex restrictions let them see (#115).
+
+        Read AS them (`PlexClient.visible_to`), so Plex applies its own rules — allow lists, excluded
+        ratings, anything the owner set — and nothing here re-implements them. The owner sees
+        everything and is never read.
+
+        Returns None when it cannot be checked (no token, or the read failed): the row is then built as
+        it always was. That costs a restricted person some picks Plex hides, never a leak — what Plex
+        shows each account is still decided by Plex.
+        """
+        if not self.can_check_visibility:
+            return None
+        unknown = [k for k in dict.fromkeys(rating_keys) if k not in self.visibility]
+        if unknown:
+            token = self.visibility_token or self.ctx.token_for_user(self.user)
+            self.visibility_token = token
+            if not token:
+                self.visibility_unreadable = True
+                logger.warning(
+                    "{}: no server token, so picks are not limited to what their Plex restrictions allow",
+                    self.user.username,
+                )
+                return None
+            try:
+                seen = self.ctx.plex.visible_to(token, unknown)
+            except Exception as e:
+                self.visibility_unreadable = True
+                logger.warning(
+                    "{}: could not read what their Plex restrictions allow ({}) — picking as before",
+                    self.user.username,
+                    type(e).__name__,
+                )
+                return None
+            self.visibility.update({k: k in seen for k in unknown})
+        return {k for k in rating_keys if self.visibility.get(k)}
 
     @cached_property
     def ratings(self) -> RatingsPolicy:
@@ -2103,6 +2194,7 @@ class RowPolicy:
                     # does not split on recency, so the gather is paid for once), and a row that
                     # overrides it re-cuts the cached `in_library` in `cut_at_recency`.
                     recency=self.cfg.recency,
+                    visible=self.visible,
                 )
             except Exception as e:
                 self.pool_failures[key] = f"{type(e).__name__}: {e}"
@@ -2363,10 +2455,21 @@ def _build_section_picks(
                     media_type=kind,
                     sources=["cold_start"],  # no history to work from — say so rather than imply a match
                 )
-                for i, (tmdb_id, item) in enumerate(ctx.plex.top_rated(section, k))
+                # Three times the row when this person's restrictions can be checked, so the titles they
+                # cannot see (#115) are replaced rather than leaving the row short.
+                for i, (tmdb_id, item) in enumerate(
+                    ctx.plex.top_rated(section, k * 3 if policy.can_check_visibility else k)
+                )
             ]
             if not cands:  # a library with nothing rated falls back to the per-user pull
-                cands = [p for p in base_cold if p.media_type is kind][:k]
+                cands = [p for p in base_cold if p.media_type is kind]
+            # Checked on THIS library's copy: the fallback's keys come from another library, and a
+            # person not shared that one would read every title as hidden.
+            cold_copy = ctx.section_index.get(section.key, {})
+            cold_seen = policy.visible([cold_copy.get(p.tmdb_id, p.rating_key) for p in cands])
+            if cold_seen is not None:
+                cands = [p for p in cands if cold_copy.get(p.tmdb_id, p.rating_key) in cold_seen]
+            cands = cands[:k]
             rewatches = library_cooling = 0
             if spec.rewatch:
                 # Too little history to SEARCH from is not too little to rewatch from. The server's
@@ -2390,6 +2493,9 @@ def _build_section_picks(
                     )
                     for c in history[:k]
                 ]
+                led_seen = policy.visible([p.rating_key for p in led])
+                if led_seen is not None:
+                    led = [p for p in led if p.rating_key in led_seen]
                 seen = policy.zero_pct_exclusions()
                 cands = [*led, *(p for p in cands if (p.tmdb_id, p.media_type) not in seen)][:k]
                 rewatches = len(history)
@@ -2458,6 +2564,12 @@ def _build_section_picks(
             ),
             recently_finished=cooling,
         )
+        # Per library, as delivered: a candidate's pool ratingKey can belong to a different library than
+        # this one, and a pick carried forward from before restrictions were checked has never been.
+        seen = policy.visible([sec_idx[c.tmdb_id] for c in sub] + [sec_idx[p.tmdb_id] for p in prior_valid])
+        if seen is not None:
+            sub = [c for c in sub if sec_idx[c.tmdb_id] in seen]
+            prior_valid = [p for p in prior_valid if sec_idx[p.tmdb_id] in seen]
         recipe = row_recipe(policy, spec)
         was = ctx.previous_recipes.get((user.slug, spec.slug, str(section.key)), "")
         recipe_changed = bool(was) and was != recipe

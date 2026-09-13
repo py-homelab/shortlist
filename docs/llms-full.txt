@@ -3195,6 +3195,14 @@ Shortlist's. Nothing else in their settings is touched. Shortlist reads what's t
 own entries, and leaves the rest exactly as they were. The original is saved first, and Uninstall
 restores all of them.
 
+## Someone has an "allow only" label or rating list. Do they still get a row?
+
+Yes. Plex's allow list shows only what it names, and a Shortlist row is labelled with that person's
+own Shortlist label, so on its own the allow list would hide their row. Shortlist adds that one label
+to their allow list, and nobody else's. It also builds their row only from titles their restrictions
+let them see, so the row isn't half-empty. Everything else their restrictions hide stays hidden,
+inside the row too.
+
 ## Do I get a row myself?
 
 Yes. Plex's user list never includes the server's own owner, so Shortlist adds you separately,
