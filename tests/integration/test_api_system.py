@@ -962,3 +962,177 @@ class TestSseEventPayloadsAreDocumented:
         assert any("done" in f for f in frames), "the per-user restore line carries the progress count"
         for data in frames:
             assert set(UninstallProgressEvent.model_validate(data).model_dump(exclude_unset=True)) == set(data), data
+
+
+class TestARestoreIsAppliedByTheRestartItAsksFor:
+    """The endpoint used to promise "Restart the container to pick up the restored database".
+
+    It used to copy the backup over `shortlist.db` and unlink the WAL while the running app still held
+    pooled connections to both. Those connections kept writing to the deleted WAL, and closing them on
+    the way out checkpointed it straight back over the restored file: the restart the owner was told to
+    do UNDID the restore (measured: every row written since the backup came back), and on a database that
+    had changed more, left pages of one database spliced into another. The restore now waits for the
+    boot, where nothing has the database open yet.
+    """
+
+    @staticmethod
+    def _boot(config_dir):
+        from contextlib import contextmanager
+
+        from shortlist.server.auth import CSRF_HEADER, session_serializer
+        from shortlist.server.db.models import Server
+
+        @contextmanager
+        def running():
+            app = create_app(config_dir=config_dir)
+            with TestClient(app) as test_client:
+                with app.state.sessions() as session:
+                    if session.query(Server).first() is None:
+                        session.add(
+                            Server(
+                                machine_id="m1",
+                                url="http://pms:32400",
+                                token_enc="x",
+                                owner_account_id=555000001,
+                                plex_pass=True,
+                                capabilities={},
+                            )
+                        )
+                        session.commit()
+                cookie = session_serializer(app.state.session_secret).dumps(
+                    {"account_id": 555000001, "username": "owner"}
+                )
+                test_client.cookies.set(SESSION_COOKIE, cookie)
+                test_client.headers[CSRF_HEADER] = "1"
+                yield test_client
+
+        return running()
+
+    @staticmethod
+    def _set(client: TestClient, key: str, value) -> None:
+        with client.app.state.sessions() as session:
+            if value is None:
+                session.query(Setting).filter(Setting.key == key).delete()
+                session.commit()
+            else:
+                SettingsStore(session).set(key, value)
+
+    @staticmethod
+    def _get(client: TestClient, key: str):
+        with client.app.state.sessions() as session:
+            return SettingsStore(session).get(key)
+
+    @classmethod
+    def _on_disk(cls, config_dir, key: str):
+        return cls._on_disk_file(config_dir / "shortlist.db", key)
+
+    @staticmethod
+    def _on_disk_file(path, key: str):
+        import json
+        import sqlite3
+
+        con = sqlite3.connect(path)
+        try:
+            assert con.execute("pragma integrity_check").fetchone() == ("ok",)
+            row = con.execute("select value from settings where key = ?", (key,)).fetchone()
+        finally:
+            con.close()
+        return None if row is None else json.loads(row[0])["v"]
+
+    def _backup_then_diverge(self, config_dir, *, backed_up="in the backup", later="written after it"):
+        from shortlist.server.db.models import Event
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(config_dir) as client:
+            self._set(client, "app.probe", backed_up)
+            backup = take_backup(config_dir, label="manual")
+            self._set(client, "app.probe", later)
+            with client.app.state.sessions() as session:
+                session.add_all(Event(scope="probe", level="info", message={"pad": "x" * 500}) for _ in range(200))
+                session.commit()
+            response = client.post("/api/system/backups/restore", json={"name": backup.name})
+            assert response.status_code == 200, response.text
+            assert "Restart" in response.json()["message"]
+            # Nothing changes until the restart: this app keeps the database it opened.
+            assert self._get(client, "app.probe") == later
+        return backup
+
+    def test_the_restart_leaves_the_restored_database_in_place(self, tmp_path):
+        self._backup_then_diverge(tmp_path)
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "in the backup"
+        assert self._on_disk(tmp_path, "app.probe") == "in the backup", "the shutdown checkpoint undid the restore"
+
+    def test_a_restore_is_applied_once_not_on_every_boot(self, tmp_path):
+        self._backup_then_diverge(tmp_path)
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.probe", "written after the restore")
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "written after the restore"
+
+    def test_the_copy_taken_first_holds_everything_written_until_the_restart(self, tmp_path):
+        from shortlist.server.services.backup import list_backups
+
+        backup = self._backup_then_diverge(tmp_path, later="the last write before the restart")
+
+        with self._boot(tmp_path):
+            pass
+        pre = [b["name"] for b in list_backups(tmp_path) if "pre-restore" in b["name"]]
+        assert len(pre) == 1 and pre[0] != backup.name
+        assert self._on_disk_file(tmp_path / "backups" / pre[0], "app.probe") == "the last write before the restart"
+
+    def test_the_restore_is_recorded_in_the_database_it_restored(self, tmp_path):
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+
+        with self._boot(tmp_path) as client, client.app.state.sessions() as session:
+            restores = session.query(Event).filter(Event.scope == "backup.restore").all()
+            assert [e.message["backup"] for e in restores] == [backup.name]
+
+    def test_a_backup_deleted_before_the_restart_leaves_the_database_alone(self, tmp_path):
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+        (tmp_path / "backups" / backup.name).unlink()
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "written after it"
+            with client.app.state.sessions() as session:
+                failed = session.query(Event).filter(Event.scope == "backup.restore_failed").all()
+                assert [e.level for e in failed] == ["error"]
+
+    def test_a_restore_that_names_no_backup_is_refused_up_front(self, tmp_path):
+        with self._boot(tmp_path) as client:
+            assert client.post("/api/system/backups/restore", json={"name": "shortlist_nope.db"}).status_code == 404
+            assert client.post("/api/system/backups/restore", json={"name": "../shortlist.db"}).status_code == 404
+        assert not (tmp_path / "restore-pending.json").exists()
+
+    @pytest.mark.parametrize("in_backup", [None, "", "1.6.0"], ids=["before-the-dialog", "never-read", "older"])
+    def test_release_notes_the_owner_closed_stay_closed(self, tmp_path, in_backup):
+        """The closed notes live in the database, so a backup from before they were read, or before the
+        dialog existed, opened the running version's notes again after a restore."""
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.release_notes_seen", in_backup)
+            backup = take_backup(tmp_path, label="manual")
+            self._set(client, "app.release_notes_seen", "1.8.0")
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.release_notes_seen") == "1.8.0"
+
+    def test_release_notes_closed_are_never_moved_backwards_by_a_restore(self, tmp_path):
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.release_notes_seen", "1.8.0")
+            backup = take_backup(tmp_path, label="manual")
+            self._set(client, "app.release_notes_seen", "1.7.0")
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.release_notes_seen") == "1.8.0"

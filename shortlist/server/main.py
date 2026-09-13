@@ -41,9 +41,10 @@ from shortlist.server.api import (
 )
 from shortlist.server.api import settings as settings_api
 from shortlist.server.base_path import BasePathMiddleware, base_path_from_env, render_shell
-from shortlist.server.db.models import Run, Server
+from shortlist.server.db.models import Event, Run, Server
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.scheduler import build_scheduler
+from shortlist.server.services import backup as backups
 from shortlist.server.services.run_service import RunService
 from shortlist.server.services.secrets import SecretBox
 from shortlist.server.services.sse import EventBus
@@ -131,6 +132,16 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # A restore the owner queued is swapped in here, before migrations or anything else opens the
+        # database: swapping it under open connections is how a restore used to be undone by the very
+        # restart it asked for (see `backups.restore_backup`). The notes they had closed are read first,
+        # so an older copy does not reopen them.
+        closed_notes = (
+            backups.read_setting(config_dir, whats_new.SEEN_KEY)
+            if (config_dir / backups.RESTORE_PENDING).exists()
+            else None
+        )
+        restore = backups.apply_pending_restore(config_dir)
         run_migrations(config_dir)
         engine = make_engine(config_dir)
         sessions = make_session_factory(engine)
@@ -207,6 +218,18 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             healed = store.encrypt_plaintext_secrets()
             unreadable = store.undecryptable_secrets()
             store.seed_from_env(dict(os.environ))
+            if restore is not None:
+                if restore["ok"]:
+                    whats_new.keep_closed(store, closed_notes)
+                # Audited in the database it produced, since the one it replaced is now a backup (rule 10).
+                session.add(
+                    Event(
+                        scope="backup.restore" if restore["ok"] else "backup.restore_failed",
+                        level="warning" if restore["ok"] else "error",
+                        message={"backup": restore["backup"], "at": datetime.now(UTC).isoformat()},
+                    )
+                )
+                session.commit()
             # Before the wizard can finish, so a fresh install starts with nothing to announce.
             whats_new.initialise(store, shortlist.__version__)
             # Configure logging from the DB setting (seeded from LOG_LEVEL on first boot). The
@@ -314,6 +337,8 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 await asyncio.wait_for(stream_task, timeout=5)
             except (TimeoutError, asyncio.CancelledError):
                 stream_task.cancel()
+            # Close the pool, so the WAL is checkpointed now rather than whenever the interpreter gets to it.
+            engine.dispose()
 
     # The interactive API docs + schema disclose the whole API surface unauthenticated. They're off
     # by default (nothing sensitive, but no reason to advertise); set SHORTLIST_ENABLE_DOCS=1 to

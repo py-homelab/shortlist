@@ -7,6 +7,7 @@ ones, and hooks into startup (pre-migration) and APScheduler (daily). The backup
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sqlite3
@@ -123,7 +124,10 @@ def list_backups(config_dir: Path) -> list[dict]:
 def restore_backup(config_dir: Path, backup_name: str) -> bool:
     """Restore a backup by copying it over the current DB. Returns True on success.
 
-    The caller must stop the app or hold the DB lock before calling this.
+    Nothing may have the database open: not a pooled connection, not a session. A connection left open
+    keeps writing to the WAL this unlinks, and closing it checkpoints those pages back over the restored
+    file. So the running app never calls this; it queues the restore (`request_restore`) and the next
+    boot applies it (`apply_pending_restore`) before anything opens the database.
     """
     try:
         backup_name = safe_backup_name(backup_name)
@@ -159,3 +163,68 @@ def restore_backup(config_dir: Path, backup_name: str) -> bool:
     shutil.copy2(backup_path, db_path)
     logger.info("restored from backup: {}", backup_name)
     return True
+
+
+#: A restore the owner asked for, waiting for the restart that applies it. In /config, not /config/backups,
+#: so the backup listing and its rotation never see it.
+RESTORE_PENDING = "restore-pending.json"
+
+
+def request_restore(config_dir: Path, backup_name: str) -> bool:
+    """Queue a restore of this backup for the next boot. False when there is no such backup.
+
+    The running app keeps the database it has open until the restart; `apply_pending_restore` swaps
+    the backup in at the start of the next boot, where nothing has the database open yet.
+    """
+    try:
+        backup_name = safe_backup_name(backup_name)
+    except ValueError:
+        logger.error("refusing a backup name that is not a plain filename: {!r}", backup_name)
+        return False
+    if not (config_dir / BACKUP_SUBDIR / backup_name).exists():
+        logger.error("backup not found: {}", backup_name)
+        return False
+    marker = config_dir / RESTORE_PENDING
+    marker.write_text(json.dumps({"backup": backup_name, "requested_at": datetime.now(UTC).isoformat()}))
+    logger.warning("restore of {} queued — it is applied when Shortlist next starts", backup_name)
+    return True
+
+
+def apply_pending_restore(config_dir: Path) -> dict | None:
+    """Apply the restore `request_restore` queued, if there is one. Call before anything opens the database.
+
+    The request is removed FIRST, so a restore that fails (or crashes the boot) is not retried on every
+    start after it; the pre-restore copy `restore_backup` takes is the way back from a bad one.
+
+    Returns:
+        None when nothing was queued, else ``{"backup": name, "ok": bool}``.
+    """
+    marker = config_dir / RESTORE_PENDING
+    if not marker.exists():
+        return None
+    try:
+        name = str(json.loads(marker.read_text())["backup"])
+    except (OSError, ValueError, KeyError, TypeError):
+        name = ""
+    marker.unlink(missing_ok=True)
+    if not name:
+        logger.error("ignoring an unreadable restore request in {} — the database was not changed", RESTORE_PENDING)
+        return {"backup": "", "ok": False}
+    return {"backup": name, "ok": restore_backup(config_dir, name)}
+
+
+def read_setting(config_dir: Path, key: str) -> object | None:
+    """One setting straight from `shortlist.db`, for the moment before the app opens it. None if unreadable."""
+    db_path = config_dir / "shortlist.db"
+    if not db_path.exists():
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        finally:
+            con.close()
+        value = json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+    return value.get("v") if isinstance(value, dict) else None

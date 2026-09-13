@@ -1033,7 +1033,13 @@ class BackupRestoredOut(PassthroughModel):
 
 @_authed.post("/backups/restore", response_model=BackupRestoredOut)
 async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dict:
-    """Restore from a named backup. The app will need to be restarted after.
+    """Queue a restore from a named backup. It is applied when the app next starts.
+
+    Not applied here: the running app has the database open, and swapping the file under its pooled
+    connections let the shutdown checkpoint write the old database back over the restored one, so the
+    restart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the
+    pre-restore copy there (so it holds everything written until the restart), and audits it in the
+    database it restored.
 
     A restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a
     copy taken before a shared row's audience was narrowed puts the wider audience back, and the
@@ -1041,27 +1047,21 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
     that were hiding that row. That is correct for the config being restored, and it is exactly the
     kind of change an operator does not expect from a button labelled "restore".
 
-    So it is stated, in the response and in the audit trail (rule 10), rather than left to be
-    discovered on someone's Home screen.
+    So it is stated, in the response, rather than left to be discovered on someone's Home screen.
     """
-    from shortlist.server.services.backup import restore_backup
+    from shortlist.server.services.backup import request_restore
 
-    state = request.app.state
-    ok = await asyncio.get_running_loop().run_in_executor(None, lambda: restore_backup(state.config_dir, body.name))
+    ok = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: request_restore(request.app.state.config_dir, body.name)
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="backup not found")
-    with state.sessions() as session:
-        session.add(
-            Event(
-                scope="backup.restore",
-                level="warning",
-                message={"backup": body.name, "at": datetime.now(UTC).isoformat()},
-            )
-        )
-        session.commit()
     return {
         "restored": body.name,
-        "message": "Restored. Restart the container to pick up the restored database.",
+        "message": (
+            "Ready to restore. Restart the container to swap this backup in; a copy of the current "
+            "database is saved first."
+        ),
         # Named separately from `message` so the UI can render it as a warning rather than a receipt.
         "privacy_note": (
             "This also restores who could see which rows at the time of the backup. If you have "

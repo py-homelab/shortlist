@@ -32,6 +32,24 @@ def initialise(store: SettingsStore, current_version: str) -> None:
     store.set(SEEN_KEY, "" if store.get("setup.completed") else current_version)
 
 
+def keep_closed(store: SettingsStore, closed_before: object) -> None:
+    """After a backup is restored, keep the newest notes the owner had closed before it.
+
+    The record lives in the database, so restoring a copy from before those notes were read (or from
+    before this dialog existed) would reopen them. Never moves the record backwards.
+
+    Args:
+        store: the settings store, on the restored database.
+        closed_before: the record as it was just before the restore, or None if there was none.
+    """
+    before = release_tuple(closed_before) if isinstance(closed_before, str) else None
+    if before is None:
+        return
+    restored = release_tuple(store.get(SEEN_KEY) or "") if store.has_row(SEEN_KEY) else None
+    if restored is None or before > restored:
+        store.set(SEEN_KEY, closed_before)
+
+
 def pending(store: SettingsStore, current_version: str) -> list[dict]:
     """The releases the owner has not read, newest first. ``[]`` when there are none, or GitHub is down.
 

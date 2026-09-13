@@ -1939,6 +1939,10 @@ A backup holds everything Shortlist knows: settings and connections, your rows a
 the people it tracks, run history and each run's picks, the request inbox, and most importantly the
 copies of each user's original Plex share filters that an uninstall restores from.
 
+Restoring one takes effect when you restart the container: Shortlist saves a copy of the current
+database and swaps the backup in as it starts, before anything else opens the database. Until that
+restart it keeps running on the database it has.
+
 Because a backup holds your rows' **audiences**, restoring one also restores who could see which
 rows at that moment. If you have narrowed a shared row's audience since the backup was taken,
 restoring widens it again and those people will see the row after the next run. Shortlist says so
