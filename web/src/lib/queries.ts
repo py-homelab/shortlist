@@ -806,8 +806,8 @@ export function useReport(window: ReportWindow = "30") {
 /**
  * Has enough time passed for a per-person "picks watched" figure to mean anything?
  *
- * A pick only counts once it has had its full `matured_days` to be watched — the rule the dashboard
- * already states in as many words, and withholds its own landing rate for. Until the OLDEST pick on
+ * A pick only counts once it has had its full `matured_days` to be watched — the rule the dashboard's
+ * "Needs a look" card states when it holds its warnings back. Until the OLDEST pick on
  * the server reaches that age, no pick anywhere has had its chance, so every person's rate is 0 and
  * says nothing about them. `formatHitRate` renders those as "—".
  *

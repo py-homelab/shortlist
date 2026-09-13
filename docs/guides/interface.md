@@ -274,13 +274,14 @@ the same as zero.
 **Avg to watch** — average days from a title first being recommended to it first being watched, over
 titles first watched in the window. Lower is better, and the change arrow is coloured accordingly.
 
-**Landing rate** — the one percentage, and the only one computed carefully enough to trust. It is the
-share of picks watched while their row was still showing them, measured over a **settled group**:
-picks delivered in the window _and_ at least 30 days ago. A pick delivered yesterday is still sitting
-in the row — it has not yet had its chance to be watched and dropped — so counting it would drag the
-rate toward zero for no reason. On a
-7-day window there is usually no settled group at all, and the card says so instead of showing a
-misleading number.
+**Of what people watched, in their Shortlist row** — the one percentage. Of the titles people watched
+in the window, the share a Shortlist row of theirs was showing when they watched it. Each person
+counts from their first pick, so viewing from before they had a row is left out, and people with no
+picks yet aren't counted. It says the rows are in front of what people choose, not that a row made the
+choice.
+
+It replaced a rate over every title ever _shown_, which stayed under 1% whether Shortlist worked or
+not: a row of 20 to 30 titles is mostly titles nobody will watch.
 
 **By person / By row** — counts, not percentages, sorted by what was actually watched, with the
 finished count beside each. At these sample sizes a percentage is noise: ranking by one put a person

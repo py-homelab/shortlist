@@ -30,6 +30,7 @@ from shortlist.server.db.models import (
     RunUser,
     SharedRowWatch,
     User,
+    WatchedTitle,
     WatchSession,
     iso_utc,
 )
@@ -311,6 +312,78 @@ def _avg_days_to_watch(session: Session, start, end=None) -> float | None:
         .scalar()
     )
     return round(value, 1) if value is not None else None
+
+
+def _viewing_share(session: Session, since: datetime | None) -> dict:
+    """Of the titles people watched in the window, how many their Shortlist row had shown them.
+
+    The dashboard's rate. The landing rate it replaced there divides by every title ever SHOWN, and a
+    20-to-30 title row is mostly titles nobody will watch, so it sat under 1% whether Shortlist was
+    working or not (71 of 10,898 on a real server). What a recommendation competes for is what people
+    actually watch, so that is the denominator here.
+
+    Each person counts from their OWN first pick, never from before it: viewing from before a row existed
+    for them is not something a row could have shown. A server-wide start got this wrong twice: a 90-day window reached
+    back before the install (1,412 titles watched against 804 for all time on a real server), and a
+    person enabled last week had their whole window counted. Dry runs write no picks, so time in safe
+    mode never counts. Only people Shortlist builds rows for (enabled) count, on both sides.
+
+    People with no picks are left out entirely, even if a shared row reaches them. Their shared-row
+    credits still count for everyone who IS counted, but a credit must never decide who is: starting
+    someone at their first shared-row watch selects people by outcome, and turned a real 1 of 51 into
+    100%. Also kept rather than modelled: viewing in a library none of their rows target still counts
+    (a Movies-only row competes with their TV too) — an understatement.
+
+    Cost: the per-person first pick is a GROUP BY over `picks`, about as expensive as
+    `_avg_days_to_watch` (1.45s at 500k picks). A `(user_id, created_at)` index would fix it if the
+    dashboard ever gets slow.
+
+    A watch is dated by `source_viewed_at` when it has one. A history transfer scrobbles every title
+    "now" and keeps the true date there, and 2,000 titles watched today would bury the real ones. The
+    cost: a transferred title REWATCHED later keeps its transfer-era date (`watch_cache._upsert` never
+    rewrites that column), so on an account that had a transfer, a rewatch of a transferred title is
+    missed on both sides.
+
+    `from_rows` is taken INSIDE `watched`: a pick the live listener credited before the nightly sync has
+    recorded the watch would otherwise count as more than all of it. It reads as "was in their row when
+    they watched it", not as proof the row caused the watch.
+    """
+    enabled = [uid for (uid,) in session.query(User.id).filter(User.enabled.is_(True))]
+    first = {
+        uid: _as_utc(at)
+        for uid, at in session.query(PickRow.user_id, func.min(PickRow.created_at))
+        .filter(PickRow.user_id.in_(enabled))
+        .group_by(PickRow.user_id)
+    }
+    if not first:
+        return {"watched": 0, "from_rows": 0, "rate": None}
+    start_for = {uid: at if since is None else max(since, at) for uid, at in first.items()}
+    earliest = min(start_for.values())
+
+    when = func.coalesce(WatchedTitle.source_viewed_at, WatchedTitle.viewed_at)
+    watched: set[tuple] = set()
+    for uid, tmdb_id, title, year, media, viewed in session.query(
+        WatchedTitle.user_id, WatchedTitle.tmdb_id, WatchedTitle.title, WatchedTitle.year, WatchedTitle.media_type, when
+    ).filter(WatchedTitle.user_id.in_(list(start_for)), when >= earliest):
+        if _as_utc(viewed) < start_for[uid]:
+            continue
+        # A title Plex never matched to TMDB is still a title they watched; it just cannot be a pick. Keyed
+        # on its name, not its ratingKey, which is only unique within one library — the same film in
+        # "Movies" and "4K Movies" is one title.
+        watched.add((uid, media, tmdb_id) if tmdb_id is not None else (uid, media, "title", title.lower(), year))
+    credited = {
+        (uid, media, tmdb_id)
+        for uid, media, tmdb_id in session.query(PickRow.user_id, PickRow.media_type, PickRow.tmdb_id).filter(
+            PickRow.user_id.in_(list(start_for)), *_watched_in(earliest)
+        )
+    } | {
+        (uid, media, tmdb_id)
+        for uid, media, tmdb_id in session.query(
+            SharedRowWatch.user_id, SharedRowWatch.media_type, SharedRowWatch.tmdb_id
+        ).filter(SharedRowWatch.user_id.in_(list(start_for)), *_shared_watched_in(earliest))
+    }
+    from_rows = len(watched & credited)
+    return {"watched": len(watched), "from_rows": from_rows, "rate": _rate(from_rows, len(watched))}
 
 
 def _landing(session: Session, now: datetime, days: int | None) -> dict:
@@ -909,6 +982,7 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
         or 0
     )
     landing = _landing(session, now, days)
+    viewing_share = _viewing_share(session, since)
 
     # The trend ignores the window on purpose — see TREND_WEEKS. SHARED rows are folded in like
     # everywhere else that counts a WATCH: the chart sits directly under the Watched tile, and a bar
@@ -1096,6 +1170,7 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
             "avg_days_to_watch": avg_now,
             "avg_days_to_watch_delta": _delta(avg_now, avg_prev),
             "landing": landing,
+            "viewing_share": viewing_share,
         },
         "watch_sync": {
             "last": last_watch_sync,

@@ -3957,6 +3957,7 @@ export interface components {
             /** Finished */
             finished: number;
             landing: components["schemas"]["LandingOut"];
+            viewing_share: components["schemas"]["ViewingShareOut"];
             /** Watched */
             watched: number;
             /** Watched Delta */
@@ -5764,6 +5765,20 @@ export interface components {
             latest_version: string | null;
             /** Update Available */
             update_available: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * ViewingShareOut
+         * @description Of the titles people watched in the window, how many their Shortlist row had shown them.
+         */
+        ViewingShareOut: {
+            /** From Rows */
+            from_rows: number;
+            /** Rate */
+            rate: number | null;
+            /** Watched */
+            watched: number;
         } & {
             [key: string]: unknown;
         };

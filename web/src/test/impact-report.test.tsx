@@ -81,6 +81,9 @@ const LANDING = {
   matured_days: 30,
 };
 
+// Distinct from every other figure in the fixture, so a swapped slot renders as different text.
+const VIEWING_SHARE = { watched: 537, from_rows: 82, rate: 0.153 };
+
 const EMPTY = {
   window: "30" as ReportWindow,
   window_days: 30,
@@ -136,6 +139,7 @@ const REPORT: EffectivenessReport = {
     avg_days_to_watch: 3.5,
     avg_days_to_watch_delta: -0.8,
     landing: LANDING,
+    viewing_share: VIEWING_SHARE,
   },
   ...EMPTY,
   top_titles: [
@@ -297,40 +301,6 @@ describe("ImpactReport", () => {
     await userEvent.click(screen.getByRole("button", { name: "90 days" }));
 
     expect(getReport).toHaveBeenCalledWith("90");
-  });
-
-  it("states the landing rate over its matured cohort, not over every pick ever", async () => {
-    renderReport();
-
-    // It lives in the verdict now, not a card of its own — two cards printing the same ratio at two
-    // roundings (1% beside 0.5%) is how a dashboard comes to disagree with itself.
-    expect(await screen.findByText("40.0%")).toBeTruthy();
-    expect(screen.getByText(/4 of 10 ·/)).toBeTruthy();
-    // The caveat is the point — without it the percentage is a number with no meaning, because the
-    // denominator is not "every pick ever".
-    expect(
-      screen.getByText(/only picks that have had their full 30 days/i),
-    ).toBeTruthy();
-  });
-
-  it("says so plainly when no pick is old enough to have a landing rate yet", async () => {
-    getReport.mockResolvedValue({
-      ...REPORT,
-      overall: {
-        ...REPORT.overall,
-        landing: { ...LANDING, delivered: 0, watched: 0, rate: null },
-      },
-    });
-    renderReport();
-
-    expect(await screen.findByText(/Not enough time yet/i)).toBeTruthy();
-    // Two rewrites' worth of lessons, both pinned. "try a longer window" was advice that cannot
-    // work — no window reaches picks that do not exist. And stating the CUTOFF ("needs picks
-    // delivered before 12 Jul") read as though it wanted old picks, when what it needs is for the
-    // picks it has to get older. It must say when a score arrives instead.
-    expect(screen.queryByText(/longer window/i)).toBeNull();
-    expect(screen.queryByText(/needs picks delivered before/i)).toBeNull();
-    expect(screen.getByText(/starts showing a score around/i)).toBeTruthy();
   });
 
   it("says there is no earlier period rather than dangling a comparison", async () => {
@@ -1125,15 +1095,22 @@ describe("ImpactReport — the engagement split", () => {
     expect(screen.queryByText(/gave up part-way/)).toBeNull();
   });
 
-  it("never reports a real rate as zero", async () => {
-    // The backend rounds `landing.rate` to three decimals before it leaves the server — a tenth of a
-    // percentage point. On a large library a genuine 0.03% arrives as 0.0, and "0.0%" reads as
-    // "nobody watched anything" when thirty people did. The counts are exact; the ratio is not.
+  it("says how much of what people watched was in their Shortlist row", async () => {
+    // Replaced "picks watched while their row still showed them" (0.7% on a real server), which divided
+    // by every title ever SHOWN and so stayed tiny whether Shortlist worked or not.
+    renderReport();
+
+    expect(await screen.findByText("15.3%")).toBeTruthy();
+    expect(screen.getByText("82 of 537 titles watched in the last 30 days")).toBeTruthy();
+    expect(screen.queryByText(/Picks watched while their row still showed them/)).toBeNull();
+  });
+
+  it("never reports a real share as zero", async () => {
     getReport.mockResolvedValue({
       ...REPORT,
       overall: {
         ...REPORT.overall,
-        landing: { ...LANDING, delivered: 100000, watched: 30, rate: 0.0 },
+        viewing_share: { watched: 100000, from_rows: 30, rate: 0.0 },
       },
     });
     renderReport();
@@ -1142,17 +1119,21 @@ describe("ImpactReport — the engagement split", () => {
     expect(screen.queryByText("0.0%")).toBeNull();
   });
 
-  it("still says nothing at all when nothing was delivered", async () => {
+  it("blames the missing watch history, not the people, when there is no share to show", async () => {
+    // The share reads the nightly watch sync; the Watched tile reads live credits. A pick credited today
+    // shows "41 watched" above a share of nothing, so "no one has watched anything" would contradict
+    // the headline on the same card. What is actually missing is synced history.
     getReport.mockResolvedValue({
       ...REPORT,
       overall: {
         ...REPORT.overall,
-        landing: { ...LANDING, delivered: 0, watched: 0, rate: null },
+        viewing_share: { watched: 0, from_rows: 0, rate: null },
       },
     });
     renderReport();
 
-    await screen.findByText(/Not enough time yet/i);
+    expect(await screen.findByText(/Nothing to count yet/i)).toBeTruthy();
+    expect(screen.queryByText(/has watched anything/i)).toBeNull();
     expect(screen.queryByText("<0.1%")).toBeNull();
   });
 });

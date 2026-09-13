@@ -72,16 +72,16 @@ function WatchSyncButton() {
 }
 
 /**
- * The landing rate as text, computed from the counts rather than the pre-rounded ratio.
+ * The viewing share as text, computed from the counts rather than the pre-rounded ratio.
  *
- * Never "0.0%" while something was watched: a rate too small to show at one decimal is reported as
- * "<0.1%", because a zero and a very small number say opposite things about whether the setup works.
+ * Never "0.0%" while something came from a row: a share too small to show at one decimal is "<0.1%",
+ * because a zero and a very small number say opposite things about whether the setup works.
  */
-function landingPercent(
-  landing: EffectivenessReport["overall"]["landing"],
+function sharePercent(
+  share: EffectivenessReport["overall"]["viewing_share"],
 ): string {
-  if (landing.delivered === 0) return "\u2014";
-  const pct = (landing.watched / landing.delivered) * 100;
+  if (share.watched === 0) return "\u2014";
+  const pct = (share.from_rows / share.watched) * 100;
   if (pct > 0 && pct < 0.05) return "<0.1%";
   return `${pct.toFixed(1)}%`;
 }
@@ -175,18 +175,15 @@ function Verdict({
   coverage,
   runs,
   sync,
-  firstPick,
   reportWindow,
 }: {
   overall: EffectivenessReport["overall"];
   coverage: EffectivenessReport["coverage"];
   runs: EffectivenessReport["runs"];
   sync: EffectivenessReport["watch_sync"];
-  /** When the very first pick landed — the empty landing rate needs it to say when a score arrives. */
-  firstPick: string | null;
   reportWindow: ReportWindow;
 }) {
-  const landing = overall.landing;
+  const share = overall.viewing_share;
   const gaveUp = overall.dropped + overall.bounced;
   const reach =
     coverage.users_enabled > 0
@@ -242,59 +239,37 @@ function Verdict({
                   It was a denominator nobody could divide by: `watched` is windowed on when the
                   watch happened, `delivered` on when the pick was CREATED, so the ratio the sentence
                   invited ("15,069 delivered, 38 finished") was never a rate of anything. The
-                  correctly matched cohort already sits immediately below as "Picks watched while
-                  their row still showed them", and reach is on the same card as "N of M people". A
+                  rate that can be read sits immediately below as "Of what people watched, in their
+                  Shortlist row", and reach is on the same card as "N of M people". A
                   five-figure count with no action attached to it only crowded both out. */}
             </p>
           </div>
 
           <div className="grid gap-4">
             <Rate
-              label="Picks watched while their row still showed them"
-              // From the exact COUNTS, not from `landing.rate`. The backend rounds that to three
-              // decimals before it leaves the server — a tenth of a percentage point — so on a large
-              // library a real 0.03% arrives as 0.0 and renders "0.0%", which reads as "nobody
-              // watched anything" when thirty people did.
-              value={landingPercent(landing)}
-              fill={
-                landing.delivered > 0
-                  ? (landing.watched / landing.delivered) * 100
-                  : 0
-              }
+              label="Of what people watched, in their Shortlist row"
+              // The dashboard's rate. It replaced "picks watched while their row still showed them",
+              // which divided by every title ever SHOWN — mostly titles nobody will watch — and so sat
+              // under 1% whether Shortlist worked or not (71 of 10,898 on a real server). What a row
+              // competes for is what people actually watch. From the exact counts, not the rounded
+              // `rate`, for the reason `sharePercent` gives.
+              value={sharePercent(share)}
+              fill={share.watched > 0 ? (share.from_rows / share.watched) * 100 : 0}
               detail={
-                landing.rate !== null
-                  ? // The caveat is the point — without it the percentage is a number with no
-                    // meaning, because the denominator is not "every pick ever".
-                    `${landing.watched.toLocaleString()} of ${landing.delivered.toLocaleString()} · only picks that have had their full ${landing.matured_days} days`
+                share.watched > 0
+                  ? `${share.from_rows.toLocaleString()} of ${share.watched.toLocaleString()} titles watched ${reportWindow === "all" ? "since their rows started" : `in ${WINDOW_PHRASE[reportWindow]}`}`
                   : undefined
               }
             >
-              {landing.rate === null && (
-                // Two rewrites' worth of lessons live in this sentence, and they survived the move
-                // out of its own card. "Try a longer window" is advice that cannot work — no window
-                // reaches picks that do not exist. And naming the CUTOFF ("needs picks delivered
-                // before 12 Jul") reads as though it wants OLD picks, when what it needs is for the
-                // picks it has to get older. So it says when a score arrives.
+              {share.watched === 0 && (
+                // Says what the share counts, never that nobody watched. It reads the nightly watch sync while
+                // the Watched figure above reads live credits, so a pick credited today can sit above an empty
+                // share; on a new install everyone's history predates their rows; and on a server with only
+                // shared rows it stays empty for good, so it must not promise a figure is on its way.
                 <p className="mt-1 text-[11px] leading-snug text-muted-foreground/70">
-                  Not enough time yet. Every pick gets {landing.matured_days}{" "}
-                  days to be watched before it counts.{" "}
-                  {firstPick ? (
-                    <>
-                      Your first picks landed{" "}
-                      {formatDate(firstPick, { dateOnly: true })}, so this
-                      starts showing a score around{" "}
-                      {formatDate(
-                        new Date(
-                          new Date(firstPick).getTime() +
-                            landing.matured_days * 86400000,
-                        ).toISOString(),
-                        { dateOnly: true },
-                      )}
-                      .
-                    </>
-                  ) : (
-                    <>It appears once your earliest picks reach that age.</>
-                  )}
+                  Nothing to count yet. This counts people with a row of their
+                  own, from their first pick, as the nightly watch sync records
+                  what they watch.
                 </p>
               )}
             </Rate>
@@ -1068,13 +1043,11 @@ function ReportBody({
         coverage={coverage}
         runs={runs}
         sync={report.watch_sync}
-        firstPick={(report.first_pick as string | null) ?? null}
         reportWindow={reportWindow}
       />
 
-      {/* The landing rate used to be the card beside this one. It is now the first thing in the
-          verdict, where the question it answers belongs — and two cards printing the same ratio at
-          two different roundings (1% beside 0.5%) is how a dashboard comes to disagree with itself. */}
+      {/* The verdict's rate is the only one on this page — two cards printing the same ratio at two
+          different roundings (1% beside 0.5%) is how a dashboard comes to disagree with itself. */}
       <div className="grid gap-4 lg:grid-cols-2">
         <Section
           title="Watches per week"

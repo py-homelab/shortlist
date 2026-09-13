@@ -922,7 +922,10 @@ class TestRunsApi:
             "avg_days_to_watch",
             "avg_days_to_watch_delta",
             "landing",
+            "viewing_share",
         }
+        # The dashboard's rate: of what people watched, how much their row was showing them.
+        assert set(body["overall"]["viewing_share"]) == {"watched", "from_rows", "rate"}
         assert set(body["overall"]["landing"]) == {
             "delivered",
             "watched",

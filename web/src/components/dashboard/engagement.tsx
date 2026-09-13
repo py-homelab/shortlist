@@ -193,11 +193,10 @@ export function NeedsALook({
           skeleton={<Skeleton className="mt-3 h-16 w-full" />}
         >
           {(data) => {
-            // The SAME maturity gate the Impact card above uses. `landing.rate === null` is that
-            // card's "Not enough time yet — every pick gets N days to be watched before it counts".
-            // Without this, a five-minute-old install showed that sentence and, twelve inches below,
-            // three amber warnings that nobody had watched anything — two cards on one screen
-            // contradicting each other by construction.
+            // A maturity gate. `landing.rate === null` is the server saying no pick has had its full N
+            // days yet. Without it a five-minute-old install showed three amber warnings that nobody had
+            // watched anything. The card says so itself when it holds them back (below) — the Impact
+            // card that used to carry "Not enough time yet" now shows a viewing share instead.
             // `?.` because an older report — or a caller that builds `overall` by hand — may carry no
             // landing block at all. Absent is NOT the same as `null`: null is the server saying "too
             // early to judge", absent is no opinion, and only the first may suppress a warning.
@@ -218,6 +217,14 @@ export function NeedsALook({
               unwatchedRequests(report.requests),
               ...gaveUp(data.people),
             ].filter((p): p is Problem => p !== null);
+            const tooEarlyNote = tooEarly ? (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Too early to say who isn&rsquo;t watching: a pick gets{" "}
+                {report.overall.landing?.matured_days ?? 30} days before it
+                counts.
+              </p>
+            ) : null;
+            if (problems.length === 0 && tooEarly) return tooEarlyNote;
             if (problems.length === 0) {
               // The verdict card above totals EVERY abandonment, this list leaves out the ones under
               // 5% — so on a day whose only give-ups were bounces, a bare "everyone watched
@@ -240,22 +247,25 @@ export function NeedsALook({
               );
             }
             return (
-              <ul className="mt-3 space-y-2">
-                {problems.map((problem) => (
-                  <li key={problem.key} className="flex items-start gap-2.5">
-                    <AlertTriangle
-                      className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary/70"
-                      aria-hidden="true"
-                    />
-                    <div className="min-w-0 text-sm text-muted-foreground">
-                      <p className="leading-snug">
-                        {problem.text}
-                        {problem.hint && <Why text={problem.hint} />}
-                      </p>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <ul className="mt-3 space-y-2">
+                  {problems.map((problem) => (
+                    <li key={problem.key} className="flex items-start gap-2.5">
+                      <AlertTriangle
+                        className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary/70"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0 text-sm text-muted-foreground">
+                        <p className="leading-snug">
+                          {problem.text}
+                          {problem.hint && <Why text={problem.hint} />}
+                        </p>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {tooEarlyNote}
+              </>
             );
           }}
         </QueryBoundary>

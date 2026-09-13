@@ -227,6 +227,16 @@ class LandingOut(PassthroughModel):
     matured_days: int
 
 
+class ViewingShareOut(PassthroughModel):
+    """Of the titles people watched in the window, how many their Shortlist row had shown them."""
+
+    #: Distinct (person, title) pairs watched in the window, by people Shortlist builds rows for.
+    watched: int
+    #: Of those, the ones a row of theirs was showing when they watched it. Always <= `watched`.
+    from_rows: int
+    rate: float | None
+
+
 class OverallOut(PassthroughModel):
     """Headline counts for the window, with the change vs the previous equal period."""
 
@@ -251,6 +261,7 @@ class OverallOut(PassthroughModel):
     avg_days_to_watch: float | None
     avg_days_to_watch_delta: int | float | None
     landing: LandingOut
+    viewing_share: ViewingShareOut
 
 
 class WatchSyncOut(PassthroughModel):

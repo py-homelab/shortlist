@@ -3153,6 +3153,9 @@
           "landing": {
             "$ref": "#/components/schemas/LandingOut"
           },
+          "viewing_share": {
+            "$ref": "#/components/schemas/ViewingShareOut"
+          },
           "watched": {
             "title": "Watched",
             "type": "integer"
@@ -3193,7 +3196,8 @@
           "dropped",
           "avg_days_to_watch",
           "avg_days_to_watch_delta",
-          "landing"
+          "landing",
+          "viewing_share"
         ],
         "title": "OverallOut",
         "type": "object"
@@ -7436,6 +7440,38 @@
           "git_branch"
         ],
         "title": "VersionOut",
+        "type": "object"
+      },
+      "ViewingShareOut": {
+        "additionalProperties": true,
+        "description": "Of the titles people watched in the window, how many their Shortlist row had shown them.",
+        "properties": {
+          "from_rows": {
+            "title": "From Rows",
+            "type": "integer"
+          },
+          "rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate"
+          },
+          "watched": {
+            "title": "Watched",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "watched",
+          "from_rows",
+          "rate"
+        ],
+        "title": "ViewingShareOut",
         "type": "object"
       },
       "WatchItemOut": {

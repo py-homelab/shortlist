@@ -266,7 +266,7 @@ POST /api/settings/curator/models {provider?, api_key?, ollama_url?} -> {provide
 ## Reports and the dashboard
 
 ```
-GET  /api/report?window=7|30|90|all -> {window, since, first_pick, overall, trend[], per_user[], per_row[], recent[], watch_sync, coverage, runs, requests, top_titles} (what got watched, from picks.watched_at)
+GET  /api/report?window=7|30|90|all -> {window, since, first_pick, overall, trend[], per_user[], per_row[], recent[], watch_sync, coverage, runs, requests, top_titles} (what got watched, from picks.watched_at; `overall.viewing_share` = `{watched, from_rows, rate}`, the share of titles enabled people watched in the window that a row of theirs was showing)
      Windowed, default 30 days, with each headline figure carried alongside its previous equal period so the UI can show a change.
      `requests.watched_after_sent` compares a watch against `request_candidates.sent_at`, stamped once when the status flips
      to "sent" (rows predating that column fall back to `updated_at`).
