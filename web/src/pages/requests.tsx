@@ -764,6 +764,25 @@ const VOTES_OPTIONS: { value: string; label: string }[] = [
   { value: "1000", label: "1k+" },
 ];
 
+/** The Language filter's "no filter" value. Never a language code: TMDB's are two letters. */
+const ANY_LANGUAGE = "any";
+
+/**
+ * The Language filter's choices for one tab: every original language a title on it carries, by name,
+ * then "Unknown" when some title has none recorded. Unknown is a choice of its own rather than a
+ * title that silently matches nothing, so every title on the tab stays reachable through the menu.
+ */
+function languageOptions(
+  list: { language: string }[],
+): { value: string; label: string }[] {
+  const codes = new Set(list.map((r) => r.language));
+  const named = [...codes]
+    .filter((code) => code !== "")
+    .map((code) => ({ value: code, label: languageName(code) }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  return codes.has("") ? [...named, { value: "", label: "Unknown" }] : named;
+}
+
 /**
  * One refinement control in the filter bar. These are deliberately NOT `Segmented`: sort + rating +
  * votes as chip groups put eleven buttons next to the Waiting/Sent tabs, four of them highlighted
@@ -1120,8 +1139,8 @@ function PeopleFilter({
 }
 
 /** Filtered down to nothing. A narrowed list must never read as an empty one, so this says how many
- *  are really on the tab and which control brings them back. Only reachable when a rating, vote or
- *  people filter is set — the Movies/Shows split only ever renders when both types are present, so
+ *  are really on the tab and which control brings them back. Only reachable when a rating, vote,
+ *  language or people filter is set — the Movies/Shows split only ever renders when both types are present, so
  *  it can never empty a list on its own — which is what makes "Clear filters" a safe thing to name. */
 function NoMatches({ label, total }: { label: string; total: number }) {
   return (
@@ -1223,11 +1242,14 @@ export function RequestsPage() {
   const [sort, setSort] = useState<RequestSort>("recent");
   const [minRating, setMinRating] = useState("0");
   const [minVotes, setMinVotes] = useState("0");
+  // An original-language code, "" for titles with none recorded, or ANY_LANGUAGE.
+  const [language, setLanguage] = useState(ANY_LANGUAGE);
   // Whose requests to show. Empty = everyone's, so the page opens unfiltered.
   const [people, setPeople] = useState<Set<string>>(new Set());
   // Free text from the search: narrows the list to titles, or wanters, containing it.
   const [query, setQuery] = useState("");
-  // The rating and vote floors live behind one Filters button rather than as two always-on dropdowns.
+  // The rating, vote and language filters live behind one Filters button rather than as always-on
+  // dropdowns.
   const [filtersOpen, setFiltersOpen] = useState(false);
   const filtersId = useId();
   const tabsId = useId();
@@ -1243,6 +1265,7 @@ export function RequestsPage() {
   const clearFilters = () => {
     setMinRating("0");
     setMinVotes("0");
+    setLanguage(ANY_LANGUAGE);
     setPeople(new Set());
     setQuery("");
   };
@@ -1334,6 +1357,12 @@ export function RequestsPage() {
     list: T[],
   ): T[] =>
     list.filter((r) => r.rating >= ratingFloor && r.vote_count >= votesFloor);
+  // Narrows the same way, to one original language. A title with none recorded is in no named
+  // language, so it only shows under Any or Unknown.
+  const applyLanguage = (list: RequestCandidate[]): RequestCandidate[] =>
+    activeLanguage === ANY_LANGUAGE
+      ? list
+      : list.filter((r) => r.language === activeLanguage);
   // The search's free text. Matches the title, and the people who wanted it by username or by the name
   // the Users page shows — so "sarah" finds her titles before she is picked as a chip.
   const needle = query.trim().toLowerCase();
@@ -1348,13 +1377,27 @@ export function RequestsPage() {
             ),
         );
   const narrow = (list: RequestCandidate[]) =>
-    sortRequests(applyQuery(applyThresholds(applyPeople(applyMedia(list)))), sort);
+    sortRequests(applyQuery(applyLanguage(applyThresholds(applyPeople(applyMedia(list))))), sort);
   // Built from the server's answer, not from `pending`/`sent`/`rejected` — those stay the loaded
   // page, because the tab counts and the "Wanted by" roster have to keep describing the whole inbox
   // rather than the slice a picked name narrowed it to.
   const pendingRows = listRows.filter((r) => r.status === "pending");
   const sentRows = listRows.filter((r) => r.status === "sent");
   const rejectedRows = listRows.filter((r) => r.status === "rejected");
+  const activeShown =
+    active === "waiting"
+      ? pendingRows
+      : active === "sent"
+        ? sentRows
+        : rejectedRows;
+  // The languages offered describe the tab you're on: the loaded page, plus the server's answer once a
+  // name is picked, which can reach titles the page never loaded. A language nothing on the tab is in
+  // any more (its last title was just sent) is dropped rather than left filtering — the same
+  // self-healing the people filter does.
+  const languageChoices = languageOptions([...activeFull, ...activeShown]);
+  const activeLanguage = languageChoices.some((o) => o.value === language)
+    ? language
+    : ANY_LANGUAGE;
   const pendingShown = narrow(pendingRows);
   const sentShown = narrow(sentRows);
   const rejectedShown = narrow(rejectedRows);
@@ -1362,12 +1405,6 @@ export function RequestsPage() {
   // The count beside a PICKED name is re-read from the server's answer, which isn't capped to this
   // page — otherwise the chip could say "(12)" beside a list of forty of that person's titles.
   // Unpicked names keep the loaded page's count; nothing better exists until they're picked.
-  const activeShown =
-    active === "waiting"
-      ? pendingRows
-      : active === "sent"
-        ? sentRows
-        : rejectedRows;
   const exactCounts = new Map(
     peopleOn(activeShown, nameOf, usernames).map((p) => [p.name, p.count]),
   );
@@ -1380,8 +1417,17 @@ export function RequestsPage() {
   // "nothing clears these filters" note. The media split is excluded on purpose: it only renders
   // when both types are present, so it can never be the reason a list is empty.
   const filtered =
-    minRating !== "0" || minVotes !== "0" || activePeople.size > 0 || needle !== "";
-  const floorsSet = (minRating !== "0" ? 1 : 0) + (minVotes !== "0" ? 1 : 0);
+    minRating !== "0" ||
+    minVotes !== "0" ||
+    activeLanguage !== ANY_LANGUAGE ||
+    activePeople.size > 0 ||
+    needle !== "";
+  // How many of the Filters menu's own choices are set, for the count on its button.
+  const menuFiltersSet =
+    (minRating !== "0" ? 1 : 0) +
+    (minVotes !== "0" ? 1 : 0) +
+    (activeLanguage !== ANY_LANGUAGE ? 1 : 0);
+  const languageLabel = activeLanguage ? languageName(activeLanguage) : "Unknown language";
 
   // Only visible pending rows are selectable, so an id lingering in the set after a send/reject or a
   // filter change is harmless, but scoping to what's shown keeps the count honest.
@@ -1613,9 +1659,9 @@ export function RequestsPage() {
                               >
                                 <SlidersHorizontal aria-hidden="true" />
                                 Filters
-                                {floorsSet > 0 && (
+                                {menuFiltersSet > 0 && (
                                   <span className="rounded-full bg-primary px-1.5 text-[11px] font-bold tabular-nums text-primary-foreground">
-                                    {floorsSet}
+                                    {menuFiltersSet}
                                   </span>
                                 )}
                               </Button>
@@ -1658,6 +1704,15 @@ export function RequestsPage() {
                             onChange={setMinVotes}
                             options={VOTES_OPTIONS}
                           />
+                          {/* One language is no choice at all: picking it would hide nothing. */}
+                          {languageChoices.length > 1 && (
+                            <FilterSelect
+                              label="Language"
+                              value={activeLanguage}
+                              onChange={setLanguage}
+                              options={[{ value: ANY_LANGUAGE, label: "Any" }, ...languageChoices]}
+                            />
+                          )}
                         </div>
                       )}
                       {/* Whenever ANYTHING is narrowing the list — even with one title left, when the
@@ -1694,6 +1749,13 @@ export function RequestsPage() {
                               label={`Votes ${VOTES_OPTIONS.find((o) => o.value === minVotes)?.label ?? minVotes}`}
                               removeLabel={`Remove the Votes ${VOTES_OPTIONS.find((o) => o.value === minVotes)?.label ?? minVotes} filter`}
                               onRemove={() => setMinVotes("0")}
+                            />
+                          )}
+                          {activeLanguage !== ANY_LANGUAGE && (
+                            <FilterChip
+                              label={languageLabel}
+                              removeLabel={`Remove the ${activeLanguage ? languageName(activeLanguage) : "unknown"} language filter`}
+                              onRemove={() => setLanguage(ANY_LANGUAGE)}
                             />
                           )}
                           <button

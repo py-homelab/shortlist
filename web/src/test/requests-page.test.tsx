@@ -1559,6 +1559,183 @@ describe("RequestsPage — the header", () => {
   });
 });
 
+describe("RequestsPage — the language filter", () => {
+  // The approved design put rating, votes AND language in the one Filters menu; only the first two
+  // shipped. A title's `language` is TMDB's original language, "" when none was recorded.
+  beforeEach(() => {
+    listRequests.mockReset();
+    deleteRequests.mockClear();
+    getSettings.mockResolvedValue({ "requests.enabled": true });
+    getUsers.mockResolvedValue([]);
+    getArrStatus.mockResolvedValue({ statuses: {}, radarr: "off", sonarr: "off" });
+  });
+
+  const mixedLanguages = () =>
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Parasite", language: "ko", rating: 8.5 }),
+      candidate({ id: 2, tmdb_id: 200, title: "Amélie", language: "fr", rating: 7.9 }),
+      candidate({ id: 3, tmdb_id: 300, title: "Dune", language: "en", rating: 8.3 }),
+      candidate({ id: 4, tmdb_id: 400, title: "Legacy Title", language: "", rating: 7.0 }),
+      candidate({ id: 5, tmdb_id: 500, title: "Shogun", language: "ja", status: "sent" }),
+      candidate({ id: 6, tmdb_id: 600, title: "Oldboy", language: "ko", status: "sent" }),
+    ]);
+
+  const pickLanguage = async (name: string) => {
+    await openFilters();
+    await userEvent.selectOptions(screen.getByLabelText("Language"), name);
+  };
+
+  it("offers the languages on this tab by name, with Any first and Unknown last", async () => {
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await openFilters();
+
+    const select = screen.getByLabelText("Language");
+    // Japanese is only on the Sent tab, so offering it here could only empty the list.
+    expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Any",
+      "English",
+      "French",
+      "Korean",
+      "Unknown",
+    ]);
+    expect(select).toHaveDisplayValue("Any");
+  });
+
+  it("shows only titles in the picked language, counted on the Filters button and removable as a chip", async () => {
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await pickLanguage("Korean");
+
+    expect(screen.getByText("Parasite")).toBeTruthy();
+    expect(screen.queryByText("Amélie")).toBeNull();
+    expect(screen.queryByText("Dune")).toBeNull();
+    expect(screen.queryByText("Legacy Title")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("1");
+
+    await userEvent.selectOptions(screen.getByLabelText("Rating"), "7+");
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("2");
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove the Korean language filter" }));
+    expect(screen.getByText("Amélie")).toBeTruthy();
+    expect(screen.getByText("Dune")).toBeTruthy();
+    expect(screen.getByLabelText("Language")).toHaveDisplayValue("Any");
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("1");
+  });
+
+  it("hides a title of unknown language once a language is picked, and finds it under Unknown", async () => {
+    // A title with no recorded language cannot be said to be in English, so picking English hides it
+    // — and Unknown is offered so that no title on the tab is unreachable through the menu.
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await pickLanguage("English");
+    expect(screen.getByText("Dune")).toBeTruthy();
+    expect(screen.queryByText("Legacy Title")).toBeNull();
+
+    await pickLanguage("Unknown");
+    expect(screen.getByText("Legacy Title")).toBeTruthy();
+    expect(screen.queryByText("Dune")).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove the unknown language filter" })).toBeTruthy();
+  });
+
+  it("is dropped by Clear filters and by a tab change, like the rating and vote floors", async () => {
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await pickLanguage("Korean");
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(screen.getByText("Dune")).toBeTruthy();
+    expect(screen.getByLabelText("Language")).toHaveDisplayValue("Any");
+    expect(screen.queryByRole("button", { name: "Remove the Korean language filter" })).toBeNull();
+
+    await pickLanguage("Korean");
+    await userEvent.click(screen.getByRole("tab", { name: "Sent (2)" }));
+    // Shogun is Japanese: a Korean filter carried across would hide it.
+    expect(await screen.findByText("Shogun")).toBeTruthy();
+    expect(screen.getByText("Oldboy")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove the Korean language filter" })).toBeNull();
+  });
+
+  it("narrows the Sent tab by the languages on that tab", async () => {
+    mixedLanguages();
+    renderPage("/requests?tab=sent");
+    await screen.findByText("Shogun");
+
+    await openFilters();
+    expect(
+      within(screen.getByLabelText("Language")).getAllByRole("option").map((o) => o.textContent),
+    ).toEqual(["Any", "Japanese", "Korean"]);
+    await userEvent.selectOptions(screen.getByLabelText("Language"), "Japanese");
+
+    expect(screen.getByText("Shogun")).toBeTruthy();
+    expect(screen.queryByText("Oldboy")).toBeNull();
+  });
+
+  it("says the filters emptied the list and names the control that brings the titles back", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Parasite", language: "ko", rating: 7.5 }),
+      candidate({ id: 2, tmdb_id: 200, title: "Dune", language: "en", rating: 8.5 }),
+    ]);
+    renderPage();
+    await screen.findByText("Parasite");
+
+    // Each leaves a title on its own; together they leave none.
+    await pickLanguage("Korean");
+    await userEvent.selectOptions(screen.getByLabelText("Rating"), "8+");
+
+    expect(screen.getByText(/No waiting title clears these filters/i)).toBeTruthy();
+    expect(screen.getByText(/2 are on this tab in total/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove the Korean language filter" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(screen.getByText("Parasite")).toBeTruthy();
+    expect(screen.getByText("Dune")).toBeTruthy();
+  });
+
+  it("offers no language choice when every title on the tab is in the same language", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Dune", language: "en" }),
+      candidate({ id: 2, tmdb_id: 200, title: "Arrival", language: "en" }),
+    ]);
+    renderPage();
+    await screen.findByText("Dune");
+
+    await openFilters();
+
+    // Picking the only language there is would hide nothing.
+    expect(screen.getByLabelText("Rating")).toBeTruthy();
+    expect(screen.queryByLabelText("Language")).toBeNull();
+  });
+
+  it("drops the language once nothing on the tab is in it", async () => {
+    // Parasite is the only Korean title waiting. Once it goes, filtering on Korean would empty the
+    // queue for a reason the menu no longer offers — the list falls back to every language.
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+    await pickLanguage("Korean");
+    expect(screen.queryByText("Dune")).toBeNull();
+
+    listRequests.mockResolvedValue([
+      candidate({ id: 2, tmdb_id: 200, title: "Amélie", language: "fr", rating: 7.9 }),
+      candidate({ id: 3, tmdb_id: 300, title: "Dune", language: "en", rating: 8.3 }),
+      candidate({ id: 4, tmdb_id: 400, title: "Legacy Title", language: "", rating: 7.0 }),
+    ]);
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Parasite" }));
+    await userEvent.click(toolbar().getByRole("button", { name: /^Delete/i }));
+
+    await waitFor(() => expect(screen.getByText("Dune")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Remove the Korean language filter" })).toBeNull();
+    expect(screen.getByLabelText("Language")).toHaveDisplayValue("Any");
+  });
+});
+
 describe("RequestsPage — what Sonarr/Radarr has", () => {
   beforeEach(() => {
     listRequests.mockReset();

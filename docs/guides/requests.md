@@ -124,9 +124,11 @@ The synopsis is there so a title you've never heard of can be judged without ope
 titles queued before Shortlist stored synopses show none until the next run re-surfaces them.
 Above the queue, **Waiting**, **Sent** and **Rejected** are tabs, and one toolbar narrows the list:
 movies or shows, a search that finds a title by name or by who wanted it (pick a name from its list to
-see every title of theirs on file), **Filters** for a minimum rating and vote count, and a sort by
-**Recent**, **Top rated** or **Most wanted**. Whatever is narrowing the list, the search text included,
-shows as a removable chip beside **Clear filters**.
+see every title of theirs on file), **Filters** for a minimum rating, a minimum vote count and a
+title's original language, and a sort by **Recent**, **Top rated** or **Most wanted**. The language
+choice lists only the languages on the tab you're on; titles with no language on record are under
+**Unknown**, never under a named language. Whatever is narrowing the list, the search text included,
+shows as a removable chip beside **Clear filters**, and switching tabs clears it all.
 Posters come straight from TMDB's image CDN (`image.tmdb.org`), the only third-party asset Shortlist's
 web UI fetches. An install behind a restrictive network, or a browser with an ad-blocker, will show a
 placeholder tile instead; so will a title TMDB has no artwork for, and one queued before posters existed
