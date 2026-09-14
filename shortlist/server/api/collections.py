@@ -1674,9 +1674,9 @@ async def _apply_plan(state, plan: list[PlannedWork], *, slug: str, build: str) 
         elif work.kind == POSTER_RESET:
             await reconcile.run_poster_reset(state, slug=slug, build=build, scope=work.scope)
         elif work.kind == VISIBILITY:
-            # Server-wide converge rather than a targeted write: the handler compares every row's
-            # resolved placement against the state it last applied, so it settles this row AND any
-            # other whose day turned over while Plex was unreachable. Durable, so an outage right now
+            # Server-wide converge rather than a targeted write: the handler recomputes today's answer
+            # for every scheduled row and keeps no state, so it settles this row AND any other whose
+            # day turned over while Plex was unreachable. Durable, so an outage right now
             # is retried rather than lost.
             # Names the row: when its days are CLEARED and no other row on the server carries a
             # schedule, the job's gate would otherwise see nothing to do and skip the very pass that

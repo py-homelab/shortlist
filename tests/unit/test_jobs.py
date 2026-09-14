@@ -892,6 +892,46 @@ class TestRestoreAfterUnpause:
         # fallback's "show it on their Home".
         assert [kwargs for _t, kwargs in promoted] == [{"shared": False, "home": False, "recommended": True}]
 
+    def test_an_unidentifiable_row_is_left_alone_when_a_row_is_hidden_today(self, sessions):
+        """Un-pausing someone on a row's day off. A `{top_seed}` collection with no ledger key and no
+        recorded title matches no row, and the no-spec fallback would put it on their Home on the very
+        day its schedule hides it. `_promote_phase` and `rows.visibility` both leave such a collection
+        alone whenever a row is hidden today; the restore has to agree with them."""
+        promoted: list = []
+        merged: list = []
+        self._add_user(sessions)
+        hidden_today = replace(
+            self.ROW, name_template="Because you watched {top_seed}", placement="off", placement_friends="off"
+        )
+        state = self._state(sessions, promoted=promoted, merged=merged, rows=[hidden_today])
+        ctx = state.run_service.build_context(dry_run=False)
+        ctx.plex.find_owned_collections(None, "shortlist_sarah")[0].title = "Because you watched Dune" + row_marker(
+            555000100
+        )
+
+        jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
+
+        assert promoted == []
+
+    def test_an_unidentifiable_row_is_still_shown_when_no_row_is_hidden_today(self, sessions):
+        """The other cell. With nothing scheduled off, the fallback showing the row is the safe direction:
+        leaving it alone would make an un-paused person's row silently stay missing."""
+        promoted: list = []
+        merged: list = []
+        self._add_user(sessions)
+        # `placement="both"`: `ROW`'s owner copy is `off`, which counts as a row placed nowhere.
+        row = replace(self.ROW, name_template="Because you watched {top_seed}", placement="both")
+        state = self._state(sessions, promoted=promoted, merged=merged, rows=[row])
+        ctx = state.run_service.build_context(dry_run=False)
+        ctx.plex.find_owned_collections(None, "shortlist_sarah")[0].title = "Because you watched Dune" + row_marker(
+            555000100
+        )
+
+        jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
+
+        # The no-spec fallback for a shared account: their own Home, never the owner's shelf.
+        assert [kwargs for _t, kwargs in promoted] == [{"shared": True, "home": False, "recommended": False}]
+
     def test_the_ledger_wins_over_a_stale_recorded_title(self, sessions):
         """Both sources can disagree — a title recorded before a rename, against a ratingKey that
         cannot go stale. Identity has to win, or a renamed row is placed by whatever it used to be."""

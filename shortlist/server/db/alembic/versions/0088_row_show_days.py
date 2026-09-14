@@ -48,3 +48,6 @@ def downgrade() -> None:
     existing = _columns(bind, "collections")
     if "show_days" in existing:
         op.drop_column("collections", "show_days")
+    # Present after 0089's downgrade re-creates it, and on an install stamped by 0088's first draft.
+    if "shown_state" in existing:
+        op.drop_column("collections", "shown_state")

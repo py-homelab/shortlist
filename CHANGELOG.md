@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **Un-pausing someone on a row's day off no longer puts that row back on their Home.** A row named
+  after a title they watched could reappear for the rest of the day when Shortlist couldn't tell which
+  row it was, even though its schedule said to hide it that day. It is now left hidden, as the nightly
+  run already did.
+
 ## [1.9.0] - 2026-09-14
 
 ### Added

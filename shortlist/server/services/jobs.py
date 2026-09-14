@@ -1426,7 +1426,7 @@ def _user_restore(state, payload: dict) -> dict:
     report and raises. The whole job is then retried, and nothing is promoted meanwhile.
     """
     from shortlist.engine.models import UserProfile, UserType
-    from shortlist.engine.pipeline import identity_map, promote_user_rows
+    from shortlist.engine.pipeline import any_row_hidden_today, identity_map, promote_user_rows
     from shortlist.engine.pipeline import run as engine_run
     from shortlist.server.db.models import Delivery, Run, RunUser, User
 
@@ -1502,7 +1502,13 @@ def _user_restore(state, payload: dict) -> dict:
     # still repaired, and the retry will find nothing left to report.
     audit_restored_restrictions(state, report)
     _require_filters_merged(report, f"promoting {slug}'s rows")
-    restored = promote_user_rows(ctx, profile, placements, placement_keys=keys)
+    # Left alone, not shown, when a row is hidden today: un-pausing on a row's day off must not put an
+    # unidentifiable `{top_seed}` collection back on Home, exactly as `_promote_phase` decides it. The
+    # trade is the nightly run's too: after a pause "left alone" means still hidden, until that row's
+    # next delivery writes the ledger key that identifies it. Over-showing is the one this cannot risk.
+    restored = promote_user_rows(
+        ctx, profile, placements, placement_keys=keys, skip_unmatched=any_row_hidden_today(ctx.config)
+    )
     # `dry_run` recorded, not assumed False: `promote_user_rows` carries its own safe-mode guard, so
     # under SHORTLIST_DRY_RUN it returns the keys it WOULD have promoted and nothing on Plex moved.
     # Auditing that as a real restore is the audit trail lying about a visibility change.

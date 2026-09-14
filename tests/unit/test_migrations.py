@@ -1477,3 +1477,20 @@ class TestRowDescriptionAndSortPrefix0091:
         command.downgrade(_alembic(tmp_path), "0090")
         assert not ({"description", "sort_title_prefix"} & set(self._columns(tmp_path, "collections")))
         assert not ({"summary_written", "title_sort_written"} & set(self._columns(tmp_path, "deliveries")))
+
+
+class TestRowShowDaysDowngrade0088:
+    """0089's downgrade re-creates `shown_state` for any install that had it, and 0088's downgrade has to
+    take it out again, or a database downgraded past 0088 keeps a column no revision below it defines."""
+
+    def test_downgrading_past_0088_leaves_no_day_schedule_columns(self, tmp_path: Path):
+        run_migrations(tmp_path)
+
+        command.downgrade(_alembic(tmp_path), "0087")
+
+        con = sqlite3.connect(tmp_path / "shortlist.db")
+        try:
+            columns = {row[1] for row in con.execute("PRAGMA table_info(collections)")}
+        finally:
+            con.close()
+        assert not ({"show_days", "shown_state"} & columns)

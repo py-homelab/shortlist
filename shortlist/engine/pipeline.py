@@ -36,6 +36,7 @@ from shortlist.engine.models import (
     LABEL_PREFIX,
     SHARED_LABEL_PREFIX,
     CollectionDiff,
+    EngineConfig,
     HubAnchor,
     MediaType,
     OwnedRow,
@@ -1216,9 +1217,7 @@ def _promote_phase(
     # no-spec fallback shows what it cannot identify, which would undo the midnight schedule for the
     # rest of the day. So the run stops guessing exactly when guessing could over-show, and keeps the
     # fallback on every server that schedules nothing (where guessing is what stops rows vanishing).
-    any_row_hidden_today = any(
-        spec.placement == "off" or spec._effective_friends_placement == "off" for spec in ctx.config.per_person_rows()
-    )
+    hidden_today = any_row_hidden_today(ctx.config)
     for position, user in enumerate(to_promote, start=1):
         _emit(ctx, "Shortlist", "promoting", {"done": position, "total": len(to_promote)})
         user_report = next((r for r in report.users if r.slug == user.slug), None)
@@ -1250,7 +1249,7 @@ def _promote_phase(
                 user_report.placement_titles if user_report else {},
                 placement_keys=ledger.get(user.slug, {}),
                 into=promoted,
-                skip_unmatched=any_row_hidden_today,
+                skip_unmatched=hidden_today,
             )
         except Exception as e:
             if user_report is not None:
@@ -1300,6 +1299,23 @@ def promote_shared_row(ctx: EngineContext, spec: RowSpec, *, into: set[int]) -> 
             into.add(int(collection.ratingKey))
 
 
+def any_row_hidden_today(config: EngineConfig) -> bool:
+    """Whether any per-person row is placed nowhere today — by its schedule, or switched off.
+
+    Every promotion that cannot identify a collection needs this answer: while some row is hidden, an
+    unidentifiable collection might BE that row, so it is left alone rather than shown.
+
+    Args:
+        config: The run's engine config, with today's day schedule already resolved into placements.
+
+    Returns:
+        True when at least one per-person row is `off` for its owner or for everyone else.
+    """
+    return any(
+        spec.placement == "off" or spec._effective_friends_placement == "off" for spec in config.per_person_rows()
+    )
+
+
 def promote_user_rows(
     ctx: EngineContext,
     user: UserProfile,
@@ -1326,8 +1342,10 @@ def promote_user_rows(
 
     With neither, a static-titled row still matches via the rendered-title fallback below, and only a
     ``{top_seed}`` row with no ledger entry falls to ``_promote_one``'s no-spec branch — which shows it
-    on its own audience's Home. Right direction for a restore (the row was visible before the pause),
-    but not the row's configured placement, which is why the ledger is consulted first.
+    on its own audience's Home, not at the row's configured placement, which is why the ledger is
+    consulted first. Unless ``skip_unmatched``: then it is left exactly as it is. ``_promote_phase`` and
+    ``user.restore`` set it whenever a row is hidden today (``any_row_hidden_today``), because the
+    unidentified collection might be that row; ``rows.visibility`` always sets it.
 
     Returns the ratingKeys touched, and writes them into ``into`` as it goes when given one — so a
     caller that catches a mid-loop PMS failure still knows which collections were already set. Raises
@@ -1438,8 +1456,8 @@ def promote_user_rows(
                 # marker characters, and a warning meant to make a collection FINDABLE cannot be a
                 # line nobody can match by eye.
                 logger.warning(
-                    "{}: no row matched it, so its surfaces are left as they are — a day schedule "
-                    "cannot be applied to it until its delivery record is rebuilt",
+                    "{}: no row matched it, so its surfaces are left as they are — neither a day schedule "
+                    "nor an un-pause can apply to it until its delivery record is rebuilt",
                     log_title(collection.title),
                 )
                 continue

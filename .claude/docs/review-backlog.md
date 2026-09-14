@@ -10,19 +10,17 @@ below is later work.
 
 ---
 
-## OPEN — v1.9.0 release review, three LOW (2026-09-14)
+## CLOSED — v1.9.0 release review, three LOW (2026-09-14)
 
-The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. Deferred, none a leak:
+The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. All three LOWs fixed the
+same day:
 
-1. **Stale comment.** `shortlist/server/api/collections.py:1678` says the visibility handler compares
-   placements "against the state it last applied"; 0089 dropped `shown_state` and it recomputes.
-2. **`user.restore` omits `skip_unmatched`.** `shortlist/server/services/jobs.py:1505`. Un-pausing
-   someone on a row's scheduled day off, when one of their `{top_seed}` rows has neither a ledger key
-   nor a last-run title, puts that row back on their own Home until the next midnight pass. Other
-   accounts' excludes still hide it. Fix: pass `skip_unmatched` the way `_promote_phase` does.
-3. **0088's downgrade leaves `collections.shown_state`** after 0089's downgrade re-creates it. Nullable
-   and unread. Both migrations are frozen (`frozen_migrations.txt`), so any fix is a new migration or
-   nothing.
+1. **Stale comment** in `api/collections.py` about the visibility handler keeping state — reworded.
+2. **`user.restore` omitted `skip_unmatched`**, so un-pausing someone on a row's day off could put an
+   unidentifiable `{top_seed}` row back on their Home. It now asks `pipeline.any_row_hidden_today`,
+   the same answer `_promote_phase` uses. Pinned by `TestRestoreAfterUnpause::test_an_unidentifiable_row_*`.
+3. **0088's downgrade left `collections.shown_state`** behind after 0089's downgrade re-created it.
+   It drops it again; recorded as a downgrade-only `amended:` line in `frozen_migrations.txt`.
 
 ---
 
