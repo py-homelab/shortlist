@@ -47,6 +47,63 @@ describe("ConnectionsSection", () => {
     getRuns.mockResolvedValue([]);
   });
 
+  describe("the Webhook card", () => {
+    const saved = {
+      "notify.webhook.url": "•••••",
+      "notify.webhook.auth_header_name": "Authorization",
+      "notify.webhook.auth_header_value": "•••••",
+    };
+
+    it("never sends a message just because Settings was opened", async () => {
+      // Every other card tests itself on load. This one's test POSTS A MESSAGE into the owner's channel.
+      renderSection(saved);
+      const card = screen.getByTestId("connection-notify");
+      await act(async () => {});
+      expect(testConnection).not.toHaveBeenCalledWith("notify");
+      await userEvent.click(within(card).getByRole("button", { name: /Send a test/i }));
+      await waitFor(() => expect(testConnection).toHaveBeenCalledWith("notify"));
+    });
+
+    it("edits the address and the auth header in one form", async () => {
+      renderSection({});
+      const card = screen.getByTestId("connection-notify");
+      await userEvent.click(within(card).getByRole("button", { name: /Set up/i }));
+      await userEvent.type(within(card).getByLabelText(/^Address/i), "https://hooks.example/x");
+      await userEvent.clear(within(card).getByLabelText(/Header name/i));
+      await userEvent.type(within(card).getByLabelText(/Header name/i), "X-Api-Key");
+      await userEvent.type(within(card).getByLabelText(/Header value/i), "k3y");
+      await userEvent.click(within(card).getByRole("button", { name: /^Save$/i }));
+      await waitFor(() =>
+        expect(putSettings).toHaveBeenCalledWith({
+          "notify.webhook.url": "https://hooks.example/x",
+          "notify.webhook.auth_header_name": "X-Api-Key",
+          "notify.webhook.auth_header_value": "k3y",
+        }),
+      );
+    });
+
+    it("explains how to stop sending the header", async () => {
+      renderSection(saved);
+      const card = screen.getByTestId("connection-notify");
+      await userEvent.click(within(card).getByRole("button", { name: /^Edit$/i }));
+      expect(within(card).getByText(/Clear the name to stop sending a header/i)).toBeInTheDocument();
+    });
+
+    it("removes the address and the header together", async () => {
+      renderSection(saved);
+      const card = screen.getByTestId("connection-notify");
+      await userEvent.click(within(card).getByRole("button", { name: /Remove Webhook connection/i }));
+      await userEvent.click(within(card).getByRole("button", { name: /^Remove$/i }));
+      await waitFor(() =>
+        expect(putSettings).toHaveBeenCalledWith({
+          "notify.webhook.url": "",
+          "notify.webhook.auth_header_name": "",
+          "notify.webhook.auth_header_value": "",
+        }),
+      );
+    });
+  });
+
   describe("the one Web search card", () => {
     it("is a single card, not one per backend", () => {
       // Exa and SearXNG are two ways to do ONE thing, so they are one connection with a choice

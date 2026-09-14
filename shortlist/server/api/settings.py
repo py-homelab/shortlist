@@ -271,7 +271,8 @@ _HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
 def _header_name(value: object) -> str | None:
-    if not isinstance(value, str) or not _HEADER_NAME.fullmatch(value):
+    # Blank means "send no header", and is how the owner stops sending one without removing the webhook.
+    if not isinstance(value, str) or (value and not _HEADER_NAME.fullmatch(value)):
         return "must be a header name such as Authorization or X-Api-Key (letters, digits and dashes)"
     return None
 

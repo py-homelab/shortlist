@@ -402,6 +402,20 @@ class TestAuthHeader:
                 notify.deliver(SettingsStore(session, secrets), notify.test_item())
         assert route.calls.last.request.headers["Authorization"] == "Bearer abc123def456"
 
+    def test_a_blank_name_sends_no_header(self, sessions, secrets):
+        """How the owner stops sending one without removing the webhook: the Connections card says so."""
+        configure(
+            sessions,
+            secrets,
+            **{"notify.webhook.auth_header_name": "", "notify.webhook.auth_header_value": "Bearer abc123def456"},
+        )
+        with respx.mock:
+            route = respx.post(WEBHOOK).mock(return_value=httpx.Response(200))
+            with sessions() as session:
+                notify.deliver(SettingsStore(session, secrets), notify.test_item())
+        assert "authorization" not in route.calls.last.request.headers
+        assert "bearer abc123def456" not in {v.lower() for v in route.calls.last.request.headers.values()}
+
     def test_no_value_sends_no_header(self, sessions, secrets):
         configure(sessions, secrets)
         with respx.mock:

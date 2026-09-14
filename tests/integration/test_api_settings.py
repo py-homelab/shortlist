@@ -402,7 +402,9 @@ class TestWebhookSettingsValidation:
         for offered in ("Authorization", "X-Gotify-Key", "x-api-key"):
             resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": offered}})
             assert resp.status_code == 200, f"{offered}: {resp.text}"
-        for refused in ("", "X Gotify", "Auth:orization", "Bad\nName"):
+        # Blank is allowed: it is how the owner stops sending a header without removing the webhook.
+        assert client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": ""}}).status_code == 200
+        for refused in ("X Gotify", "Auth:orization", "Bad\nName"):
             resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": refused}})
             assert resp.status_code == 422, f"{refused!r} was accepted"
 

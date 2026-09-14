@@ -36,8 +36,8 @@ export function InlineKeyField({
 }: {
   settingKey: string;
   label: string;
-  /** Which test-connection probe to run; also the key's home service. Omit for a field with no test of its own. */
-  service?: TestableService;
+  /** Which test-connection probe to run; also the key's home service. */
+  service: TestableService;
   settings: Settings;
   placeholder?: string;
   hint?: string;
@@ -60,9 +60,7 @@ export function InlineKeyField({
   secret?: boolean;
 }) {
   const save = useSaveSettings();
-  const test = useMutation({
-    mutationFn: (probe: TestableService) => api.testConnection(probe),
-  });
+  const test = useMutation({ mutationFn: () => api.testConnection(service) });
   const stored = settingString(settings, settingKey);
   const saved = stored !== "";
   const [value, setValue] = useState(secret ? (saved ? REDACTED : "") : stored);
@@ -122,18 +120,16 @@ export function InlineKeyField({
         >
           Save
         </Button>
-        {service && (
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => test.mutate(service)}
-            loading={test.isPending}
-            disabled={!saved && !save.isSuccess}
-          >
-            {!test.isPending && <PlugZap aria-hidden="true" />}
-            {testLabel}
-          </Button>
-        )}
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={() => test.mutate()}
+          loading={test.isPending}
+          disabled={!saved && !save.isSuccess}
+        >
+          {!test.isPending && <PlugZap aria-hidden="true" />}
+          {testLabel}
+        </Button>
       </div>
       {save.isError && (
         <p role="alert" className="text-sm text-destructive-text">

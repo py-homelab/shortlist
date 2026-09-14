@@ -254,8 +254,9 @@ GET  /api/notifications/whats-new -> {version, releases[{version, url, published
 ## Outgoing notifications
 
 ```
-Settings -> System -> Notifications, or `notify.webhook.enabled` / `notify.webhook.url` /
-`notify.webhook.events` / `notify.webhook.auth_header_name` / `notify.webhook.auth_header_value`.
+Settings -> Connections -> Webhook (`notify.webhook.url` / `notify.webhook.auth_header_name` /
+`notify.webhook.auth_header_value`) and Settings -> Notifications (`notify.webhook.enabled` /
+`notify.webhook.events`).
      Each event in `notify.webhook.events` POSTs generic JSON
      {source, version, id, severity, title, message, event, path, sent_at}, plus `content` and `text`
      carrying "title\nmessage" — the fields Discord and Slack each require — to one webhook.
@@ -274,8 +275,9 @@ Settings -> System -> Notifications, or `notify.webhook.enabled` / `notify.webho
      at rest, redacted from `GET /api/settings`, and stripped of its path and query before any exception
      text reaches a log, a `Job.error`, the audit trail or the support bundle.
      `notify.webhook.auth_header_value` is a SECRET too, sent as `<auth_header_name>: <value>` on every
-     POST when set, and removed from any error text. The name must be a valid header name (default
-     Authorization) and the value a single line, or the save is a 422.
+     POST when both it and the name are set, and removed from any error text. The name must be a valid
+     header name or blank (default Authorization; blank sends no header) and the value printable text
+     with no leading or trailing spaces, or the save is a 422.
      The "Send a test" button travels the exact same code path as a real 3am failure — same settings
      read, same body builder, same HTTP call — so a passing test cannot mean a broken channel.
 ```

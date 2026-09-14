@@ -201,8 +201,9 @@ def deliver(store: SettingsStore, item: dict) -> str:
     if not url:
         raise NotifyNotConfigured("No webhook address is saved yet — paste the one your chat app gave you.")
     auth_value = str(store.get("notify.webhook.auth_header_value") or "")
-    auth_name = str(store.get("notify.webhook.auth_header_name") or "").strip() or "Authorization"
-    headers = {auth_name: auth_value} if auth_value else {}
+    # Both or nothing: a blank name is how the owner stops sending a saved value (Settings → Connections).
+    auth_name = str(store.get("notify.webhook.auth_header_name") or "").strip()
+    headers = {auth_name: auth_value} if auth_name and auth_value else {}
     try:
         # A bare `httpx.post`, not `http_retry.post`, and deliberately: the job queue is already
         # retrying this over ~4.6 hours. Layering the client's three attempts underneath would turn

@@ -1,4 +1,4 @@
-import { Compass, Film, Globe, Inbox, Tv } from "lucide-react";
+import { Compass, Film, Globe, Inbox, Tv, Webhook } from "lucide-react";
 
 import {
   MdblistGlyph,
@@ -511,6 +511,48 @@ export function ConnectionsSection({ settings }: { settings: Settings }) {
               kind: "password",
               placeholder: "Free key from mdblist.com",
               helpUrl: "https://mdblist.com/preferences/",
+            },
+          ]}
+        />
+        <ConnectionCard
+          service="notify"
+          title="Webhook"
+          purpose="Where Shortlist sends its alerts: a Discord or Slack channel, ntfy, Gotify, Home Assistant, n8n, or anything else that accepts a webhook."
+          next="Choose what it sends under Notifications."
+          settings={settings}
+          summary={
+            settingString(settings, "notify.webhook.url")
+              ? settingString(settings, "notify.webhook.auth_header_value") &&
+                settingString(settings, "notify.webhook.auth_header_name")
+                ? "Address and auth header saved"
+                : "Address saved"
+              : ""
+          }
+          glyph={<Webhook aria-hidden className="text-primary" />}
+          // Its test posts a real message into the owner's channel, so it never runs by itself.
+          autoTest={false}
+          testLabel="Send a test"
+          fields={[
+            {
+              // A secret: a Discord or Slack webhook address works as a password for that channel.
+              key: "notify.webhook.url",
+              label: "Address",
+              kind: "password",
+              placeholder: "https://discord.com/api/webhooks/…",
+            },
+            {
+              key: "notify.webhook.auth_header_name",
+              label: "Header name",
+              kind: "text",
+              placeholder: "Authorization",
+              hint: "Only if your receiver needs a key, as ntfy, Gotify and n8n can. Clear the name to stop sending a header.",
+            },
+            {
+              key: "notify.webhook.auth_header_value",
+              label: "Header value",
+              kind: "password",
+              placeholder: "Bearer …",
+              hint: "Sent with every message, the test included. Shown as dots once saved.",
             },
           ]}
         />

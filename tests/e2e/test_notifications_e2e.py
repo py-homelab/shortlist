@@ -141,3 +141,28 @@ def test_the_settings_card_lists_the_events_and_ticks_the_chosen_ones(page: Page
         "run.failed",
         "job.failed",
     ]
+
+
+def test_the_webhook_is_set_up_and_removed_from_its_connection_card(page: Page, app: ShortlistApp):
+    """The address and the auth header live on one card in Connections, with Test and Remove like every
+    other service — removing it is the way to take the header off along with the address."""
+    page.goto("/settings")
+    card = page.get_by_test_id("connection-notify")
+    expect(card).to_be_visible(timeout=20_000)
+    card.get_by_role("button", name="Set up").click()
+    card.get_by_label("Address").fill("https://hooks.example.com/shortlist/abc")
+    card.get_by_label("Header name").fill("X-Api-Key")
+    card.get_by_label("Header value").fill("k3y-value")
+    card.get_by_role("button", name="Save", exact=True).click()
+    expect(card.get_by_text("Address and auth header saved")).to_be_visible()
+    saved = app.api("GET", "/api/settings").json()
+    assert saved["notify.webhook.url"] == "•••••"
+    assert saved["notify.webhook.auth_header_name"] == "X-Api-Key"
+    assert saved["notify.webhook.auth_header_value"] == "•••••"
+
+    card.get_by_role("button", name="Remove Webhook connection").click()
+    card.get_by_role("button", name="Remove", exact=True).click()
+    expect(card.get_by_role("button", name="Set up")).to_be_visible()
+    cleared = app.api("GET", "/api/settings").json()
+    assert (cleared["notify.webhook.url"], cleared["notify.webhook.auth_header_value"]) == ("", "")
+    assert cleared["notify.webhook.auth_header_name"] == ""

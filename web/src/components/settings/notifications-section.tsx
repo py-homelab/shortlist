@@ -1,11 +1,11 @@
-import { Card, CardContent } from "@/components/ui/card";
-import { Switch } from "@/components/ui/switch";
-import { useSaveSettings } from "@/lib/queries";
-import { settingBool, settingString } from "@/lib/format";
-import type { Settings } from "@/lib/types";
+import { ArrowRight } from "lucide-react";
 import { useState } from "react";
 
-import { InlineKeyField } from "./inline-key-field";
+import { Card, CardContent } from "@/components/ui/card";
+import { Switch } from "@/components/ui/switch";
+import { settingBool, settingString } from "@/lib/format";
+import { useSaveSettings } from "@/lib/queries";
+import type { Settings } from "@/lib/types";
 
 /** The events the server sends, in its order (`services/notify.py` EVENTS), grouped for reading. */
 const EVENT_GROUPS: {
@@ -33,20 +33,12 @@ const EVENT_GROUPS: {
     ],
   },
   {
-    title: "Privacy",
+    title: "Everything else",
     events: [
       { id: "privacy.exposure", label: "Someone can see a row that isn’t theirs" },
-    ],
-  },
-  {
-    title: "Requests",
-    events: [
       { id: "requests.waiting", label: "Titles are waiting for your approval" },
+      { id: "update.available", label: "A new version of Shortlist is out" },
     ],
-  },
-  {
-    title: "Updates",
-    events: [{ id: "update.available", label: "A new version of Shortlist is out" }],
   },
 ];
 
@@ -62,13 +54,13 @@ function storedEvents(settings: Settings): string[] {
 /**
  * Tell the owner what happened while they were asleep, on the channel they already watch.
  *
- * The owner picks the events. The server's default is a failed run and a privacy exposure — the two
- * nobody can see before their next login — so a card nobody touches stays quiet. No message names a
- * person: the server keeps names in the app.
+ * Only the on/off switch and the choice of events live here. Where the messages go — the address and
+ * an optional auth header — is the Webhook card in Connections, with every other service Shortlist
+ * talks to, where it gets Test and Remove like they do.
  *
- * The address and the auth header's value are `InlineKeyField`s rather than a bespoke form: it already
- * handles the redacted sentinel (a saved value shows as dots, and saving without retyping is a no-op
- * rather than a wipe), which both need for exactly the same reason the API keys do.
+ * The owner picks the events. The server's default is a failed run and a privacy exposure — the two
+ * nobody can see before their next login — so a section nobody touches stays quiet. No message names a
+ * person: the server keeps names in the app.
  */
 export function NotificationsSection({ settings }: { settings: Settings }) {
   const save = useSaveSettings();
@@ -76,8 +68,7 @@ export function NotificationsSection({ settings }: { settings: Settings }) {
     settingBool(settings, "notify.webhook.enabled"),
   );
   const [events, setEvents] = useState(() => storedEvents(settings));
-  const authSaved = settingString(settings, "notify.webhook.auth_header_value") !== "";
-  const [showAuth, setShowAuth] = useState(authSaved);
+  const hasAddress = settingString(settings, "notify.webhook.url") !== "";
 
   // Flip immediately so the switch feels like a switch, but put it BACK if the save fails. A switch
   // left showing "on" over a server that still says off is the one outcome worse than a slow switch:
@@ -104,9 +95,6 @@ export function NotificationsSection({ settings }: { settings: Settings }) {
     );
   };
 
-  const headerName =
-    settingString(settings, "notify.webhook.auth_header_name") || "Authorization";
-
   return (
     <div className="space-y-4">
       <div>
@@ -118,14 +106,13 @@ export function NotificationsSection({ settings }: { settings: Settings }) {
       </div>
 
       <Card>
-        <CardContent className="space-y-4 pt-6">
+        <CardContent className="space-y-6 pt-6">
           <div className="flex items-start justify-between gap-4">
             <div className="space-y-0.5">
               <p className="text-sm font-medium">Send alerts to a webhook</p>
               <p className="text-sm text-muted-foreground">
-                Posts a message to Discord, Slack, Home Assistant, n8n —
-                anything that accepts a webhook — for the events you tick
-                below. No message ever names anybody.
+                Posts a message for each thing you tick below. No message ever
+                names anybody.
               </p>
             </div>
             <Switch
@@ -141,88 +128,56 @@ export function NotificationsSection({ settings }: { settings: Settings }) {
             </p>
           )}
 
+          {enabled && !hasAddress && (
+            <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-warning/40 bg-warning/5 px-3 py-2 text-sm">
+              Nothing is sent until it has somewhere to go.
+              <a
+                href="#connections"
+                className="inline-flex items-center gap-1 font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                Add the webhook in Connections
+                <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+              </a>
+            </p>
+          )}
+
           {enabled ? (
-            <>
-              <InlineKeyField
-                settingKey="notify.webhook.url"
-                label="Webhook address"
-                service="notify"
-                settings={settings}
-                placeholder="https://discord.com/api/webhooks/…"
-                hint="Paste the address your chat app gave you. Anyone holding it can post to that channel, so it’s stored encrypted and shown as dots once saved."
-                testLabel="Send a test"
-              />
-
-              {showAuth ? (
-                <div className="space-y-2">
-                  <p className="text-sm font-medium">Authentication</p>
-                  <p className="text-sm text-muted-foreground">
-                    For a receiver that needs a key, such as ntfy, Gotify or n8n.
-                    Sent as a header with every message, the test included.
-                  </p>
-                  <InlineKeyField
-                    settingKey="notify.webhook.auth_header_name"
-                    label="Header name"
-                    settings={{
-                      ...settings,
-                      "notify.webhook.auth_header_name": headerName,
-                    }}
-                    placeholder="Authorization"
-                    secret={false}
-                  />
-                  <InlineKeyField
-                    settingKey="notify.webhook.auth_header_value"
-                    label="Header value"
-                    settings={settings}
-                    placeholder="Bearer …"
-                    hint="Stored encrypted and shown as dots once saved."
-                  />
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setShowAuth(true)}
-                  className="text-sm font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                >
-                  Add authentication
-                </button>
-              )}
-
-              <fieldset className="space-y-3">
-                <legend className="text-sm font-medium">What to send</legend>
+            <fieldset className="space-y-3">
+              <legend className="text-sm font-medium">What to send</legend>
+              <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2 lg:grid-cols-3">
                 {EVENT_GROUPS.map((group) => (
-                  <div key={group.title} className="space-y-1.5">
+                  <div key={group.title} className="space-y-2">
                     <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                       {group.title}
                     </p>
-                    {group.hint && (
-                      <p className="text-xs text-muted-foreground">{group.hint}</p>
-                    )}
-                    <div className="flex flex-wrap gap-2">
+                    <div className="space-y-1">
                       {group.events.map((event) => (
                         <label
                           key={event.id}
-                          className="flex cursor-pointer items-center gap-2 rounded-md border px-3 py-2 text-sm transition-colors hover:bg-muted/50"
+                          className="flex cursor-pointer items-start gap-2.5 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted/50"
                         >
                           <input
                             type="checkbox"
                             checked={events.includes(event.id)}
                             onChange={() => toggleEvent(event.id)}
-                            className="h-4 w-4 accent-primary"
+                            className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
                           />
                           {event.label}
                         </label>
                       ))}
                     </div>
+                    {/* Under the list, so the three columns' checkboxes start on the same line. */}
+                    {group.hint && (
+                      <p className="px-2 text-xs text-muted-foreground">{group.hint}</p>
+                    )}
                   </div>
                 ))}
-              </fieldset>
-            </>
+              </div>
+            </fieldset>
           ) : (
             <p className="text-sm text-muted-foreground">
-              Turn this on to add a webhook address. Until then, a failed run
-              shows up in the bell at the top of the page — the next time you
-              look.
+              Until this is on, a failed run shows up in the bell at the top of
+              the page — the next time you look.
             </p>
           )}
         </CardContent>

@@ -280,5 +280,9 @@ never writable through the settings PUT.
 **No migration.** Settings rows fall back to DEFAULTS, so an install that already switched the webhook
 on keeps its run-failure alert and gains the privacy one.
 
-**UI:** the Notifications card gains an event checklist grouped Runs / Jobs / Privacy / Requests /
-Updates, and an optional "Authentication" pair under the address.
+**UI (reworked the same day, owner decision):** where messages go is a **Webhook** card in Connections —
+address, header name and header value in one form, with "Send a test" (never run on page load: it posts
+a real message) and Remove, like every other service. A blank header name sends no header, which is
+how the owner takes one off without removing the webhook. The Notifications section keeps only the
+on/off switch and "What to send" (Runs / Jobs / Everything else), and points at the card when no
+address is saved.
