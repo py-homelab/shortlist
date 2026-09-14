@@ -799,6 +799,33 @@ class TestReconcileRowRenameIter:
         (pending,) = [e for e in events if e.get("user")]
         assert pending["next_run"] is True
 
+    def test_a_rename_that_already_holds_the_writer_lock_still_frees_the_name(self, sessions, monkeypatch):
+        """The roster sync renames after a nickname change while it holds the writer lock itself: seeing that
+        lock as "busy" postponed every such rename to the next run (review 2026-09-14)."""
+        from shortlist.server.services import jobs
+
+        monkeypatch.setattr(jobs, "plex_writer_busy", lambda state: True)
+        _add_user(sessions, slug="sarah", account_id=100)
+        collection = self._refusing("Old Name" + row_marker(100))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies")]
+        plex.find_owned_collections.side_effect = lambda sec, label: [collection] if label == "shortlist_sarah" else []
+        plex.collections_titled.return_value = []
+        plex.create_collection.return_value = MagicMock(ratingKey=9)
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex),
+                slug="comedy",
+                new_template="New Name",
+                old_template="Old Name",
+                holds_writer_lock=True,
+            )
+        )
+
+        plex.create_collection.assert_called_once()
+        assert events[-1] == {"done": True, "total": 1}
+
     def test_a_shared_rows_refused_rename_is_said_plainly(self, sessions):
         collection = self._refusing("Old Shared Name")
         plex = MagicMock(spec=PlexClient)

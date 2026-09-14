@@ -517,9 +517,11 @@ class TestUserSync:
 
         calls: list = []
 
-        async def spy(state, was_called):
+        async def spy(state, was_called, *, holds_writer_lock=False):
             if was_called:  # a no-op call with nothing renamed is not Plex work
                 calls.append(was_called)
+                # Inside the `sync.users` job's writer lock, so a refused name is freed now, not next run.
+                assert holds_writer_lock is True
 
         monkeypatch.setattr(user_sync, "rename_after_nickname", spy)
         monkeypatch.setattr(

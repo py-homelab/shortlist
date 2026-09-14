@@ -185,7 +185,12 @@ def _reclaim_orphaned_name(
     finally:
         if helper is not None:
             try:
-                plex.delete_owned_collection(helper, LABEL_PREFIX)
+                try:
+                    plex.delete_owned_collection(helper, LABEL_PREFIX)
+                except PermissionError:
+                    # Created by this very call, so ours whatever its title says: its own rename failed and
+                    # left it on the row's name with no marker and no label, which is all that check reads.
+                    helper.delete()
             except Exception as exc:
                 logger.error(
                     "{}: could not delete the helper collection (ratingKey {}) used to free a row name in '{}' "

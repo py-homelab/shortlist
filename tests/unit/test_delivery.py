@@ -2656,6 +2656,35 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         assert outcome == KEPT
         helper.delete.assert_called_once()
 
+    def test_a_helper_whose_own_rename_failed_is_still_deleted(self, movies):
+        """Created by this very call, so it is ours whatever its title says: a failed rename left it on the
+        row's unmarked shared name with no label, which `delete_owned_collection` cannot prove ours."""
+        from shortlist.engine.delivery import rename_or_keep
+
+        real = PlexClient.__new__(PlexClient)
+        real._collections_cache = {}
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        plex.collections_titled.return_value = []
+        plex.delete_owned_collection.side_effect = lambda c, prefix: PlexClient.delete_owned_collection(real, c, prefix)
+        helper = MagicMock(ratingKey=5555, labels=[])
+        helper.title = "Popular on the server"
+        helper.editTitle.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+        plex.create_collection.return_value = helper
+        profile = make_profile()
+
+        rename_or_keep(
+            plex,
+            self._refused_row(profile),
+            "Popular on the server",
+            profile,
+            movies,
+            label="Shortlist__shared_popular",
+            marker=row_marker(0),
+            spare_item="item",
+        )
+
+        helper.delete.assert_called_once()
+
     def test_a_helper_that_was_never_created_is_not_deleted(self, movies):
         from shortlist.engine.delivery import KEPT
 

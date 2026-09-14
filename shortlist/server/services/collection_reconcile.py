@@ -725,8 +725,12 @@ def reconcile_row_rename_iter(
     old_display_names: dict[str, str] | None = None,
     build: str = "per_person",
     dry_run: bool = False,
+    holds_writer_lock: bool = False,
 ):
     """Rename a row's collections on Plex, yielding one event per user renamed (for SSE streaming).
+
+    ``holds_writer_lock`` is for a caller already inside the Plex writer lock (the roster sync). Everyone
+    else renames outside it, so freeing a refused name waits while a run or writer job is writing.
 
     Finds collections directly from Plex (by label), not from run history — so it works even after
     runs are cleared. For each user: finds their collections by label on Plex, identifies this row's
@@ -747,6 +751,7 @@ def reconcile_row_rename_iter(
     and {"user", "library", "error"} for a per-collection PMS failure.
     At the end yields {"done": True, "total": n}.
     """
+    may_free_name = None if holds_writer_lock else (lambda: not jobs.plex_writer_busy(state))
     with state.sessions() as session:
         users_data = _users_data(session)
         other_rows = _other_rows(session, state.secrets, slug)
@@ -781,7 +786,7 @@ def reconcile_row_rename_iter(
                             # Names a helper only: ours by marker even if its label write fails.
                             marker=row_marker(0),
                             read_spare_item=lambda c=collection: next(iter(c.items()), None),
-                            may_free_name=lambda: not jobs.plex_writer_busy(state),
+                            may_free_name=may_free_name,
                         )
                         if not dry_run
                         else None
@@ -873,7 +878,7 @@ def reconcile_row_rename_iter(
                             label=label,
                             marker=marker,
                             read_spare_item=lambda c=collection: next(iter(c.items()), None),
-                            may_free_name=lambda: not jobs.plex_writer_busy(state),
+                            may_free_name=may_free_name,
                         )
                         if not dry_run
                         else None
@@ -921,8 +926,8 @@ def _refusal(outcome: str, name: str, library: str) -> str:
             "keeps its old name there."
         )
     return (
-        f"Plex refused '{name}' in {library} and freeing the name failed, so the row keeps its old name there "
-        "for now. The next run tries again."
+        f"Plex refused '{name}' in {library} and Shortlist could not free the name, so the row keeps its old "
+        "name there for now. The next run tries again."
     )
 
 
@@ -934,6 +939,7 @@ async def run_row_rename_from_plex(
     old_template: str,
     scope: str,
     old_display_names: dict[str, str] | None = None,
+    holds_writer_lock: bool = False,
 ) -> tuple[list[dict], str | None]:
     """Rename a row's collections by reading Plex, not run history. Audited (rule 10), best-effort.
 
@@ -954,6 +960,7 @@ async def run_row_rename_from_plex(
             new_template=new_template,
             old_template=old_template,
             old_display_names=old_display_names,
+            holds_writer_lock=holds_writer_lock,
         ):
             if event.get("error"):
                 failures.append(f"{event.get('user', '?')}: {event['error']}")
