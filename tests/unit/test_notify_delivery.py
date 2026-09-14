@@ -171,7 +171,21 @@ class TestWebhookBody:
             "message": "The most recent run ended in an error — open it to see what went wrong.",
             "path": "/runs/12",
             "sent_at": "2026-09-05T03:31:00+00:00",
+            "content": "The last run failed\nThe most recent run ended in an error — open it to see what went wrong.",
+            "text": "The last run failed\nThe most recent run ended in an error — open it to see what went wrong.",
         }
+
+    @pytest.mark.parametrize("field", ["content", "text"])
+    def test_a_discord_or_slack_address_gets_the_field_it_requires(self, field):
+        """Discord refuses a body with no `content`, Slack one with no `text` (both documented).
+
+        The Settings card offers a Discord address as its example, so without these every test send and
+        every 3am alert to the most common receiver would be refused with a 400.
+        """
+        for item in (notify.test_item(), notifications.run_failed_alert(SimpleNamespace(id=12))):
+            line = notify.webhook_body(item)[field]
+            assert line == f"{item['title']}\n{item['body']}"
+            assert len(line) <= 2000, "Discord refuses content over 2000 characters"
 
     def test_the_body_is_json_serialisable_as_sent(self):
         # httpx would raise at send time otherwise, on a code path that only runs at 3am.
@@ -194,6 +208,8 @@ class TestWebhookBody:
             "message",
             "path",
             "sent_at",
+            "content",
+            "text",
         }
         text = f"{with_run['title']} {with_run['body']}"
         assert "sarah" not in text.lower() and "mike" not in text.lower()

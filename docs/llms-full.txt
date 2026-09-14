@@ -2809,8 +2809,9 @@ GET  /api/notifications/whats-new -> {version, releases[{version, url, published
 
 ```
 Settings -> System -> Notifications, or `notify.webhook.enabled` / `notify.webhook.url`.
-     A whole run failing POSTs generic JSON {source, version, id, severity, title, message, path, sent_at}
-     to one webhook — the gap being closed is that a run failing overnight was visible only to someone
+     A whole run failing POSTs generic JSON {source, version, id, severity, title, message, path, sent_at},
+     plus `content` and `text` carrying "title\nmessage" — the fields Discord and Slack each require —
+     to one webhook. The gap being closed is that a run failing overnight was visible only to someone
      who opened the app. Delivery reuses the existing job queue, so retry, backoff and the dead-letter
      state are the ones already tested rather than a second mechanism.
      `notify.webhook.url` is a SECRET (a Discord or Slack webhook URL is a bearer token in a URL): Fernet

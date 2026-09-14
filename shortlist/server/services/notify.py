@@ -126,6 +126,9 @@ def webhook_body(item: dict, *, now: datetime | None = None) -> dict:
     Returns:
         A JSON-serialisable dict. `id` is stable per occurrence, so a receiver can dedupe on it.
     """
+    # Discord refuses a body with no `content` and Slack one with no `text` (both documented
+    # requirements), so the line a chat app shows is sent under both names. Other receivers ignore them.
+    chat_line = f"{item['title']}\n{item['body']}"
     return {
         "source": "shortlist",
         "version": 1,
@@ -135,6 +138,8 @@ def webhook_body(item: dict, *, now: datetime | None = None) -> dict:
         "message": item["body"],
         "path": item.get("action_url", ""),
         "sent_at": (now or datetime.now(UTC)).isoformat(),
+        "content": chat_line,
+        "text": chat_line,
     }
 
 
