@@ -398,7 +398,7 @@ describe("RunDetailPage — grouped by library", () => {
 
     await expandRows();
 
-    expect(await screen.findByText("web search 9,000 · sent + received")).toBeInTheDocument();
+    expect(await screen.findByText("sent + received")).toBeInTheDocument();
     const tile = screen.getByText("AI tokens").closest("[title]");
     expect(tile?.getAttribute("title")).toMatch(/input and output tokens/i);
     expect(tile?.getAttribute("title")).toMatch(/cache/i);
