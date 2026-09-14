@@ -361,7 +361,7 @@ export function IssuePage() {
   const enabled = status.data?.enabled ?? false;
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-6 p-6">
+    <div className="flex flex-col gap-6">
       <header className="flex flex-col gap-2">
         <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
           <LifeBuoy className="h-6 w-6 text-primary" aria-hidden="true" />

@@ -6,6 +6,7 @@ import {
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 
 import { AppShell } from "@/components/layout/app-shell";
+import { NarrowPage } from "@/components/layout/narrow-page";
 import { ErrorState } from "@/components/query-boundary";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError } from "@/lib/api";
@@ -118,16 +119,17 @@ export default function App() {
           <Route path="login" element={<LoginPage />} />
           <Route path="setup" element={<SetupPage />} />
           <Route element={<RequireApp />}>
+            {/* Tables keep the shell's full width; forms and short lists are wrapped in NarrowPage. */}
             <Route index element={<DashboardPage />} />
-            <Route path="rows" element={<RowsPage />} />
+            <Route path="rows" element={<NarrowPage><RowsPage /></NarrowPage>} />
             {/* Before "rows/:id", or "new" would be parsed as a row id. */}
-            <Route path="rows/new" element={<RowEditPage />} />
-            <Route path="rows/:id/rename" element={<RowRenamePage />} />
-            <Route path="rows/:id" element={<RowEditPage />} />
+            <Route path="rows/new" element={<NarrowPage><RowEditPage /></NarrowPage>} />
+            <Route path="rows/:id/rename" element={<NarrowPage><RowRenamePage /></NarrowPage>} />
+            <Route path="rows/:id" element={<NarrowPage><RowEditPage /></NarrowPage>} />
             <Route path="users" element={<UsersPage />} />
-            <Route path="sharing" element={<SharingPage />} />
-            <Route path="users/:id" element={<UserDetailPage />} />
-            <Route path="watching-account" element={<WatchingAccountPage />} />
+            <Route path="sharing" element={<NarrowPage><SharingPage /></NarrowPage>} />
+            <Route path="users/:id" element={<NarrowPage><UserDetailPage /></NarrowPage>} />
+            <Route path="watching-account" element={<NarrowPage><WatchingAccountPage /></NarrowPage>} />
             <Route path="runs" element={<RunsPage />} />
             <Route path="logs" element={<LogsPage />} />
             <Route path="runs/:id" element={<RunDetailPage />} />
@@ -140,16 +142,16 @@ export default function App() {
               element={<RunUserTracePage />}
             />
             <Route path="requests" element={<RequestsPage />} />
-            <Route path="jobs" element={<JobsPage />} />
+            <Route path="jobs" element={<NarrowPage><JobsPage /></NarrowPage>} />
             {/* Merged into Jobs. Redirect rather than remove: the old page was linked from docs
                 and may be bookmarked, and a 404 would read as the feature being gone. */}
             <Route path="schedule" element={<Navigate to="/jobs" replace />} />
             {/* The page was /tools until the nav started calling it Jobs. Kept as a redirect:
                 bookmarks and the `action_url` baked into notifications already in the DB. */}
             <Route path="tools" element={<Navigate to="/jobs" replace />} />
-            <Route path="issue" element={<IssuePage />} />
-            <Route path="settings" element={<SettingsPage />} />
-            <Route path="settings/uninstall" element={<UninstallPage />} />
+            <Route path="issue" element={<NarrowPage><IssuePage /></NarrowPage>} />
+            <Route path="settings" element={<NarrowPage><SettingsPage /></NarrowPage>} />
+            <Route path="settings/uninstall" element={<NarrowPage><UninstallPage /></NarrowPage>} />
             <Route path="*" element={<NotFoundPage />} />
           </Route>
         </Routes>

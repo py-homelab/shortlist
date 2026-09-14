@@ -438,7 +438,7 @@ export function RowEditor({
     // section that starts closed. With the cap gone the groups can stay open, warnings can sit
     // permanently beside the setting they concern, and there is room for the preview panel that
     // turns each abstract setting into "here is what Sarah will see tonight".
-    <div className="mx-auto w-full max-w-6xl space-y-6">
+    <div className="w-full space-y-6">
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
         <div>
           <h1 className="text-2xl font-semibold">
