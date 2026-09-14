@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -27,9 +27,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from shortlist.engine.context import EngineContext
 from shortlist.engine.pipeline import run as engine_run
-from shortlist.server.db.models import Collection, Run
+from shortlist.server.db.models import Collection, Run, RunUser, User
 from shortlist.server.safe_mode import force_dry_run
-from shortlist.server.services import jobs, run_persistence
+from shortlist.server.services import jobs, notify, run_persistence
 from shortlist.server.services.context_builder import ContextBuilder
 from shortlist.server.services.run_log import RunLogBuffer
 from shortlist.server.services.run_persistence import HIT_WINDOW_DAYS  # noqa: F401  (re-export)
@@ -38,6 +38,45 @@ from shortlist.server.services.watch_sync import WatchSync
 
 # HIT_WINDOW_DAYS moved to `run_persistence` with the hit-rate reconcile that owns it, and is
 # re-exported above because `services/report_service.py` imports it from here.
+
+
+#: How long after it started a scheduled run cut short by a restart is still worth finishing. Past this a
+#: daily row's next scheduled run is closer than the rebuild would be.
+RESUME_WITHIN = timedelta(hours=20)
+
+
+def missed_by_restart(session: Session, run: Run, now: datetime) -> tuple[list[int], list[int]] | None:
+    """``(user ids, collection ids)`` a scheduled run cut short by a restart never built, or None.
+
+    Owner decision 2026-09-14: finish it once, for only the people it had not reached. Only a SCHEDULED
+    run qualifies (a run someone started by hand is theirs to start again), never a dry run, and never
+    the resumed run itself, so a restart loop cannot re-curate the server over and over. People and rows
+    switched off since are left out. Shared rows are not rebuilt: a run scoped to some people never
+    builds them (`EngineConfig.users_scoped`), and they rebuild on the next full run.
+
+    Args:
+        session: an open session.
+        run: a run the previous process died inside, still carrying its `stats`.
+        now: the boot time.
+    """
+    if run.trigger != "schedule" or run.dry_run or run.started_at is None:
+        return None
+    started = run.started_at if run.started_at.tzinfo else run.started_at.replace(tzinfo=UTC)
+    if now - started > RESUME_WITHIN:
+        return None
+    stats = run.stats if isinstance(run.stats, dict) else {}
+    user_slugs = [u.get("slug") for u in stats.get("expected_users") or [] if isinstance(u, dict)]
+    row_slugs = [r.get("slug") for r in stats.get("expected_rows") or [] if isinstance(r, dict)]
+    reached = {user_id for (user_id,) in session.query(RunUser.user_id).filter(RunUser.run_id == run.id)}
+    users = sorted(
+        user_id
+        for (user_id,) in session.query(User.id).filter(User.slug.in_(user_slugs), User.enabled.is_(True))
+        if user_id not in reached
+    )
+    rows = sorted(
+        row_id for (row_id,) in session.query(Collection.id).filter(Collection.slug.in_(row_slugs), Collection.enabled)
+    )
+    return (users, rows) if users and rows else None
 
 
 class RunService:
@@ -112,14 +151,21 @@ class RunService:
         return self._ctx.user_history(user_id, limit=limit)
 
     def user_watched(
-        self, user_id: int, *, q: str = "", media_type: str = "", limit: int = 25, offset: int = 0
+        self,
+        user_id: int,
+        *,
+        q: str = "",
+        media_type: str = "",
+        library: str = "",
+        limit: int = 25,
+        offset: int = 0,
     ) -> dict | None:
-        return self._ctx.user_watched(user_id, q=q, media_type=media_type, limit=limit, offset=offset)
+        return self._ctx.user_watched(user_id, q=q, media_type=media_type, library=library, limit=limit, offset=offset)
 
     # -- watch-cache orchestration (delegated to WatchSync) -------------------------------
 
-    def refresh_watched(self, ctx, profile, *, incremental: bool = True, force_full: bool = False) -> list:
-        return self._watch.refresh_watched(ctx, profile, incremental=incremental, force_full=force_full)
+    def refresh_watched(self, ctx, profile, *, force_full: bool = False, sweep_dead: bool = False) -> list:
+        return self._watch.refresh_watched(ctx, profile, force_full=force_full, sweep_dead=sweep_dead)
 
     def _has_a_row_in_scope(self, ctx, profile) -> bool:
         return self._watch.has_a_row_in_scope(ctx, profile)
@@ -347,9 +393,15 @@ class RunService:
                             type(e).__name__,
                         )
                 status = "aborted" if aborted else ("ok" if report.ok else "error")
+                if status == "error":
+                    notify.enqueue_run_failure(self._sessions, run_id)
             except Exception as e:
                 logger.exception("run {} failed", run_id)
                 self._mark_run_error(run_id, {"error": f"{type(e).__name__}: {e}"})
+                # Both ways a run reaches `error` get the alert, and they are genuinely two paths: the
+                # engine returning a not-ok report, and it raising. Hooking only the tidy one would
+                # stay silent for exactly the failures worth waking up for.
+                notify.enqueue_run_failure(self._sessions, run_id)
                 self._bus.publish(
                     "run.finished", {"run_id": run_id, "status": "error", "error": f"{type(e).__name__}: {e}"}
                 )
@@ -478,10 +530,8 @@ class RunService:
 
     # -- persistence + audit (delegated to run_persistence) -------------------------------
 
-    def _reconcile_watched(
-        self, profiles, live_picks: dict[int, set[int]] | None = None, *, full_resync: bool = False
-    ) -> None:
-        run_persistence.reconcile_watched(self._sessions, profiles, live_picks, full_resync=full_resync)
+    def _reconcile_watched(self, profiles, live_picks: dict[int, set[int]] | None = None) -> None:
+        run_persistence.reconcile_watched(self._sessions, profiles, live_picks)
 
     def _live_pick_ids(self) -> dict[int, set[int]]:
         """What is in everyone's rows right now — read BEFORE a run rebuilds them (see

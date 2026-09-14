@@ -100,6 +100,24 @@ class ShareTokenWatchSource:
             )
             return None
 
+    def episode_dates(self, user: UserProfile, section, show_keys: set[int]) -> dict[int, datetime]:
+        """When each of these shows was last watched, read from its episodes AS this user.
+
+        Sits beside `fetch_section` because it needs the same per-user token.
+
+        Unlike `fetch_section` this is best-effort, and deliberately: the caller is improving a date
+        it already has, so a show that will not read keeps the date it had rather than costing the
+        sync. Only the TOKEN raises — an unreadable episode list, or a walk that could not prove it
+        finished, comes back simply absent from the result.
+
+        Raises:
+            NoWatchToken: no server token could be obtained for this user.
+        """
+        token = self._token_for(user)
+        if token is None:
+            raise NoWatchToken(f"no server token for {user.username}")
+        return self._plex.newest_episode_dates(section.key, token, show_keys)
+
     def fetch_section(
         self,
         user: UserProfile,

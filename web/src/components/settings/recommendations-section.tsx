@@ -6,6 +6,7 @@ import { RECENT_COUNT_LABEL } from "@/components/recent-count-field";
 import { SaveStatus } from "@/components/save-status";
 import { AiWebSearchCard } from "@/components/settings/ai-web-search-card";
 import { RefreshDaysField } from "@/components/settings/refresh-days-field";
+import { IdleHoldField } from "@/components/settings/idle-hold-field";
 import { InlineKeyField } from "@/components/settings/inline-key-field";
 import { RecencySlider } from "@/components/settings/recency-slider";
 import { WatchedSlider } from "@/components/settings/watched-slider";
@@ -28,6 +29,7 @@ import {
 } from "@/lib/rating-sources";
 import { useAutosavedSettings } from "@/lib/autosave";
 import {
+  IDLE_HOLD_DAYS_DEFAULT,
   REFRESH_DAYS_DEFAULT,
   RECENCY_DEFAULT,
   WATCHED_PCT_DEFAULT,
@@ -103,6 +105,13 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
       REFRESH_DAYS_DEFAULT,
     ),
   );
+  const [idleHoldDays, setIdleHoldDays] = useState<number>(() =>
+    readWholeNumber(
+      settings,
+      "recommendations.idle_hold_days",
+      IDLE_HOLD_DAYS_DEFAULT,
+    ),
+  );
   const [recency, setRecency] = useState<number>(() =>
     readPercent(settings, "recommendations.recency", RECENCY_DEFAULT),
   );
@@ -144,6 +153,7 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
       enabled,
       watchedPct,
       refreshDays,
+      idleHoldDays,
       recency,
       recentCount,
       maxSeeds,
@@ -161,6 +171,7 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
       "recommendations.dislike_threshold": dislikeThreshold,
       "recommendations.watched_pct": watchedPct / 100,
       "recommendations.refresh_days": refreshDays,
+      "recommendations.idle_hold_days": idleHoldDays,
       "recommendations.recency": recency / 100,
       "recommendations.recent_count": recentCount,
       "recommendations.max_seeds": maxSeeds,
@@ -285,6 +296,24 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
               />
             </div>
             <div className="space-y-2 border-t pt-4">
+              <Label htmlFor="idle-hold-days">
+                Hold rows for inactive viewers
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                Someone who hasn&rsquo;t watched anything since their row was
+                built has nothing new to base a rebuild on, so the row can wait
+                — which also saves a write to Plex for every row held. Off by
+                default.
+              </p>
+              <IdleHoldField
+                id="idle-hold-days"
+                value={idleHoldDays}
+                cadence={refreshDays}
+                scope="global"
+                onChange={setIdleHoldDays}
+              />
+            </div>
+            <div className="space-y-2 border-t pt-4">
               <Label htmlFor="recency">Recent releases</Label>
               <p className="text-sm text-muted-foreground">
                 How much a title’s <strong>release date</strong> counts when
@@ -297,9 +326,11 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
                 onChange={setRecency}
               />
             </div>
-            {/* The BROADER knob first. These two were the other way round, which gave no clue that
-                this one governs every source and the one below only slices the front of that same
-                list — `candidates.py` searches `seeds[:recent_count]`. Both labels are imported, not
+            {/* The narrower knob is NESTED inside the broader one, the way "Treat as didn't like
+                it" nests under "Respect Plex ratings" — because it is not a peer of it: it is a
+                slice of the very list above (`candidates.py` searches `seeds[:recent_count]`).
+                Side by side, the only clue to that was word order, and the sub-field had to spend
+                a whole paragraph explaining the setting above it. Both labels are imported, not
                 retyped: they are shared with the row editor, and a setting that goes by two names
                 across two screens is the bug this pairing already shipped once. */}
             <div className="space-y-2 border-t pt-4">
@@ -325,31 +356,31 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
                 />
                 <span className="text-sm text-muted-foreground">watches</span>
               </div>
-            </div>
-            <div className="space-y-2 border-t pt-4">
-              <Label htmlFor="recent-count">{RECENT_COUNT_LABEL}</Label>
-              <p className="text-sm text-muted-foreground">
-                A narrower slice of the same list: how many of those watches the
-                AI web search runs a &ldquo;what to watch if you liked X&rdquo;
-                search for. Fewer = tighter and cheaper, and setting it higher
-                than <strong>{MAX_SEEDS_LABEL}</strong> changes nothing. Results
-                are cached for two weeks and shared across people.
-              </p>
-              <div className="flex items-center gap-2">
-                <Input
-                  id="recent-count"
-                  type="number"
-                  min={1}
-                  max={25}
-                  value={recentCount}
-                  onChange={(e) =>
-                    setRecentCount(
-                      Math.max(1, Math.min(25, Number(e.target.value) || 1)),
-                    )
-                  }
-                  className="w-24"
-                />
-                <span className="text-sm text-muted-foreground">watches</span>
+              <div className="space-y-2 pt-2">
+                <Label htmlFor="recent-count">{RECENT_COUNT_LABEL}</Label>
+                {/* No "cached for 7 days" here any more: the AI web search card above owns the
+                    cost story and already says it, in more detail. */}
+                <p className="text-sm text-muted-foreground">
+                  How many of those the AI web search runs a &ldquo;what to
+                  watch if you liked X&rdquo; search for, newest first. Higher
+                  than the number above changes nothing.
+                </p>
+                <div className="flex items-center gap-2">
+                  <Input
+                    id="recent-count"
+                    type="number"
+                    min={1}
+                    max={25}
+                    value={recentCount}
+                    onChange={(e) =>
+                      setRecentCount(
+                        Math.max(1, Math.min(25, Number(e.target.value) || 1)),
+                      )
+                    }
+                    className="w-24"
+                  />
+                  <span className="text-sm text-muted-foreground">watches</span>
+                </div>
               </div>
             </div>
             {/* The switch and the line it draws stay in one block: "respect ratings" says nothing

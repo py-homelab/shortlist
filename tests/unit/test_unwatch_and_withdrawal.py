@@ -31,7 +31,13 @@ from shortlist.server.services.report_service import (
 )
 from shortlist.server.services.run_persistence import reconcile_watched
 
-NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+# The real clock, deliberately not a pinned date. Every fixture here places its data RELATIVE to
+# this instant, and the code under test reads `datetime.now(UTC)` — so a pinned NOW is a second clock
+# that drifts away from the first one day at a time. The withdrawal boundary tests sit ±5 days from
+# `UNWATCH_WITHDRAW_DAYS`, so they began failing 5 days after the date last pinned here, reporting a
+# bug in code nobody had touched. Nothing in this file needs a fixed calendar date; it needs the
+# same "now" the SUT sees.
+NOW = datetime.now(UTC)
 
 
 @pytest.fixture
@@ -105,10 +111,57 @@ def a_pick_so_the_rating_key_resolves(sessions, *, tmdb_id=550, rating_key=9001)
         s.commit()
 
 
-def profile(history=(), *, slug="alex", account=99):
+def profile(history=(), *, slug="alex", account=99, complete=True):
+    """`complete=True` by default: these tests are about what withdrawal decides once it is allowed
+    to run at all. Pass False to model a read that could not prove it saw everything."""
     return UserProfile(
-        username=slug, plex_account_id=account, user_type=UserType.SHARED, slug=slug, history=list(history)
+        username=slug,
+        plex_account_id=account,
+        user_type=UserType.SHARED,
+        slug=slug,
+        history=list(history),
+        history_complete=complete,
     )
+
+
+class TestTheWithdrawalLogNamesWhatItTook:
+    """`watched_at`/`finished_at` have no other copy, so the log line is the only forensic trail if
+    withdrawal ever takes back something it should not have.
+
+    Live on a real server the first version read `Rabbit Hole, Rabbit Hole, Rabbit Hole, ...` eight
+    times — one entry per pick ROW, because a title is delivered by many runs. The count is
+    row-based, because that is what was written; the names are distinct, because that is what a
+    person reads.
+    """
+
+    def test_one_title_delivered_by_many_runs_is_named_once(self, world):
+        from shortlist.server.services.run_persistence import _withdraw_unwatched
+
+        with world() as session:
+            for rank in range(1, 4):  # the same show, credited by three different runs
+                session.add(
+                    PickRow(
+                        run_id=1,
+                        user_id=1,
+                        collection_slug="staff",
+                        section_key="1",
+                        library="Movies",
+                        tmdb_id=610,
+                        media_type="movie",
+                        rating_key=0,
+                        rank=rank,
+                        title="Rabbit Hole",
+                        created_at=NOW - timedelta(days=2),
+                        watched_at=NOW - timedelta(days=1),
+                    )
+                )
+            session.commit()
+        with world() as session:
+            user = session.query(User).filter_by(id=1).one()
+            gone = _withdraw_unwatched(session, user, {}, set(), now=NOW)
+
+        assert len(gone) == 3, "the count must stay row-based — that is what was actually written"
+        assert sorted(set(gone)) == ["Rabbit Hole"], "the log would repeat the same title once per row"
 
 
 class TestUnwatchingWithdrawsOnlyAFlagBackedCredit:
@@ -143,7 +196,7 @@ class TestUnwatchingWithdrawsOnlyAFlagBackedCredit:
             s.commit()
 
     def sync(self, world, history, *, full):
-        reconcile_watched(world, [profile(history)], full_resync=full)
+        reconcile_watched(world, [profile(history, complete=full)])
 
     def test_a_flag_only_credit_is_withdrawn_when_the_flag_goes(self, world):
         self.a_credited_pick(world, tmdb=510)
@@ -167,9 +220,13 @@ class TestUnwatchingWithdrawsOnlyAFlagBackedCredit:
         with world() as s:
             assert s.query(PickRow).filter_by(tmdb_id=550).one().watched_at is not None
 
-    def test_an_incremental_read_withdraws_nothing(self, world):
-        """It sees an un-watch only inside the window it covered, so "absent from this read" would
-        withdraw half a roster's credits on any night the cursor was narrow."""
+    def test_a_caller_that_cannot_prove_a_complete_read_withdraws_nothing(self, world):
+        """Absence is only evidence when the read can prove it saw everything.
+
+        The caller that cannot is not hypothetical: a run passes profiles it filled in place, and a
+        watch sync whose read fail-softed past an unreadable library returns that library's titles as
+        absent. Believing either would withdraw credit for something the person still has watched,
+        and `watched_at`/`finished_at` have no other copy."""
         self.a_credited_pick(world, tmdb=510)
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
 
@@ -266,7 +323,7 @@ class TestSettledHistoryIsNeverErased:
         self.a_credit_aged(world, tmdb=510, days=UNWATCH_WITHDRAW_DAYS + 5)
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
 
-        reconcile_watched(world, [profile(other)], full_resync=True)
+        reconcile_watched(world, [profile(other)])
 
         with world() as s:
             assert s.query(PickRow).filter_by(tmdb_id=510).one().watched_at is not None
@@ -279,7 +336,7 @@ class TestSettledHistoryIsNeverErased:
         self.a_credit_aged(world, tmdb=511, days=UNWATCH_WITHDRAW_DAYS - 5)
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
 
-        reconcile_watched(world, [profile(other)], full_resync=True)
+        reconcile_watched(world, [profile(other)])
 
         with world() as s:
             assert s.query(PickRow).filter_by(tmdb_id=511).one().watched_at is None
@@ -318,7 +375,7 @@ class TestAWithdrawnCreditLeavesNothingBehind:
             s.commit()
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
 
-        reconcile_watched(world, [profile(other)], full_resync=True)
+        reconcile_watched(world, [profile(other)])
 
         with world() as s:
             row = s.query(PickRow).filter_by(tmdb_id=510).one()
@@ -339,7 +396,7 @@ class TestUnwatchingAndSharedRows:
         # Plex says watched, but there is no session and no play-log entry.
         history = [WatchedItem(title="Fight Club", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=550)]
 
-        reconcile_watched(world, [profile(history)], full_resync=True)
+        reconcile_watched(world, [profile(history)])
 
         with world() as s:
             assert s.query(SharedRowWatch).count() == 0, (
@@ -356,7 +413,7 @@ class TestUnwatchingAndSharedRows:
 
         # They un-watch it: it is absent from a full history read.
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
-        reconcile_watched(world, [profile(other)], full_resync=True)
+        reconcile_watched(world, [profile(other)])
 
         with world() as s:
             assert s.query(SharedRowWatch).count() == 1, "we saw them press play; that still happened"
@@ -522,7 +579,7 @@ class TestALiveCreditIsNotWithdrawnByAResyncThatMissedIt:
             s.commit()
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
 
-        reconcile_watched(world, [profile(other)], full_resync=True)
+        reconcile_watched(world, [profile(other)])
 
         with world() as s:
             row = s.query(PickRow).filter_by(tmdb_id=510).one()
@@ -554,7 +611,7 @@ class TestALiveCreditIsNotWithdrawnByAResyncThatMissedIt:
             s.commit()
         other = [WatchedItem(title="Other", media_type=MediaType.MOVIE, watched_at=NOW, tmdb_id=999)]
 
-        reconcile_watched(world, [profile(other)], full_resync=True)
+        reconcile_watched(world, [profile(other)])
 
         with world() as s:
             assert s.query(PickRow).filter_by(tmdb_id=511).one().watched_at is None

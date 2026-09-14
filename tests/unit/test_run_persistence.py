@@ -1,5 +1,19 @@
+from datetime import UTC, datetime
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from shortlist.engine.models import UserRunReport
+from shortlist.server.db.models import Base
 from shortlist.server.services.run_persistence import _cost_blob
+
+
+@pytest.fixture
+def sessions():
+    engine = create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    return sessionmaker(engine)
 
 
 class TestCostBlob:
@@ -58,3 +72,180 @@ class TestARealFailureOutlivesAThresholdReason:
         assert _is_failure_detail("on an Arr exclusion list") is False
         assert _is_failure_detail("") is False
         assert _is_failure_detail(None) is False
+
+
+class TestTheShelfEventsANightlyRunEmits:
+    """`_emit_hub_ordering_events` — the RUN path, which `jobs._audit_hub_orderings` mirrors for the
+    on-demand handlers.
+
+    Tested separately from the jobs path because they are separate emitters with separate scope
+    names, and `docs/guides.md` tells owners to read THIS one back after a nightly run
+    (`/api/events/log?scope=run.hub_unplaced` — the change log has no screen yet). The jobs-path
+    tests in `test_jobs.py` cannot see a regression here.
+    """
+
+    @staticmethod
+    def _emit(entries: list[dict], *, dry_run: bool = False) -> list[tuple]:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from shortlist.server.services import run_persistence as rp
+
+        seen: list[tuple] = []
+        report = SimpleNamespace(hub_orderings=entries, dry_run=dry_run)
+        with patch.object(rp, "add_audit", lambda session, scope, level, **f: seen.append((scope, level, f))):
+            rp._emit_hub_ordering_events(None, 7, report)
+        return seen
+
+    def test_a_placement_that_could_not_be_applied_gets_its_own_scope_and_no_verified(self):
+        """`verified` answers "we asked Plex and it stuck". Nothing was asked here, so answering it
+        would be a fabrication — and the separate scope is what keeps `_shelf_contention`'s bounded
+        window holding only the repeated moves it counts."""
+        seen = self._emit([{"library": "Movies", "placed": False, "moved": [], "reason": "anchor not found"}])
+
+        assert [(a[0], a[1]) for a in seen] == [("run.hub_unplaced", "warning")]
+        fields = seen[0][2]
+        assert fields["reason"] == "anchor not found" and fields["verified"] is None
+        assert fields["library"] == "Movies" and fields["run_id"] == 7
+
+    def test_a_move_still_uses_the_ordinary_scope(self):
+        seen = self._emit([{"library": "Movies", "moved": ["Picked for You"], "verified": True}])
+
+        assert [(a[0], a[1]) for a in seen] == [("run.hub_order", "info")]
+
+    def test_an_unverified_move_is_a_warning(self):
+        """A shelf we asked for and did not get — the SFLIX case the whole audit was rebuilt around."""
+        seen = self._emit([{"library": "Movies", "moved": ["Picked for You"], "verified": False}])
+
+        assert [(a[0], a[1]) for a in seen] == [("run.hub_order", "warning")]
+
+    def test_a_dry_run_is_never_a_warning_on_either_scope(self):
+        """A preview asked Plex for nothing, so neither kind is an alarm."""
+        seen = self._emit(
+            [
+                {"library": "Movies", "placed": False, "moved": [], "reason": "anchor not found"},
+                {"library": "TV", "moved": ["row"], "verified": False},
+            ],
+            dry_run=True,
+        )
+
+        assert [(a[0], a[1]) for a in seen] == [("run.hub_unplaced", "info"), ("run.hub_order", "info")]
+
+
+class TestTheZeroRequestedEventSaysWhetherItWasReachable:
+    """`_emit_request_events` — "0 requested" has two shapes and only one is about the owner's
+    settings. `min_demand` counts DISTINCT wanters, so a run covering fewer people than the floor
+    could never have filled the pool, whatever the settings were. Six such events on the
+    maintainer's server (2026-09-03, every one a one-user manual run) raised "Nothing is being
+    requested — loosen your floors" while the nightly 46-user run was requesting normally."""
+
+    @staticmethod
+    def _emit(*, users: int, demand_floor: int) -> dict:
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from shortlist.engine.models import RequestReport
+        from shortlist.server.services import run_persistence as rp
+
+        seen: list[tuple] = []
+        requests = RequestReport(wanted=650, pool_size=0, demand_floor=demand_floor)
+        report = SimpleNamespace(
+            requests=requests,
+            dry_run=False,
+            users=[UserRunReport(username=f"u{i}", slug=f"u{i}") for i in range(users)],
+        )
+        with patch.object(rp, "add_audit", lambda session, scope, level, **f: seen.append((scope, level, f))):
+            rp._emit_request_events(None, 7, report)
+        return next(f | {"_level": level} for scope, level, f in seen if scope == "requests.none_qualified")
+
+    def test_a_run_smaller_than_its_own_demand_floor_is_info_and_flagged(self):
+        fields = self._emit(users=1, demand_floor=2)
+
+        assert fields["_level"] == "info", "arithmetically guaranteed, so not an alarm"
+        assert fields["demand_unreachable"] is True
+        assert (fields["users"], fields["demand_floor"]) == (1, 2)
+
+    def test_a_full_roster_that_cleared_nothing_is_still_a_warning(self):
+        """The shape the alert exists for: plenty of people, plenty missing, floors too tight."""
+        fields = self._emit(users=46, demand_floor=2)
+
+        assert fields["_level"] == "warning"
+        assert fields["demand_unreachable"] is False
+
+    def test_a_floor_of_one_is_never_unreachable(self):
+        """The default. One person wanting a title is one wanter, so a single-user run clears it."""
+        assert self._emit(users=1, demand_floor=1)["demand_unreachable"] is False
+
+
+class TestPicksCarryTheBuiltAtStamp:
+    """`built_at` has to survive the write as well as the read.
+
+    The read back has a test (`test_previous_picks_carries_the_built_at_stamp`), but nothing
+    exercised the WRITE: drop `built_at=pick.built_at` from `_persist_user_report` and every stamp is
+    silently NULL, every carried row reads as "unknown", and the idle hold is inert on a real server
+    with the whole suite green.
+    """
+
+    def test_a_persisted_pick_keeps_the_stamp_the_engine_put_on_it(self, sessions):
+        from shortlist.engine.models import MediaType, Pick, UserRunReport
+        from shortlist.server.db.models import PickRow, Run, User
+        from shortlist.server.services.run_persistence import _persist_user_report
+
+        built = datetime(2026, 8, 20, 3, 30, tzinfo=UTC)
+        with sessions() as session:
+            user = User(plex_account_id=1, username="sarah", slug="sarah", enabled=True)
+            run = Run(trigger="manual", status="ok", dry_run=False, stats={})
+            session.add_all([user, run])
+            session.commit()
+            report = UserRunReport(username="sarah", slug="sarah", status="ok")
+            report.picks = [
+                Pick(
+                    tmdb_id=100,
+                    rating_key=1,
+                    title="T100",
+                    rank=1,
+                    reason="",
+                    media_type=MediaType.MOVIE,
+                    collection_slug="picked",
+                    section_key="1",
+                    built_at=built,
+                )
+            ]
+
+            _persist_user_report(session, run.id, user, report, dry_run=False)
+            session.commit()
+
+            stored = session.query(PickRow).one()
+            assert stored.built_at is not None, "the stamp was dropped on the way into the database"
+            assert stored.built_at.replace(tzinfo=stored.built_at.tzinfo or UTC) == built
+
+
+class TestTheLedgerRecordsWhatWasWrittenToASummaryAndSortTitle:
+    """Issue #120. The ledger's record is what lets clearing a row's field hand back ONLY what Shortlist
+    wrote — so the persist must forget a record the run cleared, and must keep one a run never reached."""
+
+    def _entry(self, **details) -> dict:
+        return {"row_slug": "gems", "library_key": "1", "rating_key": 42, "row_title": "Gems", **details}
+
+    def test_a_record_the_run_wrote_is_stored_and_one_it_cleared_is_forgotten(self, sessions):
+        from shortlist.server.db.models import Delivery
+        from shortlist.server.services.run_persistence import _record_deliveries
+
+        with sessions() as session:
+            _record_deliveries(session, "sarah", [self._entry(summary_written="Hi", title_sort_written="!1_Gems")])
+            row = session.get(Delivery, ("gems", "sarah", "1"))
+            assert (row.summary_written, row.title_sort_written) == ("Hi", "!1_Gems")
+
+            _record_deliveries(session, "sarah", [self._entry(summary_written=None, title_sort_written=None)])
+            assert (row.summary_written, row.title_sort_written) == (None, None)
+
+    def test_an_entry_without_the_keys_keeps_the_record(self, sessions):
+        """A legacy breakdown, or a library delivery never reached the description step for, says
+        nothing about what Plex holds — forgetting would strand a value Shortlist really wrote."""
+        from shortlist.server.db.models import Delivery
+        from shortlist.server.services.run_persistence import _record_deliveries
+
+        with sessions() as session:
+            _record_deliveries(session, "sarah", [self._entry(summary_written="Hi", title_sort_written=None)])
+            _record_deliveries(session, "sarah", [self._entry()])
+            assert session.get(Delivery, ("gems", "sarah", "1")).summary_written == "Hi"

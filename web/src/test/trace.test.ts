@@ -94,6 +94,7 @@ describe("buildLibraries", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "X",
               reason: "",
               media_type: "movie",
@@ -116,6 +117,7 @@ describe("buildLibraries", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Y",
               reason: "",
               media_type: "movie",
@@ -166,6 +168,7 @@ describe("buildLibraries", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "X",
               reason: "",
               media_type: "movie",
@@ -198,6 +201,7 @@ describe("buildLibraries", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "X",
               reason: "",
               media_type: "movie",
@@ -220,6 +224,7 @@ describe("buildLibraries", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Y",
               reason: "",
               media_type: "movie",
@@ -242,6 +247,7 @@ describe("buildLibraries", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Z",
               reason: "",
               media_type: "show",
@@ -284,6 +290,9 @@ describe("plain-English trace helpers", () => {
     expect(fateLabel("excluded_genre")).toBe("excluded genre");
     expect(fateLabel("lost_ranking_cutoff")).toBe("lost the ranking cut");
     expect(fateLabel("not_returned")).toBe("found by another source");
+    expect(fateLabel("hidden_by_their_restrictions")).toBe(
+      "hidden by their Plex restrictions",
+    );
   });
 
   it("sourceRole describes each source's real query shape", () => {
@@ -343,6 +352,7 @@ describe("plain-English trace helpers", () => {
             picks: [
               {
                 rank: 1,
+                rating_key: 0,
                 title: "X",
                 reason: "",
                 media_type: "movie",

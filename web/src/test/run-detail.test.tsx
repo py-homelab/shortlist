@@ -140,6 +140,51 @@ describe("RunDetailPage — grouped by library", () => {
     getRunLog.mockResolvedValue([]);
   });
 
+  it("says why a person's rows are identical to last night's, above their picks", async () => {
+    // The second run of a night redelivers most people unchanged. Without this the panel shows the
+    // same titles as the run before it and says nothing, which reads as a run that did nothing
+    // rather than one that decided there was nothing to do.
+    const detail = run([
+      {
+        row_slug: "picked",
+        row_title: "✨ Picked for You",
+        library_key: "1",
+        library_title: "Movies",
+        added: [],
+        removed: [],
+        kept: ["Saving Private Ryan"],
+        deleted: [],
+        created: false,
+        picks: [
+          {
+            rank: 1,
+            rating_key: 0,
+            title: "Saving Private Ryan",
+            reason: "war epic",
+            seed_title: "Pressure",
+            sources: ["tmdb_similar"],
+            affinity: 0.42,
+          },
+        ],
+      },
+    ]);
+    // Mapped rather than indexed: `noUncheckedIndexedAccess` makes `users[0]` possibly undefined,
+    // and this fixture has exactly one person in it.
+    detail.users = detail.users.map((user) => ({
+      ...user,
+      reason:
+        "It wasn't any of their rows' night to rebuild, so last run's titles were redelivered unchanged.",
+    }));
+    getRun.mockResolvedValue(detail);
+    renderDetail();
+
+    await expandRows();
+
+    expect(
+      await screen.findByText(/night to rebuild, so last run's titles/),
+    ).toBeInTheDocument();
+  });
+
   it("shows each library as its own group with its own picks, not one merged list", async () => {
     getRun.mockResolvedValue(
       run([
@@ -156,6 +201,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Saving Private Ryan",
               reason: "war epic",
               seed_title: "Pressure",
@@ -177,6 +223,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Deadliest Catch",
               reason: "survival series",
               seed_title: "Gold Rush",
@@ -209,8 +256,10 @@ describe("RunDetailPage — grouped by library", () => {
     expect(screen.getByText(/war epic/)).toBeInTheDocument();
     // This page is where "why did it pick that?" gets asked, and it has its OWN pick renderer
     // rather than using PickList — so the provenance line has to be asserted here separately.
+    // Just the match quality now. "suggested by TMDB" was dropped from this line because it put
+    // the word TMDB three times in one row — the score, the source, and the link chip.
     expect(
-      screen.getByText(/suggested by TMDB · loosely related/),
+      screen.getByText(/loosely related/),
     ).toBeInTheDocument();
     expect(screen.queryByText(/survival series/)).not.toBeInTheDocument();
 
@@ -314,7 +363,45 @@ describe("RunDetailPage — grouped by library", () => {
     await expandRows();
 
     expect((await screen.findAllByText("9,000"))[0]).toBeInTheDocument();
-    expect(screen.getByText("curate + AI sources")).toBeInTheDocument();
+    // "curate + AI sources" named a curate step that no longer exists, and said nothing about what
+    // was counted. The owner asked whether the figure included cached tokens.
+    expect(screen.getByText("sent + received")).toBeInTheDocument();
+  });
+
+  it("splits the AI tokens into input and output, which are billed at different rates", async () => {
+    const r = run([]);
+    r.stats = {
+      users_ok: 1,
+      users_error: 0,
+      llm_tokens: 360699,
+      llm_output_tokens: 60699,
+      llm_tokens_by_step: { llm_web: 360699 },
+    };
+    getRun.mockResolvedValue(r);
+
+    renderDetail("");
+
+    await expandRows();
+
+    // The tile's text, not one element's: each part of the hint is its own element so a narrow tile
+    // wraps between "300,000 in" and "60,699 out" rather than inside either.
+    const tile = (await screen.findByText("AI tokens")).closest("[title]");
+    expect(tile).toHaveTextContent("300,000 in · 60,699 out");
+  });
+
+  it("says what the AI-token figure counts, cache included", async () => {
+    const r = run([]);
+    r.stats = { users_ok: 1, users_error: 0, llm_tokens: 9000, llm_tokens_by_step: { llm_web: 9000 } };
+    getRun.mockResolvedValue(r);
+
+    renderDetail("");
+
+    await expandRows();
+
+    expect(await screen.findByText("web search 9,000 · sent + received")).toBeInTheDocument();
+    const tile = screen.getByText("AI tokens").closest("[title]");
+    expect(tile?.getAttribute("title")).toMatch(/input and output tokens/i);
+    expect(tile?.getAttribute("title")).toMatch(/cache/i);
   });
 
   it("renders the row title for the SELECTED library, not the first one", async () => {
@@ -335,6 +422,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Heat",
               reason: "crime",
               seed_title: "",
@@ -356,6 +444,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Fargo",
               reason: "crime",
               seed_title: "",
@@ -404,6 +493,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "A",
               reason: "a",
               seed_title: null,
@@ -425,6 +515,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "B",
               reason: "b",
               seed_title: null,
@@ -612,6 +703,113 @@ describe("RunDetailPage — grouped by library", () => {
     expect(screen.queryByText(/Finishing up/)).toBeNull();
   });
 
+  /** A run mid-flight with sarah not finished yet, whose latest live-log line is `line`. */
+  function sarahMidRun(line: Pick<RunLogEntry, "stage" | "counts">) {
+    const base = run([]);
+    getRun.mockResolvedValue({
+      ...base,
+      finished_at: null,
+      status: "running",
+      stats: { ...base.stats, expected_users: [{ slug: "sarah" }] },
+      // The API synthesises a `pending` entry for anyone not finished yet.
+      users: [
+        {
+          ...base.users[0]!,
+          username: "sarah",
+          slug: "sarah",
+          display_name: "sarah",
+          status: "pending",
+        },
+      ],
+    });
+    getRunLog.mockResolvedValue([
+      { seq: 1, ts: "2026-08-17T03:30:00Z", run_id: 2, user: "sarah", ...line },
+    ]);
+  }
+
+  it("tells you what a person's row is getting while it is being written", async () => {
+    // An in-place update on a big library runs for minutes (Plex removes titles one at a time).
+    // "writing the row to Plex" alone could not say whether that was a new row or ten titles being
+    // swapped, so the panel reads the pending change off the live log.
+    sarahMidRun({
+      stage: "delivering",
+      counts: { row: "Picked", library: "TV Shows", adding: 10, removing: 3 },
+    });
+
+    renderDetail("");
+    await expandRows();
+
+    expect(
+      await screen.findByText(
+        "writing the row to Plex — Picked · TV Shows · adding 10 titles · removing 3 titles…",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("names only the row for a person's other stages", async () => {
+    // The counts are shown for a row's pending write only. Earlier stages' tallies are noise in a
+    // one-line status; the full detail is in the run log.
+    sarahMidRun({ stage: "curating", counts: { candidates: 160, row: "Picked" } });
+
+    renderDetail("");
+    await expandRows();
+
+    expect(
+      await screen.findByText("curating with AI — Picked…"),
+    ).toBeInTheDocument();
+  });
+
+  it("says what the run is doing for each person still in progress", async () => {
+    // "43 of 46 people done" with "samantharobinson527 — writing the row to Plex" in the sidebar for
+    // minutes: neither said which row, which library, or whether it was waiting on someone else.
+    const base = run([]);
+    const pending = (slug: string, display_name: string) => ({
+      ...base.users[0]!,
+      slug,
+      username: slug,
+      display_name,
+      status: "pending",
+    });
+    getRun.mockResolvedValue({
+      ...base,
+      finished_at: null,
+      status: "running",
+      stats: {
+        ...base.stats,
+        expected_users: [{ slug: "moohouse" }, { slug: "sam" }, { slug: "mike" }],
+      },
+      users: [base.users[0]!, pending("sam", "Samantha"), pending("mike", "")],
+    });
+    getRunLog.mockResolvedValue(
+      [
+        { user: "sam", stage: "queued" },
+        { user: "mike", stage: "queued" },
+        { user: "moohouse", stage: "done" },
+        { user: "mike", stage: "delivering", counts: { row: "Picked", picks: 20 } },
+        { user: "sam", stage: "delivering", counts: { row: "Picked", picks: 20 } },
+        {
+          user: "sam",
+          stage: "delivering",
+          counts: { row: "Because you watched Dune", library: "TV Shows", adding: 3, removing: 2 },
+        },
+      ].map((line, seq) => ({
+        seq,
+        ts: "2026-08-17T03:30:00Z",
+        run_id: 2,
+        counts: {},
+        ...line,
+      })),
+    );
+
+    renderDetail("");
+
+    const list = await screen.findByRole("list", { name: "In progress" });
+    expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      "mike — waiting for Plex — Picked",
+      "Samantha — writing the row to Plex — Because you watched Dune · TV Shows · adding 3 titles · removing 2 titles",
+    ]);
+  });
+
   it("falls back to the flat pick list for legacy runs with no breakdown", async () => {
     // A legacy run has no per-library breakdown, but its picks still render as a plain list.
     getRun.mockResolvedValue({
@@ -636,6 +834,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Old Title",
               reason: "legacy",
               seed_title: null,
@@ -671,6 +870,7 @@ describe("RunDetailPage — grouped by library", () => {
           picks: [
             {
               rank: 1,
+              rating_key: 0,
               title: "Fresh One",
               reason: "new pick",
               seed_title: "X",
@@ -693,6 +893,16 @@ describe("RunDetailPage — grouped by library", () => {
     expect(screen.getByText("Kept from last run")).toBeInTheDocument();
     expect(screen.getByText("Rotated out for variety")).toBeInTheDocument();
     expect(screen.getByText("Top picks")).toBeInTheDocument();
+
+    // getByText matches a TEXT NODE, so every assertion above passes even when the legend's
+    // accessible text runs two labels together — which is exactly what JSX does to
+    // `<span>Title</span>` followed by bare text on the next line: the newline adjacent to the tag
+    // is dropped, giving "TitleRotated out for variety". Flexbox `gap` hides it visually, so this is
+    // a screen-reader and copy-paste defect rather than a layout one, and only a textContent
+    // assertion can see it at all.
+    const legend = screen.getByText(/What changed/i).parentElement!;
+    expect(legend.textContent).toContain("Title Rotated out for variety");
+    expect(legend.textContent).toContain("#1\u20133 Top picks");
 
     // "removed" now reads as rotation with the reason, not a bare scary count.
     expect(screen.getByText(/2 rotated out/)).toBeInTheDocument();
@@ -738,7 +948,7 @@ describe("RunDetail — a skipped person is not a success", () => {
         status: "error",
         reason: null,
       },
-      skippedUser("canary", 3),
+      skippedUser("jess", 3),
     ] as unknown as RunDetail["users"];
     getRun.mockResolvedValue(r);
 
@@ -761,7 +971,7 @@ describe("RunDetail — a skipped person is not a success", () => {
       users_skipped: 3,
       titles_requested: 0,
     };
-    r.users = ["sarah", "mike", "canary"].map((u, i) =>
+    r.users = ["sarah", "mike", "jess"].map((u, i) =>
       skippedUser(u, i),
     ) as unknown as RunDetail["users"];
     getRun.mockResolvedValue(r);
@@ -785,7 +995,7 @@ describe("RunDetail — a skipped person is not a success", () => {
       users_skipped: 3,
       titles_requested: 0,
     };
-    r.users = ["sarah", "mike", "canary"].map((u, i) =>
+    r.users = ["sarah", "mike", "jess"].map((u, i) =>
       skippedUser(u, i),
     ) as unknown as RunDetail["users"];
     getRun.mockResolvedValue(r);
@@ -816,7 +1026,7 @@ describe("RunDetail — a skipped person is not a success", () => {
     };
     r.users = [
       {
-        ...skippedUser("canary", 1),
+        ...skippedUser("jess", 1),
         status: "cold_start",
         reason:
           "Not enough watch history yet — 0 of 10 titles. The row due in this run is set to build nothing until then, so 1 already on Plex was removed.",

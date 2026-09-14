@@ -18,6 +18,8 @@ Three rules, all learned the hard way:
 
 from __future__ import annotations
 
+import math
+
 from shortlist.engine.models import Candidate
 
 _UNATTRIBUTED = "_unattributed"  # a hand-built candidate carrying no source tag
@@ -67,7 +69,40 @@ def recency_factor(year: int | None, year_now: int, recency: float) -> float:
     return 0.5 ** (age / RECENCY_HALF_LIFE_YEARS * min(recency, 1.0))
 
 
-def score(candidate: Candidate, *, recency: float = 0.0, year_now: int = 0) -> float:
+#: The floor for ALL negative signals COMBINED — deliberately one number for the whole family, not
+#: one per signal. Matches `candidates.genre_coherence`'s existing 0.5 for the same reason it chose
+#: it: a dampener shades the ranking, it does not decide it.
+NEGATIVE_MULTIPLIER_FLOOR = 0.5
+
+
+def negative_multiplier(*log2_penalties: float) -> float:
+    """Combine every negative signal into ONE floored multiplier.
+
+    Each argument is a log2-domain adjustment <= 0, where 0 means "no opinion". They are summed in
+    log space — the log-domain equivalent of multiplying the raw ratios — and the floor is applied
+    ONCE, to the total.
+
+    That ordering is the entire point. Three dampeners each floored at 0.25 and then multiplied give
+    a 1.6% floor, not 25%: a limit nobody chose, emerging from how many signals happen to be stacked.
+    Combining first means the floor is an explicit, auditable clamp instead.
+
+    RULE for anything added later: a new negative signal is ANOTHER ARGUMENT to this function, never
+    its own separately-floored multiplier beside it. Reintroducing the second floor reintroduces the
+    bug, silently.
+    """
+    total = sum(min(0.0, penalty) for penalty in log2_penalties)
+    return 2 ** max(total, math.log2(NEGATIVE_MULTIPLIER_FLOOR))
+
+
+def score(
+    candidate: Candidate,
+    *,
+    recency: float = 0.0,
+    year_now: int = 0,
+    genre_avoidance: float = 0.0,
+    franchise: float = 0.0,
+    cast: float = 0.0,
+) -> float:
     """How promising a candidate is, before the picker selects from it.
 
     ``1 + seed_frequency`` (not ``seed_frequency``): "three of your seeds suggested this" is a real
@@ -76,15 +111,63 @@ def score(candidate: Candidate, *, recency: float = 0.0, year_now: int = 0) -> f
 
     ``recency`` scales the result by release date (see ``recency_factor``); at its 0.0 default the
     factor is exactly 1.0, so this is the same arithmetic it has always been.
+
+    ``genre_avoidance`` scales the genre penalty the same way, through ``negative_multiplier``. At its
+    0.0 default the penalty argument is 0.0 and the multiplier is exactly 1.0, so every existing
+    install scores bit-for-bit as before until someone turns the dial.
     """
     seed_weight = max((s.weight for s in candidate.seeds), default=0.0)
     rating = candidate.rating or 5.0  # unrated titles get a neutral prior, not zero
     base = (1 + candidate.seed_frequency) * rating * (1.0 + seed_weight) * candidate.affinity
+    base *= negative_multiplier(candidate.genre_penalty * genre_avoidance)
+    # Every new term is a BOUNDED multiplier that is exactly 1.0 at its 0.0 default, which is what
+    # makes this composition backward-compatible by construction rather than by four separately
+    # verified accidents.
+    base *= franchise_factor(candidate.in_seed_franchise, franchise)
+    base *= cast_factor(candidate.cast_overlap, cast)
     return base * recency_factor(candidate.year, year_now, recency)
 
 
-def _sort_key(candidate: Candidate, recency: float = 0.0, year_now: int = 0) -> tuple:
-    return (-score(candidate, recency=recency, year_now=year_now), -candidate.rating, candidate.title)
+#: Neither positive signal may out-rank a well-seeded, high-affinity title on its own. A full extra
+#: seed match is already worth +100% through `seed_frequency`; "continues the same story" and "shares
+#: a lead" are strong evidence, not that. One ceiling for both, so neither can quietly outgrow the
+#: other.
+FRANCHISE_BOOST_MAX = 0.5
+CAST_BOOST_MAX = 0.5
+
+
+def franchise_factor(in_seed_franchise: bool, strength: float) -> float:
+    """Boost for a title that continues a story one of its seeds began. 1.0 when off or not a member."""
+    if not in_seed_franchise:
+        return 1.0
+    return 1.0 + FRANCHISE_BOOST_MAX * max(0.0, min(1.0, strength))
+
+
+def cast_factor(overlap: float, strength: float) -> float:
+    """Boost proportional to IDF-discounted shared cast. 1.0 when off or nothing is shared."""
+    return 1.0 + CAST_BOOST_MAX * max(0.0, min(1.0, strength)) * max(0.0, min(1.0, overlap))
+
+
+def _sort_key(
+    candidate: Candidate,
+    recency: float = 0.0,
+    year_now: int = 0,
+    genre_avoidance: float = 0.0,
+    franchise: float = 0.0,
+    cast: float = 0.0,
+) -> tuple:
+    return (
+        -score(
+            candidate,
+            recency=recency,
+            year_now=year_now,
+            genre_avoidance=genre_avoidance,
+            franchise=franchise,
+            cast=cast,
+        ),
+        -candidate.rating,
+        candidate.title,
+    )
 
 
 def cut_for_recency(
@@ -93,6 +176,9 @@ def cut_for_recency(
     keep: int,
     recency: float,
     year_now: int,
+    genre_avoidance: float = 0.0,
+    franchise: float = 0.0,
+    cast: float = 0.0,
 ) -> list[Candidate]:
     """Re-take the per-media ``pre_rank`` cut at this row's own release-date weight.
 
@@ -107,11 +193,29 @@ def cut_for_recency(
     truncate the other type away before its library's collection is ever built.
     """
     return [
-        c for kind in kinds for c in pre_rank([x for x in in_library if x.media_type is kind], keep, recency, year_now)
+        c
+        for kind in kinds
+        for c in pre_rank(
+            [x for x in in_library if x.media_type is kind],
+            keep,
+            recency,
+            year_now,
+            genre_avoidance,
+            franchise,
+            cast,
+        )
     ]
 
 
-def pre_rank(candidates: list[Candidate], keep: int, recency: float = 0.0, year_now: int = 0) -> list[Candidate]:
+def pre_rank(
+    candidates: list[Candidate],
+    keep: int,
+    recency: float = 0.0,
+    year_now: int = 0,
+    genre_avoidance: float = 0.0,
+    franchise: float = 0.0,
+    cast: float = 0.0,
+) -> list[Candidate]:
     """Top `keep` candidates, giving every source a turn (best-first within each).
 
     Round-robin, not a global sort: each source offers its best remaining candidate in turn until
@@ -124,7 +228,9 @@ def pre_rank(candidates: list[Candidate], keep: int, recency: float = 0.0, year_
     pool exceeds `keep` — the common case for a catalog-deep server, which is exactly who needs this
     — a newer title ranking below the cap could never be rescued however high the owner turned it.
     """
-    ranked = sorted(candidates, key=lambda c: _sort_key(c, recency, year_now))
+    # `genre_avoidance` participates in the CUT for the same reason `recency` does: weighting only
+    # after truncation would cap the dial's reach at whatever happened to survive the base sort.
+    ranked = sorted(candidates, key=lambda c: _sort_key(c, recency, year_now, genre_avoidance, franchise, cast))
     if len(ranked) <= keep:
         return ranked
 

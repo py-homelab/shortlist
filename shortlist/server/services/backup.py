@@ -7,10 +7,12 @@ ones, and hooks into startup (pre-migration) and APScheduler (daily). The backup
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from loguru import logger
@@ -66,15 +68,41 @@ def take_backup(config_dir: Path, *, label: str = "scheduled", max_keep: int = D
             if conn is not None:
                 conn.close()
 
-    _rotate(backup_dir, max_keep)
+    # Housekeeping must never invalidate the backup it is tidying up around. This runs on every boot,
+    # so an exception escaping here failed the boot AFTER a good backup had already been written —
+    # a crash-loop on a host that recreates the container automatically, and the backup was lost with
+    # it. Rotation failing just means old files linger, which costs disk and nothing else.
+    try:
+        _rotate(backup_dir, max_keep)
+    except OSError as e:
+        logger.warning("could not rotate old backups ({}); keeping them, the new backup is fine", e)
     return backup_path
 
 
 def _rotate(backup_dir: Path, max_keep: int) -> None:
-    """Keep only the most recent `max_keep` backups, delete the rest."""
-    backups = sorted(backup_dir.glob("shortlist_*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
+    """Keep only the most recent `max_keep` backups, delete the rest.
+
+    Every file is handled independently: `glob` gives a snapshot, and by the time we `stat` or
+    `unlink` an entry it may be gone — a concurrent boot rotating the same directory, a manual
+    tidy-up, a network filesystem. One vanished file must not stop the rest being rotated, and must
+    not be reported as a failure: it is already in the state we wanted.
+    """
+
+    def _mtime(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return 0.0  # sorts last, so it is a rotation candidate; the unlink below tolerates it
+
+    # Never the backup a restore is waiting for: it would be gone by the restart that applies it.
+    waiting = pending_restore(backup_dir.parent)
+    keep = waiting["backup"] if waiting else None
+    backups = sorted((b for b in backup_dir.glob("shortlist_*.db") if b.name != keep), key=_mtime, reverse=True)
     for old in backups[max_keep:]:
-        old.unlink()
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            continue  # someone else got there first — the desired outcome either way
         logger.debug("rotated old backup: {}", old.name)
 
 
@@ -97,10 +125,18 @@ def list_backups(config_dir: Path) -> list[dict]:
     return result
 
 
-def restore_backup(config_dir: Path, backup_name: str) -> bool:
+def restore_backup(config_dir: Path, backup_name: str, *, max_keep: int = DEFAULT_MAX_BACKUPS) -> bool:
     """Restore a backup by copying it over the current DB. Returns True on success.
 
-    The caller must stop the app or hold the DB lock before calling this.
+    Nothing may have the database open: not a pooled connection, not a session. A connection left open
+    keeps writing to the WAL this unlinks, and closing it checkpoints those pages back over the restored
+    file. So the running app never calls this; it queues the restore (`request_restore`) and the next
+    boot applies it (`apply_pending_restore`) before anything opens the database.
+
+    Args:
+        config_dir: the /config directory.
+        backup_name: a file in /config/backups.
+        max_keep: the owner's backup limit, for the rotation the pre-restore copy triggers.
     """
     try:
         backup_name = safe_backup_name(backup_name)
@@ -110,12 +146,33 @@ def restore_backup(config_dir: Path, backup_name: str) -> bool:
         return False
     backup_path = config_dir / BACKUP_SUBDIR / backup_name
     db_path = config_dir / "shortlist.db"
+    staged = config_dir / RESTORE_STAGING
     if not backup_path.exists():
         logger.error("backup not found: {}", backup_name)
         return False
 
-    # Take a pre-restore backup of current state
-    take_backup(config_dir, label="pre-restore", max_keep=DEFAULT_MAX_BACKUPS)
+    # Copied aside FIRST. The pre-restore copy below rotates the backups, and the file it rotates out is
+    # the oldest, which can be the very one being restored.
+    try:
+        shutil.copyfile(backup_path, staged)
+    except OSError as e:
+        staged.unlink(missing_ok=True)
+        logger.error("could not read backup {} ({}) — the database was not changed", backup_name, type(e).__name__)
+        return False
+
+    # The pre-restore backup is the ONLY way back from a restore chosen by mistake, so a restore
+    # that could not take one does not proceed. `take_backup` returns None on a full disk, a
+    # permission problem, or a locked database — and the next two steps unlink the WAL and replace
+    # the live database, which is exactly when there is nothing left to go back to. Refusing loses
+    # the restore; continuing loses the server's current state with no copy of it anywhere.
+    if take_backup(config_dir, label="pre-restore", max_keep=max_keep) is None:
+        staged.unlink(missing_ok=True)
+        logger.error(
+            "refusing to restore {}: could not take a pre-restore backup first, so the current "
+            "database would be overwritten with no way back",
+            backup_name,
+        )
+        return False
 
     # Remove WAL/SHM files (they belong to the old DB)
     for suffix in (".db-wal", ".db-shm"):
@@ -123,6 +180,112 @@ def restore_backup(config_dir: Path, backup_name: str) -> bool:
         if wal.exists():
             wal.unlink()
 
-    shutil.copy2(backup_path, db_path)
+    # A rename, not a copy: a crash leaves either the old database or the restored one, never half of each.
+    os.replace(staged, db_path)
     logger.info("restored from backup: {}", backup_name)
     return True
+
+
+#: A restore the owner asked for, waiting for the restart that applies it. In /config, not /config/backups,
+#: so the backup listing and its rotation never see it.
+RESTORE_PENDING = "restore-pending.json"
+#: Where a backup is copied before it replaces the database, so the swap is a rename.
+RESTORE_STAGING = "shortlist.db.restoring"
+#: A restore still waiting after this long is not applied. It rolls back who can see which rows, and an
+#: owner who asked for it a day ago and never restarted should not have it land on an unplanned restart
+#: (a host reboot, an auto-updater at 05:30).
+RESTORE_EXPIRES_AFTER = timedelta(hours=24)
+
+
+def request_restore(config_dir: Path, backup_name: str, *, max_keep: int = DEFAULT_MAX_BACKUPS) -> bool:
+    """Queue a restore of this backup for the next boot. False when there is no such backup.
+
+    The running app keeps the database it has open until the restart; `apply_pending_restore` swaps
+    the backup in at the start of the next boot, where nothing has the database open yet.
+    """
+    try:
+        backup_name = safe_backup_name(backup_name)
+    except ValueError:
+        logger.error("refusing a backup name that is not a plain filename: {!r}", backup_name)
+        return False
+    if not (config_dir / BACKUP_SUBDIR / backup_name).exists():
+        logger.error("backup not found: {}", backup_name)
+        return False
+    queued = {"backup": backup_name, "requested_at": datetime.now(UTC).isoformat(), "max_keep": max_keep}
+    (config_dir / RESTORE_PENDING).write_text(json.dumps(queued))
+    logger.warning("restore of {} queued — it is applied when Shortlist next starts", backup_name)
+    return True
+
+
+def pending_restore(config_dir: Path) -> dict | None:
+    """``{"backup", "requested_at"}`` for the restore waiting for a restart, or None."""
+    try:
+        queued = json.loads((config_dir / RESTORE_PENDING).read_text())
+        return {"backup": str(queued["backup"]), "requested_at": str(queued["requested_at"])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cancel_restore(config_dir: Path) -> dict | None:
+    """Forget the restore waiting for a restart. Returns what was waiting, or None."""
+    waiting = pending_restore(config_dir)
+    (config_dir / RESTORE_PENDING).unlink(missing_ok=True)
+    return waiting
+
+
+def apply_pending_restore(config_dir: Path, now: datetime | None = None) -> dict | None:
+    """Apply the restore `request_restore` queued, if there is one. Call before anything opens the database.
+
+    The request is removed FIRST, so a restore that fails (or crashes the boot) is not retried on every
+    start after it; the pre-restore copy `restore_backup` takes is the way back from a bad one. Never
+    raises: a boot that cannot restore still starts, on the database it had.
+
+    Returns:
+        None when nothing was queued, else ``{"backup": name, "status": "restored" | "failed" | "expired"}``.
+    """
+    marker = config_dir / RESTORE_PENDING
+    if not marker.exists():
+        # A boot killed inside the copy below had already removed the request, so nothing else would.
+        (config_dir / RESTORE_STAGING).unlink(missing_ok=True)
+        return None
+    try:
+        queued = json.loads(marker.read_text())
+        name = str(queued["backup"])
+        requested_at = datetime.fromisoformat(str(queued["requested_at"]))
+        max_keep = int(queued.get("max_keep") or DEFAULT_MAX_BACKUPS)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        name, requested_at, max_keep = "", None, DEFAULT_MAX_BACKUPS
+    marker.unlink(missing_ok=True)
+    if not name or requested_at is None:
+        logger.error("ignoring an unreadable restore request in {} — the database was not changed", RESTORE_PENDING)
+        return {"backup": name, "status": "failed"}
+    if requested_at.tzinfo is None:
+        requested_at = requested_at.replace(tzinfo=UTC)
+    if (now or datetime.now(UTC)) - requested_at > RESTORE_EXPIRES_AFTER:
+        logger.warning("not restoring {}: it was asked for over a day ago and never applied", name)
+        return {"backup": name, "status": "expired"}
+    try:
+        restored = restore_backup(config_dir, name, max_keep=max_keep)
+    except Exception:
+        logger.exception("restoring {} failed — the database was not changed", name)
+        restored = False
+    if not restored:
+        (config_dir / RESTORE_STAGING).unlink(missing_ok=True)
+    return {"backup": name, "status": "restored" if restored else "failed"}
+
+
+def read_setting(config_dir: Path, key: str) -> object | None:
+    """One setting straight from `shortlist.db`, for the moment before the app opens it. None if unreadable."""
+    db_path = config_dir / "shortlist.db"
+    if not db_path.exists():
+        return None
+    try:
+        con = sqlite3.connect(db_path)
+        try:
+            row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        finally:
+            con.close()
+        value = json.loads(row[0]) if row else None
+    except (sqlite3.Error, ValueError, TypeError):
+        return None
+    return value.get("v") if isinstance(value, dict) else None

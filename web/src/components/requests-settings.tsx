@@ -1,4 +1,4 @@
-import { Film, Tv } from "lucide-react";
+import { Film, Inbox, Tv } from "lucide-react";
 import { type ReactNode, useId, useState } from "react";
 
 import { SaveStatus } from "@/components/save-status";
@@ -24,7 +24,11 @@ import {
 } from "@/lib/request-language";
 import { useAutosavedSettings } from "@/lib/autosave";
 import { settingBool, settingNumber, settingString } from "@/lib/format";
-import { useArrOptions } from "@/lib/queries";
+import { useArrOptions, useSeerrOptions } from "@/lib/queries";
+import {
+  autoSendBarsMatchGuardrails,
+  describeRequestFlow,
+} from "@/lib/request-flow";
 import type { SonarrMonitor } from "@/lib/sonarr-monitor";
 import {
   asSonarrMonitor,
@@ -44,9 +48,16 @@ type ArrForm = {
   rootFolder: string;
 };
 
+/** Where a request is filed. "arr" posts to Radarr/Sonarr; "overseerr" hands the title to
+ *  Overseerr/Jellyseerr and lets IT drive them. Exclusive — never both. */
+type RequestTarget = "arr" | "overseerr";
+
 /** Every editable requests setting in one object, so the panel updates it with a single patcher. */
 interface RequestsForm {
   enabled: boolean;
+  target: RequestTarget;
+  /** Which Overseerr account requests go out as. 0 = the API key's own (usually auto-approving). */
+  overseerrUserId: number;
   radarr: ArrForm;
   sonarr: ArrForm;
   /** How much of a show Sonarr monitors when a request goes out. Sonarr's own Add Series choice. */
@@ -103,6 +114,15 @@ function readArr(settings: Settings, prefix: string): ArrForm {
 function readForm(settings: Settings): RequestsForm {
   return {
     enabled: settingBool(settings, "requests.enabled"),
+    target:
+      settingString(settings, "requests.target", "arr") === "overseerr"
+        ? "overseerr"
+        : "arr",
+    overseerrUserId: settingNumber(
+      settings,
+      "requests.overseerr.request_as_user_id",
+      0,
+    ),
     radarr: readArr(settings, "requests.radarr"),
     sonarr: readArr(settings, "requests.sonarr"),
     sonarrMonitor: asSonarrMonitor(settings["requests.sonarr.monitor"]),
@@ -299,8 +319,218 @@ function ArrCard({
   );
 }
 
+/** Where requests go when Overseerr/Jellyseerr is the target. Deliberately much smaller than
+ *  `ArrCard`: quality profile, root folder and 4K routing are the *seerr's own rules, which is the
+ *  whole reason to route through it. The only choice left is whose name the request goes out under. */
+/** What picking this account will DO, in the dropdown itself.
+ *
+ *  The difference between "filed for you to look at" and "already downloading" is the single most
+ *  consequential thing on this screen, and it is a property of the ACCOUNT, not of anything Shortlist
+ *  sends. Leaving it to be discovered from where the titles ended up is how someone finds out the
+ *  hard way. Partial is real and worth naming: an account can auto-approve films but not shows. */
+function accountEffect(u: {
+  auto_approve_movies?: boolean;
+  auto_approve_tv?: boolean;
+}): string {
+  const films = u.auto_approve_movies ?? false;
+  const shows = u.auto_approve_tv ?? false;
+  if (films && shows) return "approves automatically";
+  if (!films && !shows) return "requests wait for approval";
+  return films
+    ? "films approve automatically, shows wait"
+    : "shows approve automatically, films wait";
+}
+
+function OverseerrCard({
+  userId,
+  onUserChange,
+  connected,
+  onGoToConnections,
+}: {
+  userId: number;
+  onUserChange: (next: number) => void;
+  connected: boolean;
+  onGoToConnections: () => void;
+}) {
+  const options = useSeerrOptions(connected);
+  const userSelectId = useId();
+  // Undefined while the list is still loading as well as when it genuinely lacks the account —
+  // both mean "cannot name it yet", which is exactly when the fallback option below is needed.
+  const defaultAccount = options.data?.users.find(
+    (u) => u.id === options.data?.default_user_id,
+  );
+  // Resolve 0 ("Server default") to the account the API key actually is, the same way the panel
+  // does. Looking up the raw 0 finds nothing, so everything keyed on `chosen` silently vanished on
+  // the one setting almost everybody leaves alone.
+  const chosen =
+    options.data?.users.find(
+      (u) => u.id === (userId || options.data?.default_user_id),
+    ) ?? undefined;
+  const others = (options.data?.users ?? []).filter(
+    (u) => u.id !== options.data?.default_user_id,
+  );
+  const serviceAccounts = others.filter((u) => !u.is_plex_user);
+  const people = others.filter((u) => u.is_plex_user);
+  // An account already able to hold requests for review, if there is one.
+  const holdingAccount = serviceAccounts.find(
+    (u) => !u.auto_approve_movies && !u.auto_approve_tv,
+  );
+
+  return (
+    <Card>
+      <CardContent className="space-y-4 pt-6">
+        <div className="flex items-center gap-2.5">
+          <span className="grid h-9 w-9 place-items-center rounded-lg border bg-elevated text-primary [&>svg]:h-5 [&>svg]:w-5">
+            <Inbox aria-hidden="true" />
+          </span>
+          <div>
+            <p className="font-medium">Overseerr / Jellyseerr</p>
+            <p className="text-sm text-muted-foreground">
+              Files a request for films and shows alike, and it decides the
+              quality, the folder and who approves it. Overseerr, Jellyseerr and
+              Seerr all speak the same API, so any of them works here.
+            </p>
+          </div>
+        </div>
+
+        {!connected ? (
+          <div className="space-y-2 rounded-md border border-dashed bg-muted/30 p-3">
+            <p className="text-sm text-muted-foreground">
+              Overseerr isn&rsquo;t connected yet. Add its address and API key
+              on the Overseerr card in{" "}
+              <strong className="font-medium text-foreground">
+                Connections
+              </strong>
+              , then come back and choose who requests go out as.
+            </p>
+            <Button variant="outline" size="sm" onClick={onGoToConnections}>
+              Go to Connections
+            </Button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {/* Label and control on one line. A single short choice in a full-width box reads as an
+                empty text field waiting to be typed into — the two Arr cards get away with w-full
+                because they sit two-up in a grid, and this one does not. Stacks under `sm`. */}
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <Label htmlFor={userSelectId} className="shrink-0">
+                Request as
+              </Label>
+              {/* The error is shown ABOVE the control, never instead of it. An unreachable Overseerr
+                cannot name its accounts, but the choice already saved is still the owner's to see
+                and to undo — hiding the select left someone whose instance was briefly down unable
+                to put it back to Server default. Same reasoning as the Sonarr monitor select. */}
+              {options.isError && (
+                <p className="text-sm text-destructive-text">
+                  Couldn&rsquo;t reach Overseerr to load its accounts. Check its
+                  address and API key on the Overseerr card in Connections, and
+                  press Test there. You can still change this back to the server
+                  default in the meantime.
+                </p>
+              )}
+              <select
+                id={userSelectId}
+                className={`${selectBase} w-full sm:w-auto sm:min-w-[24rem] sm:max-w-full`}
+                disabled={options.isPending}
+                value={userId}
+                onChange={(e) => onUserChange(Number(e.target.value))}
+              >
+                {/* The default carries its effect too, and it is the one that matters most — it is
+                  what nearly everyone will leave selected. `default_user_id` is what makes it
+                  nameable at all; without it this said "whoever owns the API key", which is a
+                  shrug where the consequence should be. */}
+                <option value={0}>
+                  {options.isPending
+                    ? "Loading…"
+                    : defaultAccount
+                      ? `Server default (${defaultAccount.name}) — ${accountEffect(defaultAccount)}`
+                      : "Server default (whoever owns the API key)"}
+                </option>
+                {/* Only accounts made FOR this. The default is already the option above, and real
+                  people are deliberately absent — see `peopleHidden` below. */}
+                {/* Accounts made for this first, then real people. People ARE offered: on most
+                    instances every account that does not auto-approve belongs to one, so hiding
+                    them left owners with nothing to pick and every title downloading immediately.
+                    An option that can be misused but has a real use gets a warning, not a ban —
+                    the note under the picker says what choosing a person costs them. */}
+                {serviceAccounts.length > 0 && (
+                  <optgroup label="Accounts made for this">
+                    {serviceAccounts.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name} &mdash; {accountEffect(u)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {people.length > 0 && (
+                  <optgroup label="People on your server">
+                    {people.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        {u.name} &mdash; {accountEffect(u)}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {/* A saved account the list does not contain — because the fetch failed, or because
+                  it was since deleted in Overseerr. Without it the select falls back to its first
+                  option and the screen silently misreports the saved value as "Server default",
+                  which the next autosave would then WRITE. Keyed on the LIST, not on isError, so
+                  the deleted-account case is covered by the same three lines. */}
+                {userId !== 0 && !chosen && (
+                  <option value={userId}>Account #{userId}</option>
+                )}
+              </select>
+            </div>
+            {/* Only the ACTION. The dropdown above already states whether this account approves,
+                and the summary below states what that means for a title — saying it a third time
+                here meant hedging ("usually an admin, so they'll be approved") what the dropdown
+                states as fact, and promising "go straight to Radarr/Sonarr", which is Overseerr's
+                own setup to decide, not ours. An account that already holds requests needs no line
+                at all: the other two have said it. */}
+            {chosen &&
+              (chosen.auto_approve_movies || chosen.auto_approve_tv) && (
+                <p className="text-sm text-muted-foreground">
+                  Want to check them in Overseerr first?{" "}
+                  {holdingAccount ? (
+                    <>
+                      Pick{" "}
+                      <strong className="font-medium text-foreground">
+                        {holdingAccount.name}
+                      </strong>{" "}
+                      above.
+                    </>
+                  ) : (
+                    <>
+                      Make a user there without auto-approve, and pick it here.
+                    </>
+                  )}
+                </p>
+              )}
+            {/* Only when a real person is actually chosen. A title here is usually wanted by
+                several people at once while an Overseerr request has one requester, so this is a
+                real cost — but it is the owner's server and their call, so it is stated at the
+                moment they make it rather than used to remove the option. */}
+            {chosen?.is_plex_user && (
+              <p className="text-sm text-muted-foreground">
+                Every request will show as{" "}
+                <strong className="font-medium text-foreground">
+                  {chosen.name}
+                </strong>
+                &rsquo;s, count against their quota, and notify them &mdash;
+                including titles they had nothing to do with. A local account in
+                Overseerr avoids that.
+              </p>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export function RequestsSettings({ settings }: { settings: Settings }) {
   const [form, setForm] = useState<RequestsForm>(() => readForm(settings));
+  const viaSeerr = form.target === "overseerr";
   const set = (patch: Partial<RequestsForm>) =>
     setForm((prev) => ({ ...prev, ...patch }));
 
@@ -333,6 +563,45 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
   const sonarrConnected =
     Boolean(settingString(settings, "requests.sonarr.url")) &&
     settingString(settings, "requests.sonarr.apikey") === REDACTED;
+  const overseerrConnected =
+    Boolean(settingString(settings, "requests.overseerr.url")) &&
+    settingString(settings, "requests.overseerr.apikey") === REDACTED;
+
+  // Shared with OverseerrCard's own call — TanStack dedupes on the key, so asking twice costs
+  // nothing and neither component has to thread the list through the other.
+  const seerrUsers = useSeerrOptions(viaSeerr && overseerrConnected);
+  // "Server default" (0) means the account the API key itself is, which the options endpoint names —
+  // so the commonest setting resolves to a real row rather than an unknown.
+  const effectiveUserId =
+    form.overseerrUserId || (seerrUsers.data?.default_user_id ?? -1);
+  const chosenAccount = seerrUsers.data?.users.find(
+    (u) => u.id === effectiveUserId,
+  );
+  // `null` = not knowable yet (list still loading, instance unreachable, or an account it will not
+  // name). The summary then states what is certain and says nothing about approval, rather than
+  // guessing at the one fact on this screen that is expensive to get wrong.
+  // Three-valued, matching `accountEffect` — an account can auto-approve films and not shows, and
+  // flattening that to a boolean made this summary contradict the card right above it.
+  const seerrApproves: "all" | "none" | "partial" | null =
+    !viaSeerr || !chosenAccount
+      ? null
+      : chosenAccount.auto_approve_movies && chosenAccount.auto_approve_tv
+        ? "all"
+        : !chosenAccount.auto_approve_movies && !chosenAccount.auto_approve_tv
+          ? "none"
+          : "partial";
+  const flow = describeRequestFlow({
+    viaSeerr,
+    autoSend: form.autoSend,
+    everythingAutoSends: autoSendBarsMatchGuardrails({
+      autoMinDemand: form.autoMinDemand,
+      autoMinRating: form.autoMinRating,
+      minDemand: form.minDemand,
+      minRating: form.minRating,
+    }),
+    seerrApproves,
+    maxPerRun: form.maxPerRun,
+  });
 
   const goToConnections = () =>
     document
@@ -344,6 +613,8 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
   const save = useAutosavedSettings(form, () => {
     const values: Settings = {
       "requests.enabled": form.enabled,
+      "requests.target": form.target,
+      "requests.overseerr.request_as_user_id": form.overseerrUserId,
       // Address + API key are owned by Settings → Connections now; this form only saves the
       // request-filing choices (quality profile + folder) and the policy below.
       "requests.radarr.quality_profile_id": form.radarr.qualityProfileId,
@@ -377,9 +648,10 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
           <div className="space-y-1">
             <p className="font-medium">Fill in the gaps automatically</p>
             <p className="text-sm text-muted-foreground">
-              Ask Radarr or Sonarr for titles that would have been good picks
-              but aren&rsquo;t in your library. You choose which go out on their
-              own and which wait in{" "}
+              Ask for titles that would have been good picks but aren&rsquo;t in
+              your library &mdash; straight from Radarr and Sonarr, or as a
+              request in Overseerr. You choose which go out on their own and
+              which wait in{" "}
               <strong className="font-medium text-foreground">Requests</strong>{" "}
               for a yes or no.
             </p>
@@ -393,15 +665,47 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
 
         {!form.enabled && (
           <p className="text-sm text-muted-foreground">
-            Off &mdash; runs won&rsquo;t ask Radarr or Sonarr for anything, and
-            nothing new reaches your Requests inbox. Turn it on to connect the
-            apps and set the rules.
+            Off &mdash; runs won&rsquo;t ask for anything, and nothing new
+            reaches your Requests inbox. Turn it on to connect an app and set
+            the rules.
           </p>
         )}
 
         {form.enabled && (
           <div className="space-y-5 border-t pt-5">
-            {!radarrConnected && !sonarrConnected && (
+            <div className="space-y-2">
+              <Segmented<RequestTarget>
+                legend="Where requests go"
+                value={form.target}
+                onChange={(target) => set({ target })}
+                options={[
+                  { value: "arr", label: "Radarr & Sonarr" },
+                  { value: "overseerr", label: "Overseerr / Jellyseerr" },
+                ]}
+              />
+              <p className="text-sm text-muted-foreground">
+                {viaSeerr
+                  ? "Shortlist files a request in Overseerr instead of adding the title itself. Overseerr picks the quality and folder, and handles approval — so what Shortlist asks for shows up alongside everything your users request."
+                  : "Shortlist adds the title to Radarr or Sonarr itself, using the quality and folder you pick below."}
+              </p>
+            </div>
+
+            {viaSeerr && !overseerrConnected && (
+              <div className="space-y-2 rounded-lg border border-primary/40 bg-primary/5 p-4">
+                <p className="text-sm font-medium">
+                  Connect Overseerr to start requesting
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  Add its address and API key in the Connections section, then
+                  come back here to set the rules. Jellyseerr works the same
+                  way.
+                </p>
+                <Button variant="outline" size="sm" onClick={goToConnections}>
+                  Go to Connections
+                </Button>
+              </div>
+            )}
+            {!viaSeerr && !radarrConnected && !sonarrConnected && (
               <div className="space-y-2 rounded-lg border border-primary/40 bg-primary/5 p-4">
                 <p className="text-sm font-medium">
                   Connect Radarr or Sonarr to start requesting
@@ -416,65 +720,83 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                 </Button>
               </div>
             )}
-            <div className="grid gap-4 lg:grid-cols-2">
-              <ArrCard
-                service="radarr"
-                title="Radarr"
-                icon={<Film aria-hidden="true" />}
-                form={form.radarr}
-                onChange={(radarr) => set({ radarr })}
-                connected={radarrConnected}
+
+            {viaSeerr ? (
+              <OverseerrCard
+                userId={form.overseerrUserId}
+                onUserChange={(overseerrUserId) => set({ overseerrUserId })}
+                connected={overseerrConnected}
                 onGoToConnections={goToConnections}
               />
-              <ArrCard
-                service="sonarr"
-                title="Sonarr"
-                icon={<Tv aria-hidden="true" />}
-                form={form.sonarr}
-                onChange={(sonarr) => set({ sonarr })}
-                connected={sonarrConnected}
-                onGoToConnections={goToConnections}
-                monitor={form.sonarrMonitor}
-                onMonitorChange={(sonarrMonitor) => set({ sonarrMonitor })}
-              />
-            </div>
-
-            <div className="space-y-2">
-              <Label htmlFor={tagId}>Tag added items</Label>
-              <Input
-                id={tagId}
-                value={form.tag}
-                onChange={(e) => set({ tag: e.target.value })}
-                placeholder="shortlist"
-                className="max-w-xs"
-              />
-              <p className="text-sm text-muted-foreground">
-                Every film or show Shortlist asks for gets this label in
-                Radarr/Sonarr &mdash; a &ldquo;tag&rdquo;, in their words, which
-                Shortlist creates there if it doesn&rsquo;t already exist. It
-                lets you spot or filter what Shortlist added. Leave blank for no
-                tag.
-              </p>
-            </div>
-
-            <div className="flex items-start justify-between gap-4">
-              <div className="space-y-1">
-                <Label htmlFor={autoUserTagId}>Also tag by person</Label>
-                <p className="text-sm text-muted-foreground">
-                  Adds the name of whoever a title was picked for as a second
-                  tag, so you can tell in Radarr/Sonarr who it was added for
-                  &mdash; without setting a tag on every user by hand. Someone
-                  with their own tag keeps it. Individual rows can opt in or out
-                  in the row editor.
-                </p>
+            ) : (
+              <div className="grid gap-4 lg:grid-cols-2">
+                <ArrCard
+                  service="radarr"
+                  title="Radarr"
+                  icon={<Film aria-hidden="true" />}
+                  form={form.radarr}
+                  onChange={(radarr) => set({ radarr })}
+                  connected={radarrConnected}
+                  onGoToConnections={goToConnections}
+                />
+                <ArrCard
+                  service="sonarr"
+                  title="Sonarr"
+                  icon={<Tv aria-hidden="true" />}
+                  form={form.sonarr}
+                  onChange={(sonarr) => set({ sonarr })}
+                  connected={sonarrConnected}
+                  onGoToConnections={goToConnections}
+                  monitor={form.sonarrMonitor}
+                  onMonitorChange={(sonarrMonitor) => set({ sonarrMonitor })}
+                />
               </div>
-              <Switch
-                id={autoUserTagId}
-                checked={form.autoUserTag}
-                onCheckedChange={(on) => set({ autoUserTag: on })}
-                aria-label="Also tag requests with the name of the person they're for"
-              />
-            </div>
+            )}
+
+            {/* Both tag controls are Arr-only, and hidden rather than disabled on the *seerr route.
+                Overseerr's POST /request body carries no tags field at all, so leaving them on
+                screen would offer a setting that silently does nothing. The "request as" account on
+                the card above is the attribution that replaces them. */}
+            {!viaSeerr && (
+              <>
+                <div className="space-y-2">
+                  <Label htmlFor={tagId}>Tag added items</Label>
+                  <Input
+                    id={tagId}
+                    value={form.tag}
+                    onChange={(e) => set({ tag: e.target.value })}
+                    placeholder="shortlist"
+                    className="max-w-xs"
+                  />
+                  <p className="text-sm text-muted-foreground">
+                    Every film or show Shortlist asks for gets this label in
+                    Radarr/Sonarr &mdash; a &ldquo;tag&rdquo;, in their words,
+                    which Shortlist creates there if it doesn&rsquo;t already
+                    exist. It lets you spot or filter what Shortlist added.
+                    Leave blank for no tag.
+                  </p>
+                </div>
+
+                <div className="flex items-start justify-between gap-4">
+                  <div className="space-y-1">
+                    <Label htmlFor={autoUserTagId}>Also tag by person</Label>
+                    <p className="text-sm text-muted-foreground">
+                      Adds the name of whoever a title was picked for as a
+                      second tag, so you can tell in Radarr/Sonarr who it was
+                      added for &mdash; without setting a tag on every user by
+                      hand. Someone with their own tag keeps it. Individual rows
+                      can opt in or out in the row editor.
+                    </p>
+                  </div>
+                  <Switch
+                    id={autoUserTagId}
+                    checked={form.autoUserTag}
+                    onCheckedChange={(on) => set({ autoUserTag: on })}
+                    aria-label="Also tag requests with the name of the person they're for"
+                  />
+                </div>
+              </>
+            )}
 
             {/* Deliberately BEFORE Guardrails. Read the other way round, "Minimum rating 7" looked
                 like the bar for requesting at all, and the owner only met the second, higher bar two
@@ -489,11 +811,10 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                   <p className="text-sm font-medium">
                     Send the strongest titles without asking
                   </p>
+                  {/* The live answer to "what happens tonight?", instead of three settings the
+                      reader has to combine in their head — see lib/request-flow.ts. */}
                   <p className="text-sm text-muted-foreground">
-                    Titles that clear the higher bars here go out as soon as a
-                    run finds them. Everything else that clears your guardrails
-                    waits in your Requests inbox. Turn this off to look at every
-                    title yourself.
+                    {flow.summary}
                   </p>
                 </div>
                 <Switch
@@ -503,6 +824,14 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                 />
               </div>
 
+              {/* Named, never blocked: approving twice is a legitimate choice, just almost never a
+                  deliberate one. Says how to get to a single gate rather than only that there are two. */}
+              {flow.doubleApproval && (
+                <p className="rounded-md border border-primary/40 bg-primary/5 p-3 text-sm text-muted-foreground">
+                  {flow.doubleApproval}
+                </p>
+              )}
+
               {form.autoSend && (
                 <>
                   <div className="grid gap-4 sm:grid-cols-2">
@@ -510,43 +839,59 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                       <Label htmlFor={autoDemandId}>
                         Send without asking when wanted by
                       </Label>
-                      <Input
-                        id={autoDemandId}
-                        type="number"
-                        min={1}
-                        step={1}
-                        value={form.autoMinDemand}
-                        onChange={(e) =>
-                          set({
-                            autoMinDemand: Math.max(1, Number(e.target.value)),
-                          })
-                        }
-                        className="w-28"
-                      />
+                      {/* The unit sits beside the box, so the control reads as the sentence its
+                          label starts: "wanted by [4] people". Without it the label is a fragment
+                          and the number could be anything. */}
+                      <div className="flex items-center gap-2">
+                        <Input
+                          id={autoDemandId}
+                          type="number"
+                          min={1}
+                          step={1}
+                          value={form.autoMinDemand}
+                          onChange={(e) =>
+                            set({
+                              autoMinDemand: Math.max(
+                                1,
+                                Number(e.target.value),
+                              ),
+                            })
+                          }
+                          className="w-24"
+                        />
+                        <span className="text-sm text-muted-foreground">
+                          {form.autoMinDemand === 1 ? "person" : "people"}
+                        </span>
+                      </div>
                       <p className="text-sm text-muted-foreground">
-                        At least this many people. Wanted by fewer than this? It
-                        waits in the inbox.
+                        Wanted by fewer than this? It waits in the inbox.
                       </p>
                     </div>
                     <div className="space-y-2">
                       <Label htmlFor={autoRatingId}>
                         Send without asking when rated
                       </Label>
-                      <Input
-                        id={autoRatingId}
-                        type="number"
-                        min={0}
-                        max={10}
-                        step={0.1}
-                        value={form.autoMinRating}
-                        onChange={(e) =>
-                          set({ autoMinRating: Number(e.target.value) })
-                        }
-                        className="w-28"
-                      />
+                      {/* Names the source the number is measured on — it follows the rating source
+                          above, so this reads "or higher on IMDb" when that is what is judging. */}
+                      <div className="flex items-center gap-2">
+                        <Input
+                          id={autoRatingId}
+                          type="number"
+                          min={0}
+                          max={10}
+                          step={0.1}
+                          value={form.autoMinRating}
+                          onChange={(e) =>
+                            set({ autoMinRating: Number(e.target.value) })
+                          }
+                          className="w-24"
+                        />
+                        <span className="text-sm text-muted-foreground">
+                          or higher on {ratingLabel}
+                        </span>
+                      </div>
                       <p className="text-sm text-muted-foreground">
-                        At least this {ratingLabel} score. Anything lower waits
-                        for your OK.
+                        Anything lower waits for your OK.
                       </p>
                     </div>
                     {/* Weaker than "everything will be sent", on purpose: this fires when EITHER bar
@@ -729,10 +1074,7 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                       </select>
                     </div>
                     {form.preferredLanguages.length === 0 && (
-                      <p
-                        role="alert"
-                        className="text-sm text-destructive-text"
-                      >
+                      <p role="alert" className="text-sm text-destructive-text">
                         {form.languageMode === "only"
                           ? "With no languages listed, Shortlist will never ask for anything. Add at least one."
                           : "With no languages listed, every title Shortlist can identify a language for counts as another language and has to clear the higher bar."}
@@ -770,7 +1112,10 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                       min={0}
                       max={10}
                       step={0.1}
-                      value={otherLanguageBar(form.minRating, form.minRatingOther)}
+                      value={otherLanguageBar(
+                        form.minRating,
+                        form.minRatingOther,
+                      )}
                       onChange={(e) =>
                         // "" must become null, not 0. `Number("") === 0`, and 0 is a REAL bar here
                         // (nothing can fail it) — so clearing the box would silently turn "Prefer
@@ -778,7 +1123,9 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                         // of the hint's "Type a number to set it yourself", so it has to mean un-pin.
                         set({
                           minRatingOther:
-                            e.target.value === "" ? null : Number(e.target.value),
+                            e.target.value === ""
+                              ? null
+                              : Number(e.target.value),
                         })
                       }
                       className="w-28"
@@ -801,10 +1148,13 @@ export function RequestsSettings({ settings }: { settings: Settings }) {
                     )}
                     {form.minRatingOther !== null &&
                       form.minRatingOther < form.minRating && (
-                        <p role="alert" className="text-sm text-destructive-text">
+                        <p
+                          role="alert"
+                          className="text-sm text-destructive-text"
+                        >
                           This is below your minimum rating of {form.minRating},
-                          so it never applies — a title under {form.minRating} is
-                          already out.
+                          so it never applies — a title under {form.minRating}{" "}
+                          is already out.
                         </p>
                       )}
                   </div>

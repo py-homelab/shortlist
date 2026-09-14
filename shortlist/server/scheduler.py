@@ -8,8 +8,11 @@ the whole "when does this run" question is answered per row.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import tzinfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.base import BaseTrigger
+from apscheduler.triggers.combining import OrTrigger
 from apscheduler.triggers.cron import CronTrigger
 from loguru import logger
 
@@ -23,6 +26,7 @@ WATCH_SYNC_JOB_ID = "watch-sync"
 USER_SYNC_JOB_ID = "user-sync"
 BACKUP_JOB_ID = "db-backup"
 PRIVACY_SYNC_JOB_ID = "privacy-sync"
+ROW_VISIBILITY_JOB_ID = "rows-visibility"
 SYNC_CHECK_JOB_ID = "sync-check"
 MAINTENANCE_PRUNE_JOB_ID = "maintenance-prune"
 
@@ -42,10 +46,17 @@ DEFAULT_CRONS: dict[str, str] = {
     "sync.users_cron": "47 4 * * *",
     # 03:00 — before any syncs or row runs.
     "backup.cron": "0 3 * * *",
-    # 05:15 — after the watch (04:17) and user (04:47) syncs, so it merges filters for a roster that
-    # has already been refreshed. Only ever makes the server MORE private, so a daily pass costs nothing.
-    "privacy.sync_cron": "15 5 * * *",
-    # 05:45 — after the rows build (03:30), the syncs, and the privacy pass (05:15), so it checks the
+    # Every 30 minutes. It reads the plex.tv account list itself, so this is how soon an account newly
+    # shared with the server stops seeing everyone's rows in the Collections tab — once a day left that
+    # open for up to 24 hours. Only ever makes the server MORE private; a clean pass takes ~20s and
+    # writes nothing (measured on a 48-account server: 320 passes in a week, 2 filter writes).
+    "privacy.sync_cron": "*/30 * * * *",
+    # 00:00 exactly, and deliberately NOT offset off the hour like the others: this is the one
+    # schedule whose whole meaning is "the day changed" (issue #102). A row set to Mondays that
+    # turned over at 00:17 would be wrong for the first seventeen minutes of every day it owns, and
+    # a Sunday row would linger into Monday — the thing the screen promises is the calendar day.
+    "rows.visibility_cron": "0 0 * * *",
+    # 05:45 — after the rows build (03:30), the syncs, and the 05:30 privacy pass, so it checks the
     # state those actually left behind. Still turn-off-able: clearing the box stores "" and
     # `blank_means_off` keeps it off rather than falling back to this.
     "sync.check_cron": "45 5 * * *",
@@ -67,6 +78,68 @@ def effective_cron(app, key: str) -> str:
     return _resolve_cron(app, key, DEFAULT_CRONS.get(key, ""), blank_means_off=key in _OFF_ABLE)
 
 
+_WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+
+
+def _weekday_number(token: str) -> int:
+    if token.lower() in _WEEKDAYS:
+        return _WEEKDAYS.index(token.lower())
+    if not token.isdigit() or int(token) > 7:
+        raise ValueError(f"invalid day of week {token!r}")
+    return int(token)
+
+
+def crontab_trigger(expr: str, timezone: tzinfo | str | None = None) -> BaseTrigger:
+    """A trigger for a standard five-field crontab, read the way cron reads it.
+
+    Use this, never `CronTrigger.from_crontab`. APScheduler 3 departs from cron twice:
+
+    - It counts weekdays from 0 = MONDAY where cron counts from 0 = Sunday (its own docstring admits
+      it; only 4.x fixes it), so `0 4 * * 1,4` ran on Tuesday and Friday (issue #123). The day-of-week
+      field is expanded here and handed over as day NAMES, which APScheduler reads correctly.
+    - It requires the day of the month AND the weekday to match. Cron runs when EITHER does, if both
+      are restricted, so `0 4 1 * 1` means every Monday and every 1st, not a 1st that is a Monday. A
+      field starting with `*` is not a restriction (Vixie cron's DOM_STAR/DOW_STAR), so `*/2` still
+      combines with AND.
+
+    Raises:
+        ValueError: the expression is not a valid five-field cron.
+    """
+    fields = expr.split()
+    if len(fields) != 5:
+        raise ValueError(f"Wrong number of fields; got {len(fields)}, expected 5")
+    minute, hour, day, month, day_of_week = fields
+    either = not day.startswith("*") and not day_of_week.startswith("*")
+    if day_of_week != "*":
+        days: set[int] = set()
+        for part in day_of_week.split(","):
+            span, _, step = part.partition("/")
+            if "/" in part and (not step.isdigit() or int(step) < 1):
+                raise ValueError(f"invalid step in day of week {part!r}")
+            if span == "*":
+                first, last = 0, 6
+            elif "-" in span:
+                low, high = span.split("-", 1)
+                first, last = _weekday_number(low), _weekday_number(high)
+                # `sun` is 0, so a named range ending on it (`sat-sun`, `mon-sun`) ends on 7, the second
+                # Sunday. APScheduler's own names always allowed it, so schedules saved that way exist.
+                if high.lower() == "sun" and first > 0:
+                    last = 7
+            else:
+                first = _weekday_number(span)
+                last = 6 if step else first
+            if first > last:
+                raise ValueError(f"invalid day-of-week range {part!r}")
+            days.update(number % 7 for number in range(first, last + 1, int(step or 1)))  # 7 is Sunday too
+        day_of_week = ",".join(_WEEKDAYS[number] for number in sorted(days))
+    common = {"minute": minute, "hour": hour, "month": month, "timezone": timezone}
+    if either:
+        return OrTrigger(
+            [CronTrigger(day=day, day_of_week="*", **common), CronTrigger(day="*", day_of_week=day_of_week, **common)]
+        )
+    return CronTrigger(day=day, day_of_week=day_of_week, **common)
+
+
 def _job_id(cron: str) -> str:
     return f"{_JOB_PREFIX}{cron}"
 
@@ -80,7 +153,7 @@ def schedule_groups(app) -> dict[str, list[int]]:
             if not cron:
                 continue
             try:
-                CronTrigger.from_crontab(cron)
+                crontab_trigger(cron)
             except ValueError:
                 # A bad cron must never crash-loop the container; it just means that row won't fire.
                 logger.error("row {!r} has an invalid cron {!r} — skipping its schedule", row.slug, cron)
@@ -106,9 +179,7 @@ def _make_job(app, cron: str, collection_ids: list[int]):
 
 def _register(scheduler: AsyncIOScheduler, app, groups: dict[str, list[int]]) -> None:
     for cron, ids in groups.items():
-        scheduler.add_job(
-            _make_job(app, cron, ids), CronTrigger.from_crontab(cron), id=_job_id(cron), replace_existing=True
-        )
+        scheduler.add_job(_make_job(app, cron, ids), crontab_trigger(cron), id=_job_id(cron), replace_existing=True)
 
 
 async def _queue_and_drain(app, kind: str, payload: dict | None = None) -> None:
@@ -153,7 +224,7 @@ def _resolve_cron(app, key: str, fallback: str, *, blank_means_off: bool = False
     custom = (row.value or {}).get("v") if row is not None else None
     if custom and isinstance(custom, str) and custom.strip():
         try:
-            CronTrigger.from_crontab(custom.strip())
+            crontab_trigger(custom.strip())
             return custom.strip()
         except ValueError:
             logger.warning("invalid {} {!r} — falling back to default", key, custom)
@@ -180,7 +251,7 @@ def _register_watch_sync(scheduler: AsyncIOScheduler, app) -> None:
         # degrades picks server-wide while everything still looks healthy.
         await _queue_and_drain(app, "sync.history")
 
-    scheduler.add_job(fire, CronTrigger.from_crontab(cron), id=WATCH_SYNC_JOB_ID, replace_existing=True)
+    scheduler.add_job(fire, crontab_trigger(cron), id=WATCH_SYNC_JOB_ID, replace_existing=True)
 
 
 def _resolve_users_cron(app) -> str:
@@ -199,7 +270,7 @@ def _register_user_sync(scheduler: AsyncIOScheduler, app) -> None:
         # on the Jobs page, and raises a notification if it gives up.
         await _queue_and_drain(app, "sync.users")
 
-    scheduler.add_job(fire, CronTrigger.from_crontab(cron), id=USER_SYNC_JOB_ID, replace_existing=True)
+    scheduler.add_job(fire, crontab_trigger(cron), id=USER_SYNC_JOB_ID, replace_existing=True)
 
 
 def _resolve_backup_settings(app) -> tuple[str, int]:
@@ -225,11 +296,11 @@ def _register_backup(scheduler: AsyncIOScheduler, app) -> None:
         # possible moment to discover a month of unread log lines.
         await _queue_and_drain(app, "backup.take", {"label": "scheduled", "max_keep": max_keep})
 
-    scheduler.add_job(fire, CronTrigger.from_crontab(cron), id=BACKUP_JOB_ID, replace_existing=True)
+    scheduler.add_job(fire, crontab_trigger(cron), id=BACKUP_JOB_ID, replace_existing=True)
 
 
 def _register_privacy_sync(scheduler: AsyncIOScheduler, app) -> None:
-    """Nightly re-merge of every account's share filter.
+    """Scheduled re-merge of every account's share filter (every 30 minutes by default).
 
     The automatic Privacy Check + write gate that used to VERIFY hiding before each write was removed
     on 2026-07-16 at the owner's request, so nothing checks it after the fact any more — leak-safe
@@ -247,9 +318,42 @@ def _register_privacy_sync(scheduler: AsyncIOScheduler, app) -> None:
     cron = _resolve_cron(app, "privacy.sync_cron", DEFAULT_CRONS["privacy.sync_cron"])
 
     async def fire() -> None:
-        await _queue_and_drain(app, "privacy.sync")
+        from shortlist.server.db.models import Job
 
-    scheduler.add_job(fire, CronTrigger.from_crontab(cron), id=PRIVACY_SYNC_JOB_ID, replace_existing=True)
+        # Writer jobs wait out a run, so a long run would otherwise leave one pass queued per tick, all run
+        # back to back afterwards. One still waiting will read the state it finds when it starts — and so
+        # will one waiting to RETRY, which `_finish` puts back to `queued` with its `started_at` kept. Its
+        # longest backoff (15 minutes) is shorter than a tick, so it never delays a pass by more than that.
+        with app.state.sessions() as session:
+            waiting = session.query(Job).filter(Job.kind == "privacy.sync", Job.status == "queued").first()
+        if waiting is not None:
+            logger.debug("privacy sync already queued (job {}) — not queuing another", waiting.id)
+            return
+        # `scheduled`: only a pass the timer started may count as quiet and stay out of Recent.
+        await _queue_and_drain(app, "privacy.sync", {"scheduled": True})
+
+    scheduler.add_job(fire, crontab_trigger(cron), id=PRIVACY_SYNC_JOB_ID, replace_existing=True)
+
+
+def _register_row_visibility(scheduler: AsyncIOScheduler, app) -> None:
+    """Apply each row's day schedule when the day turns over ("When it appears", issue #102).
+
+    Rows build at 03:30, so a run is far too late to be what shows and hides them: a Monday row would
+    stay up until 03:30 Tuesday, and a row that rebuilds weekly for days. This tick is therefore the
+    mechanism, not a tidy-up behind one.
+
+    Free on a server where no row narrows its days, which is every server until somebody uses the
+    feature: the handler answers that from one query and returns before building a Plex client. Where
+    a row IS scheduled, the pass costs a privacy sync (`engine_run` with no users) plus one ~5ms hub
+    visibility write per collection — it holds no state, so it simply reapplies today's answer every
+    night, and anything it cannot do is done by the next one.
+    """
+    cron = _resolve_cron(app, "rows.visibility_cron", DEFAULT_CRONS["rows.visibility_cron"])
+
+    async def fire() -> None:
+        await _queue_and_drain(app, "rows.visibility")
+
+    scheduler.add_job(fire, crontab_trigger(cron), id=ROW_VISIBILITY_JOB_ID, replace_existing=True)
 
 
 def _register_sync_check(scheduler: AsyncIOScheduler, app) -> None:
@@ -271,7 +375,7 @@ def _register_sync_check(scheduler: AsyncIOScheduler, app) -> None:
     async def fire() -> None:
         await _queue_and_drain(app, "sync.check")
 
-    scheduler.add_job(fire, CronTrigger.from_crontab(cron), id=SYNC_CHECK_JOB_ID, replace_existing=True)
+    scheduler.add_job(fire, crontab_trigger(cron), id=SYNC_CHECK_JOB_ID, replace_existing=True)
 
 
 def _register_maintenance_prune(scheduler: AsyncIOScheduler, app) -> None:
@@ -287,7 +391,7 @@ def _register_maintenance_prune(scheduler: AsyncIOScheduler, app) -> None:
     async def fire() -> None:
         await _queue_and_drain(app, "maintenance.prune")
 
-    scheduler.add_job(fire, CronTrigger.from_crontab(cron), id=MAINTENANCE_PRUNE_JOB_ID, replace_existing=True)
+    scheduler.add_job(fire, crontab_trigger(cron), id=MAINTENANCE_PRUNE_JOB_ID, replace_existing=True)
 
 
 def _register_jobs_worker(scheduler: AsyncIOScheduler, app) -> None:
@@ -329,11 +433,13 @@ def build_scheduler(app) -> AsyncIOScheduler:
     _register_user_sync(scheduler, app)
     _register_backup(scheduler, app)
     _register_privacy_sync(scheduler, app)
+    _register_row_visibility(scheduler, app)
     _register_sync_check(scheduler, app)
     _register_maintenance_prune(scheduler, app)
     _register_jobs_worker(scheduler, app)
     logger.info(
-        "scheduled {} row cron group(s) + watch-sync + user-sync + backup + privacy-sync + prune{} + job worker",
+        "scheduled {} row cron group(s) + watch-sync + user-sync + backup + privacy-sync + row-visibility "
+        "+ prune{} + job worker",
         len(groups),
         " + sync-check" if scheduler.get_job(SYNC_CHECK_JOB_ID) else "",
     )
@@ -354,10 +460,12 @@ def rebuild_schedule(app) -> None:
     _register_user_sync(scheduler, app)
     _register_backup(scheduler, app)
     _register_privacy_sync(scheduler, app)
+    _register_row_visibility(scheduler, app)
     _register_sync_check(scheduler, app)
     _register_maintenance_prune(scheduler, app)
     logger.info(
-        "rebuilt schedule: {} row cron group(s) + watch-sync + user-sync + backup + privacy-sync + prune{}",
+        "rebuilt schedule: {} row cron group(s) + watch-sync + user-sync + backup + privacy-sync "
+        "+ row-visibility + prune{}",
         len(groups),
         " + sync-check" if scheduler.get_job(SYNC_CHECK_JOB_ID) else "",
     )

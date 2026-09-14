@@ -1,8 +1,8 @@
-"""Notifications API: the owner's current alerts, and dismissing the "update available" note."""
+"""Notifications API: the owner's current alerts, dismissing them, and the post-upgrade release notes."""
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 import shortlist
@@ -11,6 +11,7 @@ from shortlist.server.auth import require_owner
 from shortlist.server.notifications import DISMISSED_KEY, build_notifications
 from shortlist.server.services.audit import Level
 from shortlist.server.settings_store import SettingsStore
+from shortlist.server.whats_new import mark_seen, pending
 
 router = APIRouter(prefix="/notifications", tags=["notifications"], dependencies=[Depends(require_owner)])
 
@@ -73,4 +74,44 @@ async def dismiss(body: Dismiss, request: Request) -> dict:
             # Cap the list so a long-lived install can't grow it unbounded (keep the newest 100).
             store.set(DISMISSED_KEY, [*current, body.id][-100:])
             session.commit()
+    return {"ok": True}
+
+
+class ReleaseNotesOut(PassthroughModel):
+    version: str
+    url: str  # the release on GitHub
+    published_at: str
+    notes: str  # the release body, markdown — rendered by the dialog, which allows no raw HTML
+
+
+class WhatsNewOut(PassthroughModel):
+    #: The running build. Not necessarily ``releases[0]``: that release may not be published yet.
+    version: str
+    #: Every release after the last one the owner closed, newest first. Empty: nothing to show.
+    releases: list[ReleaseNotesOut]
+
+
+# Plain `def`, not `async def`: an unread release asks GitHub, and a blocking read inside a coroutine
+# would stall every other request for as long as GitHub takes to answer.
+@router.get("/whats-new", response_model=WhatsNewOut)
+def whats_new(request: Request) -> dict:
+    """The release notes the owner has not read since upgrading, for the What's new dialog."""
+    with request.app.state.sessions() as session:
+        releases = pending(SettingsStore(session), shortlist.__version__)
+    return {"version": shortlist.__version__, "releases": releases}
+
+
+class SeenRelease(BaseModel):
+    version: str
+
+
+@router.post("/whats-new/seen", response_model=DismissedOut)
+def whats_new_seen(body: SeenRelease, request: Request) -> dict:
+    """Close the What's new dialog for good: record the version whose notes it showed."""
+    with request.app.state.sessions() as session:
+        try:
+            mark_seen(SettingsStore(session), body.version, shortlist.__version__)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        session.commit()
     return {"ok": True}

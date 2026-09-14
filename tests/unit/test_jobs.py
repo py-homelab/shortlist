@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,6 +24,7 @@ from shortlist.engine.models import EngineConfig, RowSpec
 from shortlist.server.db.models import Event, Job
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.services import jobs
+from shortlist.server.settings_store import SettingsStore
 
 
 @pytest.fixture
@@ -418,6 +421,9 @@ class TestHandlers:
             "sync.history",
             "backup.take",
             "maintenance.prune",
+            # Takes no target either: it converges EVERY row onto the surfaces its own day schedule
+            # asks for today, so aiming it at anything is meaningless (issue #102).
+            "rows.visibility",
         }
 
     def test_the_catalog_describes_every_registered_handler(self):
@@ -441,6 +447,7 @@ class TestHandlers:
             scheduler.PRIVACY_SYNC_JOB_ID,
             scheduler.SYNC_CHECK_JOB_ID,
             scheduler.MAINTENANCE_PRUNE_JOB_ID,
+            scheduler.ROW_VISIBILITY_JOB_ID,
         }
         scheduled = {e.schedule_job_id for e in jobs.CATALOG if e.schedule_job_id}
         assert scheduled == ids
@@ -468,7 +475,10 @@ class TestHandlers:
         # make here, in a diff, rather than a number quietly moving.
         # `watch.reconcile` is a reader of Plex and a writer of our OWN database only: it credits
         # picks from playback already recorded locally and never opens a Plex client.
-        assert readers == {"sync.history", "backup.take", "maintenance.prune", "watch.reconcile"}
+        # `notify.send` touches neither Plex nor plex.tv — it POSTs one message to the owner's own
+        # webhook. Classing it a writer would park every alert behind the Plex lock, so the news that
+        # a run failed would wait on the very thing that just failed.
+        assert readers == {"sync.history", "backup.take", "maintenance.prune", "watch.reconcile", "notify.send"}
         writers = {e.kind for e in jobs.CATALOG if e.writes_plex}
         assert "privacy.sync" in writers and "sync.check" in writers
         assert {"user.cleanup", "user.hide", "user.restore", "row.reconcile"} <= writers
@@ -564,9 +574,13 @@ class TestRestoreAfterUnpause:
             # false premise that let `user.restore` promote a row nobody's filter was hiding.
             return SimpleNamespace(
                 error="could not read the plex.tv user list: RuntimeError: plex.tv 503" if merge_fails else None,
+                restrictions_restored={},
+                unreadable_filters={},
                 promotion_blockers=[],
                 swept_rows={},
                 converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
             )
 
         import shortlist.engine.pipeline as pipeline_mod
@@ -643,15 +657,139 @@ class TestRestoreAfterUnpause:
 
         pipeline_mod.run = lambda ctx, users: SimpleNamespace(
             error=None,
+            restrictions_restored={},
+            unreadable_filters={},
             promotion_blockers=["dave (plex account 300): plex.tv 503"],
             swept_rows={},
             converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
         )
 
         with pytest.raises(RuntimeError, match="dave"):
             jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
 
         assert promoted == [], "nothing may be promoted while any account's excludes are unwritten"
+
+    def test_privacy_sync_leaves_the_recommended_shelf_order_alone(self, sessions):
+        """Who can SEE a row is this job's business; where it SITS on the shelf is the nightly run's.
+
+        `rows.visibility` already says so of itself and turns ordering off; this handler was missed.
+        It is on a `*/30 * * * *` cron AND fires on every who-sees-what change, so it ran the whole
+        placement phase 48 times a day on top of the run — ~7,000 hub-move requests a day against the
+        maintainer's Plex (2026-09-08) for a position that only changes when a row is built.
+        """
+        seen: list[bool] = []
+        state = self._state(sessions, promoted=[], merged=[])
+        import shortlist.engine.pipeline as pipeline_mod
+
+        def fake_run(ctx, users):
+            seen.append(ctx.config.manage_shelf_order)
+            return SimpleNamespace(
+                error=None,
+                restrictions_restored={},
+                unreadable_filters={},
+                promotion_blockers=[],
+                swept_rows={},
+                converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
+                hub_orderings=[],
+                left_alone_failures=[],
+            )
+
+        pipeline_mod.run = fake_run
+
+        jobs._HANDLERS["privacy.sync"](state, {"reason": "someone left a shared row"})
+
+        assert seen == [False], "the privacy pass must not reorder the shelf"
+
+    def test_privacy_sync_says_when_it_switched_an_owners_restriction_back_on(self, sessions):
+        """This job persists no run, so if it is the pass that repairs a #116 filter, its detail line is
+        the only place the owner is told an account's own Plex restriction applies again."""
+        state = self._state(sessions, promoted=[], merged=[])
+        import shortlist.engine.pipeline as pipeline_mod
+
+        pipeline_mod.run = lambda ctx, users: SimpleNamespace(
+            error=None,
+            promotion_blockers=[],
+            swept_rows={},
+            converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
+            hub_orderings=[],
+            left_alone_failures=[],
+            restrictions_restored={201: "sarah"},
+            unreadable_filters={"mike": "their Plex restriction uses the label 'Kids & Family'"},
+        )
+
+        result = jobs._HANDLERS["privacy.sync"](state, {"reason": "someone left a shared row"})
+
+        assert "sarah" in result["detail"]
+        assert "restriction" in result["detail"]
+        with sessions() as session:
+            from shortlist.server.db.models import Event
+
+            restored = session.query(Event).filter_by(scope="privacy.restriction_restored").all()
+            assert [e.message["username"] for e in restored] == ["sarah"], "the bell reads this, not the detail"
+        assert "mike" in result["detail"], "an account nothing can hide must reach the Jobs page too"
+
+    def test_user_restore_leaves_the_recommended_shelf_order_alone(self, sessions):
+        """Un-pausing one person ran the WHOLE placement phase and audited none of it.
+
+        This handler never calls `_audit_hub_orderings`, so every hub it moved on Plex was a write
+        with no events row (plex-safety rule 10) — and its own docstring said it only merged filters.
+        Restoring someone's rows is about who can see them, not where they sit; the nightly run owns
+        the order, as `privacy.sync` and `rows.visibility` already say of themselves.
+        """
+        seen: list[bool] = []
+        self._add_user(sessions)
+        state = self._state(sessions, promoted=[], merged=[])
+        import shortlist.engine.pipeline as pipeline_mod
+
+        def fake_run(ctx, users):
+            seen.append(ctx.config.manage_shelf_order)
+            return SimpleNamespace(
+                error=None,
+                restrictions_restored={},
+                unreadable_filters={},
+                promotion_blockers=[],
+                swept_rows={},
+                converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
+                hub_orderings=[],
+                left_alone_failures=[],
+            )
+
+        pipeline_mod.run = fake_run
+
+        jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
+
+        assert seen == [False], "restoring a user must not reorder the shelf"
+
+    def test_a_failed_pass_names_the_blocked_account_even_when_verification_also_failed(self, sessions):
+        """Round-9 audit: the read-back now runs after an earlier failure, and its `report.error` hid the
+        named blocker — the account the owner actually has to go and fix."""
+        state = self._state(sessions, promoted=[], merged=[])
+        import shortlist.engine.pipeline as pipeline_mod
+
+        pipeline_mod.run = lambda ctx, users: SimpleNamespace(
+            error="could not verify filters: RuntimeError",
+            restrictions_restored={},
+            unreadable_filters={},
+            promotion_blockers=["kid (plex account 500): plex.tv 422"],
+            swept_rows={},
+            converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
+        )
+
+        with pytest.raises(RuntimeError) as raised:
+            jobs._HANDLERS["privacy.sync"](state, {"reason": "test"})
+
+        assert "could not verify filters" in str(raised.value)
+        assert "kid (plex account 500)" in str(raised.value)
 
     def test_privacy_sync_does_not_report_success_when_no_filter_was_written(self, sessions):
         """It read only `swept_rows`/`converged` and returned a result dict, so `_finish` marked the
@@ -662,9 +800,13 @@ class TestRestoreAfterUnpause:
 
         pipeline_mod.run = lambda ctx, users: SimpleNamespace(
             error="could not read the plex.tv user list: RuntimeError: plex.tv 503",
+            restrictions_restored={},
+            unreadable_filters={},
             promotion_blockers=[],
             swept_rows={},
             converged=0,
+            filters_not_enforced={},
+            unhideable_rows={},
         )
 
         with pytest.raises(RuntimeError, match=re.escape("plex.tv 503")):
@@ -674,11 +816,11 @@ class TestRestoreAfterUnpause:
         ("user_type", "expected"),
         [
             # The row says: owner sees it nowhere, friends see it on the Recommended shelf only.
-            ("owner", {"shared": False, "home": False, "recommended": False, "pin_top": True}),
-            ("shared", {"shared": False, "home": False, "recommended": True, "pin_top": True}),
+            ("owner", {"shared": False, "home": False, "recommended": False}),
+            ("shared", {"shared": False, "home": False, "recommended": True}),
             # MANAGED goes with SHARED, never the owner — Plex's own docs: promotedToSharedHome
             # "applies to all shared users, INCLUDING managed users".
-            ("managed", {"shared": False, "home": False, "recommended": True, "pin_top": True}),
+            ("managed", {"shared": False, "home": False, "recommended": True}),
         ],
     )
     def test_it_promotes_onto_the_surfaces_the_row_actually_asks_for(self, sessions, user_type, expected):
@@ -715,9 +857,7 @@ class TestRestoreAfterUnpause:
 
         jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
 
-        assert [kwargs for _t, kwargs in promoted] == [
-            {"shared": False, "home": False, "recommended": True, "pin_top": True}
-        ]
+        assert [kwargs for _t, kwargs in promoted] == [{"shared": False, "home": False, "recommended": True}]
 
     def test_a_top_seed_row_is_placed_from_the_ledger_with_no_run_history_at_all(self, sessions):
         """The last gap the ledger closes. A `{top_seed}` title is different every run, so nothing can
@@ -750,9 +890,7 @@ class TestRestoreAfterUnpause:
 
         # The ROW's placement — off for the owner, Recommended-only for friends, pinned — not the
         # fallback's "show it on their Home".
-        assert [kwargs for _t, kwargs in promoted] == [
-            {"shared": False, "home": False, "recommended": True, "pin_top": True}
-        ]
+        assert [kwargs for _t, kwargs in promoted] == [{"shared": False, "home": False, "recommended": True}]
 
     def test_the_ledger_wins_over_a_stale_recorded_title(self, sessions):
         """Both sources can disagree — a title recorded before a rename, against a ratingKey that
@@ -787,9 +925,7 @@ class TestRestoreAfterUnpause:
 
         jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
 
-        assert [kwargs for _t, kwargs in promoted] == [
-            {"shared": False, "home": False, "recommended": True, "pin_top": True}
-        ]
+        assert [kwargs for _t, kwargs in promoted] == [{"shared": False, "home": False, "recommended": True}]
 
     def test_a_top_seed_row_is_placed_from_what_the_last_run_delivered(self, sessions):
         """A `{top_seed}` title is different every run, so it cannot be re-rendered from the template.
@@ -816,16 +952,16 @@ class TestRestoreAfterUnpause:
                     run_id=run.id,
                     user_id=user.id,
                     status="ok",
-                    breakdown=[{"row_slug": "picked", "row_title": "Because you watched Dune"}],
+                    # `library_key` as every breakdown since v1.0.0 carries it: a title is only a row's
+                    # within one library (issue #121).
+                    breakdown=[{"row_slug": "picked", "row_title": "Because you watched Dune", "library_key": "1"}],
                 )
             )
             session.commit()
 
         jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
 
-        assert [kwargs for _t, kwargs in promoted] == [
-            {"shared": False, "home": False, "recommended": True, "pin_top": True}
-        ]
+        assert [kwargs for _t, kwargs in promoted] == [{"shared": False, "home": False, "recommended": True}]
 
     def test_a_replayed_job_does_nothing_once_the_user_is_paused_again(self, sessions):
         """Jobs are replayed after a crash with no way to know how far they got. This is the one
@@ -914,7 +1050,16 @@ class TestSafeMode:
         monkeypatch.setattr(
             pipeline_mod,
             "run",
-            lambda ctx, users: SimpleNamespace(error=None, promotion_blockers=[], swept_rows={}, converged=0),
+            lambda ctx, users: SimpleNamespace(
+                error=None,
+                restrictions_restored={},
+                unreadable_filters={},
+                promotion_blockers=[],
+                swept_rows={},
+                converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
+            ),
         )
 
         result = jobs._HANDLERS["user.restore"](self._state(sessions, self._ctx(wrote=wrote)), {"slug": "sarah"})
@@ -1245,7 +1390,7 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
         def build_context(dry_run: bool, plex_only: bool = False):
             plex = MagicMock()
             plex.sections.return_value = list(sections or [])
-            plex.order_owned_hubs.return_value = {"skipped": False, "moved": ["row"], "verified": True}
+            plex.place_rows.return_value = {"skipped": False, "moved": ["row"], "verified": True}
             ctx = SimpleNamespace(
                 config=EngineConfig(
                     dry_run=dry_run or forced_dry_run,
@@ -1254,7 +1399,10 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
                 ),
                 plex=plex,
                 delivery_sections=[],
-                delivered_keys={},
+                # A ledger entry, because a row with no delivered collection has nothing to place —
+                # the handler reports that rather than moving hubs, and a fake without one was
+                # asserting against a state no live server is ever in.
+                delivered_keys={("sarah", "picked", "1"): 4242},
                 write_lock=threading.Lock(),
             )
             built.append(ctx)
@@ -1296,7 +1444,7 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
         # "Press Check now and it tells you what it would change without touching anything" — the
         # shelf pass is inside that promise too, so it must be asked for as a DRY RUN and worded so.
         ctx = state.contexts[0]
-        assert ctx.plex.order_owned_hubs.call_args.kwargs["dry_run"] is True
+        assert ctx.plex.place_rows.call_args.kwargs["dry_run"] is True
         assert "would reposition rows on the shelf in Movies" in result["detail"]
 
     def test_it_also_puts_the_rows_back_in_place_on_the_shelf(self, monkeypatch):
@@ -1317,9 +1465,47 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
         assert [s.title for s in ctx.delivery_sections] == ["Movies"]
         ctx.plex.build_library_index.assert_not_called()
         # ...and the shelf placement really was asked for, not just reported.
-        ctx.plex.order_owned_hubs.assert_called_once()
-        assert ctx.plex.order_owned_hubs.call_args.kwargs["dry_run"] is False
+        ctx.plex.place_rows.assert_called_once()
+        assert ctx.plex.place_rows.call_args.kwargs["dry_run"] is False
+        # The arguments the PIPELINE is responsible for computing, not just that a call happened.
+        # Only `dry_run` was ever asserted here, so emptying `sequence` — the entire arrangement —
+        # broke nothing in this suite (testing rule: "if removing a parameter from the SUT wouldn't
+        # break the test, the test isn't covering that parameter").
+        from shortlist.engine.pipeline import LABEL_PREFIX
+
+        kwargs = ctx.plex.place_rows.call_args.kwargs
+        assert kwargs["label_prefix"] == LABEL_PREFIX
+        assert kwargs["sequence"] == [("top", ""), ("rows", {4242})], (
+            "the ledger's one delivered key, with its own position marker"
+        )
+        assert ctx.plex.place_rows.call_args.args[0] is movies
         assert "repositioned rows on the shelf in Movies" in result["detail"]
+
+    def test_the_audit_records_how_many_hubs_were_repositioned_in_total(self, monkeypatch):
+        """`moved` names only OUR rows. A bottom-build writes to the backbone as well, so without the
+        total the events feed understates what reached Plex (plex-safety rule 10)."""
+        self._converge_spy(monkeypatch)
+        state = self._state(sections=[MagicMock(type="movie", key="1", title="Movies")])
+        original = state.run_service.build_context
+
+        def build(dry_run: bool, plex_only: bool = False):
+            ctx = original(dry_run=dry_run, plex_only=plex_only)
+            ctx.plex.place_rows.return_value = {
+                "skipped": False,
+                "moved": ["row"],
+                "repositioned": 94,
+                "verified": True,
+            }
+            return ctx
+
+        state.run_service.build_context = build
+        written: list = []
+        monkeypatch.setattr(jobs, "write_audit", lambda st, scope, level, **kw: written.append((scope, kw)))
+
+        jobs._HANDLERS["sync.check"](state, {"confirmed": True})
+
+        shelf = [kw for scope, kw in written if scope == "shelf.order"]
+        assert shelf and shelf[0]["repositioned"] == 94
 
     def test_the_shelf_pass_is_audited_even_though_no_run_is_persisted(self, monkeypatch):
         """`run_persistence` only audits a PERSISTED run, and this handler persists none.
@@ -1355,7 +1541,7 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
 
         def unverified_context(dry_run: bool, plex_only: bool = False):
             ctx = original(dry_run, plex_only)
-            ctx.plex.order_owned_hubs.return_value = {"skipped": False, "moved": ["row"], "verified": False}
+            ctx.plex.place_rows.return_value = {"skipped": False, "moved": ["row"], "verified": False}
             return ctx
 
         state.run_service.build_context = unverified_context
@@ -1364,6 +1550,70 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
         shelf = [a for a in audits if a[0] == "shelf.order"]
         assert [a[1] for a in shelf] == ["warning"]
         assert shelf[0][2]["verified"] is False
+
+    def test_a_placement_we_could_not_apply_is_audited_under_its_own_scope(self, monkeypatch):
+        """Issue #106's second half. A configured placement we cannot honour was a container-log
+        warning and nothing else, so the Rows page went on showing a setting that had silently done
+        nothing since the night it was saved.
+
+        Its OWN scope, not `shelf.order`: `_shelf_contention` counts repeated MOVES within a bounded
+        event budget, and one stale anchor re-reported on every privacy sync has nothing to tell it.
+        And no `verified` — nothing was asked of Plex, so that question has no answer here.
+        """
+        self._converge_spy(monkeypatch)
+        audits: list[tuple] = []
+        monkeypatch.setattr(jobs, "write_audit", lambda st, scope, level, **f: audits.append((scope, level, f)))
+        state = self._state(sections=[MagicMock(type="movie", key="1", title="Movies")])
+        original = state.run_service.build_context
+
+        def unplaceable_context(dry_run: bool, plex_only: bool = False):
+            ctx = original(dry_run, plex_only)
+            # The real shape: `place_rows` NAMES the anchors it refused, so the audit can report each
+            # one on its own. It used to return for the whole library on the first bad anchor.
+            ctx.plex.place_rows.return_value = {
+                "anchor": "Archive 2019",
+                "moved": [],
+                "repositioned": 0,
+                "skipped": True,
+                "reason": "anchor not found",
+                "refused": ["Archive 2019"],
+            }
+            return ctx
+
+        state.run_service.build_context = unplaceable_context
+        result = jobs._HANDLERS["sync.check"](state, {"confirmed": True})
+
+        assert [a[0] for a in audits if a[0].startswith("shelf.")] == ["shelf.unplaced"]
+        _, level, fields = next(a for a in audits if a[0] == "shelf.unplaced")
+        assert level == "warning"
+        assert fields["reason"] == "anchor not found"
+        assert fields["anchor"] == "Archive 2019", "the owner must be told WHICH anchor is doing nothing"
+        assert fields["verified"] is None  # never fabricated: we asked Plex for nothing
+        # And the operator's line says so instead of claiming a reposition.
+        assert "could NOT place rows in Movies" in result["detail"]
+        assert "repositioned rows on the shelf" not in result["detail"]
+
+    def test_a_dry_run_never_files_an_unplaceable_row_as_a_warning(self, monkeypatch):
+        """A dry run asked Plex for nothing, so it is a preview either way — the rule
+        `run_persistence._emit_hub_ordering_events` already states for `verified`.
+
+        Driven through `_audit_hub_orderings` directly: `sync.check` without `confirmed` previews
+        DELETES but still writes, so it is not a dry run and cannot exercise this branch.
+        """
+        from types import SimpleNamespace
+
+        audits: list[tuple] = []
+        monkeypatch.setattr(jobs, "write_audit", lambda st, scope, level, **f: audits.append((scope, level, f)))
+        report = SimpleNamespace(
+            hub_orderings=[
+                {"library": "Movies", "placed": False, "moved": [], "reason": "anchor not found"},
+                {"library": "TV", "moved": ["row"], "verified": False},
+            ]
+        )
+
+        jobs._audit_hub_orderings(None, report, dry_run=True)
+
+        assert [(a[0], a[1]) for a in audits] == [("shelf.unplaced", "info"), ("shelf.order", "info")]
 
     def test_the_unattended_nightly_pass_still_has_no_delete_authority(self, monkeypatch):
         """The scheduled pass sends neither flag. It must demote and report, never destroy — upgrading
@@ -1396,7 +1646,7 @@ class TestSyncCheckPreviewsWhatItWouldDelete:
         assert "1 orphaned collection(s) to remove" in result["detail"]
         assert "removed" not in result["detail"]
         # Safe mode has to reach the shelf pass too — it is a Plex write like any other here.
-        assert state.contexts[0].plex.order_owned_hubs.call_args.kwargs["dry_run"] is True
+        assert state.contexts[0].plex.place_rows.call_args.kwargs["dry_run"] is True
         assert "would reposition" in result["detail"]
 
 
@@ -1494,3 +1744,615 @@ class TestWatchReconcileTellsTheDashboard:
 
         assert second == {"users_credited": 0}
         assert published == []
+
+
+class TestScheduledRowVisibility:
+    """The midnight `rows.visibility` tick (issue #102).
+
+    Rows build at 03:30, so a run is far too late to turn a row over: a Monday row would sit on
+    people's Home until 03:30 Tuesday, and a weekly-rebuilding row for days. This job is what makes a
+    day schedule mean anything, so its ordering, its no-op case and its refusal to promote anything it
+    cannot identify are all load-bearing.
+    """
+
+    ON = RowSpec(slug="picked", name_template="✨ Picked for You", size=10, placement="both", placement_friends="both")
+    OFF = RowSpec(slug="gems", name_template="✨ Hidden Gems", size=10, placement="off", placement_friends="off")
+    #: A row whose title cannot be re-rendered without picks, so it matches no spec by title.
+    SEEDED = RowSpec(
+        slug="seeded",
+        name_template="✨ Because you watched {top_seed}",
+        size=10,
+        placement="off",
+        placement_friends="off",
+    )
+    SHARED = RowSpec(
+        slug="crowd",
+        name_template="✨ Popular Here",
+        size=10,
+        shared=True,
+        placement="off",
+        placement_friends="off",
+    )
+
+    ACCOUNT = 555000100
+    #: 2026-08-31 is a Monday. Frozen so "shown on Monday" is a fact in these tests, not a coin toss.
+    MONDAY = datetime(2026, 8, 31, 12, 0)
+    TUESDAY = 2
+
+    @pytest.fixture(autouse=True)
+    def _freeze_today(self, monkeypatch):
+        import shortlist.server.services.context_builder as cb
+
+        monkeypatch.setattr(cb, "local_now", lambda: self.MONDAY)
+
+    def _state(
+        self,
+        sessions,
+        *,
+        calls: list,
+        rows,
+        merge_fails=False,
+        collections=None,
+        paused_all=False,
+        dry_run=False,
+    ):
+        """A fake Plex plus a stub `engine_run`, both recording into ONE ordered list.
+
+        One list, not two: the claim this suite has to be able to make is that the share-filter merge
+        happened BEFORE any promote, and two separate lists can only show that both occurred.
+        """
+        marker = row_marker(self.ACCOUNT)
+        owned = collections if collections is not None else [("✨ Picked for You" + marker, 42, "shortlist_sarah")]
+        objects = [SimpleNamespace(title=title, ratingKey=key) for title, key, _ in owned]
+        by_label: dict[str, list] = {}
+        for obj, (_, _, label) in zip(objects, owned, strict=True):
+            by_label.setdefault(label, []).append(obj)
+
+        config = EngineConfig(rows=list(rows), rows_defined=True, dry_run=dry_run)
+        plex = SimpleNamespace(
+            sections=lambda: [SimpleNamespace(title="Movies", key=1, type="movie")],
+            find_owned_collections=lambda section, label: by_label.get(label, []),
+            promote=lambda c, **kw: calls.append(("promote", c.title, kw)),
+            demote_all=lambda c, **kw: calls.append(("demote", c.title, kw)) or True,
+        )
+        ctx = SimpleNamespace(plex=plex, config=config, write_lock=None)
+
+        def fake_engine_run(_ctx, users):
+            calls.append(("merge", users))
+            return SimpleNamespace(
+                error="could not read the plex.tv user list: RuntimeError: plex.tv 503" if merge_fails else None,
+                restrictions_restored={},
+                unreadable_filters={},
+                promotion_blockers=[],
+                swept_rows={},
+                converged=0,
+                filters_not_enforced={},
+                unhideable_rows={},
+            )
+
+        import shortlist.engine.pipeline as pipeline_mod
+
+        self._patched = (pipeline_mod, pipeline_mod.run)
+        pipeline_mod.run = fake_engine_run
+
+        from shortlist.server.services.context_builder import ContextBuilder
+        from shortlist.server.services.secrets import SecretBox
+        from shortlist.server.services.sse import EventBus
+
+        secrets = SecretBox(Path(tempfile.mkdtemp()))
+        builder = ContextBuilder(sessions, secrets, EventBus())
+        if paused_all:
+            with sessions() as session:
+                SettingsStore(session, secrets).set("paused_all", True)
+                session.commit()
+
+        run_service = SimpleNamespace(
+            build_context=lambda dry_run, plex_only=False: ctx,
+            enabled_profiles=lambda session, user_ids=None: builder.enabled_profiles(session, user_ids),
+        )
+        return SimpleNamespace(sessions=sessions, run_service=run_service, secrets=secrets)
+
+    @pytest.fixture(autouse=True)
+    def _restore_engine_run(self):
+        self._patched = None
+        yield
+        if self._patched:
+            module, original = self._patched
+            module.run = original
+
+    def _seed(self, sessions, *, rows: dict, paused=False, user_type="shared", deliveries=()):
+        from shortlist.server.db.models import Collection, Delivery, User
+
+        with sessions() as session:
+            session.query(Collection).delete()
+            session.add(
+                User(
+                    plex_account_id=self.ACCOUNT,
+                    username="sarah",
+                    slug="sarah",
+                    user_type=user_type,
+                    enabled=True,
+                    prefs={"paused": True} if paused else {},
+                )
+            )
+            for slug, show_days in rows.items():
+                session.add(
+                    Collection(
+                        slug=slug,
+                        name=slug,
+                        build="shared" if slug == "crowd" else "per_person",
+                        enabled=True,
+                        show_days=show_days,
+                    )
+                )
+            for slug, key in deliveries:
+                session.add(
+                    Delivery(collection_slug=slug, user_slug="sarah", library_key="1", rating_key=key, title="x")
+                )
+            session.commit()
+
+    def _promotes(self, calls):
+        return [c for c in calls if c[0] == "promote"]
+
+    # ---- the cheap night ------------------------------------------------------------------
+
+    def test_a_server_that_schedules_nothing_touches_nothing_at_all(self, sessions):
+        """The gate that keeps this free for everybody who does not use the feature — which is every
+        server until somebody picks days. It has to sit before the Plex client is even built, or the
+        "costs nothing" claim in the docs and the job description is false on every night."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": [], "gems": []})
+        built: list = []
+        state = self._state(sessions, calls=calls, rows=[self.ON, self.OFF])
+        state.run_service.build_context = lambda dry_run, plex_only=False: (
+            built.append(1)
+            or (_ for _ in ()).throw(AssertionError("build_context must not be reached on a night with no work"))
+        )
+
+        result = jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert result["changed"] == []
+        assert built == [], "the Plex/plex.tv/TMDB clients must not be constructed for a no-op tick"
+        assert calls == []
+
+    def test_a_row_with_no_schedule_never_makes_work(self, sessions):
+        """Every row carries `show_days=[]` straight after migration 0088, and a server where nobody
+        has scheduled anything must do nothing at midnight — not build a Plex client, not merge a
+        filter, nothing."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": []})
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+        state.run_service.build_context = lambda dry_run, plex_only=False: (_ for _ in ()).throw(
+            AssertionError("an unscheduled row must not converge anything")
+        )
+
+        assert jobs._HANDLERS["rows.visibility"](state, {})["changed"] == []
+
+    # ---- the write path -------------------------------------------------------------------
+
+    def test_a_row_that_turned_off_is_taken_off_every_surface(self, sessions):
+        """Asserted on the OFF row's OWN collection and its exact flags. An earlier version of this
+        test only had a collection for the ON row, so it passed on that row's promotion and would
+        have gone green with the off row left up."""
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        # `picked` shows on Monday and already did; `gems` shows on Tuesday and was up yesterday, so
+        # today is its transition to hidden.
+        self._seed(
+            sessions,
+            rows={"picked": [1], "gems": [2]},
+            deliveries=(("picked", 42), ("gems", 43)),
+        )
+        # `gems` is scheduled off today: its spec placement is already `off`.
+        state = self._state(
+            sessions,
+            calls=calls,
+            rows=[self.ON, self.OFF],
+            collections=[
+                ("✨ Picked for You" + marker, 42, "shortlist_sarah"),
+                ("✨ Hidden Gems" + marker, 43, "shortlist_sarah"),
+            ],
+        )
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        off = next(c for c in self._promotes(calls) if "Hidden Gems" in c[1])
+        assert off[2]["home"] is False
+        assert off[2]["shared"] is False
+        assert off[2]["recommended"] is False
+        on = next(c for c in self._promotes(calls) if "Picked for You" in c[1])
+        assert on[2]["shared"] is True, "the row that IS on today must still be promoted"
+
+    def test_a_row_whose_collection_matches_no_spec_is_left_alone(self, sessions):
+        """The HIGH finding. A `{top_seed}` title cannot be re-rendered without picks, so if the
+        delivery ledger has no key for it the collection matches nothing — and promotion's no-spec
+        fallback PROMOTES, which would put a row scheduled OFF onto Home. Under-showing is the safe
+        direction for this job, unlike a run."""
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        self._seed(sessions, rows={"seeded": [2]}, deliveries=())  # no ledger key
+        state = self._state(
+            sessions,
+            calls=calls,
+            rows=[self.SEEDED],
+            collections=[("✨ Because you watched Heat" + marker, 77, "shortlist_sarah")],
+        )
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert self._promotes(calls) == [], "an unidentifiable collection must not be promoted onto Home"
+
+    def test_the_share_filters_are_merged_before_anything_is_promoted(self, sessions):
+        """plex-safety rule 1, asserted as ORDER rather than as "both happened"."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": [1]}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        kinds = [c[0] for c in calls]
+        assert "merge" in kinds and "promote" in kinds
+        assert kinds.index("merge") < kinds.index("promote"), "a row must never appear before its excludes"
+
+    def test_a_failed_filter_merge_promotes_nothing_at_all(self, sessions):
+        calls: list = []
+        self._seed(sessions, rows={"picked": [1]}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON], merge_fails=True)
+
+        with pytest.raises(RuntimeError, match="503"):
+            jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert self._promotes(calls) == []
+
+    # ---- the exclusions -------------------------------------------------------------------
+
+    def test_pause_all_stops_it_like_every_other_scheduled_task(self, sessions):
+        """The Danger Zone kill switch. `enabled_profiles` returns [] when `paused_all` is set, and
+        this job must go through it rather than hand-rolling the roster — it is the first scheduled
+        task that writes to people's shelves, so a kill switch it ignores is the whole point."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": [1]}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON], paused_all=True)
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert self._promotes(calls) == [], "pause all must stop the midnight tick too"
+
+    def test_a_paused_persons_rows_are_not_put_back_by_a_schedule(self, sessions):
+        """Two independent reasons a row is hidden, and only one of them is lifting."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": [1]}, paused=True, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert self._promotes(calls) == []
+
+    def test_a_restricted_managed_account_is_skipped(self, sessions):
+        """Plex refuses a label filter for an account with a parental profile, so it can never have a
+        private row. `enabled_profiles` drops it; a hand-rolled roster did not."""
+        from shortlist.server.db.models import Collection, User
+
+        calls: list = []
+        self._seed(sessions, rows={"picked": [1]}, deliveries=(("picked", 42),))
+        with sessions() as session:
+            session.query(User).filter_by(slug="sarah").update(
+                {"user_type": "managed", "restricted": True, "restriction_profile": "little_kid"}
+            )
+            session.query(Collection).count()
+            session.commit()
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert self._promotes(calls) == []
+
+    # ---- shared rows, and the preview -----------------------------------------------------
+
+    def test_a_shared_row_is_converged_too(self, sessions):
+        """A shared row is ONE public collection under its own label, so it goes through a different
+        promote path than a per-person row — and nothing exercised it."""
+        calls: list = []
+        self._seed(sessions, rows={"crowd": [2]})
+        state = self._state(
+            sessions,
+            calls=calls,
+            rows=[self.SHARED],
+            collections=[("✨ Popular Here", 99, self.SHARED.label)],
+        )
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        promoted = self._promotes(calls)
+        assert promoted, "the shared row's public collection was never converged"
+        assert promoted[0][2]["home"] is False and promoted[0][2]["shared"] is False
+
+    def test_a_dry_run_writes_nothing_and_still_records_what_it_would_do(self, sessions):
+        """Rule 8 for the preview, rule 10 for the audit — a dry run that leaves no event is a
+        visibility change nobody can account for."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": [1]}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+
+        result = jobs._HANDLERS["rows.visibility"](state, {"dry_run": True})
+
+        assert calls == [], "a dry run must not merge filters or promote anything"
+        assert result["dry_run"] is True
+        assert result["changed"] == ["picked"]
+        with sessions() as session:
+            audited = [e.message.get("dry_run") for e in session.query(Event).filter_by(scope="rows.visibility")]
+        assert audited == [True]
+
+    def test_every_scheduled_row_is_converged_on_the_same_pass(self, sessions):
+        """One pass settles every scheduled row, each with its OWN placement — the case that only
+        exists once a server has more than one schedule."""
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        self._seed(sessions, rows={"picked": [1], "gems": [2]}, deliveries=(("picked", 42), ("gems", 43)))
+        state = self._state(
+            sessions,
+            calls=calls,
+            rows=[self.ON, self.OFF],
+            collections=[
+                ("✨ Picked for You" + marker, 42, "shortlist_sarah"),
+                ("✨ Hidden Gems" + marker, 43, "shortlist_sarah"),
+            ],
+        )
+
+        result = jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert result["changed"] == ["gems", "picked"]
+        on = next(c for c in self._promotes(calls) if "Picked for You" in c[1])[2]
+        off = next(c for c in self._promotes(calls) if "Hidden Gems" in c[1])[2]
+        assert on["shared"] is True, "the row on today"
+        assert (off["shared"], off["home"], off["recommended"]) == (False, False, False), "the row off today"
+
+    def test_pause_all_leaves_the_work_owed_rather_than_recording_it_as_done(self, sessions):
+        """Found by live testing. The pass must stop BEFORE the filter merge and record nothing, so
+        lifting the pause simply recomputes and applies it. An earlier version cached the answer here
+        and left the row visible on its off day for good."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": [2]}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.OFF], paused_all=True)
+
+        result = jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert calls == [], "pause all must stop the merge too, not just the promote"
+        assert "paused" in result["detail"].lower()
+
+    def test_the_owners_own_row_uses_the_owner_flags_not_the_friends_ones(self, sessions):
+        """`_promote_one` branches three ways on user type and only the `shared` cell was covered.
+
+        Asserted on a row that is ON today, because that is the only state where the branches differ:
+        an off row is all-False whoever it belongs to, so an off row cannot tell them apart.
+        """
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        self._seed(sessions, rows={"picked": [1]}, user_type="owner", deliveries=(("picked", 42),))
+        state = self._state(
+            sessions, calls=calls, rows=[self.ON], collections=[("✨ Picked for You" + marker, 42, "shortlist_sarah")]
+        )
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        flags = next(c for c in self._promotes(calls) if "Picked for You" in c[1])[2]
+        assert flags["home"] is True, "the owner's own row belongs on the OWNER's Home"
+        assert flags["shared"] is False, "and never on Friends' Home"
+
+    def test_an_unrestricted_managed_user_goes_through_the_friends_flags(self, sessions):
+        """Plex's own docs are explicit that Shared Users' Home covers managed users too, so a managed
+        account without a parental profile is treated like a friend here, not like the owner. Routing
+        it through the owner flag would hide its row from the person it belongs to."""
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        self._seed(sessions, rows={"picked": [1]}, user_type="managed", deliveries=(("picked", 42),))
+        state = self._state(
+            sessions, calls=calls, rows=[self.ON], collections=[("✨ Picked for You" + marker, 42, "shortlist_sarah")]
+        )
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        flags = next(c for c in self._promotes(calls) if "Picked for You" in c[1])[2]
+        assert flags["shared"] is True
+        assert flags["home"] is False, "a managed user's row must never land on the OWNER's Home"
+
+    def test_a_collection_two_rows_claim_is_left_alone_rather_than_arbitrated(self, sessions):
+        """The midnight job is where guessing wrong is worst: arbitrating an ambiguous ledger key
+        hands the collection the OTHER row's placement, which can show a row scheduled off.
+
+        Dropping it sends it to the title map; with no title stamped either, `skip_unmatched` leaves
+        it exactly as it is — the conservative end of the branch.
+        """
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        self._seed(
+            sessions,
+            rows={"picked": [1], "gems": [2]},
+            # Both rows name the SAME collection: a stale entry that survived an out-of-band delete,
+            # plus Plex handing the freed rowid to a new collection.
+            deliveries=(("picked", 42), ("gems", 42)),
+        )
+        state = self._state(
+            sessions,
+            calls=calls,
+            rows=[self.ON, self.OFF],
+            collections=[("✨ Because you watched Heat" + marker, 42, "shortlist_sarah")],
+        )
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert self._promotes(calls) == [], "an ambiguous key must not decide a row's surfaces"
+
+    def test_clearing_the_last_schedule_on_the_server_still_puts_that_row_back(self, sessions):
+        """The gate asks "does any row narrow its days" — and after a clear, none does. Without the
+        row named in the payload the pass would skip, and the row it was meant to restore would stay
+        hidden until 03:30. This is the ONLY path that covers it.
+        """
+        calls: list = []
+        marker = row_marker(self.ACCOUNT)
+        self._seed(sessions, rows={"picked": []}, deliveries=(("picked", 42),))
+        state = self._state(
+            sessions, calls=calls, rows=[self.ON], collections=[("✨ Picked for You" + marker, 42, "shortlist_sarah")]
+        )
+
+        result = jobs._HANDLERS["rows.visibility"](state, {"row": "picked"})
+
+        assert self._promotes(calls), "the row whose schedule was just cleared was never put back"
+        assert result["collections"] == 1
+
+    def test_without_the_row_in_the_payload_an_unscheduled_server_does_nothing(self, sessions):
+        """The other half of the pair: the midnight cron passes no row, so a server that schedules
+        nothing must still cost one query."""
+        calls: list = []
+        self._seed(sessions, rows={"picked": []}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+
+        assert jobs._HANDLERS["rows.visibility"](state, {})["changed"] == []
+        assert calls == []
+
+    def test_the_shelf_order_is_left_to_the_nightly_run(self, sessions):
+        """`engine_run` would otherwise run its ordering phase here EVERY night, writing the
+        `shelf.order` events that the "something else is reordering your shelf" notification counts
+        (3 in a day trips it) — and ordering before promoting, so a row shown today moves again at
+        03:30. Position is the run's job; this pass only decides visibility."""
+        calls: list = []
+        seen: list = []
+        self._seed(sessions, rows={"picked": [1]}, deliveries=(("picked", 42),))
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+        inner = state.run_service.build_context
+        state.run_service.build_context = lambda dry_run, plex_only=False: (
+            seen.append(inner(dry_run=dry_run)) or seen[-1]
+        )
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert seen[0].config.manage_shelf_order is False
+
+
+class TestAPrivacySyncSaysWhenItWasQuiet:
+    """The header's Recent list hides a privacy sync only when the pass says it was quiet: started by the
+    schedule, and nothing changed or went wrong since the last pass. Anything else is news."""
+
+    SCHEDULED: ClassVar[dict] = {"scheduled": True}
+
+    def _run(self, monkeypatch, sessions, payload: dict, **report_fields) -> dict:
+        from shortlist.engine import pipeline
+        from shortlist.engine.models import RunReport
+        from shortlist.server.services import jobs
+
+        report = RunReport(started_at=datetime.now(UTC))
+        for name, value in report_fields.items():
+            setattr(report, name, value)
+        monkeypatch.setattr(pipeline, "run", lambda ctx, users: report)
+        ctx = SimpleNamespace(config=SimpleNamespace(dry_run=False, manage_shelf_order=True))
+        state = SimpleNamespace(run_service=SimpleNamespace(build_context=lambda dry_run: ctx), sessions=sessions)
+        return jobs._privacy_sync(state, payload)
+
+    def _previous_pass(self, sessions, result: dict) -> None:
+        from shortlist.server.db.models import Job
+
+        with sessions() as session:
+            session.add(
+                Job(kind="privacy.sync", status="done", payload={}, result=result, finished_at=datetime.now(UTC))
+            )
+            session.commit()
+
+    def test_a_scheduled_pass_that_changed_nothing_is_quiet(self, monkeypatch, sessions):
+        assert self._run(monkeypatch, sessions, self.SCHEDULED)["quiet"] is True
+
+    def test_a_pass_started_without_the_schedule_is_not_quiet(self, monkeypatch, sessions):
+        """The Jobs page button, the new-account pass and the crash-recovery pass carry no `scheduled`; the
+        owner who pressed the button still needs to see it ran."""
+        assert self._run(monkeypatch, sessions, {})["quiet"] is False
+
+    @pytest.mark.parametrize(
+        "news",
+        [
+            {"reason": "a person was switched off"},
+            {"swept_rows": {"sarah": ["✨ Movies Picked for You"]}},
+            {"swept_rows": {"freed-name helper:sarah": ["Shortlist freed name 0123456789ab"]}},
+            {"filter_writes": {100: {"username": "sarah", "fields": {"filterMovies": ("", "label!=Shortlist_mike")}}}},
+            {"converged": ["sarah's row taken off your Home"]},
+            {"left_alone_failures": {300: "mike: plex.tv refused the write"}},
+            {"restrictions_restored": {201: "sarah"}},
+            {"unreadable_filters": {"sarah": "Movies: a&b"}},
+            {"filters_not_enforced": {"sarah": [5001]}},
+            {"unhideable_rows": {"kid": [5001]}},
+        ],
+        ids=[
+            "caused by a change",
+            "swept unhidable rows",
+            "removed a leftover helper",
+            "wrote a filter",
+            "converged",
+            "could not leave an account alone",
+            "restored an owner restriction",
+            "unreadable filter",
+            "filter not enforced",
+            "unhideable rows",
+        ],
+    )
+    def test_a_scheduled_pass_with_news_is_not_quiet(self, monkeypatch, sessions, news):
+        # `hub_orderings` has no row: this job switches shelf ordering off, so that list is always empty.
+        payload = {**self.SCHEDULED, **({"reason": news.pop("reason")} if "reason" in news else {})}
+        assert self._run(monkeypatch, sessions, payload, **news)["quiet"] is False
+
+    def test_a_leftover_helper_it_deleted_is_said_apart_from_rows(self, monkeypatch, sessions):
+        """This job writes no run, so its detail line is the only record of the delete (rule 10), and a helper
+        is not a row of anyone's."""
+        detail = self._run(
+            monkeypatch,
+            sessions,
+            self.SCHEDULED,
+            swept_rows={"freed-name helper:sarah": ["Shortlist freed name 0123456789ab"]},
+        )["detail"]
+
+        assert "removed 1 leftover name-freeing helper" in detail
+        assert "unhidable row" not in detail
+
+    def test_a_warning_the_last_pass_already_gave_is_not_news_again(self, monkeypatch, sessions):
+        """A kid profile Plex will not take a hide-list for is reported by EVERY pass. Counting it as news each
+        time would put all 48 passes a day in Recent on exactly the server that has one."""
+        first = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]})
+        self._previous_pass(sessions, first)
+
+        again = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]})
+
+        assert first["quiet"] is False
+        assert again["quiet"] is True
+
+    def test_a_warning_about_someone_new_is_news(self, monkeypatch, sessions):
+        self._previous_pass(sessions, self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]}))
+
+        later = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001], "teen": [5002]})
+
+        assert later["quiet"] is False
+
+    def test_the_baseline_is_the_newest_successful_pass_not_a_failed_or_older_one(self, monkeypatch, sessions):
+        from shortlist.server.db.models import Job
+
+        now = datetime.now(UTC)
+        with sessions() as session:
+            session.add(
+                Job(
+                    kind="privacy.sync",
+                    status="done",
+                    payload={},
+                    result={"standing": []},
+                    finished_at=now - timedelta(hours=1),
+                )
+            )
+            session.add(
+                Job(
+                    kind="privacy.sync",
+                    status="done",
+                    payload={},
+                    result={"standing": ["can see others' rows: kid"]},
+                    finished_at=now - timedelta(minutes=30),
+                )
+            )
+            session.add(Job(kind="privacy.sync", status="failed", payload={}, result={"standing": []}, finished_at=now))
+            session.commit()
+
+        again = self._run(monkeypatch, sessions, self.SCHEDULED, unhideable_rows={"kid": [5001]})
+
+        assert again["quiet"] is True

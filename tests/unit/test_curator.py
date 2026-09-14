@@ -33,6 +33,7 @@ from openai.types.responses import Response as OpenAIResponse
 from shortlist.engine.curator import NullCurator, make_curator
 from shortlist.engine.curator.anthropic import AnthropicCurator
 from shortlist.engine.curator.google import GoogleCurator
+from shortlist.engine.curator.openai import DEFAULT_MODEL as OPENAI_DEFAULT_MODEL
 from shortlist.engine.curator.openai import OpenAICurator
 from shortlist.engine.curator.openai_compatible import OpenAICompatibleCurator, normalize_base_url
 from shortlist.engine.models import MediaType, Seed
@@ -116,6 +117,7 @@ class TestAnthropicCurator:
             {"title": "Severance", "year": 2022, "media": "show"},
         ]
         assert curator.last_tokens == 612 + 143
+        assert curator.last_output_tokens == 143
 
     def test_recommend_web_degrades_to_empty_list_on_api_error(self):
         curator = make_curator("anthropic", api_key="sk-ant-test")
@@ -140,6 +142,7 @@ class TestAnthropicCurator:
 
         assert text == "Based on the articles, I'd recommend The Wild Robot and Severance for their next watch."
         assert curator.last_tokens == 340 + 27
+        assert curator.last_output_tokens == 27
 
     def test_complete_degrades_to_empty_string_on_api_error(self):
         curator = make_curator("anthropic", api_key="sk-ant-test")
@@ -182,6 +185,7 @@ class TestOpenAICurator:
             {"title": "Severance", "year": 2022, "media": "show"},
         ]
         assert curator.last_tokens == 636
+        assert curator.last_output_tokens == 96
 
     def test_recommend_web_degrades_to_empty_list_on_api_error(self):
         curator = make_curator("openai", api_key="sk-test")
@@ -204,8 +208,9 @@ class TestOpenAICurator:
 
         assert text == "Based on the articles, I'd recommend The Wild Robot and Severance."
         assert curator.last_tokens == 228
+        assert curator.last_output_tokens == 18
         call_kwargs = curator._client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["model"] == "gpt-4o-mini"
+        assert call_kwargs["model"] == OPENAI_DEFAULT_MODEL
 
     def test_complete_degrades_to_empty_string_on_api_error(self):
         curator = make_curator("openai", api_key="sk-test")
@@ -273,8 +278,9 @@ class TestOpenAICompatibleCurator:
 
         assert text == "Based on the articles, I'd recommend The Wild Robot and Severance."
         assert curator.last_tokens == 228
+        assert curator.last_output_tokens == 18
         call_kwargs = curator._client.chat.completions.create.call_args.kwargs
-        assert call_kwargs["model"] == "llama3.3"  # resolved off the server's model list, not gpt-4o-mini
+        assert call_kwargs["model"] == "llama3.3"  # resolved off the server's model list, not OpenAI's default
 
     def test_send_model_falls_back_to_the_only_model_when_nothing_chat_capable_is_available(self):
         curator = make_curator("ollama", base_url="http://localhost:11434/v1")
@@ -307,6 +313,7 @@ class TestGoogleCurator:
             {"title": "Severance", "year": 2022, "media": "show"},
         ]
         assert curator.last_tokens == 380
+        assert curator.last_output_tokens == 80
 
     def test_recommend_web_logs_only_the_exception_type_never_the_message(self):
         """google.py's comment: the google-genai error text can carry the API key (`?key=AIza...`),
@@ -338,6 +345,27 @@ class TestGoogleCurator:
 
         assert text == "Based on the articles, I'd recommend The Wild Robot and Severance."
         assert curator.last_tokens == 164
+        assert curator.last_output_tokens == 14
+
+    def test_thinking_tokens_count_as_output(self):
+        # The default `gemini-flash-latest` is a thinking model: Google bills its thinking at the output rate
+        # but reports it in `thoughts_token_count`, apart from the reply's `candidates_token_count`. The
+        # recorded fixture above predates thinking, so the shape is built from the SDK's own model here.
+        payload = _load("curator_google_generate_content_complete.json")
+        payload["usage_metadata"] = {
+            "prompt_token_count": 150,
+            "candidates_token_count": 14,
+            "thoughts_token_count": 200,
+            "total_token_count": 364,
+        }
+        curator = make_curator("google", api_key="AIzaTest")
+        curator._client = MagicMock()
+        curator._client.models.generate_content.return_value = gtypes.GenerateContentResponse.model_validate(payload)
+
+        curator.complete("system", "user")
+
+        assert curator.last_tokens == 364
+        assert curator.last_output_tokens == 14 + 200
 
     def test_complete_logs_only_the_exception_type_never_the_message(self):
         curator = make_curator("google", api_key="AIzaTest")

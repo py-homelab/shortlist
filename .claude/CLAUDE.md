@@ -39,12 +39,17 @@ uv pip compile pyproject.toml \
 
 # Frontend
 pnpm -C web install
-pnpm -C web dev              # Vite dev server (proxies /api to :5959)
+pnpm -C web dev              # Vite dev server on :5173; proxies /api to :5959 by default
+SHORTLIST_API_PROXY=http://localhost:5960 pnpm -C web dev   # ...or to a scripts/devrun.sh backend
 pnpm -C web test             # vitest
 pnpm -C web build
 
-# Run (dev) — module-level `app` only exists when SHORTLIST_CONFIG is set
-SHORTLIST_CONFIG=./devconfig uvicorn --factory shortlist.server.main:create_app --reload --port 5959
+# Run (dev) — throwaway config, safe mode, port 5960. Refuses to start if a running container
+# already mounts that config dir (two schedulers on one DB duplicates real Plex writes).
+bash scripts/devrun.sh
+# Overridable: PORT=... SHORTLIST_CONFIG=... SHORTLIST_DRY_RUN=0 bash scripts/devrun.sh
+# Under the hood — module-level `app` only exists when SHORTLIST_CONFIG is set:
+SHORTLIST_CONFIG=./devconfig uvicorn --factory shortlist.server.main:create_app --reload --port 5960
 
 # Docker
 docker build -t shortlist:dev .   # multi-stage: node web build → python runtime
@@ -55,7 +60,10 @@ docker build -t shortlist:dev .   # multi-stage: node web build → python runti
 Rows are made private by share-filter excludes: each account's `filterMovies`/`filterTelevision`
 gets `label!=shortlist_<otheruser>` for every row that isn't theirs. The ordering is what keeps it
 leak-safe — rows are delivered UNPROMOTED, all filters merged, and only then promoted, so a new row
-is never visible before the exclusions that hide it exist.
+is never promoted before the exclusions that hide it exist. Unpromoted is not invisible: a row is listed
+in the library's Collections tab until its exclude is on an account's filter, so a person's FIRST row is
+excluded as soon as it is written, before any other row is — unless plex.tv fails, when the end-of-run
+merge does it (plex-safety rule 1).
 
 The old automatic Privacy Check + write gate that _verified_ this before each write was **removed at
 the owner's request** (2026-07-16). Writes are no longer gated on a recorded check; the hiding still
@@ -79,10 +87,21 @@ Long sessions are the single biggest cost: every turn re-sends the whole convers
 - **Say when a `/clear` is due.** When the next request is a genuinely new task — a different
   feature, a different bug, a different area — say so in one line before starting, and let the owner
   decide. Don't nag mid-task; the cost of losing context you still need is higher than the tokens.
-- **Test what you changed, not everything, while iterating.** `pytest tests/unit/test_foo.py` (or
-  `-k`) during the edit loop; the FULL suite once before committing, plus `pnpm test`/`pnpm build`
-  when web files changed and `-m e2e` when a UI flow or the wizard changed. CI runs everything
-  regardless, so a green full suite immediately before the commit is the bar — not after each edit.
+- **Write the test first, then run only that test** (owner decision 2026-09-12). What made testing
+  feel like it set the pace of development was running the WHOLE suite mid-edit. Writing the test
+  before the code fixes that: it gives you one file to run, and one file is ~3.5s.
+  So, during the edit loop: `superpowers:test-driven-development`, then
+  `pytest tests/unit/test_foo.py` or `-k <name>` — that file, nothing else. Never `pytest` bare,
+  never `-m e2e`, never the whole `pnpm test`, until the work has settled.
+  At the END, once: `pytest`, `pnpm test`, `tsc -b --force`, `eslint .`, plus `-m e2e` when a UI flow
+  or the wizard changed. That pass is the bar before any commit — CI runs it all regardless, so a
+  green full pass immediately before the commit is what counts, not a green one mid-edit.
+- **One pytest at a time on this host.** Several agent sessions share it, and each run fans out to
+  `PYTEST_XDIST_AUTO_NUM_WORKERS` processes — four overlapping runs is four times that, which is the
+  shape that took the plex host down (2026-09-12: 189 workers, ~30 GB into swap). A `PreToolUse` hook
+  (`.claude/hooks/pytest-serialize.sh`) denies a `pytest` command while another one is in flight; when
+  it fires, wait and retry rather than working around it. Scoped runs stay cheap and stay encouraged —
+  it is the OVERLAP that costs, not the frequency.
 - **Don't re-verify what a tool already told you.** No re-reading a file you just wrote, no re-running
   a suite after a formatting-only change, no full-suite run to confirm a docs edit.
 - **Keep tool output small**: `-q`, `| tail`, targeted `grep`/`sed -n` over dumping whole files.

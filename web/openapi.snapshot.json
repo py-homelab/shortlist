@@ -1,6 +1,100 @@
 {
   "components": {
     "schemas": {
+      "AccountPrivacyOut": {
+        "additionalProperties": true,
+        "description": "One Plex account's share filter, as plex.tv reports it RIGHT NOW.",
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "integer"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "hides": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Hides",
+            "type": "array"
+          },
+          "manage_sharing": {
+            "title": "Manage Sharing",
+            "type": "boolean"
+          },
+          "missing": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Missing",
+            "type": "array"
+          },
+          "other_conditions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Other Conditions",
+            "type": "array"
+          },
+          "restriction_profile": {
+            "title": "Restriction Profile",
+            "type": "string"
+          },
+          "should_hide": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Should Hide",
+            "type": "array"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "user": {
+            "title": "User",
+            "type": "string"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          },
+          "user_type": {
+            "title": "User Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user",
+          "display_name",
+          "slug",
+          "account_id",
+          "user_id",
+          "user_type",
+          "restriction_profile",
+          "manage_sharing",
+          "state",
+          "hides",
+          "should_hide",
+          "missing",
+          "other_conditions"
+        ],
+        "title": "AccountPrivacyOut",
+        "type": "object"
+      },
       "ApiTokenCreatedOut": {
         "additionalProperties": true,
         "properties": {
@@ -102,6 +196,16 @@
         "additionalProperties": true,
         "description": "Per-row download status, plus whether each app actually answered.\n\n``reach`` is the half this used to omit. A failed Arr lookup is swallowed on purpose (one app\nbeing down must not blank the other), so an unreachable Radarr produced an all-``null`` map \u2014\nbyte-identical to \"Radarr is fine and tracks none of these\". The inbox therefore showed no\nbadges, for ever, with nothing anywhere saying why.",
         "properties": {
+          "overseerr": {
+            "default": "off",
+            "enum": [
+              "ok",
+              "unreachable",
+              "off"
+            ],
+            "title": "Overseerr",
+            "type": "string"
+          },
           "radarr": {
             "enum": [
               "ok",
@@ -521,6 +625,18 @@
             "title": "Defer Rename",
             "type": "boolean"
           },
+          "description": {
+            "default": "",
+            "description": "The collection's Plex summary; takes {user}, {library_name} and {top_seed}. Empty leaves the summary on Plex alone.",
+            "maxLength": 2000,
+            "title": "Description",
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
           "enabled": {
             "default": true,
             "title": "Enabled",
@@ -538,6 +654,19 @@
             },
             "title": "Hub Anchor",
             "type": "object"
+          },
+          "idle_hold_days": {
+            "anyOf": [
+              {
+                "maximum": 365.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle Hold Days"
           },
           "library_keys": {
             "items": {
@@ -920,6 +1049,13 @@
             "title": "Rewatch",
             "type": "boolean"
           },
+          "rewatch_cooldown_days": {
+            "default": 30,
+            "maximum": 365.0,
+            "minimum": 0.0,
+            "title": "Rewatch Cooldown Days",
+            "type": "integer"
+          },
           "schedule": {
             "default": "30 3 * * *",
             "maxLength": 64,
@@ -933,6 +1069,14 @@
             "title": "Seed Window",
             "type": "integer"
           },
+          "show_days": {
+            "description": "Days this row appears, as ISO weekdays (1=Monday .. 7=Sunday). Empty means every day.",
+            "items": {
+              "type": "integer"
+            },
+            "title": "Show Days",
+            "type": "array"
+          },
           "size": {
             "default": 15,
             "maximum": 40.0,
@@ -944,6 +1088,13 @@
             "default": 0,
             "title": "Sort Order",
             "type": "integer"
+          },
+          "sort_title_prefix": {
+            "default": "",
+            "description": "Put before the row's name to make its Plex sort title, e.g. '!010_'. Orders the row in the library's Collections tab, not on Home. Empty leaves the sort title alone.",
+            "maxLength": 64,
+            "title": "Sort Title Prefix",
+            "type": "string"
           },
           "unstarted_only": {
             "default": false,
@@ -1023,6 +1174,21 @@
             ],
             "title": "Cold Start"
           },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "dry_run": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dry Run"
+          },
           "enabled": {
             "title": "Enabled",
             "type": "boolean"
@@ -1041,6 +1207,17 @@
           "id": {
             "title": "Id",
             "type": "integer"
+          },
+          "idle_hold_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle Hold Days"
           },
           "last_run_id": {
             "anyOf": [
@@ -1132,8 +1309,33 @@
             "title": "Placement Friends",
             "type": "string"
           },
+          "plan": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/PlanEntryOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan"
+          },
           "poster": {
             "$ref": "#/components/schemas/PosterOut"
+          },
+          "preview_incomplete": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview Incomplete"
           },
           "recency": {
             "anyOf": [
@@ -1396,6 +1598,10 @@
             "title": "Rewatch",
             "type": "boolean"
           },
+          "rewatch_cooldown_days": {
+            "title": "Rewatch Cooldown Days",
+            "type": "integer"
+          },
           "schedule": {
             "title": "Schedule",
             "type": "string"
@@ -1403,6 +1609,19 @@
           "seed_window": {
             "title": "Seed Window",
             "type": "integer"
+          },
+          "show_days": {
+            "description": "Days this row appears, as ISO weekdays (1=Monday .. 7=Sunday). Empty means every day.",
+            "items": {
+              "type": "integer"
+            },
+            "title": "Show Days",
+            "type": "array"
+          },
+          "shown_today": {
+            "description": "Whether this row is on its surfaces today, judged on the SERVER's clock \u2014 which is the clock the midnight schedule and Plex follow, not the viewer's.",
+            "title": "Shown Today",
+            "type": "boolean"
           },
           "size": {
             "title": "Size",
@@ -1415,6 +1634,10 @@
           "sort_order": {
             "title": "Sort Order",
             "type": "integer"
+          },
+          "sort_title_prefix": {
+            "title": "Sort Title Prefix",
+            "type": "string"
           },
           "unstarted_only": {
             "title": "Unstarted Only",
@@ -1447,13 +1670,17 @@
           "sort_order",
           "name_template",
           "fallback_name",
+          "description",
+          "sort_title_prefix",
           "min_watchers",
           "request_tag",
           "candidate_sources",
           "watched_pct",
           "rewatch",
+          "rewatch_cooldown_days",
           "unstarted_only",
           "refresh_days",
+          "idle_hold_days",
           "recency",
           "recent_count",
           "max_seeds",
@@ -1479,6 +1706,8 @@
           "pick_order",
           "placement",
           "placement_friends",
+          "show_days",
+          "shown_today",
           "pin_top",
           "hub_anchor",
           "library_keys",
@@ -1827,6 +2056,96 @@
         "title": "EffectivenessReportOut",
         "type": "object"
       },
+      "EnforcementOut": {
+        "additionalProperties": true,
+        "description": "The last time a run looked through a real account's eyes at their Home screen.\n\n`measured` is the whole point. An empty `not_enforced` on an unmeasured run is not \"all clear\" \u2014\nit is \"nobody looked\", and rendering the two the same is how a live alert gets cleared.",
+        "properties": {
+          "measured": {
+            "title": "Measured",
+            "type": "boolean"
+          },
+          "measured_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Measured At"
+          },
+          "not_enforced": {
+            "additionalProperties": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Not Enforced",
+            "type": "object"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "unhideable": {
+            "additionalProperties": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "title": "Unhideable",
+            "type": "object"
+          },
+          "unhideable_measured": {
+            "title": "Unhideable Measured",
+            "type": "boolean"
+          },
+          "unhideable_measured_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unhideable Measured At"
+          },
+          "unhideable_run_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unhideable Run Id"
+          }
+        },
+        "required": [
+          "measured",
+          "run_id",
+          "measured_at",
+          "not_enforced",
+          "unhideable",
+          "unhideable_measured",
+          "unhideable_run_id",
+          "unhideable_measured_at"
+        ],
+        "title": "EnforcementOut",
+        "type": "object"
+      },
       "EngagementOut": {
         "additionalProperties": true,
         "properties": {
@@ -2045,7 +2364,7 @@
         "type": "object"
       },
       "HubAnchorIn": {
-        "description": "A per-library shelf placement for one row: the very TOP (``top``), or after/before either\nanother Shortlist ROW (``row``, a row slug) or a foreign collection (``anchor``, a title).\n``top`` needs neither; otherwise exactly one of ``row``/``anchor`` must be set.\n\n``row`` is a slug rather than a title because a per-person row is one Plex collection PER PERSON:\na title names one account's copy and is meaningless for everyone else, which is what made the\npicker offer forty identical-looking options and place none of them (issue #81).",
+        "description": "A per-library shelf placement for one row: the very TOP (``top``), or after/before either\nanother Shortlist ROW (``row``, a row slug) or a foreign collection (``anchor``, a title).\n``top`` needs neither; otherwise exactly one of ``row``/``anchor`` must be set. ``enabled``\nfalse is a placement in its own right \u2014 \"never position this row\" \u2014 and needs neither.\n\n``row`` is a slug rather than a title because a per-person row is one Plex collection PER PERSON:\na title names one account's copy and is meaningless for everyone else, which is what made the\npicker offer forty identical-looking options and place none of them (issue #81).",
         "properties": {
           "anchor": {
             "default": "",
@@ -2056,6 +2375,11 @@
           "before": {
             "default": false,
             "title": "Before",
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
             "type": "boolean"
           },
           "row": {
@@ -2461,15 +2785,20 @@
       },
       "LibraryCollectionOut": {
         "additionalProperties": true,
-        "description": "A candidate anchor title. Title only \u2014 the shelf is ordered by title, not by rating key.",
+        "description": "A candidate anchor. Title, because the shelf is ordered by title, not by rating key \u2014 plus\nwhether it has a position on a Plex shelf at all, which decides if it can anchor anything.",
         "properties": {
+          "on_shelf": {
+            "title": "On Shelf",
+            "type": "boolean"
+          },
           "title": {
             "title": "Title",
             "type": "string"
           }
         },
         "required": [
-          "title"
+          "title",
+          "on_shelf"
         ],
         "title": "LibraryCollectionOut",
         "type": "object"
@@ -2848,6 +3177,9 @@
           "landing": {
             "$ref": "#/components/schemas/LandingOut"
           },
+          "viewing_share": {
+            "$ref": "#/components/schemas/ViewingShareOut"
+          },
           "watched": {
             "title": "Watched",
             "type": "integer"
@@ -2888,7 +3220,8 @@
           "dropped",
           "avg_days_to_watch",
           "avg_days_to_watch_delta",
-          "landing"
+          "landing",
+          "viewing_share"
         ],
         "title": "OverallOut",
         "type": "object"
@@ -2966,6 +3299,46 @@
           "orphans"
         ],
         "title": "OwnedCollectionsOut",
+        "type": "object"
+      },
+      "PendingRestore": {
+        "additionalProperties": true,
+        "properties": {
+          "backup": {
+            "title": "Backup",
+            "type": "string"
+          },
+          "requested_at": {
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backup",
+          "requested_at"
+        ],
+        "title": "PendingRestore",
+        "type": "object"
+      },
+      "PendingRestoreOut": {
+        "additionalProperties": true,
+        "description": "The restore waiting for a restart, if any.",
+        "properties": {
+          "pending": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingRestore"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "pending"
+        ],
+        "title": "PendingRestoreOut",
         "type": "object"
       },
       "PerRowOut": {
@@ -3092,6 +3465,11 @@
             ],
             "title": "Rating"
           },
+          "rating_key": {
+            "default": 0,
+            "title": "Rating Key",
+            "type": "integer"
+          },
           "reason": {
             "title": "Reason",
             "type": "string"
@@ -3201,6 +3579,58 @@
           "linked"
         ],
         "title": "PinStatusOut",
+        "type": "object"
+      },
+      "PlanEntryOut": {
+        "additionalProperties": true,
+        "description": "One unit of Plex work an edit would cause.",
+        "properties": {
+          "collections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Collections",
+            "type": "array"
+          },
+          "in_sections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "In Sections",
+            "type": "array"
+          },
+          "kind": {
+            "description": "What this step would do.",
+            "enum": [
+              "poster_reset",
+              "privacy_sync",
+              "reconcile",
+              "rename",
+              "visibility"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "only_user_ids": {
+            "items": {
+              "type": "integer"
+            },
+            "title": "Only User Ids",
+            "type": "array"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason",
+          "collections",
+          "only_user_ids",
+          "in_sections"
+        ],
+        "title": "PlanEntryOut",
         "type": "object"
       },
       "PlexServerOut": {
@@ -3346,6 +3776,70 @@
           "mode"
         ],
         "title": "PosterUploadOut",
+        "type": "object"
+      },
+      "PrivacyStatusOut": {
+        "additionalProperties": true,
+        "description": "One live reading of the whole server's sharing state.",
+        "properties": {
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/AccountPrivacyOut"
+            },
+            "title": "Accounts",
+            "type": "array"
+          },
+          "enforcement": {
+            "$ref": "#/components/schemas/EnforcementOut"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "read_at": {
+            "title": "Read At",
+            "type": "string"
+          },
+          "rows_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rows Error"
+          },
+          "rows_on_plex": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Rows On Plex",
+            "type": "array"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "read_at",
+          "summary",
+          "accounts",
+          "rows_on_plex",
+          "rows_error",
+          "error",
+          "enforcement"
+        ],
+        "title": "PrivacyStatusOut",
         "type": "object"
       },
       "ProbeCheckOut": {
@@ -3528,6 +4022,10 @@
             "title": "Media Type",
             "type": "string"
           },
+          "rating_key": {
+            "title": "Rating Key",
+            "type": "integer"
+          },
           "row": {
             "title": "Row",
             "type": "string"
@@ -3539,6 +4037,10 @@
           "title": {
             "title": "Title",
             "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
           },
           "user_id": {
             "anyOf": [
@@ -3565,6 +4067,17 @@
               }
             ],
             "title": "Watched At"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
           }
         },
         "required": [
@@ -3573,6 +4086,9 @@
           "display_name",
           "title",
           "media_type",
+          "tmdb_id",
+          "rating_key",
+          "year",
           "row",
           "library",
           "seed_title",
@@ -3595,6 +4111,35 @@
           "rejected"
         ],
         "title": "RejectedOut",
+        "type": "object"
+      },
+      "ReleaseNotesOut": {
+        "additionalProperties": true,
+        "properties": {
+          "notes": {
+            "title": "Notes",
+            "type": "string"
+          },
+          "published_at": {
+            "title": "Published At",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "url",
+          "published_at",
+          "notes"
+        ],
+        "title": "ReleaseNotesOut",
         "type": "object"
       },
       "RemovedOut": {
@@ -3974,6 +4519,64 @@
           "path"
         ],
         "title": "RootFolderOut",
+        "type": "object"
+      },
+      "RowDeletePreviewOut": {
+        "additionalProperties": true,
+        "description": "What `DELETE /collections/{id}?dry_run=true` WOULD do. Nothing is written.",
+        "properties": {
+          "anchors_cleared": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Anchors Cleared",
+            "type": "array"
+          },
+          "collections": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Collections",
+            "type": "array"
+          },
+          "dry_run": {
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "preview_incomplete": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preview Incomplete"
+          },
+          "privacy_sync": {
+            "title": "Privacy Sync",
+            "type": "boolean"
+          },
+          "schedule_cleared": {
+            "title": "Schedule Cleared",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "dry_run",
+          "collections",
+          "anchors_cleared",
+          "privacy_sync",
+          "schedule_cleared",
+          "preview_incomplete",
+          "message"
+        ],
+        "title": "RowDeletePreviewOut",
         "type": "object"
       },
       "RowEffectivenessOut": {
@@ -4363,7 +4966,8 @@
             "enum": [
               "schedule",
               "manual",
-              "wizard"
+              "wizard",
+              "resume"
             ],
             "title": "Trigger",
             "type": "string"
@@ -4748,7 +5352,8 @@
             "enum": [
               "schedule",
               "manual",
-              "wizard"
+              "wizard",
+              "resume"
             ],
             "title": "Trigger",
             "type": "string"
@@ -5196,6 +5801,81 @@
           "next_run"
         ],
         "title": "ScheduleRowsOut",
+        "type": "object"
+      },
+      "SeenRelease": {
+        "properties": {
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "title": "SeenRelease",
+        "type": "object"
+      },
+      "SeerrOptionsOut": {
+        "additionalProperties": true,
+        "properties": {
+          "default_user_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default User Id"
+          },
+          "users": {
+            "items": {
+              "$ref": "#/components/schemas/SeerrUserOut"
+            },
+            "title": "Users",
+            "type": "array"
+          }
+        },
+        "required": [
+          "users"
+        ],
+        "title": "SeerrOptionsOut",
+        "type": "object"
+      },
+      "SeerrUserOut": {
+        "additionalProperties": true,
+        "properties": {
+          "auto_approve_movies": {
+            "default": false,
+            "title": "Auto Approve Movies",
+            "type": "boolean"
+          },
+          "auto_approve_tv": {
+            "default": false,
+            "title": "Auto Approve Tv",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "is_plex_user": {
+            "default": false,
+            "title": "Is Plex User",
+            "type": "boolean"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "SeerrUserOut",
         "type": "object"
       },
       "SendOut": {
@@ -5712,6 +6392,10 @@
             "title": "Media Type",
             "type": "string"
           },
+          "rating_key": {
+            "title": "Rating Key",
+            "type": "integer"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -5720,16 +6404,37 @@
             "title": "Tmdb Id",
             "type": "integer"
           },
+          "watcher_sample": {
+            "items": {
+              "$ref": "#/components/schemas/WatcherOut"
+            },
+            "title": "Watcher Sample",
+            "type": "array"
+          },
           "watchers": {
             "title": "Watchers",
             "type": "integer"
+          },
+          "year": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Year"
           }
         },
         "required": [
           "tmdb_id",
           "media_type",
           "title",
-          "watchers"
+          "watchers",
+          "rating_key",
+          "year",
+          "watcher_sample"
         ],
         "title": "TopTitleOut",
         "type": "object"
@@ -6386,6 +7091,10 @@
             ],
             "title": "Rating"
           },
+          "rating_key": {
+            "title": "Rating Key",
+            "type": "integer"
+          },
           "reason": {
             "title": "Reason",
             "type": "string"
@@ -6432,6 +7141,7 @@
           "rank",
           "title",
           "reason",
+          "rating_key",
           "media_type",
           "collection_slug",
           "library",
@@ -6887,6 +7597,38 @@
         "title": "VersionOut",
         "type": "object"
       },
+      "ViewingShareOut": {
+        "additionalProperties": true,
+        "description": "Of the titles people watched in the window, how many their Shortlist row had shown them.",
+        "properties": {
+          "from_rows": {
+            "title": "From Rows",
+            "type": "integer"
+          },
+          "rate": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rate"
+          },
+          "watched": {
+            "title": "Watched",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "watched",
+          "from_rows",
+          "rate"
+        ],
+        "title": "ViewingShareOut",
+        "type": "object"
+      },
       "WatchItemOut": {
         "additionalProperties": true,
         "description": "One recent watch, from the same source recommendations are built from.",
@@ -7029,6 +7771,26 @@
         "title": "WatchSyncOut",
         "type": "object"
       },
+      "WatchedLibraryOut": {
+        "additionalProperties": true,
+        "description": "One Plex library this person has a cached watch in.\n\nThe `media_type` is what lets the page decide whether a library filter is worth showing: one\nlibrary per type means the Movies/Shows buttons already draw every distinction a library choice\ncould, and a second control offering the same two words is noise (#111).",
+        "properties": {
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "media_type"
+        ],
+        "title": "WatchedLibraryOut",
+        "type": "object"
+      },
       "WatchedPageOut": {
         "additionalProperties": true,
         "description": "A page of the watched set, plus how complete the set behind it is.\n\nThe staleness fields travel WITH the page on purpose: this list is a cache, and a page that\ndoesn't say when it was last filled invites \"I watched that, why is it recommended?\" \u2014 the exact\nquestion this endpoint exists to answer.",
@@ -7062,6 +7824,13 @@
             ],
             "title": "Last Full Sync At"
           },
+          "libraries": {
+            "items": {
+              "$ref": "#/components/schemas/WatchedLibraryOut"
+            },
+            "title": "Libraries",
+            "type": "array"
+          },
           "rated_count": {
             "title": "Rated Count",
             "type": "integer"
@@ -7082,6 +7851,7 @@
         "required": [
           "items",
           "total",
+          "libraries",
           "last_full_sync_at",
           "synced_titles",
           "dislike_threshold",
@@ -7093,7 +7863,7 @@
       },
       "WatchedTitleOut": {
         "additionalProperties": true,
-        "description": "One title from the cached watched set \u2014 the set recommendations are actually filtered against.",
+        "description": "One TITLE from the cached watched set \u2014 the set recommendations are actually filtered against.\n\nOne title, not one stored row: a title held in two Plex libraries is cached once per library, and\nthose copies are merged here (issue #111). `libraries` names the ones it was found in, and every\nother field is merged to the claim the engine acts on \u2014 see `_merge_watched_copies`.",
         "properties": {
           "leaf_count": {
             "anyOf": [
@@ -7106,9 +7876,20 @@
             ],
             "title": "Leaf Count"
           },
+          "libraries": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Libraries",
+            "type": "array"
+          },
           "media_type": {
             "title": "Media Type",
             "type": "string"
+          },
+          "rating_key": {
+            "title": "Rating Key",
+            "type": "integer"
           },
           "title": {
             "title": "Title",
@@ -7169,16 +7950,59 @@
         },
         "required": [
           "title",
+          "rating_key",
           "tmdb_id",
           "media_type",
           "watched_at",
           "year",
           "watch_count",
+          "libraries",
           "viewed_leaf_count",
           "leaf_count",
           "user_rating"
         ],
         "title": "WatchedTitleOut",
+        "type": "object"
+      },
+      "WatcherOut": {
+        "additionalProperties": true,
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "title": "WatcherOut",
+        "type": "object"
+      },
+      "WhatsNewOut": {
+        "additionalProperties": true,
+        "properties": {
+          "releases": {
+            "items": {
+              "$ref": "#/components/schemas/ReleaseNotesOut"
+            },
+            "title": "Releases",
+            "type": "array"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "releases"
+        ],
+        "title": "WhatsNewOut",
         "type": "object"
       },
       "WizardState": {
@@ -7255,7 +8079,7 @@
   },
   "info": {
     "title": "Shortlist",
-    "version": "1.8.0"
+    "version": "1.9.0"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -7431,6 +8255,7 @@
     },
     "/api/collections/{collection_id}": {
       "delete": {
+        "description": "Delete a row, or with ``dry_run=true`` report what deleting it would do and write nothing.\n\nA query parameter rather than a body: `DELETE` bodies are awkward through both `fetch` and\nFastAPI, and this works with the SPA's existing `request()` helper unchanged.\n\n`POST /{id}/cleanup?dry_run=true` already previews the PLEX half. What only this can show is the\nLOCAL half, and one part of it is a genuine surprise: deleting this row silently strips every\nOTHER row's shelf placement that was positioned relative to it, changing where two other people's\nrows appear. That was logged after the fact and warned about nowhere.\n\nA preview answers 200 with :class:`RowDeletePreviewOut` instead of the delete's 204.",
         "operationId": "delete_collection_api_collections__collection_id__delete",
         "parameters": [
           {
@@ -7441,9 +8266,29 @@
               "title": "Collection Id",
               "type": "integer"
             }
+          },
+          {
+            "in": "query",
+            "name": "dry_run",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Dry Run",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RowDeletePreviewOut"
+                }
+              }
+            },
+            "description": "A dry-run preview; nothing was deleted."
+          },
           "204": {
             "description": "Successful Response"
           },
@@ -8027,6 +8872,133 @@
         "summary": "Dismiss",
         "tags": [
           "notifications"
+        ]
+      }
+    },
+    "/api/notifications/whats-new": {
+      "get": {
+        "description": "The release notes the owner has not read since upgrading, for the What's new dialog.",
+        "operationId": "whats_new_api_notifications_whats_new_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WhatsNewOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Whats New",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/api/notifications/whats-new/seen": {
+      "post": {
+        "description": "Close the What's new dialog for good: record the version whose notes it showed.",
+        "operationId": "whats_new_seen_api_notifications_whats_new_seen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeenRelease"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DismissedOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Whats New Seen",
+        "tags": [
+          "notifications"
+        ]
+      }
+    },
+    "/api/picks/{rating_key}/poster": {
+      "get": {
+        "description": "One delivered pick's artwork, streamed from the PMS.\n\n404 rather than a placeholder image when the item or its artwork is gone: a pick's ratingKey goes\nstale when a title is removed and re-added, and the SPA already renders a tile of the right size\nfor that. Answering with a picture would make a missing item indistinguishable from a real one.\n502 when the PMS itself failed, for the same reason \u2014 an outage is not \"this title has no art\".\n\nArgs:\n    rating_key: The pick's Plex ratingKey. `0` means the pipeline never matched the title.\n    request: The live request, for the app state and `If-None-Match`.\n\nReturns:\n    The image bytes with the PMS's own content type, or a `304` when the browser's copy is\n    current.\n\nRaises:\n    HTTPException: `404` when there is no artwork to serve, `502` when Plex could not be read.",
+        "operationId": "pick_poster_api_picks__rating_key__poster_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "rating_key",
+            "required": true,
+            "schema": {
+              "title": "Rating Key",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pick Poster",
+        "tags": [
+          "picks"
+        ]
+      }
+    },
+    "/api/privacy/status": {
+      "get": {
+        "description": "Every account's live share filter, plus the last enforcement spot-check.\n\nCosts one plex.tv roster read and one PMS collections read. Writes nothing and mints no token, so\nit is safe to call from a screen the owner leaves open.\n\nArgs:\n    request: The live request, for app state.\n\nReturns:\n    The whole server's sharing state as of now, with the enforcement measurement beside it.",
+        "operationId": "privacy_status_endpoint_api_privacy_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivacyStatusOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Privacy Status Endpoint",
+        "tags": [
+          "privacy"
         ]
       }
     },
@@ -9103,6 +10075,28 @@
           }
         },
         "summary": "Curator Models",
+        "tags": [
+          "settings"
+        ]
+      }
+    },
+    "/api/settings/overseerr/options": {
+      "get": {
+        "description": "The instance's accounts, so the UI can offer a \"request as\" dropdown.\n\nThe *seerr equivalent of ``arr_options``, and deliberately much smaller: quality profiles and\nroot folders are Overseerr's business on this route, so the only choice left to Shortlist is\nwhose name the request goes out under.",
+        "operationId": "overseerr_options_api_settings_overseerr_options_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeerrOptionsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Overseerr Options",
         "tags": [
           "settings"
         ]
@@ -10330,8 +11324,48 @@
       }
     },
     "/api/system/backups/restore": {
+      "delete": {
+        "description": "Cancel the restore waiting for the next start. Nothing has been changed yet, so nothing is undone.",
+        "operationId": "cancel_restore_endpoint_api_system_backups_restore_delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingRestoreOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Cancel Restore Endpoint",
+        "tags": [
+          "system"
+        ]
+      },
+      "get": {
+        "description": "The restore waiting for the next start, so the owner can see it is still to come, or cancel it.",
+        "operationId": "pending_restore_endpoint_api_system_backups_restore_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingRestoreOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Pending Restore Endpoint",
+        "tags": [
+          "system"
+        ]
+      },
       "post": {
-        "description": "Restore from a named backup. The app will need to be restarted after.\n\nA restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a\ncopy taken before a shared row's audience was narrowed puts the wider audience back, and the\nshared-exclude prune \u2014 the only un-hiding path Shortlist has \u2014 then removes the `label!=` excludes\nthat were hiding that row. That is correct for the config being restored, and it is exactly the\nkind of change an operator does not expect from a button labelled \"restore\".\n\nSo it is stated, in the response and in the audit trail (rule 10), rather than left to be\ndiscovered on someone's Home screen.",
+        "description": "Queue a restore from a named backup. It is applied when the app next starts.\n\nNot applied here: the running app has the database open, and swapping the file under its pooled\nconnections let the shutdown checkpoint write the old database back over the restored one, so the\nrestart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the\npre-restore copy there (so it holds everything written until the restart), and audits it in the\ndatabase it restored. Until then it can be seen and cancelled (`GET`/`DELETE` below), and one left\nwaiting for over a day is not applied.\n\nA restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a\ncopy taken before a shared row's audience was narrowed puts the wider audience back, and the\nshared-exclude prune \u2014 the only un-hiding path Shortlist has \u2014 then removes the `label!=` excludes\nthat were hiding that row. That is correct for the config being restored, and it is exactly the\nkind of change an operator does not expect from a button labelled \"restore\".\n\nSo it is stated, in the response and in the audit trail (rule 10), rather than left to be\ndiscovered on someone's Home screen.",
         "operationId": "restore_backup_endpoint_api_system_backups_restore_post",
         "requestBody": {
           "content": {
@@ -10439,7 +11473,7 @@
     },
     "/api/system/jobs": {
       "get": {
-        "description": "Recent background jobs, newest first \u2014 the \"did that actually happen?\" answer.\n\nMaintenance work used to be fire-and-forget: it landed in the logs and the events table and\nnowhere an operator would look. Runs keep their own page; this is everything else.\n\n`kind` narrows it to one job type, which is how the Jobs page shows a single job's own history\nwithout pulling every other kind's rows down with it. `before_id` pages backwards \u2014 pass the id\nof the oldest job you already have.\n\n`status` narrows it to one outcome, and it exists because the Jobs page's \"N failed\" badge\ncounts every failed row in the table while the feed behind it could only fetch the newest N.\nMeasured on a real server: 8 failures, all `privacy.sync`, at ids 587-596 \u2014 the newest hundred\njobs started at id 680, so filtering a fetched page client-side answered \"8 failed\" with an\nempty list. A count over the whole table needs a filter over the whole table.",
+        "description": "Recent background jobs, newest first \u2014 the \"did that actually happen?\" answer.\n\nMaintenance work used to be fire-and-forget: it landed in the logs and the events table and\nnowhere an operator would look. Runs keep their own page; this is everything else.\n\n`kind` narrows it to one job type, which is how the Jobs page shows a single job's own history\nwithout pulling every other kind's rows down with it. `before_id` pages backwards \u2014 pass the id\nof the oldest job you already have.\n\n`status` narrows it to one outcome, and it exists because the Jobs page's \"N failed\" badge\ncounts every failed row in the table while the feed behind it could only fetch the newest N.\nMeasured on a real server: 8 failures, all `privacy.sync`, at ids 587-596 \u2014 the newest hundred\njobs started at id 680, so filtering a fetched page client-side answered \"8 failed\" with an\nempty list. A count over the whole table needs a filter over the whole table.\n\n`exclude_routine` also drops a finished job whose result says it was `quiet` \u2014 a scheduled privacy sync\nthat found nothing to change. And it drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,\nand exists for the same reason `status` does: a client filter over a fetched page cannot work\nwhen the noise outnumbers the news. Measured on a 46-user server, `watch.reconcile` was 165 of\nthe 197 jobs queued in a day, so the newest 30 rows the header polls were almost all reconciles\nand nothing else could be seen behind them. The Jobs page does not pass it \u2014 that is where you\ngo to look at reconciles \u2014 and a failure is never dropped, because a reconcile that fails is the\nonly thing that would say a partial watch went uncredited.",
         "operationId": "list_jobs_api_system_jobs_get",
         "parameters": [
           {
@@ -10506,6 +11540,16 @@
                 }
               ],
               "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude_routine",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Exclude Routine",
+              "type": "boolean"
             }
           }
         ],
@@ -11536,7 +12580,7 @@
     },
     "/api/users/{user_id}/watched": {
       "get": {
-        "description": "Search one person's watched set.\n\nReads the local `watched_titles` cache, so unlike `/history` it never touches Plex: it is a DB\nquery, it can search the WHOLE set rather than the page on screen, and it shows the same titles\nthe recommender excludes from.",
+        "description": "Search one person's watched set.\n\nReads the local `watched_titles` cache, so unlike `/history` it never touches Plex: it is a DB\nquery, it can search the WHOLE set rather than the page on screen, and it shows the same titles\nthe recommender excludes from. One row per TITLE \u2014 a title held in two libraries is merged, and\nnames both.",
         "operationId": "user_watched_api_users__user_id__watched_get",
         "parameters": [
           {
@@ -11569,6 +12613,19 @@
               "default": "",
               "pattern": "^(movie|show)?$",
               "title": "Media Type",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Display name of a Plex library; empty for all.",
+            "in": "query",
+            "name": "library",
+            "required": false,
+            "schema": {
+              "default": "",
+              "description": "Display name of a Plex library; empty for all.",
+              "maxLength": 255,
+              "title": "Library",
               "type": "string"
             }
           },

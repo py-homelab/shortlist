@@ -1,0 +1,222 @@
+"""Every provider retries the blips it can safely retry — and only those.
+
+The gap this pins cost real candidates: Exa's search went through the MUTATION retry path, which
+retries 429 alone, so a read timeout or a 502 lost the search outright. The first real 46-user run
+lost 13 of 21 searches that way. A search is idempotent — repeating it changes nothing — so it now
+retries the same wide set a GET does.
+
+The other half matters just as much: a genuine mutation must NOT gain that behaviour, because a
+retried write can double a Radarr add or a share-filter change.
+"""
+
+from __future__ import annotations
+
+import httpx
+import pytest
+import requests
+import respx
+
+from shortlist.engine.clients import http_retry
+from shortlist.engine.clients.search import ExaClient, SearxngClient
+
+URL = "https://example.test/search"
+
+
+def _no_backoff(monkeypatch):
+    """Retries really do sleep; the point here is the policy, not the wait."""
+    monkeypatch.setattr(http_retry.time, "sleep", lambda _s: None)
+
+
+class TestAnIdempotentPostRetriesLikeARead:
+    @pytest.mark.parametrize("status", [429, 500, 502, 503, 504])
+    @respx.mock
+    def test_it_retries_every_blip_status(self, status, monkeypatch):
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(side_effect=[httpx.Response(status), httpx.Response(200, json={"ok": True})])
+        assert http_retry.idempotent_post(URL, json={}).status_code == 200
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_it_retries_a_read_timeout(self, monkeypatch):
+        """The case that lost the searches: the request landed, the answer never came."""
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(
+            side_effect=[httpx.ReadTimeout("too slow"), httpx.Response(200, json={"ok": True})]
+        )
+        assert http_retry.idempotent_post(URL, json={}).status_code == 200
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_it_gives_up_rather_than_retrying_for_ever(self, monkeypatch):
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(return_value=httpx.Response(503))
+        assert http_retry.idempotent_post(URL, json={}).status_code == 503
+        assert route.call_count == http_retry.DEFAULT_ATTEMPTS
+
+    @respx.mock
+    def test_a_4xx_that_is_not_rate_limiting_is_not_retried(self, monkeypatch):
+        """A bad key is an answer, not a blip — retrying it just wastes the run's time."""
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(return_value=httpx.Response(401))
+        assert http_retry.idempotent_post(URL, json={}).status_code == 401
+        assert route.call_count == 1
+
+
+class TestMutationsStayConservative:
+    @respx.mock
+    def test_a_mutation_does_NOT_retry_a_5xx(self, monkeypatch):
+        """The write may already have applied — a blind retry doubles it."""
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(return_value=httpx.Response(500))
+        assert http_retry.request("POST", URL, json={}).status_code == 500
+        assert route.call_count == 1
+
+    @respx.mock
+    def test_a_mutation_does_NOT_retry_a_read_timeout(self, monkeypatch):
+        _no_backoff(monkeypatch)
+        respx.post(URL).mock(side_effect=httpx.ReadTimeout("too slow"))
+        with pytest.raises(httpx.ReadTimeout):
+            http_retry.request("POST", URL, json={})
+
+
+class TestCheapAndExpensiveFailuresGetDifferentBudgets:
+    """A 429 and a hang cost a run wildly different amounts, so one attempt count cannot serve both.
+
+    Measured through the real Exa client: a 429 comes back in ~0.2s, while a hang burns the whole 90s
+    ceiling before it even reports. Bounding the hang to 2 attempts — which is right, since a third
+    costs 271s per stuck seed at concurrency 8 — silently capped the 429s at 2 as well, throwing away
+    a nearly-free retry on the case a busy run actually hits.
+    """
+
+    @pytest.mark.parametrize("status", [429, 503])
+    @respx.mock
+    def test_a_cheap_status_gets_the_bigger_budget(self, status, monkeypatch):
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(return_value=httpx.Response(status))
+        http_retry.idempotent_post(URL, json={}, attempts=2, status_attempts=5)
+        assert route.call_count == 5
+
+    @respx.mock
+    def test_an_expensive_timeout_keeps_the_small_one(self, monkeypatch):
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(httpx.ReadTimeout):
+            http_retry.idempotent_post(URL, json={}, attempts=2, status_attempts=5)
+        assert route.call_count == 2, "a hang must stay bounded even when statuses get more chances"
+
+    @respx.mock
+    def test_the_budgets_default_to_the_same_number(self, monkeypatch):
+        """Omitting `status_attempts` must behave exactly as before — every other caller relies on it."""
+        _no_backoff(monkeypatch)
+        route = respx.post(URL).mock(return_value=httpx.Response(503))
+        http_retry.idempotent_post(URL, json={}, attempts=2)
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_exa_ships_with_the_split(self, monkeypatch):
+        """The client the run actually uses, not just the helper underneath it."""
+        from shortlist.engine.clients.search import EXA_SEARCH_URL, ExaClient
+
+        _no_backoff(monkeypatch)
+        route = respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(429))
+        with pytest.raises(httpx.HTTPStatusError):
+            ExaClient("k").search("q")
+        assert route.call_count == 5, "a rate-limited search should keep trying — each one costs ~0.2s"
+
+    @respx.mock
+    def test_a_server_that_honours_retry_after_is_obeyed(self, monkeypatch):
+        """A service telling us exactly how long to wait beats any ladder we compute."""
+        sleeps: list[float] = []
+        monkeypatch.setattr(http_retry.time, "sleep", sleeps.append)
+        respx.post(URL).mock(
+            side_effect=[httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200, json={})]
+        )
+        http_retry.idempotent_post(URL, json={})
+        assert sleeps == [7.0]
+
+
+class TestEveryBackoffIsJittered:
+    """Runs process `run.concurrency` users at once, so a service wobble hits them together.
+
+    An unjittered ladder marches every thread back in lockstep, and each synchronised wave makes the
+    next failure MORE likely. Three loops outside `http_retry` do their own backoff and all three
+    used a bare `delay * 2`.
+    """
+
+    def test_the_helper_actually_spreads_the_delay(self):
+        spread = {http_retry.jittered(10.0) for _ in range(200)}
+        assert len(spread) > 100, "jittered() returned a near-constant value"
+        assert all(8.0 <= d <= 12.0 for d in spread), (min(spread), max(spread))
+
+    def test_two_callers_do_not_get_the_same_delay(self):
+        """The property that matters: two threads failing at the same instant must not agree."""
+        assert len({http_retry.jittered(5.0) for _ in range(50)}) > 40
+
+    def test_the_shared_retry_path_does_not_sleep_the_bare_ladder(self, monkeypatch):
+        """The unjittered ladder is 1s then 2s. Real sleeps must land near those, never exactly on
+        them — otherwise every parallel caller wakes at the same instant."""
+        sleeps: list[float] = []
+        monkeypatch.setattr(http_retry.time, "sleep", sleeps.append)
+        with respx.mock:
+            respx.post(URL).mock(return_value=httpx.Response(503))
+            http_retry.idempotent_post(URL, json={})
+        assert sleeps, "a 503 should have backed off before retrying"
+        assert all(s not in (1.0, 2.0, 4.0) for s in sleeps), sleeps
+
+    def test_the_pms_delivery_retry_is_jittered(self, monkeypatch):
+        """`_retry_idempotent` backs off 2/4/8s for EVERY parallel user identically without this."""
+        import shortlist.engine.clients.plex_pms as pms
+
+        seen: list[float] = []
+        monkeypatch.setattr(pms.http_retry, "jittered", lambda d: seen.append(d) or 0.0)
+        monkeypatch.setattr(pms.time, "sleep", lambda _s: None)
+        calls = {"n": 0}
+
+        def flaky():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                # `requests`, not httpx: plexapi talks over requests, and `_PMS_TIMEOUTS` is defined
+                # in those terms — an httpx error would sail straight past the retry.
+                raise requests.exceptions.ReadTimeout("slow")
+
+        pms._retry_idempotent(flaky, label="test")
+        assert seen, "the delivery retry computed a delay without passing it through jittered()"
+
+    def test_the_pms_session_sets_a_backoff_jitter(self):
+        """urllib3 defaults `backoff_jitter` to 0.0 — the PMS session must not accept that."""
+        import shortlist.engine.clients.plex_pms as pms
+
+        session = pms._retrying_session()
+        retry = session.get_adapter("http://x").max_retries
+        assert getattr(retry, "backoff_jitter", 0.0) > 0.0
+
+
+class TestTheSearchBackendsUseTheRightPolicy:
+    @pytest.mark.parametrize("status", [429, 502])
+    @respx.mock
+    def test_exa_survives_a_blip(self, status, monkeypatch):
+        _no_backoff(monkeypatch)
+        route = respx.post("https://api.exa.ai/search").mock(
+            side_effect=[httpx.Response(status), httpx.Response(200, json={"results": [{"title": "x"}]})]
+        )
+        assert ExaClient("k").search("q")
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_exa_survives_a_read_timeout(self, monkeypatch):
+        _no_backoff(monkeypatch)
+        route = respx.post("https://api.exa.ai/search").mock(
+            side_effect=[httpx.ReadTimeout("slow"), httpx.Response(200, json={"results": [{"title": "x"}]})]
+        )
+        assert ExaClient("k").search("q")
+        assert route.call_count == 2
+
+    @respx.mock
+    def test_searxng_survives_a_blip(self, monkeypatch):
+        """SearXNG was already on the read policy; this stops a refactor quietly moving it."""
+        _no_backoff(monkeypatch)
+        route = respx.get("http://searx.test/search").mock(
+            side_effect=[httpx.Response(503), httpx.Response(200, json={"results": [{"title": "x"}]})]
+        )
+        assert SearxngClient("http://searx.test").search("q")
+        assert route.call_count == 2

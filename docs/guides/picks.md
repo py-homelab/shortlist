@@ -35,7 +35,7 @@ the libraries you pick.
 
 ### How often rows rebuild, already-watched, and cost
 
-Settings → Finding titles has four more dials, each of which a row can override:
+Settings → Finding titles has five more dials, each of which a row can override:
 
 - **How often it changes**, called **How often rows rebuild** in Settings where the global lives.
   A number of days, so it says what it does: `1` rebuilds every night, `7` weekly, `30` monthly, and
@@ -47,9 +47,42 @@ Settings → Finding titles has four more dials, each of which a row can overrid
   `8` days. If you trigger two runs the same day, a row that isn't due won't change. That is
   expected.
 
-  This used to be a 0–1 "Freshness" percentage that a curve turned into days behind the scenes, so
-  `0.55` meant "every 7 days" and there was no way to ask for anything slower than a fortnight.
-  Upgrading converts every value to the day count it already meant, so no row changes pace.
+- **Hold rows for inactive viewers**, called **Hold when they aren't watching** in the row editor.
+  A number of days; `0` (the default) turns it off, so a row rebuilds on its normal cadence whatever
+  its owner has been watching.
+
+  **Set it higher than the rebuild cadence, or it does nothing.** A row is rebuilt on its due night,
+  so by its next due night it is exactly one cadence old — and the hold releases at that age. A row
+  rebuilding every 30 days with a 30-day hold therefore never holds at all. Settings and the row
+  editor warn you when the two cancel, and `/api/support/row-schedule` names any row where the hold
+  has no effect.
+
+  The exception is a row **named after a watch** (`{top_seed}`), which Shortlist rebuilds nightly
+  whatever its cadence says — so any hold above one day works there, and that is the row the wizard
+  creates. A **frozen** row (cadence `0`) never rebuilds at all, so a hold does nothing on it.
+
+  Turn it on and a row that is due to rebuild is left alone while the person it belongs to has not
+  watched anything since that row was last built — there is nothing new to base a rebuild on, and
+  skipping it saves a write to Plex for every row held. The number is a **ceiling**, not a freeze:
+  once the row is that many days old it rebuilds anyway, however quiet the person has been. That
+  matters, because the row nobody watches is exactly the one that most needs to look different next
+  time they open Plex.
+
+  Two rows never hold. A **shared** row has no single owner whose watching could be idle. A row that
+  **cycles its seed** (Seed window above 1) advances one watch per rebuild by design, so holding it
+  would stop the rotation rather than delay it. The row editor hides the control for both.
+
+  Two things also override a hold in progress, so neither waits for the ceiling: changing a setting
+  that decides the row's titles (including blocking a seed), and a row named after a watch whose seed
+  has moved — which is what happens if someone marks their most recent title unwatched.
+
+  When a row is held you can see it: open that run, pick the person, and the row's line in
+  **Delivered** says it was its night to rebuild and why it was left alone. `/api/support/row-schedule`
+  reports the ceiling beside the cadence for every row.
+
+  It saves **Plex writes**, not AI cost. Finding candidate titles happens before the rebuild decision
+  on every path, at every cadence, so a held row costs the same to think about as a rebuilt one — it
+  just doesn't get written.
 
 - **Recent releases.** How much a title's **release date** counts when Shortlist ranks it. At
   `0.0` release date is ignored entirely: a well-rated 1996 film and a well-rated 2024 one are
@@ -62,8 +95,8 @@ Settings → Finding titles has four more dials, each of which a row can overrid
 
   **This applies to existing servers too.** Upgrading to the release that introduced it shifts each
   row towards newer titles on its next rebuild night — staggered by each row's cadence rather than
-  all at once. Nothing about who can see what changes. If you preferred the old behaviour, set the
-  slider to `0` and ranking ignores release date exactly as it used to.
+  all at once. Nothing about who can see what changes, and setting the slider to `0` turns release
+  date back out of the ranking entirely.
 
   It is a preference, not a filter. Nothing is excluded for being old — an older title simply has
   to be a better match to win a slot, so a classic three of someone's watches point at still beats a
@@ -87,11 +120,12 @@ This is rare, because Shortlist reads each person's **complete** watched set fro
 including titles they only _marked_ watched, whether ticked off individually or a whole season at
 once, rather than played.
 
-It reads the library _as that user_, with the per-user server token Plex mints for every share, and
-`viewCount > 0` covers both plays and marks at any depth. There is nothing to configure, and it works
-whether or not Shortlist runs on the same machine as Plex. This replaced an older playback-history
-read that saw plays only and capped at around 200. On one real server that hid **13,201** of a user's
-watched titles behind the roughly 1,000 the API reported.
+It reads the library _as that user_, with the per-user access key Plex mints for every share, and
+counts anything with a play count above zero — plays and marks alike, at any depth. There is nothing
+to configure, and it works whether or not Shortlist runs on the same machine as Plex. Plex's own
+playback-history feed would not do: it reports plays only, and stops at roughly the most recent 200 —
+on one real server it saw about **1,000** of a user's watched titles where reading the library in
+full found around **13,000**.
 
 When it does happen, it is almost always timing. **The read is per-run, so a title you mark watched
 after the last run stays eligible until the next one.** To fix it immediately without waiting for a
@@ -109,6 +143,7 @@ Settings → Finding titles sets what a row uses **unless the row says otherwise
 | **Recommendation sources**                           | Switch to "Choose for this row" and tick its own sources                                  |
 | **Libraries**                                        | Which Plex libraries it builds in, which also sets what it recommends                     |
 | **How often it changes**, **Already-watched titles** | How often it refreshes, and how much already-watched it allows                            |
+| **Hold when they aren't watching**                  | How long it waits when its owner has watched nothing since it was built                  |
 | **Recent releases**                                  | How much release date counts for this row — a “new and notable” shelf, or one that digs up older films |
 | **Row size**, **Audience**                           | How many titles, and who gets it                                                          |
 | **Watches the AI web search looks up**               | How many recent watches AI web search looks up for this row (shown only on rows using it) |
@@ -141,11 +176,11 @@ other row.
 - **Rename a row.** Its collection is retitled in place for every user, so nothing is orphaned.
 - **Disable a user, or drop someone from a row's audience.** That person's now-stale collections are
   removed immediately.
-- **Remove from Plex**, the button on each row. Clears a row's collections on demand without deleting
+- **Remove from Plex**, under **Remove or delete** on a row. Clears a row's collections on demand without deleting
   the row's settings. Handy to force a rebuild on the next run.
 - **Disable a row**, its on/off switch. Its collection comes off Plex Home on the next run. A row
-  whose title is dynamic, built from a top pick, is left for that rebuild; use **Remove from Plex** if
-  you want it gone right now. Everything left in place stays private, because the row's label keeps it
+  whose title is dynamic, built from a top pick, is left for that rebuild; use **Remove or delete →
+  Remove from Plex** if you want it gone right now. Everything left in place stays private, because the row's label keeps it
   excluded from everyone else.
 
 ## Blocking a seed
@@ -160,8 +195,7 @@ usually what you noticed in the first place. There is also a search box on a per
 
 Blocks are personal. A **shared** row is public, so one person's block does _not_ reshape what
 everyone else sees. Otherwise an individual preference would become a server-wide edit nobody else
-can see or undo. Shared rows use their own server-wide list,
-`recommendations.blocked_shared_seeds`.
+can see or undo. Shared rows have their own server-wide block list instead.
 
 ## Letting people block their own
 
@@ -177,10 +211,9 @@ A few things worth knowing:
 
 - **A rating they haven't given changes nothing.** Only a low rating acts, so this is silent for the
   majority of people, who rate nothing at all.
-- **Rating what they just watched works straight away.** The nightly sync reads everything watched
-  since it last ran, and a rating rides along with it. Rating something from months ago is the slow
-  case: that title is behind the point the nightly read reaches back to, so it waits for the weekly
-  full re-read. Lower `sync.watch_full_days` if you'd rather not wait for those.
+- **Ratings land on the next sync, however old the title.** The sync re-reads every watched title
+  each time it runs, and a rating rides along with it, so rating something you saw months ago counts
+  just as quickly as rating last night's film.
 - **A title stops seeding only if it was going to seed.** Rows are built from someone's most recent
   watches, so disliking a film from two years ago is recorded but changes nothing — it was never
   going to be picked as a seed. The rating matters when it's something they saw lately.

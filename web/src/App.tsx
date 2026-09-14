@@ -6,19 +6,22 @@ import {
 import { BrowserRouter, Navigate, Route, Routes } from "react-router";
 
 import { AppShell } from "@/components/layout/app-shell";
-import { EmptyState, ErrorState } from "@/components/query-boundary";
+import { ErrorState } from "@/components/query-boundary";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError } from "@/lib/api";
+import { basePath } from "@/lib/base-path";
 import { resolveArea } from "@/lib/auth";
 import { queryKeys, useSession, useSetupState } from "@/lib/queries";
 import { DashboardPage } from "@/pages/dashboard";
 import { LoginPage } from "@/pages/login";
+import { NotFoundPage } from "@/pages/not-found";
 import { RequestsPage } from "@/pages/requests";
 import { RowEditPage } from "@/pages/row-edit";
 import { RowRenamePage } from "@/pages/row-rename";
 import { RowsPage } from "@/pages/rows";
 import { RunDetailPage } from "@/pages/run-detail";
 import { RunUserTracePage } from "@/pages/run-user-trace";
+import { SharingPage } from "@/pages/sharing";
 import { WatchingAccountPage } from "@/pages/watching-account";
 import { LogsPage } from "@/pages/logs";
 import { IssuePage } from "@/pages/issue";
@@ -110,7 +113,7 @@ function RequireApp() {
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
+      <BrowserRouter basename={basePath || "/"}>
         <Routes>
           <Route path="login" element={<LoginPage />} />
           <Route path="setup" element={<SetupPage />} />
@@ -122,6 +125,7 @@ export default function App() {
             <Route path="rows/:id/rename" element={<RowRenamePage />} />
             <Route path="rows/:id" element={<RowEditPage />} />
             <Route path="users" element={<UsersPage />} />
+            <Route path="sharing" element={<SharingPage />} />
             <Route path="users/:id" element={<UserDetailPage />} />
             <Route path="watching-account" element={<WatchingAccountPage />} />
             <Route path="runs" element={<RunsPage />} />
@@ -146,15 +150,7 @@ export default function App() {
             <Route path="issue" element={<IssuePage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="settings/uninstall" element={<UninstallPage />} />
-            <Route
-              path="*"
-              element={
-                <EmptyState
-                  title="Page not found"
-                  hint="That address doesn't exist. Use the navigation on the left."
-                />
-              }
-            />
+            <Route path="*" element={<NotFoundPage />} />
           </Route>
         </Routes>
       </BrowserRouter>

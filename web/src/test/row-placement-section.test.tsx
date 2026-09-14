@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RowPlacementSection } from "@/components/settings/row-placement-section";
+import { DOCS_SHELF_CONTENTION_URL } from "@/lib/support";
 import type { Settings } from "@/lib/types";
 
 const { putSettings, getLibraries, getLibraryCollections } = vi.hoisted(() => ({
@@ -40,107 +41,61 @@ describe("RowPlacementSection", () => {
       { key: "2", title: "TV Shows", type: "show" },
     ]);
     getLibraryCollections.mockResolvedValue([
-      { title: "New Series (Unwatched)" },
-      { title: "Trending" },
+      { title: "New Series (Unwatched)", on_shelf: true },
+      { title: "Trending", on_shelf: true },
+      { title: "Archive 2019", on_shelf: false },
     ]);
   });
 
-  it("anchors a library's rows after a chosen collection and saves the mapping", async () => {
+  it("saves only the master switch — placement itself lives on the row", async () => {
     renderSection();
-    expect(await screen.findByText("TV Shows")).toBeTruthy();
 
-    // Choose "after a collection", then pick one from the live dropdown.
-    await userEvent.selectOptions(
-      screen.getByLabelText("Place Shortlist rows"),
-      "after",
-    );
-    const anchor = await screen.findByLabelText("Collection");
-    await userEvent.selectOptions(anchor, "New Series (Unwatched)");
-
-    await waitFor(() =>
-      expect(putSettings.mock.calls.at(-1)?.[0]).toEqual({
-        "rows.hub_anchor": {
-          "2": { anchor: "New Series (Unwatched)", before: false },
-        },
-        "rows.manage_shelf_order": true,
-      }),
-    );
-  });
-
-  it("does not persist a library whose mode is set but no collection is chosen yet", async () => {
-    renderSection();
-    await screen.findByText("TV Shows");
-    await userEvent.selectOptions(
-      screen.getByLabelText("Place Shortlist rows"),
-      "after",
-    );
-
-    // The prompt shows, and nothing half-set reaches the backend.
-    expect(
-      await screen.findByText(/Pick a collection to anchor to/i),
-    ).toBeTruthy();
-    await waitFor(() => expect(putSettings).toHaveBeenCalled());
-    for (const [payload] of putSettings.mock.calls) {
-      expect(payload["rows.hub_anchor"]).toEqual({});
-    }
-  });
-
-  it("loads an existing anchor and lets it be cleared back to the Plex default", async () => {
-    renderSection({
-      "rows.hub_anchor": { "2": { anchor: "Trending", before: true } },
-    });
-    await screen.findByText("TV Shows");
-    // Mode reflects the saved 'before' anchor.
-    expect(screen.getByLabelText("Place Shortlist rows")).toHaveValue("before");
-
-    await userEvent.selectOptions(
-      screen.getByLabelText("Place Shortlist rows"),
-      "default",
-    );
-    await waitFor(() =>
-      expect(putSettings.mock.calls.at(-1)?.[0]).toEqual({
-        "rows.hub_anchor": {},
-        "rows.manage_shelf_order": true,
-      }),
-    );
-  });
-
-  it("hides the per-library controls and skips ordering when the master toggle is off", async () => {
-    renderSection({ "rows.manage_shelf_order": false });
     await userEvent.click(
-      screen.getByLabelText(/Let Shortlist order the Recommended shelf/i),
+      screen.getByLabelText("Let Shortlist order the Recommended shelf"),
     );
-    // Toggling on reveals the library controls; toggling off hides them.
-    expect(await screen.findByText("TV Shows")).toBeTruthy();
-    await userEvent.click(
-      screen.getByLabelText(/Let Shortlist order the Recommended shelf/i),
-    );
-    expect(screen.queryByText("TV Shows")).toBeNull();
-    expect(screen.getByText(/Shelf ordering is off/i)).toBeTruthy();
-    // The off state must actually persist, not just hide the controls.
+
     await waitFor(() =>
-      expect(putSettings.mock.calls.at(-1)?.[0]).toMatchObject({
+      expect(putSettings).toHaveBeenCalledWith({
         "rows.manage_shelf_order": false,
       }),
     );
+    // `rows.hub_anchor` is NOT written from here any more. It was a second source of truth for the
+    // same decision and contradicted the engine: its "Wherever Plex puts them" wrote no entry, and
+    // with no library configured the engine read that as "top of the shelf".
+    expect(putSettings.mock.calls.every(([v]) => !("rows.hub_anchor" in v))).toBe(true);
   });
 
-  it("names the maintained Agregarr fork even with shelf ordering switched off", async () => {
-    // This is the ONLY place a "Wherever Plex puts them" owner sees it. The shelf-contention
-    // notification carries the same advice, but that notification only fires while Shortlist is
-    // ordering the shelf — and switching that off is the fix it recommends. Owners who take that
-    // advice would otherwise never be told the version they run re-promotes rows onto their own
-    // Home, which no share filter can cover.
+  it("offers no per-library controls at all", async () => {
+    renderSection();
+    await screen.findByText("Row placement");
+
+    expect(screen.queryByLabelText("Place Shortlist rows")).toBeNull();
+    expect(screen.queryByText("TV Shows")).toBeNull();
+  });
+
+  it("points at the row editor for where a row actually goes", async () => {
+    renderSection({ "rows.manage_shelf_order": true });
+
+    expect(await screen.findByText(/Where it sits/)).toBeTruthy();
+  });
+
+  it("says what happens when ordering is off — new rows land at the end of the shelf", async () => {
     renderSection({ "rows.manage_shelf_order": false });
 
-    const text = (await screen.findByText(/no longer actively released/i))
-      .textContent;
-    expect(text).toMatch(/re-promotes collections/i);
-    // The claim must stay hedged: converge clears the flag every run, so this is a gap between
-    // runs, not a standing leak. Overstating it in copy we ship is what the review caught.
-    expect(text).toMatch(/gap between runs/i);
+    const note = await screen.findByText(/Shelf ordering is off/);
+    expect(note.textContent).toMatch(/end of the shelf/);
+  });
+
+  it("keeps the Agregarr warning and its link", async () => {
+    renderSection();
+
+    // The warning that matters and is not in the guides: an unmaintained Agregarr re-promotes
+    // collections with Plex's defaults, putting other people's rows on the OWNER's own Home.
     expect(
-      screen.getByRole("link", { name: /bitr8\/agregarr-dev/i }),
-    ).toHaveAttribute("href", "https://github.com/bitr8/agregarr-dev");
+      await screen.findByText(/can put other people’s rows on/),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("link", { name: /How to run one alongside Shortlist/ }),
+    ).toHaveAttribute("href", DOCS_SHELF_CONTENTION_URL);
   });
 });

@@ -5,7 +5,147 @@ Findings from the nine-reviewer pre-`beta.8` sweep (July 2026). **Everything is 
 history for 2026-07-31.
 
 Kept as the record of what was fixed, so a future reviewer who rediscovers one of these checks the
-history before "fixing" it again. Nothing here is outstanding.
+history before "fixing" it again. Everything from that sweep is closed; the OPEN section immediately
+below is later work.
+
+---
+
+## OPEN — v1.9.0 release review, three LOW (2026-09-14)
+
+The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. Deferred, none a leak:
+
+1. **Stale comment.** `shortlist/server/api/collections.py:1678` says the visibility handler compares
+   placements "against the state it last applied"; 0089 dropped `shown_state` and it recomputes.
+2. **`user.restore` omits `skip_unmatched`.** `shortlist/server/services/jobs.py:1505`. Un-pausing
+   someone on a row's scheduled day off, when one of their `{top_seed}` rows has neither a ledger key
+   nor a last-run title, puts that row back on their own Home until the next midnight pass. Other
+   accounts' excludes still hide it. Fix: pass `skip_unmatched` the way `_promote_phase` does.
+3. **0088's downgrade leaves `collections.shown_state`** after 0089's downgrade re-creates it. Nullable
+   and unread. Both migrations are frozen (`frozen_migrations.txt`), so any fix is a new migration or
+   nothing.
+
+---
+
+## CLOSED — a person's first row was in the Collections tab until the merge (2026-09-13)
+
+Found auditing #119. A person with no row yet has no `label!=shortlist_<slug>` in anyone's share
+filter until a merge writes one, and the merge ran after EVERY person's delivery — about an hour on
+SFLIX, longer on a refresh night now that rows update in place.
+
+**Measured, read-only, as a shared account** (`tests/fixtures/pms_collections_tab_filter_visibility.json`):
+collection mode "hide" does not cover the Collections tab or collection search — the public shared rows,
+mode 0 and excluded by nobody, were listed 2 of 2 — while every row the account's filter excluded was
+absent, 0 of 180. So the gap was real: title and contents, for every shared account, for the rest of
+delivery.
+
+**Fixed:** when a person whose slug was not in the run-start `stored_labels` gets a stored label,
+`delivery.deliver_rows` calls `_exclude_first_rows` (via `rows._deliver_row`) as soon as that library's write
+returns — created, labelled, browse-hidden and postered — inside the same hold of the write lock, so no other
+collection is written in between, at any concurrency, not even the row's next library — merging excludes
+into every other account
+(additive only: no enumeration, no departure evidence, so nothing is removed but a person's own label from
+their own filter). A delivery that raises in a later library has already triggered it. The first plex.tv failure that is not a per-account 422 stops early merges for
+the rest of the run, since each failing write backs off for a minute or more while every delivery waits on
+the lock. The end-of-run `_privacy_sync_phase` still runs, reads every filter fresh — which catches an early
+write plex.tv did not keep, and confirms or withdraws any #116 "restriction working again" notice the early
+merge recorded — and still gates promotion. Cost: one merge per new person; on a first rollout, where
+everyone is new, about (people × accounts) plex.tv writes instead of one round.
+
+The early hide from browse at creation (`PlexClient.hide_from_browse`) stays, for library browse.
+
+**Not covered, deliberately (architecture review 2026-09-13):** "already on the server" is taken as
+"already excluded", which is not proof. Three cases fall outside the fix; the first two are older than #119:
+1. An account newly shared with the server sees every row until the next merge — the end of the next run
+   or the daily privacy sync (05:15). A merge before delivery would narrow that to the start of the next
+   run, at one extra plex.tv roster read per run; not done, since the daily sync is the gap that matters.
+2. A run killed (a `dev` redeploy recreates the container) between someone's first row being created and
+   their `_exclude_first_rows` leaves that row unexcluded until the next merge, because the next run treats
+   the person as existing. The window is that person's own delivery: minutes for a multi-library person.
+3. The early writes are audited only when the run finishes: `report.filter_writes` becomes `run.privacy_sync`
+   events in `_persist_report`. A run that crashes or is redeployed after an early merge leaves filter writes
+   with no events row, and the next run finds those filters already right and audits nothing. The end-of-run
+   writes always had this gap, for the short phases after the merge; it now spans delivery. Accepted: every
+   early write only narrows what an account can see. The fix, if wanted, is a live `ctx.on_filter_write` hook
+   like `ctx.on_user_done`.
+
+---
+
+## OPEN — every pick vanishing before a create fails the person (2026-09-13)
+
+Found auditing #119, LOW, pre-existing. **Never observed on SFLIX:** 0 in 7 days of logs, and 0 vanished
+picks in run history back to 2026-07-24 (checked 2026-09-13). Leave it unless it is ever seen. If every pick for a library is deleted from Plex in the seconds
+between curation and `_create_labelled_collection`'s `fetch_items`, `create_collection(section, title,
+[])` reaches plexapi's `Collection._create`, which raises `BadRequest('Must include items…')` before
+any request. It is not transient, so the person's delivery fails that night and heals the next.
+
+A fix was tried and reverted in the same session: returning "nothing created" made the
+refuses-every-add repair delete the broken row, create nothing, and report success with a ledger entry
+still naming the deleted ratingKey, and made the run page show a row that was never created. A correct
+fix has to resolve the picks BEFORE the repair's delete, and keep the breakdown out of the run record.
+
+---
+
+## OPEN — issue #108 watch-status follow-ups (2026-09-02)
+
+Six commits landed for #108 (`dd2614a`, `a829724`, `1c61a9c`, `ac0a165`, `545a340`, `83cf07a`), and
+the reporter then tested all nine watch-status paths against `2bf1d90`. **Six pass**: mark a show
+watched, unmark it, mark a show that already had some episodes, mark an episode, unmark an episode,
+unmark a season. Three do not. None is a regression from those commits — 2 and 3 are deliberate
+trade-offs made in them, and 1 predates them.
+
+**1. A season marked watched on a NEVER-watched show does not appear.** The reporter's own
+characterisation: mark the whole show watched, unmark it, THEN mark a season, and it works — so Plex
+only propagates a season mark once some watch record already exists for that show. It could not be
+reproduced on the maintainer's server (a season mark there DID set the episodes and the show
+appeared, `The Night Agent`, verified 2026-09-02), so the behaviour differs by server or by how the
+show got into that state.
+
+The signal exists and is measured: `?type=3&unwatched=0` returned 1,045 seasons rolling up to 522
+shows, of which **52 are invisible to the show-level read**. Those season rows carry `viewCount` and
+`lastViewedAt` but NO `leafCount`/`viewedLeafCount`, so they say a season was watched and nothing
+about how much — the same shape as the show-level bug one level down. Every one on that server is old
+(2017–2024), so they are historical residue there rather than fresh marks.
+
+*Fix direction:* read `?type=3&unwatched=0`, roll up by `parentRatingKey`. **Open question first:**
+such a show has a watched season and zero watched episodes per Plex, so what does
+`viewed_leaf_count` become? Recording 0 makes it not count as watched anyway, which defeats the
+point. Needs a decision, not just code.
+
+**2. The "Finished" date does not move when a partly-watched show is marked fully watched.** CLOSED.
+Plex does not update a show's own `lastViewedAt` when its episodes are MARKED, so a series finished
+today still read as finished months ago. Not cosmetic: that date is the recency half of a seed's
+weight and halves every ~45 days, so a series marked watched today but dated two years ago never
+seeds — you finish a show and get nothing like it.
+
+The cost objection recorded here (an episode read for every library, every sync) was answered by
+detecting WHICH shows need it instead of reading for all of them: the cache already holds last
+night's `viewed_leaf_count`, and a count that went UP while the show's date stood still has exactly
+one cause. A quiet night makes no request at all; marking a few shows costs one small
+`/library/metadata/{key}/allLeaves` each, and past a dozen it falls back to the single library-wide
+read. Two traps found by probing the live server rather than reasoning: that endpoint SILENTLY
+IGNORES `unwatched=0`, and a part-watched episode carries a `lastViewedAt` with no `viewCount` —
+on the first real show tried, that abandoned episode's stamp was NEWER than the only episode
+actually watched. Both recorded in `pms_all_leaves.xml.txt`.
+
+**3. A pick stays "finished" on the dashboard after being unmarked in Plex.** CLOSED by `ea33454`.
+Withdrawal was gated on the `sync.watch_full_days` pass to protect against INCREMENTAL reads, which
+could not tell "they un-watched it" from "this pass did not look". Since #108 no read is
+incremental, so the gate bought nothing but the seven-day lag. Completeness is now a property of
+each person's own read (`UserProfile.history_complete`, stamped by `refresh_watched`) rather than a
+roster-wide claim — the Architecture Review on the first attempt found that a roster-wide `True`
+would erase credit for every pick in a library that failed to read, because `ShareTokenWatchSource.
+fetch` fail-softs past an unreadable section and returns a non-empty answer that looks complete.
+
+**Also outstanding, unrelated to the reporter:**
+
+* **The watch sync now takes ~87s** (was ~27s on the broken read). The cost is 141 serial PMS calls —
+  users x their libraries — not any single query. Two levers, neither tried: fetch the static half of
+  a library's metadata once instead of once per user, and run users in parallel (`run.concurrency`
+  already exists for other work).
+* ~~**`545a340` and `83cf07a` never had an Architecture Review.**~~ DONE — reviewed, no HIGH
+  findings; its five MED and four LOW are fixed in `5d75496`. Original note: both touch watch history —
+  `545a340` changes which rows are DELETED — which the risk list in `.claude/CLAUDE.md` says is not
+  optional. Do this before the next release tag.
 
 ---
 
@@ -139,7 +279,9 @@ One item described an "AI-from-library" source that has never existed (`sources.
    llm_web — and llm_web searches the WEB, not the library. Someone could hunt for a toggle that
    isn't there. Also "discovery engines" → "where this row looks for titles".
 5. **Settings paths that don't say what is there** (repeated): `row-editor.tsx:553,647,858-861`,
-   `row-shelf-placement.tsx:66` ("Use the default (Settings)"), `row-sources-field.tsx:143-145`.
+   `row-sources-field.tsx:143-145`. The `row-shelf-placement.tsx` case ("Use the default (Settings)")
+   is MOOT as of 2026-09-12 — the global per-library placement default was retired, so the control no
+   longer offers it and there is no Settings path left to name.
 6. **"MDBList" dropped in with no gloss** (`row-editor.tsx:816-817`) — IMDb/RT/Metacritic are
    recognisable, the service supplying them is not.
 7. **Trakt and Exa named with no context** (`sources.ts:39-40,46-48`); "Search backend below" is a
@@ -741,3 +883,25 @@ rows key correctly, so this decays to nothing on its own.
 
 What it means for anyone reading the dashboard in the meantime: shared-row watch counts start from
 the first run after the upgrade, not from the row's whole history.
+
+## FIXED 2026-09-13: last-run titles matched in every library on an on-demand removal
+
+Found by the Architecture Review of the issue #121 fix. **Older than that fix; not a regression.**
+
+`collection_reconcile._walk_row_collections` unions `_delivered_titles_by_user` (the last run's
+recorded titles for this row) into `displays` and throws away the library each was recorded in. The
+#121 guard (`titles_other_rows_build`) renders other rows WITHOUT picks, so for a `{top_seed}` row it
+claims only its fallback name, never the "Because you watched X" it actually wore.
+
+Precondition: one person has two `{top_seed}` rows, one Movies-only and one TV-only, and on the last
+run both rendered the same title (both seeded by the same watch). Deleting, switching off or
+resetting the poster of the Movies row then matches the TV row's collection by that recorded title.
+The title-clash check never compared `{top_seed}` templates, so this pair was always allowable.
+
+*Fixed in the same change:* `collection_reconcile._claimed_titles` adds, for every OTHER `{top_seed}`
+row this person is in the audience of, the `(library_key, title)` pairs the delivery ledger last
+recorded for it — per row, so it does not depend on which row the latest run happened to build. A
+claim only ever blocks a title match; it never selects a collection. Static rows are left out because
+a rename writes no ledger entry, so their recorded title can go stale. Pinned by
+`test_collection_reconcile.py::TestATitleAnotherRowBuildsUnderIsNeverThisRows::
+test_what_another_top_seed_row_was_delivered_as_is_claimed_in_that_library`.

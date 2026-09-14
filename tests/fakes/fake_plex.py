@@ -16,8 +16,14 @@ Fidelity notes (mirrors of real-Plex behavior the engine depends on):
 
 from __future__ import annotations
 
+import base64
+import io
+import os
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -53,6 +59,41 @@ class FakeMovie:
     grandparent_rating_key: int | None = None
     parent_index: int = 0  # season number
     index: int = 0  # episode number within the season
+    #: What a share filter reads off an item. Empty by default, which every existing test assumes: no
+    #: rating and no labels, so only an allow list can hide the item.
+    content_rating: str = ""
+    labels: list[str] = field(default_factory=list)
+
+
+def share_filter_admits(raw: str, labels, content_rating: str) -> bool:
+    """Whether a share filter lets an account see a thing with these labels and this content rating.
+
+    Grouped the way a real PMS was measured to (`pms_share_filter_allow_lists.json`): `&`-separated
+    groups of `|`-separated alternatives, `(A|B)&C`. `|` binds tighter — `contentRating=XYZNOPE&
+    label=recommended|contentRating=G` showed nothing, where left-to-right would have shown every G
+    movie. A field the thing has no value for fails `=` and passes `!=`, which is why an unrated
+    collection passes `contentRating!=R` (#116). A literal `&` inside a label raises here; a real PMS
+    answers that account's Home with a 500.
+    """
+    if not raw:
+        return True
+    have = {
+        "label": {unquote(label).casefold() for label in labels},
+        "contentRating": {content_rating.casefold()} if content_rating else set(),
+    }
+    for group in raw.split("&"):
+        alternatives = []
+        for condition in group.split("|"):
+            match = re.match(r"^([A-Za-z]+)(!=|=)(.*)$", condition)
+            if match is None:
+                raise ValueError(f"fake PMS cannot read share filter condition {condition!r}")
+            field_name, op, rest = match.groups()
+            values = {unquote(v).casefold() for v in re.split(r"%2C|%2c|,", rest) if v}
+            hit = bool(have.get(field_name, set()) & values)
+            alternatives.append(hit if op == "=" else not hit)
+        if not any(alternatives):
+            return False
+    return True
 
 
 @dataclass
@@ -96,6 +137,39 @@ class FakeCollection:
     promoted_recommended: bool = False
     promoted_own_home: bool = False
     promoted_shared_home: bool = False
+    summary: str = ""
+    summary_locked: bool = False
+    # None -> derived from the title at creation, as Plex does. See `plex_sort_title` and
+    # tests/fixtures/pms_collection_field_edits.json for how each edit moves it.
+    title_sort: str | None = None
+    title_sort_locked: bool = False
+    #: The name of the `tags` row holding this collection's membership. Plex renames that row in place,
+    #: so a same-named twin in another library, which shares it, keeps its title while its tag moves.
+    #: None until the fake first writes it: a collection seeded straight into state is tagged as titled.
+    tag: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.title_sort is None:
+            self.title_sort = plex_sort_title(self.title)
+
+
+def tag_name(title: str) -> str:
+    """How Plex's `tags.tag` column compares names: `COLLATE NOCASE`, which folds ASCII letters only."""
+    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in title)
+
+
+def collection_tag(collection: FakeCollection) -> str:
+    return collection.tag if collection.tag is not None else tag_name(collection.title)
+
+
+RENAME_CONFLICT_BODY = "<html><head><title>Conflict</title></head><body><h1>409 Conflict</h1></body></html>"
+
+
+def plex_sort_title(title: str) -> str:
+    """The sort title a real PMS derives from a collection title: leading symbols dropped, the space
+    after them kept (`✨ Movies Picked for You` -> ` Movies Picked for You`). Measured, not a spec —
+    only the leading-emoji case is recorded (pms_collection_field_edits.json, pms_collections_listing.json)."""
+    return re.sub(r"^[^\w\s]+", "", title)
 
 
 @dataclass
@@ -110,6 +184,9 @@ class FakeUser:
     protected: bool = False
     uuid: str = ""
     filters: dict[str, str] = field(default_factory=lambda: dict.fromkeys(FILTER_FIELDS, ""))
+    #: Library keys this account is shared. None = every library, which every existing test assumes. A
+    #: library it is not shared reads like a filtered one (`pms_share_filter_allow_lists.json`).
+    shared_sections: set[int] | None = None
 
     def __post_init__(self) -> None:
         # DERIVED, not a free field: plex.tv reports `restricted="1"` for EVERY Plex Home account,
@@ -133,7 +210,10 @@ class FakePlexState:
     """Shared in-memory truth for both fake servers; tests assert on it directly."""
 
     machine_id: str = "fake-machine-1"
-    friendly_name: str = "FakePlex"
+    #: What the wizard screenshots show as the server's name, so it has to read like a name somebody
+    #: would actually give their server. It was "FakePlex", which told every visitor to the docs site
+    #: that the picture was staged — on the one screen whose job is "this is what setup looks like".
+    friendly_name: str = "Home Server"
     version: str = "1.43.3.10793"
     owner_token: str = "owner-token"
     owner_account_id: int = 555000001  # the owner's plex.tv id
@@ -145,6 +225,17 @@ class FakePlexState:
     pms_url: str = "http://127.0.0.1:32400"  # set by the harness once the fake PMS has a port
     sections: dict[int, FakeSection] = field(default_factory=_default_sections)
     collections: dict[int, FakeCollection] = field(default_factory=dict)
+    #: Names a deleted collection left behind in Plex's `tags` table. Nothing removes them, a rename
+    #: onto one is refused, and a create with one takes it over (pms_collection_title_tags.json).
+    orphaned_titles: set[str] = field(default_factory=set)
+    #: Managed-hub order per section — identifiers, Plex's own hubs and our collections in ONE list,
+    #: because that is what `GET /hubs/sections/{id}/manage` returns and what `.../move` reorders.
+    #: Shelf order used to be modelled as the insertion order of `collections`, which meant a
+    #: built-in could not be moved or moved past, so the shipped default placement (a row above
+    #: `movie.recentlyadded`) was unrealisable and the engine burned its retries against it.
+    #: Populated lazily by `_shelf`, which appends collections it has not seen — new hubs go to the
+    #: BOTTOM, as on a real server.
+    hub_order: dict[int, list[str]] = field(default_factory=dict)
     users: dict[int, FakeUser] = field(default_factory=dict)  # owner is NOT in this dict
     history: list[FakeHistoryEntry] = field(default_factory=list)
     #: Per-account LEAF watch state — `{account_id: {rating_key: [view_count, view_offset_ms]}}`.
@@ -392,6 +483,22 @@ class FakePlexState:
         plays = sum(1 for h in self.history if h.account_id == account_id and h.rating_key == rating_key)
         return plays, 0
 
+    #: Show keys a real PMS would OMIT from `?type=2&unwatched=0` despite their episodes being
+    #: watched — the issue #108 shape. Marking a series or a season watched sets the episodes without
+    #: establishing the show-level watch-state row the query filters on, and 20 of 491 shows on a real
+    #: server were in exactly this state. Without it the fake answers the show-level read from the
+    #: same set as the episode read, the two can never disagree, and the whole recovery path is dead
+    #: code in every full-stack test — the "fake must be no easier than the real server" rule.
+    invisible_to_show_read: set[int] = field(default_factory=set)
+
+    #: Show ratingKeys the show read RETURNS but with **no** `lastViewedAt` — the mark-as-watched
+    #: shape. A real PMS sets the show's own watch-state row only when the show itself was played;
+    #: marking a series or a season leaves `viewedLeafCount` correct and the date absent, and 19 of
+    #: 492 shows on a real server were in exactly this state. Without it `_movie_xml` dates every
+    #: watched show, no show is ever undated, and `_dates_from_episodes` — the whole reason the
+    #: episode roll-up exists — is dead code in every full-stack test.
+    undated_in_show_read: set[int] = field(default_factory=set)
+
     def watched_now(self, account_id: int) -> set[int]:
         """Every key this account currently counts as watched, from BOTH sources.
 
@@ -403,19 +510,123 @@ class FakePlexState:
         keys |= {k for k, v in self.leaf_state.get(account_id, {}).items() if v[0] > 0}
         return {k for k in keys if self.leaf_view(account_id, k)[0] > 0}
 
-    @staticmethod
-    def excluded_labels(user: FakeUser) -> set[str]:
-        """Lowercased ``label!=`` values across the user's movie/TV share filters."""
-        excludes: set[str] = set()
-        for fieldname in ("filterMovies", "filterTelevision"):
-            for condition in (user.filters.get(fieldname) or "").split("|"):
-                if condition.startswith("label!="):
-                    excludes.update(v.lower() for v in condition.removeprefix("label!=").split(",") if v)
-        return excludes
+    def sees(self, user: FakeUser | None, collection: FakeCollection) -> bool:
+        """Whether a real PMS would show this account `collection`, given its share filter.
+
+        `filterMovies` applies to movie libraries and `filterTelevision` to TV. The owner (`None`) has
+        no filter, and an off-type collection is matched by neither (see `filterable`). A collection
+        carries labels and no content rating — see `share_filter_admits` for how the filter is read.
+        """
+        if user is None or not self.filterable(collection):
+            return True
+        fieldname = "filterMovies" if self.section_type(collection.section_id) == "movie" else "filterTelevision"
+        return share_filter_admits(user.filters.get(fieldname) or "", collection.labels, "")
+
+    def admits_item(self, user: FakeUser | None, item: FakeMovie) -> bool:
+        """Whether this account's share filter lets it see one library item (recorded: a batch read AS a
+        restricted account leaves out what its filter hides)."""
+        if user is None:
+            return True
+        section = self.section_of(item.rating_key)
+        if section is not None and user.shared_sections is not None and section.key not in user.shared_sections:
+            return False
+        kind = section.type if section else ("movie" if item.media_type == "movie" else "show")
+        fieldname = "filterMovies" if kind == "movie" else "filterTelevision"
+        return share_filter_admits(user.filters.get(fieldname) or "", item.labels, item.content_rating)
+
+
+#: The demo library the docs screenshots are taken against. Real titles, because every one of
+#: them sits beside its own poster in a published image, and a placeholder name under real cover
+#: art reads as a mock-up — the owner's verdict on the drawn version was "it looks a bit odd".
+#:
+#: The ARTWORK is not in this repo. `scripts/fetch_demo_posters.py` downloads it from TMDB into
+#: `tests/e2e/assets/posters/` (gitignored) and `_fake_poster` serves it when present, falling
+#: back to a drawn placeholder — so an ordinary test run still needs no network and no key. Only
+#: the finished screenshots are committed, which is the posture the hero image already has.
+#:
+#: Index order is load-bearing: item N keeps rating_key 100+N (movies) or 300+N (shows), so every
+#: fixture, seeded watch and recorded expectation that addresses an item by KEY is untouched by
+#: what it is called. Tests that need a name should ask `movie_title()` / `show_title()` rather
+#: than hardcoding one.
+DEMO_MOVIES: tuple[tuple[str, int], ...] = (
+    ("The Shawshank Redemption", 1994),
+    ("The Godfather", 1972),
+    ("The Dark Knight", 2008),
+    ("Pulp Fiction", 1994),
+    ("Inception", 2010),
+    ("Interstellar", 2014),
+    ("The Matrix", 1999),
+    ("GoodFellas", 1990),
+    ("Se7en", 1995),
+    ("Fight Club", 1999),
+    ("Forrest Gump", 1994),
+    ("Gladiator", 2000),
+    ("The Departed", 2006),
+    ("Whiplash", 2014),
+    ("Parasite", 2019),
+    ("Mad Max: Fury Road", 2015),
+    ("Blade Runner 2049", 2017),
+    ("Arrival", 2016),
+    ("Dune", 2021),
+    ("Heat", 1995),
+    ("No Country for Old Men", 2007),
+    ("There Will Be Blood", 2007),
+    ("The Prestige", 2006),
+    ("Casino Royale", 2006),
+    ("Sicario", 2015),
+    ("Prisoners", 2013),
+    ("Nightcrawler", 2014),
+    ("Ex Machina", 2015),
+    ("Her", 2013),
+    ("Drive", 2011),
+)
+
+DEMO_SHOWS: tuple[tuple[str, int], ...] = (
+    ("Breaking Bad", 2008),
+    ("The Sopranos", 1999),
+    ("The Wire", 2002),
+    ("Chernobyl", 2019),
+    ("Band of Brothers", 2001),
+    ("True Detective", 2014),
+    ("Better Call Saul", 2015),
+    ("Succession", 2018),
+    ("Severance", 2022),
+    ("The Bear", 2022),
+    ("Fargo", 2014),
+    ("MINDHUNTER", 2017),
+    ("Dark Matter", 2024),
+    ("Stranger Things", 2016),
+    ("The Last of Us", 2023),
+    ("Andor", 2022),
+    ("The Expanse", 2015),
+    ("Peaky Blinders", 2013),
+    ("Sherlock", 2010),
+    ("Black Mirror", 2011),
+    ("Ted Lasso", 2020),
+    ("The Crown", 2016),
+    ("Ozark", 2017),
+    ("Narcos", 2015),
+    ("Westworld", 2016),
+    ("House of the Dragon", 2022),
+    ("Yellowstone", 2018),
+    ("Slow Horses", 2022),
+    ("Shōgun", 2024),
+    ("The Boys", 2019),
+)
+
+
+def movie_title(index: int) -> str:
+    """The demo library's Nth film, 1-based — the title on rating_key ``100 + index``."""
+    return DEMO_MOVIES[index - 1][0]
+
+
+def show_title(index: int) -> str:
+    """The demo library's Nth show, 1-based — the title on rating_key ``300 + index``."""
+    return DEMO_SHOWS[index - 1][0]
 
 
 def seed_state() -> FakePlexState:
-    """Two libraries (30 movies, 30 shows), 3 users (one Home canary without a PIN), history.
+    """Two libraries (30 movies, 30 shows), 3 users (one Home user without a PIN), history.
 
     The TV library is not decoration: a server with only movies cannot exhibit the class of bug
     where a show is delivered into a movie collection, so every test would pass while the real
@@ -424,10 +635,11 @@ def seed_state() -> FakePlexState:
     state = FakePlexState()
     base_added = 1_700_000_000
     for i in range(1, 31):
+        title, year = DEMO_MOVIES[i - 1]
         state.movies[100 + i] = FakeMovie(
             rating_key=100 + i,
-            title=f"Movie {i:02d}",
-            year=1990 + i,
+            title=title,
+            year=year,
             added_at=base_added + i * 86_400,
             tmdb_id=9000 + i,
             audience_rating=5.0 + (i * 7) % 40 / 10,
@@ -436,10 +648,11 @@ def seed_state() -> FakePlexState:
     # watched starves the candidate pool and makes row sizes a property of the fixture, not the
     # engine.
     for i in range(1, 31):
+        title, year = DEMO_SHOWS[i - 1]
         state.shows[300 + i] = FakeMovie(
             rating_key=300 + i,
-            title=f"Show {i:02d}",
-            year=2000 + i,
+            title=title,
+            year=year,
             added_at=base_added + i * 86_400,
             tmdb_id=7000 + i,
             audience_rating=5.0 + (i * 3) % 40 / 10,
@@ -448,7 +661,7 @@ def seed_state() -> FakePlexState:
         )
     state.users[201] = FakeUser(id=201, username="sarah")
     state.users[202] = FakeUser(id=202, username="mike")
-    state.users[203] = FakeUser(id=203, username="canary", home=True, uuid="uuid-203")
+    state.users[203] = FakeUser(id=203, username="jess", home=True, uuid="uuid-203")
     # A managed account with a parental preset. Plex refuses a label filter for one, so Shortlist
     # writes it no excludes — and this account can still SEE collections, which is the whole point:
     # `little_kid` sees none, `older_kid` sees them (measured on a real server, 2026-08-11, #76).
@@ -457,7 +670,7 @@ def seed_state() -> FakePlexState:
     state.users[204] = FakeUser(id=204, username="kid", home=True, uuid="uuid-204", restriction_profile="older_kid")
     base_viewed = 1_752_000_000
     # One run then covers the whole delivery matrix: sarah watches both types (two rows), mike
-    # watches only TV (one row, in the TV library), the canary has no history (cold start).
+    # watches only TV (one row, in the TV library), the jess has no history (cold start).
     watched = {
         201: list(range(101, 109)) + list(range(301, 305)),
         202: list(range(305, 313)),
@@ -469,6 +682,13 @@ def seed_state() -> FakePlexState:
         for offset, key in enumerate(keys):
             state.history.append(FakeHistoryEntry(account_id=account, rating_key=key, viewed_at=base_viewed + offset))
     return state
+
+
+#: A valid 1x1 PNG, for the artwork endpoint. Real bytes rather than a placeholder string so the
+#: proxy's content-type passthrough and the browser's `<img>` both behave as they would live.
+_PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
 
 
 def _xml(root: Element) -> Response:
@@ -534,12 +754,20 @@ def _movie_xml(parent: Element, state: FakePlexState, movie: FakeMovie, *, watch
         year=movie.year,
         addedAt=movie.added_at,
         audienceRating=movie.audience_rating,
+        # Artwork, in the shape a real PMS serves it — a server-relative path whose trailing segment
+        # is the artwork's own stamp (recorded: `pms_play_history.xml.txt`,
+        # `pms_collections_listing.json`). The poster proxy reads exactly this and builds its ETag
+        # from that stamp, so leaving it off would exercise only the "no artwork" branch.
+        thumb=f"/library/metadata/{movie.rating_key}/thumb/{movie.added_at}",
         # The library that actually holds it — never inferred from the type, or a second movie
         # library's items would all claim to live in the first one.
         librarySectionID=section.key if section else state.section_id,
     )
     if watched_by is not None:
-        element.set("lastViewedAt", str(state.last_viewed_at(watched_by, movie.rating_key)))
+        # Omitted for a show in `undated_in_show_read`: see the field. The episode read is then the
+        # only place its date exists, which is what the production date-repair path is built on.
+        if not (is_show and movie.rating_key in state.undated_in_show_read):
+            element.set("lastViewedAt", str(state.last_viewed_at(watched_by, movie.rating_key)))
         # Only for the account being read AS — the real PMS omits the attribute entirely for anyone
         # who hasn't rated it, which is what makes "never rated" distinguishable from a 0.
         rating = state.user_ratings.get((watched_by, movie.rating_key))
@@ -551,6 +779,13 @@ def _movie_xml(parent: Element, state: FakePlexState, movie: FakeMovie, *, watch
             # series IN PROGRESS, which is what `unwatched=0` mostly returns on a real server and the
             # only shape that tells `watched` and `finished` apart.
             viewed = state.partial_shows.get((watched_by, movie.rating_key), movie.leaf_count)
+            # `FakeMovie.leaf_count` defaults to 0, and the show read now filters on
+            # `viewedLeafCount != 0` — so a show seeded without an explicit leaf_count is invisible to
+            # it and the failure reads as a mystery. Loud here rather than puzzling three files away.
+            assert movie.leaf_count, (
+                f"show {movie.rating_key} ({movie.title!r}) was seeded with leaf_count=0, so it can "
+                "never appear in a watched read — give it a real episode count"
+            )
             element.set("viewedLeafCount", str(min(viewed, movie.leaf_count)))
             element.set("leafCount", str(movie.leaf_count))
         else:
@@ -579,6 +814,10 @@ def _collection_xml(
         type="collection",
         subtype=collection.subtype,
         title=collection.title,
+        titleSort=collection.title_sort,
+        # Always present in a real listing, empty or not (pms_collections_listing.json). Leaving it off
+        # would make plexapi re-read the collection behind `collection.summary`.
+        summary=collection.summary,
         smart="0",
         collectionMode=collection.mode,
         collectionSort=collection.sort,
@@ -591,6 +830,10 @@ def _collection_xml(
     if labels:
         for i, tag in enumerate(collection.labels, start=1):
             _el(directory, "Label", id=i, tag=tag)
+        # Lock state, like labels, is served only on the per-collection read (pms_collections_listing.json).
+        for name, locked in (("summary", collection.summary_locked), ("titleSort", collection.title_sort_locked)):
+            if locked:
+                _el(directory, "Field", locked="1", name=name)
     # plexapi's editAdvanced (modeUpdate/sortUpdate) reads these to validate enum values.
     preferences = SubElement(directory, "Preferences")
     for setting_id, default, value, enums in (
@@ -615,6 +858,35 @@ def _managed_hub_xml(parent: Element, section_id: int, collection: FakeCollectio
         promotedToSharedHome=int(collection.promoted_shared_home),
         homeVisibility="all" if collection.promoted_shared_home else "none",
         recommendationsVisibility="all" if collection.promoted_recommended else "none",
+    )
+
+
+#: Plex's OWN hubs, which `GET /hubs/sections/{id}/manage` returns alongside the collections —
+#: recorded in `tests/fixtures/pms_managed_hubs.xml.txt`. The fake served collections only, and their
+#: promotion flags are now load-bearing on both sides of the app: `can_anchor` refuses an anchor that
+#: is promoted nowhere, and the anchor picker greys the same ones out. With no built-in in the fake,
+#: no full-stack path ever saw one (testing rule: the fake must be no easier than the real server).
+#:
+#: One ON and one OFF, because the OFF case is the one that used to be silently unplaceable: a
+#: built-in the owner switched off in Manage Recommendations reads with all three flags at 0.
+_BUILTIN_HUBS = (
+    ("movie.recentlyadded", "Recently Added", True),
+    ("movie.genre", "By Genre", False),
+)
+
+
+def _builtin_hub_xml(parent: Element, identifier: str, title: str, promoted: bool) -> Element:
+    """A built-in hub as a real PMS serves it: no `deletable`, and all three flags always present."""
+    return _el(
+        parent,
+        "Hub",
+        identifier=identifier,
+        title=title,
+        promotedToRecommended=int(promoted),
+        promotedToOwnHome=0,
+        promotedToSharedHome=0,
+        homeVisibility="none",
+        recommendationsVisibility="all" if promoted else "none",
     )
 
 
@@ -658,6 +930,81 @@ def _sorted_items(items: list[FakeMovie], sort: str | None) -> list[FakeMovie]:
         return sorted(items, key=lambda m: m.rating_key)
     fieldname, _, direction = sort.split(",")[0].rsplit(".", 1)[-1].partition(":")  # 'movie.addedAt:asc' -> addedAt
     return sorted(items, key=_SORT_KEYS.get(fieldname, lambda m: m.rating_key), reverse=direction == "desc")
+
+
+def _poster_title_lines(draw, title: str, font, max_width: int) -> list[str]:
+    """Wrap a poster title to at most two lines, ellipsising the second — a title block has no third."""
+    lines = [""]
+    for word in title.split():
+        trial = f"{lines[-1]} {word}".strip()
+        if not lines[-1] or draw.textlength(trial, font=font) <= max_width:
+            lines[-1] = trial
+        elif len(lines) < 2:
+            lines.append(word)
+        else:
+            lines[-1] = f"{lines[-1]}\u2026"
+            break
+    return lines
+
+
+#: Where `scripts/fetch_demo_posters.py` puts real cover art. Gitignored and usually absent.
+_DEMO_POSTERS = Path(__file__).resolve().parents[1] / "e2e" / "assets" / "posters"
+#: Only a capture run draws on that art; every other run gets the drawn placeholder, so the
+#: bytes a test sees never depend on what somebody happened to download.
+_CAPTURING = bool(os.environ.get("SHOTS_DIR"))
+
+
+@lru_cache(maxsize=256)
+def _fake_poster(rating_key: int, title: str = "") -> bytes:
+    """A poster-SHAPED, per-title-COLOURED image carrying its own title, not a stretched single pixel.
+
+    The 1x1 placeholder below is right for asserting "artwork was served"; it is wrong for the
+    screenshots the docs site ships, where every pick rendered as the same flat green rectangle and
+    the pick list looked broken rather than illustrated. Since `.claude/rules/testing.md` says the
+    fake must be no EASIER than the real server, and a real PMS returns a distinct 2:3 image per
+    title with that title printed on it, this returns one too — at 400x600, because the docs site's
+    hero renders a poster around 360 device pixels wide and a 200px source upscales to mush.
+
+    Deterministic from the rating key and title, so a screenshot re-taken tomorrow is byte-identical
+    and does not churn the repo. Falls back to the flat pixel if Pillow is missing, so the fake never
+    becomes the reason a test cannot run.
+    """
+    # Real cover art, but ONLY while capturing the docs images — see `scripts/fetch_demo_posters.py`.
+    #
+    # Gated on SHOTS_DIR rather than on the file simply being there, which is how it was written
+    # first and was wrong: whether a developer had ever run the fetch script then decided what these
+    # bytes were, so `test_a_delivered_pick_serves_the_artwork_the_server_actually_holds` passed on
+    # CI and failed on the machine that had. A fixture must not depend on untracked local state.
+    if _CAPTURING and (real := _DEMO_POSTERS / f"{rating_key}.jpg").is_file():
+        return real.read_bytes()
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:  # pragma: no cover - Pillow ships in requirements.lock via the posters extra
+        return _PNG_1X1
+
+    width, height, band = 400, 600, 118
+    hue = (rating_key * 47) % 360  # spread neighbouring keys far apart so a list looks varied
+    image = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(image)
+    for y in range(height):
+        # Top-to-bottom darkening, which is what makes it read as artwork rather than a colour swatch.
+        lightness = 62 - int(38 * y / height)
+        draw.line([(0, y), (width, y)], fill=f"hsl({hue}, 45%, {lightness}%)")
+    # A darker band where a real poster carries its title block.
+    draw.rectangle([0, height - band, width, height], fill=f"hsl({hue}, 40%, 14%)")
+    if title:
+        # The same built-in face `poster_service` renders row posters with, so the fake needs no font
+        # file on disk and CI, the Mac and the image all produce identical bytes.
+        font = ImageFont.load_default(size=36)
+        lines = _poster_title_lines(draw, title, font, width - 40)
+        y = height - band + (band - len(lines) * 44) // 2
+        for line in lines:
+            draw.text(((width - draw.textlength(line, font=font)) / 2, y), line, font=font, fill=(238, 238, 242))
+            y += 44
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def make_fake_plex(state: FakePlexState) -> FastAPI:
@@ -736,9 +1083,19 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
         # The share-token watched read (ShareTokenWatchSource): `unwatched=0` filters to what the
         # REQUESTING account has watched, served AS them with their own per-user viewCount/leaf counts.
         # The token is in the X-Plex-Token header (includeToken=False keeps the owner's out of the URL).
-        if query.get("unwatched") == "0":
+        if query.get("unwatched") == "0" or query.get("viewedLeafCount!") is not None:
             account_id = state.watched_account_id(request.headers.get("X-Plex-Token", ""))
             watched = state.watched_now(account_id) if account_id is not None else set()
+            # The two queries DISAGREE, exactly as they do on a real server (issue #108).
+            # `unwatched=0` filters on the show's own watch-state row, which marking a series or a
+            # season never establishes — so a finished series is missing from it while its episode
+            # counts are correct. `viewedLeafCount!=0` filters on the counts and returns it.
+            #
+            # Modelled because otherwise both answer from the same set, they can never disagree, and
+            # the whole reason the read changed is unrepresentable here — the rule that a fake must
+            # be no easier than the real server.
+            if query.get("viewedLeafCount!") is None:
+                watched -= state.invisible_to_show_read
             listing = [item for item in _sorted_items(list(items.values()), None) if item.rating_key in watched]
             # The INCREMENTAL read asks for `sort=lastViewedAt:desc` and stops client-side at the
             # first title older than its cutoff. It deliberately does NOT send a `lastViewedAt>=`
@@ -805,18 +1162,43 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
 
     @app.put("/library/sections/{section_id}/all")
     def section_edit(section_id: int, request: Request) -> Response:
-        """plexapi's tag/field edit endpoint (addLabel, editTitle): type=18&id=...&label[0].tag.tag=..."""
+        """plexapi's tag/field edit endpoint (addLabel, editTitle, edit): type=18&id=...&label[0].tag.tag=..."""
         query = request.query_params
         labels = [value for key, value in query.multi_items() if _LABEL_PARAM.match(key)]
         for raw_id in (query.get("id") or "").split(","):
             collection = state.collections.get(int(raw_id)) if raw_id.isdigit() else None
             if collection is None:
                 continue
+            if query.get("title.value"):
+                # A title is a server-wide tag row: the rename is refused while any OTHER row carries the
+                # name, live in any library or orphaned by a delete (pms_collection_title_tags.json).
+                wanted, own = tag_name(query["title.value"]), collection_tag(collection)
+                taken = wanted in state.orphaned_titles or any(
+                    collection_tag(other) == wanted for other in state.collections.values()
+                )
+                if wanted != own and taken:
+                    return Response(RENAME_CONFLICT_BODY, status_code=409, media_type="text/html")
             if labels:
                 existing = {label.lower(): label for label in collection.labels}
                 collection.labels = [existing.get(v.lower(), state.store_label(v)) for v in labels]
+            if "summary.value" in query:
+                collection.summary = query["summary.value"]
+                collection.summary_locked = query.get("summary.locked") == "1"
+            # titleSort BEFORE title: a PUT that unlocks the sort title and sends a title gets the
+            # title's derived sort title, exactly as a real PMS does (pms_collection_field_edits.json).
+            if "titleSort.value" in query:
+                # A blank value is not stored blank: Plex rebuilds it from the FULL title, emoji kept.
+                collection.title_sort = query["titleSort.value"] or collection.title
+                collection.title_sort_locked = query.get("titleSort.locked") == "1"
             if query.get("title.value"):
+                # Renamed IN PLACE: every collection on the row moves with it, a twin's title does not.
+                own, wanted = collection_tag(collection), tag_name(query["title.value"])
+                for other in state.collections.values():
+                    if collection_tag(other) == own:
+                        other.tag = wanted
                 collection.title = query["title.value"]
+                if not collection.title_sort_locked:
+                    collection.title_sort = plex_sort_title(collection.title)
         return Response(status_code=200)
 
     @app.post("/library/collections")
@@ -837,6 +1219,8 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             # ends up holding a show-subtype collection that no share filter can touch.
             subtype=types.pop() if len(types) == 1 else "movie",
         )
+        # A create is never refused on its name: it takes over the tag row that name already has.
+        state.orphaned_titles.discard(collection_tag(collection))
         state.collections[collection.rating_key] = collection
         root = _container(size=1)
         _collection_xml(root, state, collection)
@@ -857,14 +1241,32 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
         return _xml(root)
 
     @app.get("/library/collections/{rating_key}/children")
-    @app.get("/library/metadata/{rating_key}/children")
     def collection_children(rating_key: int) -> Response:
+        # NOT filtered by the caller's share filter — recorded: a real PMS served every member of a row
+        # the account could not see on this path (`pms_share_filter_allow_lists.json`).
         collection = _collection(rating_key)
         members = state.members(collection)  # shared with any same-titled collection in this library
         root = _container(size=len(members), totalSize=len(members))
         for key in members:
             if (item := state.item(key)) is not None:
                 _movie_xml(root, state, item)
+        return _xml(root)
+
+    @app.get("/library/metadata/{rating_key}/children")
+    def metadata_children(rating_key: int, request: Request) -> Response:
+        # Filtered, like a real PMS: 404 for a row the account cannot see, else only the items it can.
+        user = state.user_for_token(request.headers.get("X-Plex-Token", ""))
+        collection = _collection(rating_key)
+        if not state.sees(user, collection):
+            raise HTTPException(status_code=404, detail=f"no collection {rating_key}")
+        members = [
+            item
+            for key in state.members(collection)
+            if (item := state.item(key)) is not None and state.admits_item(user, item)
+        ]
+        root = _container(size=len(members), totalSize=len(members))
+        for item in members:
+            _movie_xml(root, state, item)
         return _xml(root)
 
     @app.put("/library/collections/{rating_key}/items")
@@ -921,31 +1323,89 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             ):
                 other.item_keys = [k for k in other.item_keys if k not in collection.item_keys]
         del state.collections[rating_key]
+        # The tag row outlives its last collection: the name stays taken for renames, not for creates.
+        tag = collection_tag(collection)
+        if not any(collection_tag(other) == tag for other in state.collections.values()):
+            state.orphaned_titles.add(tag)
         return Response(status_code=200)
 
     @app.get("/library/metadata/{rating_keys}")
-    def metadata(rating_keys: str) -> Response:
+    def metadata(rating_keys: str, request: Request) -> Response:
+        # Read AS a shared account, the batch leaves out what its share filter hides, and 404s when that
+        # is everything — the same shape as a batch of deleted keys (`pms_share_filter_allow_lists.json`).
+        user = state.user_for_token(request.headers.get("X-Plex-Token", ""))
         root = _container(librarySectionID=state.section_id)
         found = 0
         for raw in rating_keys.split(","):
             key = int(raw)
             if (item := state.item(key)) is not None:
+                if not state.admits_item(user, item):
+                    continue
                 _movie_xml(root, state, item)
                 found += 1
             elif key in state.collections:
+                if not state.sees(user, state.collections[key]):
+                    continue
                 _collection_xml(root, state, state.collections[key])
                 found += 1
         if not found:
             raise HTTPException(status_code=404, detail=f"no items for {rating_keys}")
         root.set("size", str(found))
+        if "json" in request.headers.get("Accept", ""):
+            # A real PMS answers in JSON when asked (recorded: `pms_metadata_batch_partial.json`).
+            metadata = [dict(child.attrib) for child in root]
+            return JSONResponse({"MediaContainer": {"size": found, "Metadata": metadata}})
         return _xml(root)
+
+    @app.get("/library/metadata/{rating_key}/thumb/{stamp}")
+    def item_thumb(rating_key: int, stamp: str) -> Response:
+        """One item's artwork bytes.
+
+        Served ONLY behind the metadata read, exactly as a real PMS does: the caller has to learn the
+        path (stamp included) from `/library/metadata/{key}` first. Guessing it — or asking for an
+        item that is gone — is a 404, so the proxy's "missing item" branch is a real branch here and
+        not something only the mocks can reach.
+        """
+        item = state.item(rating_key)
+        if item is None or stamp != str(item.added_at):
+            raise HTTPException(status_code=404, detail=f"no artwork at {rating_key}/thumb/{stamp}")
+        # Sniffed, not assumed: a real PMS serves whatever the artwork happens to be, and while
+        # capturing this is a JPEG off TMDB rather than the drawn PNG.
+        art = _fake_poster(rating_key, item.title)
+        return Response(art, media_type="image/jpeg" if art[:2] == b"\xff\xd8" else "image/png")
+
+    def _shelf(section_id: int) -> list[str]:
+        """This section's managed-hub order, as one list of identifiers.
+
+        Self-maintaining: it starts as Plex's own hubs, and every collection the section has that is
+        not in it yet is APPENDED — which is exactly what a real PMS does with a newly created
+        collection, and the reason an unplaced row sinks out of sight. Collections that have gone are
+        dropped. Returned by reference so `move_hub` reorders the state.
+        """
+        order = state.hub_order.setdefault(section_id, [identifier for identifier, _t, _p in _BUILTIN_HUBS])
+        live = [
+            f"custom.collection.{section_id}.{c.rating_key}"
+            for c in state.collections.values()
+            if c.section_id == section_id
+        ]
+        order[:] = [i for i in order if not i.startswith("custom.collection.") or i in live]
+        order.extend(i for i in live if i not in order)
+        return order
 
     @app.get("/hubs/sections/{section_id}/manage")
     def manage_hubs(section_id: int, request: Request) -> Response:
         wanted = request.query_params.get("metadataItemId")
         root = _container()
-        for collection in state.collections.values():
-            if collection.section_id != section_id:
+        builtins = dict((identifier, (title, promoted)) for identifier, title, promoted in _BUILTIN_HUBS)
+        for identifier in _shelf(section_id):
+            if identifier in builtins:
+                # A single-hub lookup asks about one COLLECTION, so Plex's own hubs are not in it.
+                if wanted is None:
+                    title, promoted = builtins[identifier]
+                    _builtin_hub_xml(root, identifier, title, promoted)
+                continue
+            collection = state.collections.get(int(identifier.rsplit(".", 1)[-1]))
+            if collection is None:
                 continue
             if wanted is not None and collection.rating_key != int(wanted):
                 continue
@@ -967,24 +1427,23 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
     @app.put("/hubs/sections/{section_id}/manage/{identifier}/move")
     def move_hub(section_id: int, identifier: str, request: Request) -> Response:
         # after=None (no query) -> pinned to the top of the Managed Recommendations shelf.
-        key = int(identifier.rsplit(".", 1)[-1])
         after = request.query_params.get("after")
         # And REALLY reorder. `manage_hubs` serves `state.collections` in insertion order, so this
         # used to answer 200 while the shelf never moved — which is precisely the misbehaviour a real
-        # PMS was caught in (2026-08-12), and which `order_owned_hubs` now retries and reports as
+        # PMS was caught in (2026-08-12), and which `place_rows` now retries and reports as
         # unverified. A fake that behaves like the bug makes every shelf-order assertion vacuous and
         # would have had e2e re-issuing moves three times and finishing on a warning. Testing rule:
         # the fake must be no easier than the real server.
-        order = [k for k in state.collections if k != key]
+        order = _shelf(section_id)
+        if identifier not in order:
+            return Response(status_code=404)
+        order.remove(identifier)
         if after is None:
-            index = 0
+            order.insert(0, identifier)
+        elif after in order:
+            order.insert(order.index(after) + 1, identifier)
         else:
-            after_key = int(after.rsplit(".", 1)[-1])
-            index = order.index(after_key) + 1 if after_key in order else len(order)
-        order.insert(index, key)
-        reordered = {k: state.collections[k] for k in order}
-        state.collections.clear()
-        state.collections.update(reordered)
+            order.append(identifier)
         return Response(status_code=200)
 
     @app.put("/hubs/sections/{section_id}/manage/{identifier}")
@@ -999,7 +1458,6 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
         user = state.user_for_token(token)
         if user is None and token != state.owner_token:
             return JSONResponse({"errors": [{"code": 1001, "message": "Unauthorized"}]}, status_code=401)
-        excludes = state.excluded_labels(user) if user else set()
         hub_list: list[dict] = [
             {"key": "/hubs/home/continueWatching", "title": "Continue Watching", "type": "mixed", "promoted": True}
         ]
@@ -1011,10 +1469,7 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             promoted = collection.promoted_own_home if user is None else collection.promoted_shared_home
             if not promoted:
                 continue
-            excluded = bool({label.lower() for label in collection.labels} & excludes)
-            # An exclude only takes effect if the PMS can actually match this collection with a
-            # library filter. Off-type collections are unfilterable and stay visible — the leak.
-            if excluded and state.filterable(collection):
+            if not state.sees(user, collection):
                 continue
             children_key = f"/library/collections/{collection.rating_key}/children"
             hub_list.append(
@@ -1106,7 +1561,14 @@ def make_fake_plextv(state: FakePlexState) -> FastAPI:
                 protected=int(user.protected),
                 **user.filters,
             )
-            _el(user_el, "Server", id=user.id, serverId="1", machineIdentifier=state.machine_id, name="FakePlex")
+            _el(
+                user_el,
+                "Server",
+                id=user.id,
+                serverId="1",
+                machineIdentifier=state.machine_id,
+                name=state.friendly_name,
+            )
         return _xml(root)
 
     @app.get("/api/servers/{machine_id}/shared_servers")

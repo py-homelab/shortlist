@@ -7,6 +7,7 @@ APP_BASE_PATH) stay live and are never persisted.
 
 from __future__ import annotations
 
+import base64
 from typing import Any
 
 from loguru import logger
@@ -17,6 +18,11 @@ from shortlist.server.scheduler import DEFAULT_CRONS as _DEFAULT_CRONS
 
 DEFAULTS: dict[str, Any] = {
     "plex.url": "",
+    # Seconds between the two independent "is this row really unlabelled?" reads the sweep takes
+    # before DELETING an orphan — the engine's one irreversible write. 30s is long enough to outlast
+    # the transient miss this guards against (a PMS mid library-index rebuild) and costs nothing on a
+    # healthy server, where no row ever reaches the second read. 0 restores back-to-back confirms.
+    "plex.orphan_confirm_delay_s": 30.0,
     "tautulli.url": "",
     "tmdb.apikey": "",
     "curator.provider": "none",
@@ -31,6 +37,16 @@ DEFAULTS: dict[str, Any] = {
     # gated so it can never balloon a library — a title must clear BOTH thresholds, and only the
     # top N per run are ever requested. API keys live in SECRET_KEYS below (encrypted at rest).
     "requests.enabled": False,
+    # WHERE a request is filed. "arr" posts to Radarr/Sonarr directly (the original route, and still
+    # the default so no existing install changes behaviour). "overseerr" hands the title to
+    # Overseerr/Jellyseerr and lets IT drive the download apps — its quality profile, its root
+    # folder, its approval. The two are exclusive; see `_build_requests`.
+    "requests.target": "arr",
+    "requests.overseerr.url": "",
+    # Which Overseerr account the request is filed as. 0 = the API key's own (admin) account, which
+    # normally auto-approves. Point it at an account without auto-approve to get a second approval
+    # gate inside Overseerr. Shortlist never creates the account — it is chosen from the ones there.
+    "requests.overseerr.request_as_user_id": 0,
     "requests.radarr.url": "",
     "requests.radarr.quality_profile_id": 0,
     "requests.radarr.root_folder": "",
@@ -69,7 +85,6 @@ DEFAULTS: dict[str, Any] = {
     # key: {"anchor": "<collection title>", "before": false}. Empty = leave Plex's default order (rows
     # land last, under any co-managing tool like Kometa). Re-applied at end of each run; anchor is
     # read-only, only our rows move.
-    "rows.hub_anchor": {},
     # Master switch for Shortlist touching the Recommended-shelf ORDER. False -> never reorder the
     # shelf (a co-managing tool like agregarr/Kometa owns the order). Default on.
     "rows.manage_shelf_order": True,
@@ -81,15 +96,10 @@ DEFAULTS: dict[str, Any] = {
     # "what changed on whose share at 03:31" (plex-safety rule 10) is the one record an operator may
     # want long after the run detail around it is gone.
     "events.retention": 0,
-    # Read only what changed since the last sync instead of every watched title, every night, per
-    # user, per library. An incremental read notices an un-watch inside the window it covered, but
-    # nothing further back and no deletion, so a COMPLETE read still runs every `sync.watch_full_days`
-    # regardless — this switch only decides whether the nights in between are cheap. Off = always
-    # read everything.
-    "sync.watch_incremental": True,
-    # How often the complete re-read happens, in days. It is the only thing that can notice a title
-    # un-watched or removed longer ago than the nightly read reaches back, so it is not optional —
-    # only its frequency is.
+    # How often the RECONCILE pass runs, in days. Not "how often a complete read happens" — every
+    # sync reads each library in full (issue #108). This gates the three things that act on a title
+    # being ABSENT, and so believe a single response: dropping cached titles the read no longer
+    # returns, the dead-library sweep, and withdrawing pick credit.
     "sync.watch_full_days": 7,
     # (the schedulable crons are added below, derived from scheduler.DEFAULT_CRONS)
     "backup.max_keep": 10,  # how many backups to retain
@@ -100,9 +110,15 @@ DEFAULTS: dict[str, Any] = {
     # Notification ids the owner dismissed. Each id encodes its state (run id / version), so the same
     # alert stays hidden but a new failure or a newer release surfaces again. Capped to the newest 100.
     "notifications.dismissed": [],
+    # Send the bell's alerts to a webhook as well. Opt-in, off by default: an unasked-for outbound
+    # POST from a self-hosted tool is not a default anyone should inherit. Only ONE event goes out —
+    # a whole run failing — because that is the one an owner cannot see before their next login
+    # (services/notify.py). The address itself is a SECRET_KEY below: it is a bearer token in a URL.
+    "notify.webhook.enabled": False,
+    "notify.webhook.url": "",
     # Which candidate sources feed recommendations (engine/candidates.py). More = wider recall.
     "candidates.sources": ["tmdb_similar", "tmdb_discover"],
-    # Which backend the "AI — web search" (llm_web) source searches with. Exactly one, always:
+    # Which backend the web-search (llm_web) source searches with. Exactly one, always:
     #   'native'  — the curator provider's own web-search tool (Claude/GPT/Gemini only)
     #   'exa'     — the hosted Exa search API
     #   'searxng' — the owner's own SearXNG instance. Self-hosted metasearch: no vendor account, key
@@ -118,6 +134,12 @@ DEFAULTS: dict[str, Any] = {
     # a reverse proxy in front of it (SearXNG itself has no auth); the password is a SECRET_KEY.
     "searxng.url": "",
     "searxng.username": "",
+    # How hard Exa works on each search, and what it costs. Measured on two seeds (see
+    # `.claude/docs/llm-web-search-upgrade.md`): `deep-lite` found 47 and 36 TMDB-resolvable titles
+    # for $0.012 a search, where `auto` found 13 and 8 for $0.007 — and once returned nothing at all
+    # from 26k characters of page text. `deep-lite` is the default despite costing more because the
+    # cheap modes are erratic, and every search is cached 14 days and shared across the whole roster.
+    "exa.search_type": "deep-lite",
     # Cap on already-finished titles in a row, as a fraction: 0.0 = all fresh (default), 1.0 = no
     # filtering, in between = at most that share of the row may be things already watched. Per-row.
     "recommendations.watched_pct": 0.0,
@@ -129,6 +151,17 @@ DEFAULTS: dict[str, Any] = {
     # 8 rather than 7 because 8 is exactly what the old `recommendations.freshness` default of 0.5
     # resolved to, and migration 0065 must not shift the cadence of a server that never set it.
     "recommendations.refresh_days": 8,
+    # The other half of the cadence: how long a row may wait when the person it belongs to has
+    # watched NOTHING since it was last built. 0 (the default, and every existing install) = off, so
+    # a row rebuilds on its cadence whatever they have been doing. Set to N and a row due tonight is
+    # held instead — no re-pick, no Plex write — until either they watch something or the row turns
+    # N days old, whichever comes first. Per-row overridable.
+    #
+    # The ceiling is what makes this a hold rather than a freeze, and it is not optional: the row
+    # nobody watches is the one that most needs to look different next time they open Plex, so
+    # "inactive" must never mean "frozen for ever" (issue #109). It saves Plex writes, not AI tokens
+    # — the candidate gather runs above the refresh decision on every path, at every cadence.
+    "recommendations.idle_hold_days": 0,
     # How much a title's RELEASE DATE counts when ranking it: 0.0 = ignore age, 1.0 = every ~8 years
     # of age halves a title's weight. A weight, never a filter — an old title is only asked to be a
     # better match. Distinct from the cadence above, which is HOW OFTEN a row rebuilds, not which
@@ -140,6 +173,13 @@ DEFAULTS: dict[str, Any] = {
     # a default that means one thing on a new server and another on an old one is two products.
     # Nothing is rewritten at upgrade: a row adopts it on its next refresh night.
     "recommendations.recency": 0.5,
+    # OFF for everyone, including existing installs. `recency` above is seeded to 0.5 on purpose;
+    # that was a deliberate product call and is not a precedent for turning a new signal on for
+    # people who never asked for it.
+    "recommendations.genre_avoidance": 0.0,
+    # Both OFF by default, like genre_avoidance above and for the same reason.
+    "recommendations.franchise": 0.0,
+    "recommendations.cast": 0.0,
     # How many of a person's most recent watches the web-search source searches per row (one cached
     # Exa search each). Row-overridable. Fewer = tighter/cheaper; the DbCache dedups shared titles.
     "recommendations.recent_count": 10,
@@ -226,6 +266,7 @@ SECRET_KEYS = {
     "tautulli.apikey",
     "tmdb.apikey",  # was the ONE api key stored in the clear — and returned unredacted by all_public()
     "curator.api_key",
+    "requests.overseerr.apikey",
     "requests.radarr.apikey",
     "requests.sonarr.apikey",
     "requests.mdblist.apikey",  # MDBList key for IMDb/Trakt/RT/Metacritic rating gating
@@ -233,6 +274,10 @@ SECRET_KEYS = {
     "exa.apikey",  # Exa web-search API key for the llm_web source
     "searxng.password",  # reverse-proxy password guarding a self-hosted SearXNG
     "api.token",  # our own programmatic API token (encrypted at rest so the owner can reveal it)
+    # A Discord/Slack webhook address IS a bearer token — anyone holding the URL can post to that
+    # channel — so it is encrypted at rest and redacted on read like any other credential, even
+    # though it looks like a mere address.
+    "notify.webhook.url",
 }
 
 # Keys stored server-side but NEVER returned by all_public() and never writable via the generic
@@ -256,6 +301,9 @@ PRIVATE_KEYS = {
     # clear it would be a way to silence exactly the warning that must not be silenceable.
     "watch.stream_connected_at",
     "watch.stream_down_since",
+    # Which release notes the owner has closed (`whats_new.py`). Only the dialog's own endpoint moves
+    # it, and only forwards: a generic write could mark a release read before anyone saw it.
+    "app.release_notes_seen",
 }
 
 # Dropped keys purged from the settings table on boot, so stale rows don't linger.
@@ -269,6 +317,11 @@ PRIVATE_KEYS = {
 LEGACY_KEYS = {
     "api.token_hash",
     "api.token_hint",
+    # Dropped with issue #108: every sync reads each library in full, so there was nothing left for
+    # it to switch off. Its `false` path bypassed the cache entirely, which also stopped
+    # `watched_titles` being refreshed — the user page's watched list went stale while the setting
+    # read like it was making reads MORE thorough.
+    "sync.watch_incremental",
     "requests.omdb.apikey",
     "staleness_runs",
     "agregarr.url",
@@ -286,6 +339,29 @@ ENV_SEEDS = {
 
 
 _UNSET = object()
+
+# A Fernet token is base64url(0x80 || timestamp(8) || IV(16) || ciphertext || HMAC(32)), so the
+# smallest possible one decodes to 57 bytes and every one starts with the version byte 0x80.
+# Cryptography's spec: https://github.com/fernet/spec/blob/master/Spec.md
+_FERNET_VERSION_BYTE = 0x80
+_FERNET_MIN_BYTES = 57
+
+
+def _looks_like_fernet_token(value: str) -> bool:
+    """Whether `value` is SHAPED like a Fernet token, regardless of which key would decrypt it.
+
+    This is the only way to tell "encrypted with a key we have lost" from "never encrypted at all":
+    both raise an identical, message-less `InvalidToken` when decryption is attempted, so the
+    exception carries no information to branch on. Getting that wrong overwrote real credentials
+    (see `encrypt_plaintext_secrets`). Shape is checked instead, and it is checked conservatively —
+    a false "yes" only means a plaintext value is left alone and reported, while a false "no" would
+    destroy a credential.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(value.encode())
+    except Exception:  # not even base64url — a bare API key, so genuinely plaintext
+        return False
+    return len(raw) >= _FERNET_MIN_BYTES and raw[0] == _FERNET_VERSION_BYTE
 
 
 class SettingsStore:
@@ -389,6 +465,33 @@ class SettingsStore:
             out[row.key] = ("•••••" if value else "") if row.key in SECRET_KEYS else value
         return out
 
+    def _stored_secret(self, key: str) -> tuple[Setting | None, str | None]:
+        """The row and its raw stored string for one SECRET_KEY, or (row, None) when there is nothing
+        worth inspecting."""
+        row = self._session.get(Setting, key)
+        value = (row.value or {}).get("v") if row else None
+        return row, value if value and isinstance(value, str) else None
+
+    def undecryptable_secrets(self) -> list[str]:
+        """SECRET_KEYS whose stored value IS a Fernet token but does not decrypt with the current key.
+
+        Every one of these is a credential encrypted with a key we no longer hold — almost always a
+        lost or regenerated `/config/secret.key`. They are unrecoverable without that file, so the
+        only useful response is to tell the owner exactly which ones, loudly, and re-prompt for them.
+        """
+        if not self._secrets:
+            return []
+        bad = []
+        for key in sorted(SECRET_KEYS):
+            _row, value = self._stored_secret(key)
+            if value is None or not _looks_like_fernet_token(value):
+                continue
+            try:
+                self._secrets.decrypt(value)
+            except Exception:
+                bad.append(key)
+        return bad
+
     def encrypt_plaintext_secrets(self) -> list[str]:
         """Re-store any SECRET_KEY still sitting in the clear, encrypted. Returns the keys healed.
 
@@ -398,23 +501,25 @@ class SettingsStore:
         Fernet-decrypt the existing plaintext and raise, breaking TMDB (and so every recommendation)
         on every existing install.
 
-        Runs at boot, idempotent, and covers any key added to SECRET_KEYS in future — an encrypted
-        value round-trips, a plaintext one is re-written. Detection is by decryptability rather than a
-        prefix check, so it cannot be fooled by a key that merely looks Fernet-shaped.
+        Runs at boot, idempotent, and covers any key added to SECRET_KEYS in future.
+
+        A decrypt failure ALONE does not mean the value is plaintext, and treating it that way
+        destroyed credentials: a wrong key and genuine plaintext both raise a bare `InvalidToken`
+        carrying no message, so a lost `/config/secret.key` made this method re-encrypt every real
+        credential with the newly-minted key — overwriting the only copy that the original key could
+        ever have recovered — and report it as "stored in the clear". The two cases are told apart by
+        SHAPE instead: a Fernet token is still recognisable as one when it cannot be decrypted, so
+        anything token-shaped is left byte-for-byte alone and surfaced by `undecryptable_secrets()`.
         """
         if not self._secrets:
             return []
         healed = []
         for key in sorted(SECRET_KEYS):
-            row = self._session.get(Setting, key)
-            value = (row.value or {}).get("v") if row else None
-            if not value or not isinstance(value, str):
-                continue
-            try:
-                self._secrets.decrypt(value)
-            except Exception:  # any decrypt failure means the value is not encrypted
-                row.value = {"v": self._secrets.encrypt(value)}
-                healed.append(key)
+            row, value = self._stored_secret(key)
+            if value is None or _looks_like_fernet_token(value):
+                continue  # already ours, or encrypted under a key we have lost — never overwrite it
+            row.value = {"v": self._secrets.encrypt(value)}
+            healed.append(key)
         if healed:
             self._session.commit()
         return healed

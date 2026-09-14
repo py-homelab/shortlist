@@ -101,7 +101,7 @@ function candidate(
     title: "Dune: Part Two",
     year: 2024,
     imdb_id: "",
-  language: "",
+    language: "",
     poster_path: "",
     overview: "",
     rating: 8.3,
@@ -138,10 +138,17 @@ function renderPage(initialEntry = "/requests") {
  * box with a list. Tests go through the same two steps a person does: open the box, click the name.
  */
 async function pickPerson(name: string) {
-  await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+  await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
   await userEvent.click(
     await screen.findByRole("option", { name: new RegExp(`^${name},`) }),
   );
+}
+
+/** Open the Filters panel, where the rating and vote floors live. Idempotent: a panel already open
+ *  (a filter is set) stays open. */
+async function openFilters() {
+  const button = screen.getByRole("button", { name: /^Filters/ });
+  if (button.getAttribute("aria-expanded") !== "true") await userEvent.click(button);
 }
 
 /** The bulk toolbar, which acts on the ticked rows. Every action name it carries — Send, Delete,
@@ -194,7 +201,8 @@ describe("RequestsPage", () => {
     renderPage();
     expect(await screen.findByText("Amazing Digital Circus")).toBeTruthy();
     expect(
-      screen.getByText(/Sonarr was told never to add this again/i),
+      // "fetch", not "add": Radarr adds, Overseerr fetches, and the sentence is shared.
+      screen.getByText(/Sonarr was told never to fetch this again/i),
     ).toBeTruthy();
     // The Arr's own word for it stays, so the owner can find the setting there.
     expect(screen.getByText(/import exclusion/i)).toBeTruthy();
@@ -226,7 +234,7 @@ describe("RequestsPage", () => {
     // The inbox opens on Waiting; the sent title lives behind the "Sent" tab (labelled with its count).
     expect(await screen.findByText("Dune: Part Two")).toBeTruthy();
     expect(screen.queryByText("Shogun")).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Sent (1)" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sent (1)" }));
     expect(screen.getByText("Shogun")).toBeTruthy();
     // The log is its own section, and each entry carries the app's answer (the outcome).
     expect(
@@ -247,7 +255,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     await userEvent.click(screen.getByRole("button", { name: /^Clear$/i }));
     await waitFor(() => expect(clearRequests).toHaveBeenCalledWith([2]));
@@ -271,7 +279,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     const open = screen.getByRole("link", { name: /Open in Sonarr/i });
     expect((open as HTMLAnchorElement).href).toBe(
@@ -296,7 +304,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     const open = screen.getByRole("link", { name: /Open in Sonarr/i });
     expect((open as HTMLAnchorElement).href).toBe("https://tv.stevez0.com/");
@@ -319,7 +327,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Sent (1)" }),
+      await screen.findByRole("tab", { name: "Sent (1)" }),
     );
     const open = screen.getByRole("link", { name: /Open in Radarr/i });
     expect((open as HTMLAnchorElement).href).toBe(
@@ -335,7 +343,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await screen.findByText("Dune: Part Two");
-    await userEvent.click(screen.getByRole("button", { name: "Sent" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Sent" }));
     expect(
       screen.getByRole("heading", { name: "Sent to Radarr & Sonarr" }),
     ).toBeTruthy();
@@ -373,7 +381,7 @@ describe("RequestsPage", () => {
     renderPage("/requests?tab=dismissed");
     expect(await screen.findByText("Old Reject")).toBeTruthy();
     expect(screen.queryByText("Dune: Part Two")).toBeNull();
-    expect(screen.getByRole("button", { name: "Rejected (1)" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Rejected (1)" })).toBeTruthy();
   });
 
   it("falls back to Waiting when the deep-linked tab has no items to show", async () => {
@@ -385,7 +393,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage("/requests?tab=rejected");
     expect(await screen.findByText("Dune: Part Two")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /^Rejected/ })).toBeNull();
+    expect(screen.queryByRole("tab", { name: /^Rejected/ })).toBeNull();
   });
 
   it("splits the waiting queue by library (Movies / Shows) when both are present", async () => {
@@ -431,6 +439,7 @@ describe("RequestsPage", () => {
     await screen.findByText("Acclaimed");
     expect(screen.getByText("Middling")).toBeTruthy();
     // Raise the floor to 8+ — the 5.2 title drops out, the 9.1 stays.
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Rating"), "8+");
     expect(screen.getByText("Acclaimed")).toBeTruthy();
     expect(screen.queryByText("Middling")).toBeNull();
@@ -450,6 +459,7 @@ describe("RequestsPage", () => {
     await screen.findByText("Well Attested");
     expect(screen.getByText("Barely Rated")).toBeTruthy();
     // A high score on 12 votes is noise — the 500+ floor drops it.
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Votes"), "500+");
     expect(screen.getByText("Well Attested")).toBeTruthy();
     expect(screen.queryByText("Barely Rated")).toBeNull();
@@ -501,6 +511,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await screen.findByText("Middling");
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Rating"), "9+");
     expect(screen.queryByText("Middling")).toBeNull();
     // Not a blank panel: it says how many are waiting and how to get them back.
@@ -721,6 +732,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage("/requests?tab=sent");
     await screen.findByText("Sent Low");
+    await openFilters();
     await userEvent.selectOptions(screen.getByLabelText("Rating"), "9+");
     // NOT "Nothing sent yet" — two titles are on file and one control brings them back.
     expect(screen.queryByText(/Nothing sent yet/i)).toBeNull();
@@ -737,8 +749,28 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await screen.findByText("One");
-    // Filtering to the only person there is would hide nothing, so the control isn't drawn.
-    expect(screen.queryByRole("button", { name: /^Sarah/ })).toBeNull();
+    // Filtering to the only person there is would hide nothing, so no list of names is offered — the
+    // search box still finds titles.
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.queryByRole("option", { name: /^Sarah/ })).toBeNull();
+  });
+
+  it("does not pick a person with Enter when no list of names is offered", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "One", wanters: ["Sarah"] }),
+      candidate({ id: 2, tmdb_id: 200, title: "Two", wanters: ["Sarah"] }),
+    ]);
+    renderPage();
+    await screen.findByText("One");
+
+    const box = screen.getByRole("combobox", { name: /who wanted them/i });
+    // "sa" matches Sarah, so without the guard Enter would pick her and clear the box.
+    await userEvent.type(box, "sa{Enter}");
+
+    expect(screen.queryByRole("button", { name: "Stop filtering by Sarah" })).toBeNull();
+    expect(box).toHaveValue("sa");
+    expect(box).toHaveAttribute("aria-expanded", "false");
   });
 
   it("drops a name from the filter once nothing on the tab carries it", async () => {
@@ -773,7 +805,7 @@ describe("RequestsPage", () => {
     );
     await userEvent.click(toolbar().getByRole("button", { name: /^Delete/i }));
     await waitFor(() => expect(screen.getByText("Mike Pick")).toBeTruthy());
-    expect(screen.queryByRole("button", { name: /^Sarah/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop filtering by Sarah" })).toBeNull();
   });
 
   it("offers no library split when the queue is a single media type", async () => {
@@ -801,7 +833,7 @@ describe("RequestsPage", () => {
     renderPage();
     await screen.findByText("Dune: Part Two");
     expect(screen.queryByText("Old Reject")).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: "Rejected (1)" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Rejected (1)" }));
     expect(screen.getByText("Old Reject")).toBeTruthy();
   });
 
@@ -982,7 +1014,7 @@ describe("RequestsPage", () => {
     await screen.findByText("Sarah Pick");
     // The chip reads as the person, not as their login...
     // The option reads as the person, not as their login...
-    await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
     expect(await screen.findByRole("option", { name: /^Sarah,/ })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /sarah_p89/ })).toBeNull();
 
@@ -1018,7 +1050,7 @@ describe("RequestsPage", () => {
     renderPage();
     await screen.findByText("Sarah Pick");
 
-    await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
     const list = await screen.findByRole("listbox");
 
     // Pete wanted none of the loaded titles, but he is still there to pick...
@@ -1059,9 +1091,9 @@ describe("RequestsPage", () => {
     renderPage();
     await screen.findByText("Sarah Pick");
 
-    await userEvent.click(screen.getByRole("combobox", { name: /Wanted by/i }));
+    await userEvent.click(screen.getByRole("combobox", { name: /who wanted them/i }));
     await userEvent.type(
-      screen.getByRole("combobox", { name: /Wanted by/i }),
+      screen.getByRole("combobox", { name: /who wanted them/i }),
       "p89",
     );
 
@@ -1123,7 +1155,7 @@ describe("RequestsPage", () => {
     renderPage();
     // No pending title to findByText, so wait on the tab itself before interacting.
     await userEvent.click(
-      await screen.findByRole("button", { name: "Rejected (1)" }),
+      await screen.findByRole("tab", { name: "Rejected (1)" }),
     );
     await userEvent.click(screen.getByRole("button", { name: /Allow again/i }));
     // Restore (back to pending) — NOT delete: the item must reappear in Waiting, not vanish.
@@ -1143,7 +1175,7 @@ describe("RequestsPage", () => {
     ]);
     renderPage();
     await userEvent.click(
-      await screen.findByRole("button", { name: "Rejected (2)" }),
+      await screen.findByRole("tab", { name: "Rejected (2)" }),
     );
     await userEvent.click(
       screen.getByRole("button", { name: /Allow all again/i }),
@@ -1391,6 +1423,319 @@ describe("RequestsPage", () => {
  * fetched ONCE with no polling and nothing ever invalidated it, so two of those three were states
  * you could sit in indefinitely with no way to tell which you were in.
  */
+describe("RequestsPage — the header", () => {
+  // Six stacked rows sat above the first title: two sets of buttons, three dropdowns, a person search,
+  // a paragraph repeating the page subtitle, and a second paragraph explaining Delete and Reject.
+  beforeEach(() => {
+    listRequests.mockReset();
+    getSettings.mockResolvedValue({ "requests.enabled": true });
+    getUsers.mockResolvedValue([]);
+    getArrStatus.mockResolvedValue({ statuses: {}, radarr: "off", sonarr: "off" });
+  });
+
+  const twoWaitingOneSent = () =>
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Acclaimed", rating: 9.1, wanters: ["sarah"] }),
+      candidate({ id: 2, tmdb_id: 200, title: "Middling", rating: 5.2, wanters: ["mike"] }),
+      candidate({ id: 3, tmdb_id: 300, title: "Sent One", status: "sent", wanters: ["ann"] }),
+    ]);
+
+  it("shows Waiting and Sent as tabs, since they are two lists rather than two filters", async () => {
+    twoWaitingOneSent();
+    renderPage();
+
+    const tabs = await screen.findByRole("tablist", { name: "Which requests to show" });
+    const waiting = within(tabs).getByRole("tab", { name: "Waiting (2)" });
+    expect(waiting).toHaveAttribute("aria-selected", "true");
+    await userEvent.click(within(tabs).getByRole("tab", { name: "Sent (1)" }));
+    expect(within(tabs).getByRole("tab", { name: "Sent (1)" })).toHaveAttribute("aria-selected", "true");
+    expect(await screen.findByText("Sent One")).toBeTruthy();
+  });
+
+  it("finds a title by typing its name in the search", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    await userEvent.type(screen.getByRole("combobox", { name: /who wanted them/i }), "accl");
+
+    expect(screen.getByText("Acclaimed")).toBeTruthy();
+    expect(screen.queryByText("Middling")).toBeNull();
+  });
+
+  it("finds titles by who wanted them in the same search", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    await userEvent.type(screen.getByRole("combobox", { name: /who wanted them/i }), "mike");
+
+    expect(screen.getByText("Middling")).toBeTruthy();
+    expect(screen.queryByText("Acclaimed")).toBeNull();
+  });
+
+  it("keeps rating and votes behind one Filters button, and shows an active floor as a removable chip", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+    expect(screen.queryByLabelText("Rating")).toBeNull();
+
+    await openFilters();
+    await userEvent.selectOptions(screen.getByLabelText("Rating"), "8+");
+
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("1");
+    expect(screen.queryByText("Middling")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Remove the Rating 8+ filter" }));
+    expect(screen.getByText("Middling")).toBeTruthy();
+  });
+
+  it("shows the typed search as a chip, so it can be cleared even once the search box is gone", async () => {
+    // Search "dune", send Dune, and Arrival is the only title left: with one title the toolbar is not
+    // drawn, but the text still filtered — an empty list pointing at a "Clear filters" that did not exist.
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Dune" }),
+      candidate({ id: 2, tmdb_id: 200, title: "Arrival" }),
+    ]);
+    renderPage();
+    await screen.findByText("Arrival");
+    await userEvent.type(screen.getByRole("combobox", { name: /who wanted them/i }), "dune");
+    expect(screen.getByText("“dune”")).toBeTruthy();
+
+    listRequests.mockResolvedValue([candidate({ id: 2, tmdb_id: 200, title: "Arrival" })]);
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Dune" }));
+    await userEvent.click(toolbar().getByRole("button", { name: /^Delete/i }));
+
+    await waitFor(() => expect(screen.queryByRole("combobox")).toBeNull());
+    await userEvent.click(screen.getByRole("button", { name: "Clear the search" }));
+    expect(await screen.findByText("Arrival")).toBeTruthy();
+  });
+
+  it("keeps the Delete and Reject difference on screen while titles are selected", async () => {
+    // That is exactly when the bulk buttons act — the difference must not be hover-only then.
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Acclaimed" }));
+
+    expect(screen.getByRole("button", { name: "Clear selection" })).toBeTruthy();
+    expect(screen.getByText(/blocks it for good/)).toBeTruthy();
+  });
+
+  it("moves between tabs with the arrow keys, and labels the panel by its tab", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    const waiting = await screen.findByRole("tab", { name: "Waiting (2)" });
+    expect(waiting).toHaveAttribute("tabindex", "0");
+    expect(screen.getByRole("tab", { name: "Sent (1)" })).toHaveAttribute("tabindex", "-1");
+
+    waiting.focus();
+    await userEvent.keyboard("{ArrowRight}");
+
+    const sentTab = screen.getByRole("tab", { name: "Sent (1)" });
+    expect(sentTab).toHaveAttribute("aria-selected", "true");
+    expect(sentTab).toHaveFocus();
+    expect(screen.getByRole("tabpanel", { name: "Sent (1)" })).toBeTruthy();
+  });
+
+  it("does not repeat the page subtitle above the list", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    expect(screen.queryByText(/Titles Shortlist wanted for your people/)).toBeNull();
+  });
+
+  it("turns the select-all row into an action bar that can clear the selection", async () => {
+    twoWaitingOneSent();
+    renderPage();
+    await screen.findByText("Middling");
+
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Acclaimed" }));
+
+    expect(screen.getByText("1 selected")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Clear selection" }));
+    expect(screen.getByText("2 waiting")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Clear selection" })).toBeNull();
+  });
+});
+
+describe("RequestsPage — the language filter", () => {
+  // The approved design put rating, votes AND language in the one Filters menu; only the first two
+  // shipped. A title's `language` is TMDB's original language, "" when none was recorded.
+  beforeEach(() => {
+    listRequests.mockReset();
+    deleteRequests.mockClear();
+    getSettings.mockResolvedValue({ "requests.enabled": true });
+    getUsers.mockResolvedValue([]);
+    getArrStatus.mockResolvedValue({ statuses: {}, radarr: "off", sonarr: "off" });
+  });
+
+  const mixedLanguages = () =>
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Parasite", language: "ko", rating: 8.5 }),
+      candidate({ id: 2, tmdb_id: 200, title: "Amélie", language: "fr", rating: 7.9 }),
+      candidate({ id: 3, tmdb_id: 300, title: "Dune", language: "en", rating: 8.3 }),
+      candidate({ id: 4, tmdb_id: 400, title: "Legacy Title", language: "", rating: 7.0 }),
+      candidate({ id: 5, tmdb_id: 500, title: "Shogun", language: "ja", status: "sent" }),
+      candidate({ id: 6, tmdb_id: 600, title: "Oldboy", language: "ko", status: "sent" }),
+    ]);
+
+  const pickLanguage = async (name: string) => {
+    await openFilters();
+    await userEvent.selectOptions(screen.getByLabelText("Language"), name);
+  };
+
+  it("offers the languages on this tab by name, with Any first and Unknown last", async () => {
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await openFilters();
+
+    const select = screen.getByLabelText("Language");
+    // Japanese is only on the Sent tab, so offering it here could only empty the list.
+    expect(within(select).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Any",
+      "English",
+      "French",
+      "Korean",
+      "Unknown",
+    ]);
+    expect(select).toHaveDisplayValue("Any");
+  });
+
+  it("shows only titles in the picked language, counted on the Filters button and removable as a chip", async () => {
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await pickLanguage("Korean");
+
+    expect(screen.getByText("Parasite")).toBeTruthy();
+    expect(screen.queryByText("Amélie")).toBeNull();
+    expect(screen.queryByText("Dune")).toBeNull();
+    expect(screen.queryByText("Legacy Title")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("1");
+
+    await userEvent.selectOptions(screen.getByLabelText("Rating"), "7+");
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("2");
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove the Korean language filter" }));
+    expect(screen.getByText("Amélie")).toBeTruthy();
+    expect(screen.getByText("Dune")).toBeTruthy();
+    expect(screen.getByLabelText("Language")).toHaveDisplayValue("Any");
+    expect(screen.getByRole("button", { name: /^Filters/ })).toHaveTextContent("1");
+  });
+
+  it("hides a title of unknown language once a language is picked, and finds it under Unknown", async () => {
+    // A title with no recorded language cannot be said to be in English, so picking English hides it
+    // — and Unknown is offered so that no title on the tab is unreachable through the menu.
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await pickLanguage("English");
+    expect(screen.getByText("Dune")).toBeTruthy();
+    expect(screen.queryByText("Legacy Title")).toBeNull();
+
+    await pickLanguage("Unknown");
+    expect(screen.getByText("Legacy Title")).toBeTruthy();
+    expect(screen.queryByText("Dune")).toBeNull();
+    expect(screen.getByRole("button", { name: "Remove the unknown language filter" })).toBeTruthy();
+  });
+
+  it("is dropped by Clear filters and by a tab change, like the rating and vote floors", async () => {
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+
+    await pickLanguage("Korean");
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(screen.getByText("Dune")).toBeTruthy();
+    expect(screen.getByLabelText("Language")).toHaveDisplayValue("Any");
+    expect(screen.queryByRole("button", { name: "Remove the Korean language filter" })).toBeNull();
+
+    await pickLanguage("Korean");
+    await userEvent.click(screen.getByRole("tab", { name: "Sent (2)" }));
+    // Shogun is Japanese: a Korean filter carried across would hide it.
+    expect(await screen.findByText("Shogun")).toBeTruthy();
+    expect(screen.getByText("Oldboy")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove the Korean language filter" })).toBeNull();
+  });
+
+  it("narrows the Sent tab by the languages on that tab", async () => {
+    mixedLanguages();
+    renderPage("/requests?tab=sent");
+    await screen.findByText("Shogun");
+
+    await openFilters();
+    expect(
+      within(screen.getByLabelText("Language")).getAllByRole("option").map((o) => o.textContent),
+    ).toEqual(["Any", "Japanese", "Korean"]);
+    await userEvent.selectOptions(screen.getByLabelText("Language"), "Japanese");
+
+    expect(screen.getByText("Shogun")).toBeTruthy();
+    expect(screen.queryByText("Oldboy")).toBeNull();
+  });
+
+  it("says the filters emptied the list and names the control that brings the titles back", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Parasite", language: "ko", rating: 7.5 }),
+      candidate({ id: 2, tmdb_id: 200, title: "Dune", language: "en", rating: 8.5 }),
+    ]);
+    renderPage();
+    await screen.findByText("Parasite");
+
+    // Each leaves a title on its own; together they leave none.
+    await pickLanguage("Korean");
+    await userEvent.selectOptions(screen.getByLabelText("Rating"), "8+");
+
+    expect(screen.getByText(/No waiting title clears these filters/i)).toBeTruthy();
+    expect(screen.getByText(/2 are on this tab in total/i)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove the Korean language filter" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    expect(screen.getByText("Parasite")).toBeTruthy();
+    expect(screen.getByText("Dune")).toBeTruthy();
+  });
+
+  it("offers no language choice when every title on the tab is in the same language", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, tmdb_id: 100, title: "Dune", language: "en" }),
+      candidate({ id: 2, tmdb_id: 200, title: "Arrival", language: "en" }),
+    ]);
+    renderPage();
+    await screen.findByText("Dune");
+
+    await openFilters();
+
+    // Picking the only language there is would hide nothing.
+    expect(screen.getByLabelText("Rating")).toBeTruthy();
+    expect(screen.queryByLabelText("Language")).toBeNull();
+  });
+
+  it("drops the language once nothing on the tab is in it", async () => {
+    // Parasite is the only Korean title waiting. Once it goes, filtering on Korean would empty the
+    // queue for a reason the menu no longer offers — the list falls back to every language.
+    mixedLanguages();
+    renderPage();
+    await screen.findByText("Parasite");
+    await pickLanguage("Korean");
+    expect(screen.queryByText("Dune")).toBeNull();
+
+    listRequests.mockResolvedValue([
+      candidate({ id: 2, tmdb_id: 200, title: "Amélie", language: "fr", rating: 7.9 }),
+      candidate({ id: 3, tmdb_id: 300, title: "Dune", language: "en", rating: 8.3 }),
+      candidate({ id: 4, tmdb_id: 400, title: "Legacy Title", language: "", rating: 7.0 }),
+    ]);
+    await userEvent.click(screen.getByRole("checkbox", { name: "Select Parasite" }));
+    await userEvent.click(toolbar().getByRole("button", { name: /^Delete/i }));
+
+    await waitFor(() => expect(screen.getByText("Dune")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "Remove the Korean language filter" })).toBeNull();
+    expect(screen.getByLabelText("Language")).toHaveDisplayValue("Any");
+  });
+});
+
 describe("RequestsPage — what Sonarr/Radarr has", () => {
   beforeEach(() => {
     listRequests.mockReset();
@@ -1458,6 +1803,208 @@ describe("RequestsPage — what Sonarr/Radarr has", () => {
     expect(await screen.findByText(/Can.t reach Radarr/i)).toBeInTheDocument();
     expect(screen.queryByText(/Can.t reach Sonarr/i)).toBeNull();
     expect(screen.getByText("Downloading")).toBeInTheDocument();
+  });
+
+  it("calls the exclusion a blocklist on the Overseerr route", async () => {
+    // The app NAME was made route-aware; the concept was not. Naming Overseerr and then calling its
+    // blocklist an "import exclusion" sends the owner looking for a screen it does not have — and
+    // the whole-page Radarr/Sonarr assertion cannot catch it, because the sentence contains neither
+    // word and nothing else renders an excluded row on this route.
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, title: "Dune", excluded: true }),
+    ]);
+    getArrStatus.mockResolvedValue({
+      statuses: {},
+      radarr: "off",
+      sonarr: "off",
+      overseerr: "ok",
+    });
+    getSettings.mockResolvedValue({
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+    });
+    renderPage();
+
+    expect(await screen.findByText(/calls it a blocklist/)).toBeTruthy();
+    expect(screen.queryByText(/import exclusion/)).toBeNull();
+  });
+
+  it("still calls it an import exclusion on the Arr route", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, title: "Dune", excluded: true }),
+    ]);
+    getArrStatus.mockResolvedValue({
+      statuses: {},
+      radarr: "ok",
+      sonarr: "ok",
+      overseerr: "off",
+    });
+    getSettings.mockResolvedValue({
+      "requests.enabled": true,
+      "requests.radarr.url": "http://radarr.test",
+    });
+    renderPage();
+
+    expect(
+      await screen.findByText(/calls it an import exclusion/),
+    ).toBeTruthy();
+  });
+
+  it("says a pending request is waiting for a person, not searching", async () => {
+    // "Searching" is right for an Arr that is monitoring and hunting. On this route PENDING means
+    // the request is sitting in Overseerr waiting for someone to approve it — the one state here
+    // the owner can actually act on, so it must not read as the machine already working.
+    listRequests.mockResolvedValue([candidate({ id: 1, title: "Dune" })]);
+    getArrStatus.mockResolvedValue({
+      statuses: { "1": "awaiting_approval" },
+      radarr: "off",
+      sonarr: "off",
+      overseerr: "ok",
+    });
+    getSettings.mockResolvedValue({
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+    });
+    renderPage();
+
+    expect(await screen.findByText("Waiting for approval")).toBeInTheDocument();
+    expect(screen.queryByText("Searching")).toBeNull();
+  });
+
+  it("puts the remedy for a stuck status behind a button, not behind hover", async () => {
+    // 246 characters of "here is what to do about it" lived in a `title` and nowhere else, on one
+    // of the two statuses an owner most needs explained (audit finding, Sep 2026). A hover-only
+    // explanation does not exist on a phone, and this app is read on one.
+    listRequests.mockResolvedValue([candidate({ id: 1, title: "Dune" })]);
+    getArrStatus.mockResolvedValue({
+      statuses: { "1": "awaiting_approval" },
+      radarr: "off",
+      sonarr: "off",
+      overseerr: "ok",
+    });
+    getSettings.mockResolvedValue({
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+    });
+    renderPage();
+
+    expect(await screen.findByText("Waiting for approval")).toBeInTheDocument();
+    // Shut to begin with — it is an explanation, not a warning.
+    expect(screen.queryByText(/Overseerr is holding it/)).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /^Why\?$/ }));
+
+    expect(screen.getByText(/Overseerr is holding it/)).toBeInTheDocument();
+    expect(screen.getByText(/Approve it there/)).toBeInTheDocument();
+  });
+
+  it("names Overseerr, never the Arrs, everywhere on that route", async () => {
+    // Found by looking at the running app, not by reading the diff: ten review rounds and an
+    // architecture review all missed four strings on this page — the header, the bulk button, the
+    // "already in {app}" line and the sent-section heading — because a diff shows what changed and
+    // this page's Arr names had not. The assertion is deliberately the whole page, not four
+    // separate lookups, so a fifth string cannot be added without it failing.
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, title: "Dune", media_type: "movie" }),
+      candidate({
+        id: 2,
+        tmdb_id: 200,
+        title: "Shogun",
+        media_type: "show",
+        status: "sent",
+      }),
+    ]);
+    getArrStatus.mockResolvedValue({
+      statuses: { "1": "downloaded" },
+      radarr: "off",
+      sonarr: "off",
+      overseerr: "ok",
+    });
+    getSettings.mockResolvedValue({
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+    });
+    renderPage();
+
+    // BOTH tabs. The first version of this checked only the default one and passed against a
+    // deliberately re-broken "Sent to Radarr & Sonarr" heading, because that heading lives on the
+    // Sent tab — an absence assertion is worthless over a region the test never renders.
+    expect(await screen.findByText("Dune")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/Radarr|Sonarr/);
+    expect(document.body.textContent).toMatch(/Overseerr/);
+
+    await userEvent.click(screen.getByRole("tab", { name: /^Sent/ }));
+    expect(await screen.findByText("Shogun")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/Radarr|Sonarr/);
+    expect(document.body.textContent).toMatch(/Sent to Overseerr/);
+  });
+
+  it("still names the Arrs on the default route", async () => {
+    // The control. Switching the route back must restore every one of those strings.
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, title: "Dune" }),
+      candidate({ id: 2, tmdb_id: 200, title: "Shogun", status: "sent" }),
+    ]);
+    getArrStatus.mockResolvedValue({
+      statuses: {},
+      radarr: "ok",
+      sonarr: "ok",
+      overseerr: "off",
+    });
+    getSettings.mockResolvedValue({
+      "requests.enabled": true,
+      "requests.radarr.url": "http://radarr.test",
+    });
+    renderPage();
+
+    expect(await screen.findByText("Dune")).toBeInTheDocument();
+    expect(document.body.textContent).toMatch(/Radarr/);
+    expect(document.body.textContent).not.toMatch(/Overseerr/);
+
+    await userEvent.click(screen.getByRole("tab", { name: /^Sent/ }));
+    expect(await screen.findByText("Shogun")).toBeInTheDocument();
+    expect(document.body.textContent).toMatch(/Sent to Radarr/);
+    expect(document.body.textContent).not.toMatch(/Overseerr/);
+  });
+
+  it("blames Overseerr, not Radarr, when that is the route", async () => {
+    listRequests.mockResolvedValue([
+      candidate({ id: 1, title: "Dune", media_type: "movie" }),
+      candidate({ id: 2, tmdb_id: 200, title: "Shogun", media_type: "show" }),
+    ]);
+    // On this route both Arr fields are always "off" — one app answers for films and shows alike.
+    getArrStatus.mockResolvedValue({
+      statuses: {},
+      radarr: "off",
+      sonarr: "off",
+      overseerr: "unreachable",
+    });
+    renderPage();
+
+    expect((await screen.findAllByText(/Can.t reach Overseerr/i)).length).toBe(
+      2,
+    );
+    expect(screen.queryByText(/Can.t reach Radarr/i)).toBeNull();
+  });
+
+  it("treats a response with no overseerr field as the Arr route", async () => {
+    // The field is absent from any response predating it. Reading "is Overseerr in use?" as
+    // `!== "off"` made `undefined` mean YES, which sent every existing install down the Overseerr
+    // branch and blanked its badges — caught by the two Arr tests above, pinned here on purpose.
+    listRequests.mockResolvedValue([candidate({ id: 1, title: "Dune" })]);
+    getArrStatus.mockResolvedValue({
+      statuses: {},
+      radarr: "unreachable",
+      sonarr: "ok",
+    });
+    renderPage();
+
+    expect(await screen.findByText(/Can.t reach Radarr/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Can.t reach Overseerr/i)).toBeNull();
   });
 
   it("re-asks the Arrs the moment something is sent to them", async () => {

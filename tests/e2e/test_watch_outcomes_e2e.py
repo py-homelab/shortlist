@@ -62,17 +62,20 @@ def seed_outcomes(app: ShortlistApp) -> None:
     faves_slug = created.json()["slug"]
 
     rows = [
-        # (tmdb, media_type, slug, library, delivered_ago, watched_ago, finished_ago)
-        (901, "movie", "picked", "Movies", 20, 18, 18),  # film: watched == finished
-        (902, "movie", "picked", "Movies", 20, 17, 17),
-        (903, "movie", "picked", "Movies", 20, None, None),  # never opened
-        (904, "show", faves_slug, "TV Shows", 20, 16, None),  # credited on one episode
-        (905, "show", faves_slug, "TV Shows", 20, 15, None),
-        (906, "show", faves_slug, "TV Shows", 20, 14, 3),  # series seen out
+        # (tmdb, rating_key, media_type, slug, library, delivered_ago, watched_ago, finished_ago)
+        # The ratingKey is a REAL item in the fake library (movies 101+, shows 301+). A delivered pick is
+        # always matched to one, and the dashboard now draws its poster from that key — a key for no item
+        # 404s like a title deleted from Plex, which is a different case from the one this seeds.
+        (901, 101, "movie", "picked", "Movies", 20, 18, 18),  # film: watched == finished
+        (902, 102, "movie", "picked", "Movies", 20, 17, 17),
+        (903, 103, "movie", "picked", "Movies", 20, None, None),  # never opened
+        (904, 301, "show", faves_slug, "TV Shows", 20, 16, None),  # credited on one episode
+        (905, 302, "show", faves_slug, "TV Shows", 20, 15, None),
+        (906, 303, "show", faves_slug, "TV Shows", 20, 14, 3),  # series seen out
     ]
     with sqlite3.connect(db) as con:
         uid = con.execute("SELECT id FROM users ORDER BY id LIMIT 1").fetchone()[0]
-        for tmdb, media, slug, library, d_ago, w_ago, f_ago in rows:
+        for tmdb, rating_key, media, slug, library, d_ago, w_ago, f_ago in rows:
             con.execute(
                 "INSERT INTO picks (user_id, tmdb_id, media_type, rating_key, rank, collection_slug, "
                 "section_key, library, title, reason, sources, affinity, created_at, watched_at, finished_at) "
@@ -81,7 +84,7 @@ def seed_outcomes(app: ShortlistApp) -> None:
                     uid,
                     tmdb,
                     media,
-                    tmdb,
+                    rating_key,
                     slug,
                     "1" if media == "movie" else "2",
                     library,

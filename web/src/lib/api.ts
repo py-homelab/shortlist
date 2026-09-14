@@ -1,5 +1,6 @@
 import type {
   Job,
+  PrivacyStatus,
   UserPickOutcome,
   RowEffectiveness,
   JobCatalogEntry,
@@ -8,8 +9,11 @@ import type {
   ApiTokenCreated,
   ApiTokenStatus,
   NotificationsPage,
+  WhatsNew,
   ArrOptions,
+  SeerrOptions,
   Backup,
+  PendingRestore,
   BlockedSeed,
   DeletedRowHistory,
   EffectivenessReport,
@@ -71,6 +75,8 @@ import type {
   WatchedPage,
 } from "./types";
 
+import { basePath } from "./base-path";
+
 /**
  * Error thrown for any failed API call, normalized so the UI can always show
  * a plain-English message. `status` is 0 when the server was unreachable.
@@ -102,7 +108,7 @@ function trimTrailingSlash(value: string): string {
 // reverse proxy). Defaults to same-origin root; override at build time with
 // VITE_API_BASE or at runtime with configureApiBase().
 let apiBase = trimTrailingSlash(
-  (import.meta.env.VITE_API_BASE as string | undefined) ?? "",
+  (import.meta.env.VITE_API_BASE as string | undefined) ?? basePath,
 );
 
 export function configureApiBase(base: string): void {
@@ -218,6 +224,10 @@ export const api = {
       body: JSON.stringify(state),
     }),
 
+  // --- Sharing and privacy ---
+  getPrivacyStatus: (): Promise<PrivacyStatus> =>
+    request("/api/privacy/status"),
+
   // --- Users ---
   getUsers: (): Promise<User[]> => request("/api/users"),
 
@@ -258,13 +268,21 @@ export const api = {
   }> => request("/api/users/sync", { method: "POST" }),
 
   // --- Background jobs ---
-  getJobs: (kind?: string, limit = 25, status?: JobStatus): Promise<Job[]> =>
+  getJobs: (
+    kind?: string,
+    limit = 25,
+    status?: JobStatus,
+    excludeRoutine = false,
+  ): Promise<Job[]> =>
     request(
       `/api/system/jobs?limit=${limit}` +
         (kind ? `&kind=${encodeURIComponent(kind)}` : "") +
         // Server-side, not a client filter over a fetched page: the "N failed" badge counts every
         // failed row in the table, and on a real server all eight sat past the newest hundred.
-        (status ? `&status=${encodeURIComponent(status)}` : ""),
+        (status ? `&status=${encodeURIComponent(status)}` : "") +
+        // Same reason, other direction: `watch.reconcile` was 165 of 197 jobs in a day, so the
+        // newest page the header polls was almost all reconciles. Failures still come through.
+        (excludeRoutine ? "&exclude_routine=true" : ""),
     ),
 
   /** Every job Shortlist can run, with its schedule and how it went last time. */
@@ -343,11 +361,12 @@ export const api = {
 
   getUserWatched: (
     id: number,
-    { q, mediaType, limit }: WatchedFilters,
+    { q, mediaType, library, limit }: WatchedFilters,
   ): Promise<WatchedPage> => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (q) params.set("q", q);
     if (mediaType) params.set("media_type", mediaType);
+    if (library) params.set("library", library);
     return request(`/api/users/${id}/watched?${params}`);
   },
 
@@ -473,6 +492,11 @@ export const api = {
   getArrOptions: (service: "radarr" | "sonarr"): Promise<ArrOptions> =>
     request(`/api/settings/arr/${service}/options`),
 
+  /** Overseerr/Jellyseerr accounts, for the "request as" dropdown. No quality profiles or root
+   *  folders here — those are the *seerr's own business on that route. */
+  getSeerrOptions: (): Promise<SeerrOptions> =>
+    request("/api/settings/overseerr/options"),
+
   /** Model ids a provider offers, for the model picker. The body carries the (possibly unsaved)
    *  provider + key/URL being edited so the list reflects the current form; blank fields fall back to
    *  saved settings and a redacted key means "use the saved key" (empty result = free-text fallback). */
@@ -512,6 +536,16 @@ export const api = {
     request("/api/notifications/dismiss", {
       method: "POST",
       body: JSON.stringify({ id }),
+    }),
+
+  /** The release notes the owner has not read since upgrading (empty when there are none). */
+  getWhatsNew: (): Promise<WhatsNew> => request("/api/notifications/whats-new"),
+
+  /** Close the What's new dialog for good, up to the newest release it showed. */
+  markWhatsNewSeen: (version: string): Promise<{ ok: boolean }> =>
+    request("/api/notifications/whats-new/seen", {
+      method: "POST",
+      body: JSON.stringify({ version }),
     }),
 
   /** The plain-text diagnostics bundle for bug reports (secrets-free). */
@@ -559,8 +593,12 @@ export const api = {
 
   /** A library's managed collections — the candidate anchors for placing rows in the shelf. */
   /** A library's FOREIGN collections — ours are excluded server-side, because a Shortlist row is
-   *  anchored by row slug rather than by title (a per-person row is one collection per person). */
-  getLibraryCollections: (key: string): Promise<{ title: string }[]> =>
+   *  anchored by row slug rather than by title (a per-person row is one collection per person).
+   *  `on_shelf` is whether it has a position on a Plex shelf at all: a collection that has none
+   *  cannot anchor anything (issue #106). Plex's own built-in hubs are always true. */
+  getLibraryCollections: (
+    key: string,
+  ): Promise<{ title: string; on_shelf: boolean }[]> =>
     request(`/api/system/libraries/${encodeURIComponent(key)}/collections`),
 
   /** Cleanup audit: every shortlist-labelled collection on Plex, with drift/orphan flags. */
@@ -718,6 +756,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name }),
     }),
+
+  getPendingRestore: (): Promise<PendingRestore> =>
+    request("/api/system/backups/restore"),
+
+  cancelRestore: (): Promise<PendingRestore> =>
+    request("/api/system/backups/restore", { method: "DELETE" }),
 
   // --- Support Mode ---
   // The tools 403 until the mode is on; `supportStatus` is what the page uses to tell the two

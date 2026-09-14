@@ -3,7 +3,11 @@ import { useEffect, useRef } from "react";
 import { QueryBoundary } from "@/components/query-boundary";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
-import { useCollections, useLibraries, useLibraryCollections } from "@/lib/queries";
+import {
+  useCollections,
+  useLibraries,
+  useLibraryCollections,
+} from "@/lib/queries";
 import type { CollectionInput, HubAnchorMap, PlexLibrary } from "@/lib/types";
 
 const selectClass =
@@ -11,7 +15,7 @@ const selectClass =
   "focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60";
 
 type Entry = HubAnchorMap[string];
-type Mode = "default" | "top" | "after" | "before";
+type Mode = "top" | "after" | "before" | "off";
 
 /** A row targets a library when it lists it, or (when it lists none) any library of its media type. */
 function targetsLibrary(
@@ -25,9 +29,15 @@ function targetsLibrary(
     : libraryKeys.includes(library.key);
 }
 
-/** No entry = inherit the global default; `top` = the very top; else after/before its anchor. */
+/** No entry = the default, which is the top of the shelf. `enabled: false` = never positioned.
+ *
+ * "No entry" used to mean "inherit the per-library default from Settings", and that default was
+ * itself decided two ways: with no library configured it meant the top, and the moment one was
+ * configured every other library silently meant "leave alone" — while the screen read "Wherever
+ * Plex puts them" in both cases. One default, stated here, replaces it. */
 function modeOf(entry: Entry | undefined): Mode {
-  if (!entry) return "default";
+  if (!entry) return "top";
+  if (entry.enabled === false) return "off";
   if (entry.top) return "top";
   return entry.before ? "before" : "after";
 }
@@ -72,10 +82,17 @@ function LibraryAnchor({
   const candidates = otherRows.filter((row) =>
     targetsLibrary(library, row.libraryKeys, row.media),
   );
+  // A collection on no Plex shelf has no position to be relative to, so it can
+  // anchor nothing (issue #106 — the engine used to follow it anyway and bury the row at the very
+  // bottom). Shown but unselectable rather than hidden: an owner whose saved anchor simply vanished
+  // from the list has no way to tell "not on the shelf" from "deleted".
+  const onShelf = (collections.data ?? []).filter((c) => c.on_shelf);
+  const offShelf = (collections.data ?? []).filter((c) => !c.on_shelf);
+  const anchorOffShelf = offShelf.some((c) => c.title === entry?.anchor);
 
   const setMode = (next: Mode) => {
-    if (next === "default") return onChange(undefined);
     if (next === "top") return onChange({ top: true });
+    if (next === "off") return onChange({ enabled: false });
     // Keep whichever anchor is already chosen when only flipping after/before.
     onChange({
       anchor: entry?.anchor ?? "",
@@ -103,10 +120,10 @@ function LibraryAnchor({
             value={mode}
             onChange={(event) => setMode(event.target.value as Mode)}
           >
-            <option value="default">Follow the default from Settings</option>
             <option value="top">Top of the shelf</option>
             <option value="after">Right after…</option>
             <option value="before">Right before…</option>
+            <option value="off">Don’t place this row</option>
           </select>
         </div>
         {relative && (
@@ -131,11 +148,12 @@ function LibraryAnchor({
                 </option>
                 {/* A saved anchor that no longer exists still shows, so the setting reads truthfully
                     rather than silently appearing unset. */}
-                {entry?.row && !candidates.some((r) => r.slug === entry.row) && (
-                  <option value={`row:${entry.row}`}>
-                    {entry.row} (row not found)
-                  </option>
-                )}
+                {entry?.row &&
+                  !candidates.some((r) => r.slug === entry.row) && (
+                    <option value={`row:${entry.row}`}>
+                      {entry.row} (row not found)
+                    </option>
+                  )}
                 {entry?.anchor &&
                   !collections.data?.some((c) => c.title === entry.anchor) && (
                     <option value={`coll:${entry.anchor}`}>
@@ -151,13 +169,24 @@ function LibraryAnchor({
                     ))}
                   </optgroup>
                 )}
-                <optgroup label="Collections in this library">
-                  {collections.data?.map((c) => (
-                    <option key={c.title} value={`coll:${c.title}`}>
-                      {c.title}
-                    </option>
-                  ))}
-                </optgroup>
+                {onShelf.length > 0 && (
+                  <optgroup label="Collections in this library">
+                    {onShelf.map((c) => (
+                      <option key={c.title} value={`coll:${c.title}`}>
+                        {c.title}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {offShelf.length > 0 && (
+                  <optgroup label="Not on a Plex shelf — can’t be used">
+                    {offShelf.map((c) => (
+                      <option key={c.title} value={`coll:${c.title}`} disabled>
+                        {c.title}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select>
             )}
           </div>
@@ -165,7 +194,31 @@ function LibraryAnchor({
       </div>
       {relative && !chosen && (
         <p className="text-sm text-muted-foreground">
-          Pick a row or collection to sit {mode === "before" ? "before" : "after"}, or nothing moves.
+          Pick a row or collection to sit{" "}
+          {mode === "before" ? "before" : "after"}, or nothing moves.
+        </p>
+      )}
+      {/* The engine's rule, the right way round and for BOTH directions. `_shelf_sequence` resolves
+          a row-to-row relation by walking to the head of the chain, and gives up to "top of the
+          shelf" whenever the named row is not one Shortlist places — which is direction-agnostic, so
+          gating this note on `before` left "right after <row>" with no warning at all. The earlier
+          wording was also inverted ("only works if Shortlist isn't also positioning that row") and
+          named a library default that no longer exists. */}
+      {entry?.row && (
+        <p className="text-sm text-muted-foreground">
+          The other row needs its own placement switched on in this library too —
+          Shortlist can only hold two rows together if it is placing both. If that
+          one is set to <strong>Don’t position</strong>, or has nothing in this
+          library yet, this row goes to the top of the shelf instead, in your Rows
+          order.
+        </p>
+      )}
+      {anchorOffShelf && (
+        <p className="text-sm text-destructive-text">
+          “{entry?.anchor}” isn’t on any of this library’s Plex shelves, so
+          there’s no position to sit {mode === "before" ? "before" : "after"}.
+          Turn it on in Plex (the library’s Manage Recommendations screen) or
+          choose something else — until then this row stays where it is.
         </p>
       )}
       {rowSlug && entry?.row === rowSlug && (
@@ -177,9 +230,11 @@ function LibraryAnchor({
   );
 }
 
-/** Per-library placement of THIS row in the Recommended shelf. Each targeted library can inherit the
- *  global default, sit at the Top, or anchor after/before a collection. `pinnedTop` carries a legacy
- *  row-level pin over into per-library "Top" once, then `onConsumePin` lets the editor clear it. */
+/** Per-library placement of THIS row in the Recommended shelf. Each targeted library sits at the Top
+ *  (the default when nothing is set), anchors after/before a collection or another row, or is left
+ *  unpositioned. There is no global default to inherit any more — it was a second place to set the
+ *  same thing and disagreed with its own screen. `pinnedTop` carries a legacy row-level pin over into
+ *  per-library "Top" once, then `onConsumePin` lets the editor clear it. */
 export function RowShelfPlacement({
   value,
   libraryKeys,

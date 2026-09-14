@@ -6,6 +6,283 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.0] - 2026-09-14
+
+### Added
+
+- **See what changed after you update.** Shortlist told you when an update was out, but once you
+  had installed it, nothing said what was in it. Now the first page you open after an update shows
+  the release notes for every version since you last read them. If you skipped a few, you see all of
+  them. Close it and it stays closed, in every browser, until the next release. A new install
+  doesn't show it.
+
+- **Star on GitHub, or buy me a coffee.** The sidebar's "Support this project" link opened GitHub
+  Sponsors, which only works if you have a GitHub account and a card to hand. It is now two links: a
+  star, which is free and is how other Plex owners find Shortlist, and a Ko-fi coffee, which takes a
+  guest checkout with card, Apple Pay, Google Pay or PayPal. GitHub Sponsors is still on the repo.
+
+- **A row can now take days off.** Rows were permanent fixtures: once built, one sat on everybody's
+  Home until you switched it off or deleted it. Open a row and set **When it appears → Only on these
+  days**, and it shows on the days you pick and is hidden the rest of the time.
+
+  Two rows can cover a week between them — one on Monday, Wednesday and Friday, another filling the
+  rest — so the Home screen is not the same every night. On its off days a row is hidden, not
+  deleted: it keeps its titles and comes straight back on its next day without being rebuilt, so this
+  costs a few milliseconds rather than the minutes a rebuild takes on a large TV library.
+
+  Days turn over at midnight, on the server's clock. Changing them takes effect immediately rather
+  than waiting for the night. The Rows page shows **Showing today** or **Hidden today** against any
+  row that has a schedule, because a row that is simply missing is indistinguishable from a broken
+  one — and some Plex apps only notice the change once you leave the Home screen and come back. A
+  Roku re-reads it on its own; a Shield needs the nudge. (#102)
+
+- **Requests can go through Overseerr or Jellyseerr instead of straight to Radarr and Sonarr.** If
+  you already run Overseerr, Jellyseerr or Seerr, add it in Settings → **Connections**, then set
+  **Where requests go** to it under **Requests**. Overseerr then fetches each title with its own
+  quality profiles and folders. Pick a **Request as** account and that account's own approval
+  settings apply: choose one with auto-approve off, and Shortlist's requests wait in Overseerr for
+  your yes. The Requests settings now say in one sentence what will happen to a title, instead of
+  leaving you to work it out from three separate settings. Radarr and Sonarr stay the default, so
+  nothing changes until you switch. (#110)
+
+- **Someone with an "allow only" restriction now sees their own row.** Plex's allow list shows only
+  the labels or ratings it names, and a Shortlist row carries neither, so a person restricted that
+  way could not see their own row at all. Shortlist now adds that person's own row label to their
+  allow list, and nothing else: everything the list hid stays hidden, inside the row too. Their row
+  is also built only from titles their restrictions let them see, so it isn't half-empty. (#115)
+
+- **A row can set its Plex description and sort title.** Two optional fields in the row editor. A
+  **Description** is what Plex shows when someone opens the collection, and takes the same
+  placeholders as the row's name. A **Sort title prefix** orders the row in the library's
+  Collections tab (not on Home), and keeps working when the row is renamed. Leave either empty and
+  Shortlist never touches that field, so a summary or sort title set in agregarr stays. (#120)
+
+- **A row can wait while its person isn't watching.** A row rebuilt for someone who has watched
+  nothing since it was last built just swaps in more titles from the same taste, and on a large TV
+  library every rebuild is a slow Plex write. Set a hold in Settings, or per row with **Hold when
+  they aren't watching**, and the row waits until they watch something — but only for the number
+  of days you set, because the row nobody watches is the one that most needs to look different.
+  Off by default. (#109)
+
+- **Get told when a run fails.** Shortlist runs overnight, and a failed run was only visible to
+  someone who opened the app. Turn on **Send failures to a webhook** in Settings and give it an
+  address, and a failed run posts a message there: a Discord or Slack channel, Home Assistant, n8n,
+  or anything else that accepts a webhook. A button sends a test first. The address is stored
+  encrypted, because a webhook address works as a password.
+
+- **Serve Shortlist from a subpath.** Set `APP_BASE_PATH` (for example `/shortlist`) to run it
+  behind a reverse proxy at `https://your-host/shortlist`, with no prefix-stripping in the proxy.
+  Thanks to @jaredledvina. (#105)
+
+- **Posters where you look at titles.** Pick lists, each person's **Watched** tab and the Dashboard
+  now show posters, read from your own Plex server, so they are the artwork your library actually
+  has. The Dashboard's **Most watched** is a poster shelf, **Recently watched** groups titles under
+  the day they were watched, and titles carry TMDB, IMDb and Trakt links.
+
+- **A Sharing and privacy page.** It checks every account's Plex sharing live from plex.tv, rather
+  than trusting what Shortlist last wrote, and names any account that can see a row it shouldn't.
+  Open it from **Users**.
+
+- **Web search with Exa no longer needs an AI provider.** Exa returns the titles its pages
+  recommend, so it can now feed recommendations on its own. You can choose how hard it searches
+  (Instant, Auto, Deep lite — the default — or Deep), and the hint beside each says how it
+  performed when measured. Searches are cached for 7 days instead of 14, so a new release or a new
+  season shows up sooner.
+
+### Changed
+
+- **The privacy sync runs every 30 minutes by default, instead of once a night.** It is what hides
+  everyone's rows from a Plex account you have just shared your server with. Run once a night, that
+  account could browse every person's rows in the library's Collections tab for up to a day. A scheduled
+  pass that finds nothing to change takes about 20 seconds, writes nothing, and is no longer listed under
+  **Recent**; one that fails, changes something, raises a new warning, or that you caused by changing a
+  setting still is. A failure is no longer reported once a later pass succeeds, and passes no longer pile up behind a
+  long run. If you set your own schedule for it, yours is kept. (#119)
+
+- **The Dashboard no longer shows a row of "needs attention" chips.** Each chip repeated an alert
+  the notification bell already lists, so the bell is now the one place to look.
+
+- **The Dashboard's watch rate counts what people watched, not what they were shown.** The old
+  figure divided watched picks by every title a row had ever shown, most of which nobody will ever
+  watch, so it sat under 1% whether Shortlist was working or not. It now shows, of the titles people
+  watched, the share a row of theirs was showing at the time: on the maintainer's server, 99 of 535
+  over 30 days, where the old figure read 71 of 10,898. It says when it is too early to judge
+  instead of reporting an all-clear.
+
+- **A "watch it again" row is built from what people have finished.** It used to draw from the same
+  similar-titles pool as every other row, so someone with hundreds of finished films could get a row
+  of two, topped up with things they had never seen. It now leads with their favourites (4 stars or
+  more, when Plex ratings are on), then titles close to what they watch now, then whatever they have
+  gone longest without seeing. Anything finished in the last 30 days stays out; change that with
+  **Skip titles finished in the last**. (#114)
+
+- **The row editor is grouped around what people see.** Six groups instead of eight, in the order
+  you'd ask the questions: how it looks on Plex, who gets it, what goes in it, when it updates,
+  where people see it, and requests. The first puts the name, description and poster together,
+  beside an **On Plex** card showing them filled in for a sample person.
+
+- **The Requests inbox has tabs and one toolbar.** Waiting, Sent and Rejected are tabs. One toolbar
+  holds the movie/TV split, a search that finds a title by name or by who wanted it, filters for
+  rating, votes and language, and sort. Anything narrowing the list shows as a chip you can remove.
+
+- **The run page says what a live run is doing,** person by person, and "waiting for Plex" while it
+  waits its turn to write. AI tokens are shown as input and output, because output costs several
+  times more. Someone whose rows came out the same as last night now gets a line saying why.
+
+- **The Watched tab lists each title once.** A film held in two libraries was two lines, each with
+  a Block button that blocked both. It is now one line, with its libraries as tags beside the title
+  and a library filter when there is more than one to choose from. (#111)
+
+- **Two rows can share a name when they build in different libraries.** A Movies-only row and a
+  TV-only row can now both be called "{library_name} Picked For You". (#121)
+
+- **The documentation moved to [shortlistapp.dev](https://shortlistapp.dev).**
+
+### Fixed
+
+- **Restrictions you set on someone in Plex were being switched off.** If you had set a restriction
+  on someone — excluding a content rating like R, or an allow-list of ratings or labels — Shortlist
+  added its hide rule to it joined with `|`. Plex reads that as "either/or", not "both", so your
+  restriction quietly stopped applying. With an exclude rule, that person could also see every other
+  person's row; with an allow-list, they could see the whole library. Plex stored the rule exactly as
+  written, so the Sharing page and the check before promotion both reported the account as hidden.
+  Measured on a real server before fixing it.
+
+  Shortlist now joins its rule with `&`, which Plex applies together with yours. The first privacy
+  pass after you update repairs every account an earlier version wrote, and a notice names the
+  accounts it fixed. Those people may notice less on the server than before: that is your original
+  restriction working again. Someone with an allow-list still sees their own row: see the entry on
+  "allow only" restrictions above.
+
+  One case Shortlist can't fix for you: a label with a literal `&` in its name ("Kids & Family") in
+  someone's restrictions. Plex returns an error for their Home screen with a restriction like that,
+  so Shortlist can't add its rule to it. You'll get a notice naming the person and the label to
+  rename; the Sharing page says the same, and everyone else's rows carry on as normal. (#116, #115)
+
+- **Schedules with a day of the week now run on that day, not the day after.** `0 4 * * 1,4` is
+  Mondays and Thursdays, but it ran on Tuesdays and Fridays: the scheduler library counts weekdays
+  from Monday where cron counts from Sunday. The same slip moved every **Weekly** row from Sunday
+  to Monday, and "mondays at 9pm" to Tuesday. Saved schedules are unchanged and simply run on the
+  day they always said. If you shifted a day number to work around this, shift it back. `7` is now
+  accepted as Sunday too, and a list of days now gets a description ("Every Monday and Thursday at
+  4:00 AM") instead of none. A schedule that sets both a day of the month and a day of the week now
+  runs when either one matches, as cron does: `0 4 1 * 1` used to run only on a 1st that fell on a
+  Monday. (#123)
+
+- **A person's first row is hidden from everyone else as soon as it is built, not at the end of the run.**
+  Until Shortlist has written the exclusion onto every other account's share, a brand-new row could be
+  seen in the library's Collections tab by the other people on your server: the row's name, which can
+  say what the person watched, and the titles in it. That lasted until the privacy step at the end of
+  the run, which on a large library could be an hour or more. Now someone's first row is hidden from
+  every other account as soon as it is written, before any other row is. If plex.tv is failing, the
+  privacy step at the end of the run still hides it, as before. People who already had rows were not
+  affected. A first run, where everyone is new, makes more share-filter writes as a result — one round
+  per person rather than one at the end — and the rows pause while each round is written. (#119)
+
+- **A row keeps its Plex collection when its titles change, so agregarr settings stick.**
+  A row that lost five or more titles in a run used to be deleted and created again, because that
+  was quicker on a large TV library. The new collection had a new Plex id, and tools that remember a
+  collection by its id lost what you had set on it: agregarr's custom summary and sort title were
+  wiped every time the row refreshed. Shortlist now always updates the existing collection in place.
+
+  The trade is time. Plex removes titles from a collection one at a time, and on a very large TV
+  library each removal is slow, so a nightly run there can take a lot longer than before. Nothing
+  changes for a row whose titles did not change. While a row is being written, the run page now says
+  what it is doing: which library, and how many titles it is adding and removing, or that it is
+  creating a new row. (#119)
+
+- **"Something else is reordering your shelf" no longer fires because two people watched the same
+  film.** A "Because you watched X" row is named after the film, so everyone who watched that film
+  gets a row with the *same* name. The check that spots another tool fighting Shortlist for the shelf
+  was counting those as one row being moved over and over — so two people sharing a film was enough
+  to set it off, and the alert then pointed at Kometa or Agregarr, which had done nothing. It now
+  counts each row once per pass, which is what it always meant to do. A shelf genuinely being fought
+  over still raises it. (#106)
+
+- **"Something else is reordering your shelf" no longer fires when nothing else is.** A row rebuilt
+  during a run got a new Plex id, and the shelf-ordering pass at the end of that same run was still
+  working from the delivery record read before the run started. So it did not recognise the row as
+  one you had placed by hand: it swept it to the library default instead, and the next pass — the
+  privacy sync minutes later, or the next run — put it back where you asked. Every rebuilt row moved
+  twice per cycle, for ever, and moving the same row over and over is exactly what Shortlist treats
+  as proof that another tool (Kometa, Agregarr) is fighting it for the shelf.
+
+  Rows now land in their configured slot in the run that rebuilds them. On the maintainer's server
+  one run moved 70 rows and the pass twenty seconds later moved the same 70 straight back; that is
+  now zero. If you still see the alert after this, something really is reordering your shelf.
+  (#106)
+
+- **Rows land where you put them on the Recommended shelf again.** Plex stores each row's shelf
+  position as a number and places a row by halving the gap between its neighbours. After about fifty
+  moves there is no gap left, and Plex then accepts every move and applies none — in every Plex app,
+  its own web app included. One library on the maintainer's server had been stuck like that for over
+  a week. Shortlist now arranges the shelf by sending each row to the end in turn, the one move Plex
+  always has room for, which also repairs a library that is already stuck. Other tools' rows move
+  only as far as fitting Shortlist's among them requires, and keep their order relative to each
+  other. Placing a row "before" another row, next to a collection that isn't on the shelf, or in a
+  loop of rows that point at each other now settles too. (#106)
+
+- **A series marked watched by hand is picked up the same night.** Marking a TV series watched in
+  Plex could leave it out of Shortlist for up to a week, because the sync read history in pieces and
+  a show's own date can be older than its episodes'. Every sync now reads each library in full. A
+  series marked watched is dated from its episodes, not left at the last time it was played, and that
+  date decides how strongly it steers recommendations, so a show you finish today counts as today.
+  Unmarking a title takes back its pick's credit that night, not a week later. (#108)
+
+- **Renaming a row onto a name Plex refuses now works.** Plex keeps a collection's name reserved
+  after the collection is deleted and refuses to rename anything onto it, so a row named after its
+  top title could keep the old title's name over the new title's picks while the run page showed the
+  new name. Shortlist now frees a name a deleted collection left behind. Renaming from the row editor
+  lists each person as renamed, waiting for the next run, or refused with the reason, instead of
+  stopping at the first refusal.
+
+- **Restoring a backup actually restores it.** The restore copied the backup in while the app still
+  had the database open, and the restart you were told to do then wrote the old data back over it.
+  A restore now waits and is applied at the next start, before anything opens the database.
+  **Jobs → Backups** shows a waiting restore with a Cancel button, and one still waiting after a day
+  is dropped.
+
+- **A nightly run cut short by a restart finishes for the people it never reached.** When a container
+  update restarted Shortlist part-way through a run, everyone after that point went without new rows
+  — the same people each time. The next start now runs for them, listed on Runs as **Resumed after a
+  restart**. Only a scheduled run from the last 20 hours is resumed, and never twice.
+
+- **Losing `secret.key` no longer destroys your saved credentials.** If `/config/secret.key` went
+  missing or was regenerated, the next start re-encrypted every saved Plex token and API key with the
+  new key, overwriting the only copy the old key could read, and logged it as a success. They are now
+  left untouched, so putting the original key back still works.
+
+- **A failed Support check could write your Plex token to the log file.** The checks on the Support
+  page removed tokens from what they showed you but not from the log line they wrote, and the log file
+  always records at full detail, so a failed check put a live Plex token on disk and into any support
+  bundle made after it. If you have posted a support bundle publicly, remove it or check it for
+  `X-Plex-Token` first.
+
+- **On a server with a single Shortlist row, one bad read from Plex could delete it.** Before deleting a
+  row it can't match to anyone, Shortlist cross-checks the read against every other row — which was
+  skipped when there was only one row on the server, the case with nothing to check against. Every
+  such delete is now confirmed with a second read first.
+
+- **A row Plex had stopped accepting titles for is rebuilt.** Plex occasionally breaks a collection
+  so that it refuses every title added to it, and that person's row then stayed empty night after
+  night. Shortlist now deletes and recreates a row in that state.
+
+- **Auto-send no longer spends its nightly slots on titles that can never be added.** A show with no
+  TheTVDB id, or a title whose Radarr or Sonarr isn't fully set up, took a send slot, failed, and took
+  it again the next night: on one server, 25 of 40 slots in a week. Those titles now wait in the
+  Requests inbox with the reason.
+
+- **Going back in the setup wizard no longer resets your row name and size.** The customize step
+  forgot what you had saved, and the next save — including **Skip for now** — wrote the defaults over
+  it.
+
+- **AI token counts are right after a failed call.** A failed call counted the previous call's tokens
+  again, usually another person's, which inflated the run's total.
+
+- **Web search rides out a slow or busy Exa.** A timeout or a server error from Exa lost that search
+  outright, and on a busy run Exa also starts turning requests away; both now retry with a pause. A
+  dead MDBList no longer uses up the whole lookup budget before giving up.
+
 ## [1.8.0] - 2026-08-26
 
 ### Added

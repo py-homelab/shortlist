@@ -173,14 +173,27 @@ class WatchItemOut(PassthroughModel):
 
 
 class WatchedTitleOut(PassthroughModel):
-    """One title from the cached watched set — the set recommendations are actually filtered against."""
+    """One TITLE from the cached watched set — the set recommendations are actually filtered against.
+
+    One title, not one stored row: a title held in two Plex libraries is cached once per library, and
+    those copies are merged here (issue #111). `libraries` names the ones it was found in, and every
+    other field is merged to the claim the engine acts on — see `_merge_watched_copies`.
+    """
 
     title: str
+    # The Plex ratingKey of the copy `title` and `year` came from, so the page can draw its artwork
+    # through `GET /api/picks/{rating_key}/poster`. That route serves any library item the owner's
+    # token can read, not only delivered picks — a watched title has never been a pick by definition.
+    rating_key: int
     tmdb_id: int | None
     media_type: str
     watched_at: str
     year: int | None
     watch_count: int
+    # Display names of the Plex libraries holding this title, sorted. Usually one; two or more is the
+    # duplicate this page used to render as separate rows. Empty for rows cached before 0087, whose
+    # library name is filled in by that person's next sync.
+    libraries: list[str]
     # A show's progress straight from Plex. Both None for movies and for anything reporting no
     # episode totals — which is NOT the same claim as "none of it watched", so the UI must not
     # render 0 of 0 for it.
@@ -189,6 +202,18 @@ class WatchedTitleOut(PassthroughModel):
     # What THIS person rated it in Plex, 0..10, or None if they never did — which is almost always.
     # Read with their own share token, so it is their rating and nobody else's.
     user_rating: float | None
+
+
+class WatchedLibraryOut(PassthroughModel):
+    """One Plex library this person has a cached watch in.
+
+    The `media_type` is what lets the page decide whether a library filter is worth showing: one
+    library per type means the Movies/Shows buttons already draw every distinction a library choice
+    could, and a second control offering the same two words is noise (#111).
+    """
+
+    name: str
+    media_type: str  # movie | show
 
 
 class WatchedPageOut(PassthroughModel):
@@ -200,9 +225,17 @@ class WatchedPageOut(PassthroughModel):
     """
 
     items: list[WatchedTitleOut]
+    # How many TITLES match the filters — the same thing `items` counts. Smaller than `synced_titles`
+    # on a server that holds anything in two libraries.
     total: int
+    # Every library this person has a cached watch in, sorted, for the page's library filter. Never
+    # narrowed by the `library` parameter, or picking one would empty the control that picked it.
+    libraries: list[WatchedLibraryOut]
     # None when any library has never had a full read — see `user_watched`.
     last_full_sync_at: str | None
+    # Rows in the cache: one per library COPY, summed across this person's libraries. Deliberately
+    # not the same number as `total` — the UI says "library copies" so the two can't read as a
+    # contradiction.
     synced_titles: int
     # At or below this 0..10 rating, a title stops seeding this person's rows. None = Plex ratings
     # are switched off server-wide, so no rating is acting on anything.
@@ -220,6 +253,39 @@ class UserSyncOut(PassthroughModel):
     added: int
     updated: int
     total: int
+
+
+def merged_prefs(stored: dict, sent: BaseModel) -> dict:
+    """``stored`` with the fields ``sent`` actually mentioned applied, and nothing else touched.
+
+    Read with ``model_fields_set``, never with an ``is not None`` filter. "The client did not mention
+    this field" and "the client set it to null" are different instructions, and only the first means
+    "leave it alone" — the None filter collapsed them, so a pref could be set but never CLEARED. It
+    would also have started silently clobbering the day a ``UserPrefs`` field gained a non-``None``
+    default, because ``model_dump()`` renders that default whether or not the client sent it, writing
+    it into every user on every unrelated PATCH. ``PATCH /collections`` and ``PUT …/rows`` already
+    read the request this way; this was the last partial write that did not.
+
+    ``model_dump`` rather than ``getattr``, and that is not a style choice: ``prefs`` is a JSON
+    column and ``blocked_seeds`` accepts objects, so reading the field off the model would hand
+    SQLAlchemy ``BlockSeedBody`` instances instead of dicts. ``exclude_unset`` gives exactly the
+    fields ``model_fields_set`` names, with the nested models already converted.
+
+    Args:
+        stored: The prefs mapping as it is on the user right now. Never mutated.
+        sent: The parsed request body's prefs model.
+
+    Returns:
+        A new mapping. Keys the model knows nothing about (an install's accrued ``history_depth``,
+        say) pass through untouched.
+    """
+    merged = dict(stored)
+    for key, value in sent.model_dump(exclude_unset=True).items():
+        if value is None:
+            merged.pop(key, None)  # an explicit null clears the override
+        else:
+            merged[key] = value
+    return merged
 
 
 def _watch_depths(session) -> dict[int, int]:
@@ -397,9 +463,8 @@ async def patch_user(user_id: int, patch: UserPatch, request: Request) -> dict:
         if patch.request_tag is not None:
             user.request_tag = patch.request_tag.strip()
         if patch.prefs is not None:
-            prefs = dict(user.prefs or {})
-            was_paused = bool(prefs.get("paused"))
-            prefs.update({k: v for k, v in patch.prefs.model_dump().items() if v is not None})
+            was_paused = bool((user.prefs or {}).get("paused"))
+            prefs = merged_prefs(user.prefs or {}, patch.prefs)
             user.prefs = prefs
             # Pausing means "stop showing their row", so it has to come down NOW — a paused person is
             # absent from every run by definition, so nothing else would ever act on it. Unpausing is
@@ -674,6 +739,7 @@ async def user_watched(
     request: Request,
     q: str = Query("", max_length=200, description="Case-insensitive substring of the title."),
     media_type: str = Query("", pattern="^(movie|show)?$"),
+    library: str = Query("", max_length=255, description="Display name of a Plex library; empty for all."),
     limit: int = Query(25, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> dict:
@@ -681,9 +747,12 @@ async def user_watched(
 
     Reads the local `watched_titles` cache, so unlike `/history` it never touches Plex: it is a DB
     query, it can search the WHOLE set rather than the page on screen, and it shows the same titles
-    the recommender excludes from.
+    the recommender excludes from. One row per TITLE — a title held in two libraries is merged, and
+    names both.
     """
-    page = request.app.state.run_service.user_watched(user_id, q=q, media_type=media_type, limit=limit, offset=offset)
+    page = request.app.state.run_service.user_watched(
+        user_id, q=q, media_type=media_type, library=library, limit=limit, offset=offset
+    )
     if page is None:
         raise HTTPException(status_code=404, detail="user not found")
     return page

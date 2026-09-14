@@ -22,4 +22,12 @@ overrides:
   # future bound here needs the same check — "we already have an override" is not the same as "the
   # version it forces is fixed". Drop the whole block once openapi-typescript ships a
   # @redocly/openapi-core that no longer pins a vulnerable js-yaml.
-  js-yaml@>=4.0.0 <4.3.1: 4.3.1
+  #
+  # Bumped 4.3.1 -> 4.3.2 (2026-09-13): GHSA-2883-xcg3-v3hh, `maxTotalMergeKeys` does not limit CPU
+  # for empty merge sources; fixed in 4.3.2 only.
+  js-yaml@>=4.0.0 <4.3.2: 4.3.2
+  # GHSA-mh99-v99m-4gvg and GHSA-rgw5-rvv9-x895: brace-expansion expands unbounded patterns (DoS).
+  # Same build-time-only path as js-yaml above (openapi-typescript -> @redocly/openapi-core ->
+  # minimatch 5, which asks for ^2.0.1). 2.1.4 is the first release fixing both; eslint's minimatch 10
+  # already brings the unaffected 5.x line, which this range leaves alone.
+  brace-expansion@>=2.0.0 <2.1.4: 2.1.4

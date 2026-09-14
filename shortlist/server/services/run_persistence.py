@@ -22,6 +22,7 @@ from sqlalchemy import and_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
 from shortlist.engine.models import SHARED_SLUG_PREFIX
 from shortlist.engine.requests import QUEUE_REASON_PREFIXES
 from shortlist.server.db.models import (
@@ -42,7 +43,7 @@ from shortlist.server.db.models import (
     WatchSession,
 )
 from shortlist.server.services import jobs
-from shortlist.server.services.audit import add_audit
+from shortlist.server.services.audit import RESTRICTION_RESTORED_SCOPE, add_audit
 from shortlist.server.services.watch_events import (
     RowMembership,
     _attribution_floor,
@@ -102,6 +103,12 @@ def _record_deliveries(session: Session, user_slug: str, breakdown: list[dict]) 
             session.add(row)
         row.rating_key = rating_key
         row.title = entry.get("row_title") or ""
+        # Absent on an entry delivery never reached the description step with (and on legacy breakdowns):
+        # keep the record rather than forget a value Plex may still hold.
+        if "summary_written" in entry:
+            row.summary_written = entry["summary_written"]
+        if "title_sort_written" in entry:
+            row.title_sort_written = entry["title_sort_written"]
         row.updated_at = datetime.now(UTC)
 
 
@@ -603,7 +610,7 @@ def _withdraw_unwatched(
     observed: set[tuple[int, str]],
     *,
     now: datetime,
-) -> int:
+) -> list[str]:
     """Take back credits that Plex's flag was the ONLY evidence for, once that flag is gone.
 
     Someone can un-watch a title, and Plex marks things watched wrongly often enough that correcting
@@ -622,10 +629,11 @@ def _withdraw_unwatched(
     * **Anything settled.** See `UNWATCH_WITHDRAW_DAYS`: past that, a title missing from the read is
       far more likely to have left the library than to have been un-watched.
 
-    Returns how many were withdrawn, for the log.
+    Returns the titles withdrawn, sorted — the log names them, because the two columns this clears
+    have no other copy and a wrong withdrawal is otherwise undiagnosable.
     """
     cutoff = now - timedelta(days=UNWATCH_WITHDRAW_DAYS)
-    withdrawn = 0
+    withdrawn: list[str] = []
     for pick in session.query(PickRow).filter(PickRow.user_id == user.id, PickRow.watched_at.isnot(None)).all():
         key = (pick.tmdb_id, pick.media_type)
         if key in latest_watch or key in observed:
@@ -642,12 +650,12 @@ def _withdraw_unwatched(
             continue  # settled history — see UNWATCH_WITHDRAW_DAYS
         pick.watched_at = None
         pick.finished_at = None
+        withdrawn.append(pick.title or f"tmdb:{pick.tmdb_id}")
         # The percentage is NOT cleared here, and cannot need to be: the guard above means a pick
         # carrying one is never withdrawn at all. What protects against a percentage outliving its
         # credit — which happens when the credited row is deleted and its history cleared — is
         # `resolve_outcomes`, which refuses to call a percentage with no credit an outcome.
-        withdrawn += 1
-    return withdrawn
+    return sorted(withdrawn)
 
 
 @dataclass
@@ -797,8 +805,6 @@ def reconcile_watched(
     sessions: sessionmaker[Session],
     profiles,
     live_picks: dict[int, set[int]] | None = None,
-    *,
-    full_resync: bool = False,
 ) -> None:
     """Mark the picks a person actually watched — the hit rate, and the whole point of the app.
 
@@ -902,14 +908,19 @@ def reconcile_watched(
             )
             _apply_outcomes(session, user, desired)
 
-            # Only on a FULL re-read, and only for someone whose history actually came back. An
-            # incremental read sees an un-watch only inside the window it covered (see
-            # `WatchSync._full_resync_due`), so "absent from this read" would withdraw half a
-            # roster's credits on any night the cursor was narrow. An EMPTY history is excluded for
-            # the same reason from the other direction: a read that failed and a person who has
-            # watched nothing are indistinguishable here, and wrongly wiping real history is far
-            # worse than leaving one stale credit for someone who un-watched their only title.
-            if full_resync and profile.history:
+            # PER PERSON, never per batch, and only for someone whose history actually came back.
+            # Withdrawal acts on ABSENCE and cannot be undone, so it runs only when THIS person's own
+            # read proved it saw everything — `history_complete`, stamped by `refresh_watched`.
+            #
+            # A roster-wide flag was wrong and provably so: `ShareTokenWatchSource.fetch` swallows an
+            # unreadable library as "nothing watched there" and returns the other libraries' titles,
+            # which is non-empty and looks exactly like a complete read. Every credited pick in the
+            # unreadable library then read as un-watched and lost its credit for good.
+            #
+            # An EMPTY history is excluded from the other direction: a read that failed and a person
+            # who has watched nothing are indistinguishable here, and wrongly wiping real history is
+            # far worse than leaving one stale credit for someone who un-watched their only title.
+            if getattr(profile, "history_complete", False) and profile.history:
                 gone = _withdraw_unwatched(
                     session,
                     user,
@@ -918,7 +929,20 @@ def reconcile_watched(
                     now=datetime.now(UTC),
                 )
                 if gone:
-                    logger.info("watch-sync: withdrew {} un-watched credit(s) for {}", gone, user.username)
+                    # WHICH, not just how many. `watched_at`/`finished_at` have no other copy, so this
+                    # line is the entire forensic trail if it ever takes back something it shouldn't
+                    # — the standard plex-safety rule 10 already sets for writes that reach Plex.
+                    # DISTINCT titles, not one entry per row. A title is delivered by many runs, so
+                    # a single withdrawal is typically 8+ pick rows for the same show, and the raw
+                    # list read "Rabbit Hole, Rabbit Hole, Rabbit Hole, ..." — which buries the one
+                    # thing this line exists to say. The COUNT stays row-based: that is what was
+                    # actually written.
+                    logger.info(
+                        "watch-sync: withdrew {} un-watched credit(s) for {}: {}",
+                        len(gone),
+                        user.username,
+                        ", ".join(sorted(set(gone))),
+                    )
 
             existing = shared_rows[user.id]
             _apply_shared(
@@ -1010,6 +1034,8 @@ def persist_report(
         if report.error:
             _add_event(session, "run", "error", run_id, error=report.error)
         _finalize_run(run, report, status, error, ok, errors, skipped)
+        for account_id, username in report.restrictions_restored.items():
+            add_audit(session, RESTRICTION_RESTORED_SCOPE, "info", account_id=account_id, username=username)
         session.commit()
     # Retention is applied AFTER this transaction commits, as its own `maintenance.prune` job.
     # It used to share this transaction: a bulk delete across runs/run_users/run_log_lines/picks
@@ -1026,19 +1052,43 @@ def _queue_retention_prune(sessions: sessionmaker[Session]) -> None:
         logger.warning("could not queue the retention prune ({}) — the next run will", type(e).__name__)
 
 
+# Key prefixes nothing reads any more. Renaming a cache namespace strands every row under the old
+# name: no code can reach them again, but they keep their TTL and sit in the file the nightly backup
+# copies whole. `websearch:` was retired for `websearch2:` when the payload changed shape to carry
+# extracted titles beside the raw results — 711 stranded rows on a 46-user server, none of them
+# expired, all of them unreadable. Expiry alone clears these eventually; naming them clears them now.
+_RETIRED_CACHE_PREFIXES = ("websearch:", "index2:")
+
+
 def prune_expired_cache(session: Session) -> int:
-    """Drop cache rows whose TTL has passed.
+    """Drop cache rows whose TTL has passed, plus any left behind by a renamed key namespace.
 
     `DbCache.get` filters on `expires_at`, but nothing ever DELETED an expired row, so the table
     only grew. `library_index` is the worst of them: its key deliberately changes whenever the
     library changes, so every library edit stranded a whole-library JSON blob that could never be
     read again — in the same file the nightly backup copies in full and keeps ten of.
+
+    Retired prefixes are the same problem arriving a different way: the row is live by its TTL and
+    dead by its key. Matching on the key rather than `kind` is required — the old and new web-search
+    namespaces share `kind='websearch'`, so a kind-wide delete would take the live rows too.
     """
     from shortlist.server.db.models import CacheRow
 
     removed = session.query(CacheRow).filter(CacheRow.expires_at < time.time()).delete(synchronize_session=False)
     if removed:
         logger.info("pruned {} expired cache row(s)", removed)
+    for prefix in _RETIRED_CACHE_PREFIXES:
+        # `startswith(autoescape=True)`, never a hand-built LIKE: in LIKE, `_` matches ANY character,
+        # so a future prefix such as `library_index:` would over-match — and this loop DELETES. An
+        # assert would not do as a guard either, since `python -O` strips it.
+        stranded = (
+            session.query(CacheRow)
+            .filter(CacheRow.key.startswith(prefix, autoescape=True))
+            .delete(synchronize_session=False)
+        )
+        if stranded:
+            logger.info("pruned {} cache row(s) under the retired '{}' key namespace", stranded, prefix)
+            removed += stranded
     return removed
 
 
@@ -1329,8 +1379,8 @@ def _persist_user_report(session: Session, run_id: int, user: User, user_report,
         )
     )
     if not dry_run:
-        # Forget BEFORE recording: a row removed and then re-delivered in the same run (a retitle that
-        # went through delete+create) must end up with the entry the delivery just wrote, not without one.
+        # Forget BEFORE recording: a row removed and then re-delivered in the same run (a repair that
+        # recreates it) must end up with the entry the delivery just wrote, not without one.
         _forget_removed_deliveries(session, user.slug, user_report.removed_deliveries)
         _record_deliveries(session, user.slug, user_report.breakdown)
         for pick in user_report.picks:
@@ -1354,6 +1404,7 @@ def _persist_user_report(session: Session, run_id: int, user: User, user_report,
                     rating=pick.rating,
                     year=pick.year,
                     recipe=pick.recipe,
+                    built_at=pick.built_at,
                 )
             )
     _add_event(
@@ -1387,7 +1438,9 @@ def _emit_sweep_event(session: Session, run_id: int, report) -> None:
         dry_run=report.dry_run,
         reason="row was broken beyond repair-in-place — no share filter could hide it (wrong "
         "type for its library, or no shortlist label at all — an orphan from an interrupted "
-        "run), or it shared a collection tag with other users' rows and held their picks",
+        "run), or it shared a collection tag with other users' rows and held their picks. Keys "
+        "starting 'freed-name helper:' are not rows: a helper a stopped run left behind while "
+        "freeing a row's name",
         deleted=report.swept_rows,
     )
 
@@ -1414,24 +1467,38 @@ def _emit_privacy_sync_events(session: Session, run_id: int, report) -> None:
 def _emit_hub_ordering_events(session: Session, run_id: int, report) -> None:
     # Recommended-shelf reorders. Moving a managed hub shifts every collection's position on a
     # server-wide shelf that a co-managing tool (Kometa) also cares about, so each library we
-    # actually moved rows in is audited — "what changed on the shelf at 03:31" (plex-safety rule 10).
+    # actually moved rows in is audited — "what changed on the shelf at 03:31" (plex-safety rule 10)
+    # — and so is each one whose configured placement could not be applied (a refused anchor).
     for entry in report.hub_orderings:
         # `verified` is the whole point of the record. "We asked" and "it happened" are different
         # facts — a co-managing tool (agregarr, Kometa) reorders the same shelf on its own clock — and an
         # audit that only ever said the first is how a shelf owned by another tool was reported as a
         # successful reorder for weeks (SFLIX 2026-08-12). A dry run asked for nothing, so it is neither
         # verified nor a warning.
+        #
+        # An unplaceable entry asked Plex for nothing either, so it carries NO `verified` and gets its
+        # own scope — `_shelf_contention` counts repeated moves within a bounded event budget, and a
+        # stale anchor re-reported every pass has nothing to tell it.
         verified = entry.get("verified")
+        unplaced = entry.get("placed") is False
         _add_event(
             session,
-            "run.hub_order",
-            "warning" if verified is False else "info",
+            "run.hub_unplaced" if unplaced else "run.hub_order",
+            "info" if report.dry_run else ("warning" if unplaced or verified is False else "info"),
             run_id,
             dry_run=report.dry_run,
             library=entry.get("library"),
             anchor=entry.get("anchor"),
             moved=entry.get("moved", []),
+            # How many hubs the pass repositioned in TOTAL. A bottom-build writes to the backbone as
+            # well as to our rows, and `moved` names only ours — so without this the feed understates
+            # what reached Plex (plex-safety rule 10).
+            repositioned=entry.get("repositioned"),
             verified=verified,
+            reason=entry.get("reason"),
+            # The row that could not be placed, when the record is about one. Kept apart from
+            # `anchor`, which everywhere else names what we anchored TO (rule 10).
+            row=entry.get("row"),
         )
 
 
@@ -1457,10 +1524,17 @@ def _emit_request_events(session: Session, run_id: int, report) -> None:
     # window), and keying on the pool skipped exactly that case. `wanted == 0` stays silent — nothing
     # was missing, which is not a problem to report.
     if report.requests is not None and report.requests.wanted and not report.requests.considered:
+        # How many people's demand fed this pass, and the floor it had to clear. Demand counts
+        # DISTINCT wanters, so a run covering fewer people than the floor cannot fill the pool no
+        # matter what the settings say — a one-user manual run against `min_demand=2` is guaranteed
+        # to land here. That is not a warning and it is not the owner's floors: it is the run's own
+        # scope, so it is recorded as INFO and `notifications._requests_found_nothing` skips it.
+        population = len(report.users)
+        unreachable = report.requests.demand_floor > population
         _add_event(
             session,
             "requests.none_qualified",
-            "warning",
+            "info" if unreachable else "warning",
             run_id,
             dry_run=report.dry_run,
             wanted=report.requests.wanted,
@@ -1469,6 +1543,9 @@ def _emit_request_events(session: Session, run_id: int, report) -> None:
             examined=report.requests.examined,
             lookups_spent=report.requests.lookups_spent,
             exhausted_pool=report.requests.examined >= report.requests.pool_size,
+            users=population,
+            demand_floor=report.requests.demand_floor,
+            demand_unreachable=unreachable,
         )
     if report.requests is None or not report.requests.outcomes:
         return
@@ -1511,12 +1588,30 @@ def persist_request_queue(session: Session, run_id: int, report) -> None:
     # Drop pending candidates the library now holds; leave sent/rejected alone (owner-actioned).
     present = {(tid, mt.value) for tid, mt in report.library_present}
     present |= report.requests.arr_present  # best-effort; empty when a check was skipped/failed
-    for key in [k for k, r in existing.items() if r.status == "pending" and k in present]:
+    # A title this run SENT is never pruned, however the presence checks read it: the send is the
+    # newer fact, and filing it as `sent` is the whole reason a downloading title isn't re-requested
+    # tomorrow night. Without this the sent pass below re-inserts the key the prune just deleted.
+    sent_keys = {(m.tmdb_id, m.media_type.value) for m in report.requests.sent}
+    for key in [k for k, r in existing.items() if r.status == "pending" and k in present and k not in sent_keys]:
         session.delete(existing.pop(key))
+    # The deletes go out BEFORE any insert below. SQLAlchemy orders a flush by mapper, not by the
+    # order you called it in, so INSERTs for a table precede its DELETEs — and one key that is both
+    # pruned and re-filed then trips the UNIQUE constraint, losing the ENTIRE report, not just the
+    # inbox row (issue #104). Nothing below re-files a pruned key any more; this keeps it that way.
+    session.flush()
     for m in report.requests.queued:
-        row = existing.get((m.tmdb_id, m.media_type.value))
+        key = (m.tmdb_id, m.media_type.value)
+        if key in present:
+            # The library or an Arr already has it — the prune above is the right answer, and
+            # re-queueing would put the row straight back for the next run to delete again.
+            continue
+        row = existing.get(key)
         if row is None:
-            session.add(_candidate_row(m, run_id, status="pending"))
+            # Registered, not just added: a key reaching this loop twice would otherwise insert
+            # twice and lose the ENTIRE report to the UNIQUE constraint. The engine dedupes before
+            # this point, but the barrier belongs on both sides of that contract (issue #104).
+            existing[key] = _candidate_row(m, run_id, status="pending")
+            session.add(existing[key])
         elif row.status == "pending":
             _refresh_pending(row, m)
 
@@ -1528,13 +1623,15 @@ def persist_request_queue(session: Session, run_id: int, report) -> None:
     # "already in Radarr", …), not just that it went.
     auto_outcomes = {(o.tmdb_id, o.media_type.value): o for o in report.requests.outcomes}
     for m in report.requests.sent:
-        row = existing.get((m.tmdb_id, m.media_type.value))
-        outcome = auto_outcomes.get((m.tmdb_id, m.media_type.value))
+        key = (m.tmdb_id, m.media_type.value)
+        row = existing.get(key)
+        outcome = auto_outcomes.get(key)
         if row is None:
             new_row = _candidate_row(m, run_id, status="sent")
             new_row.sent_at = datetime.now(UTC)
             if outcome is not None:
                 new_row.detail = outcome.detail
+            existing[key] = new_row  # same barrier as the queued pass above
             session.add(new_row)
         else:
             # Only on the TRANSITION: a title re-surfaced by a later run is not a second send,
@@ -1572,7 +1669,9 @@ def _finalize_run(
         # Built nothing, but nothing went wrong — see RunUser.reason for which case it was.
         "users_skipped": skipped,
         "dry_run": report.dry_run,
-        "rows_swept": sum(len(titles) for titles in report.swept_rows.values()),
+        "rows_swept": sum(
+            len(titles) for key, titles in report.swept_rows.items() if not key.startswith(FREED_NAME_HELPER_KEY)
+        ),
         "shares_updated": len(report.filter_writes),
         "titles_added": titles_added,
         "titles_removed": titles_removed,
@@ -1607,6 +1706,9 @@ def _finalize_run(
         "requests_examined": report.requests.examined if report.requests else 0,
         "requests_lookups": report.requests.lookups_spent if report.requests else 0,
         "llm_tokens": sum(u.llm_tokens for u in report.users),
+        # The output share of that total, which the provider bills at a higher rate. Absent on runs
+        # recorded before it was measured — the UI then shows the total alone.
+        "llm_output_tokens": sum(u.llm_output_tokens for u in report.users),
         "llm_tokens_by_step": tokens_by_step,
         "exa_searches": sum(u.exa_searches for u in report.users),
         # Cache hits served from the shared 14-day web-search cache. Reported so the UI can read
@@ -1628,6 +1730,9 @@ def _finalize_run(
     # assumed it meant.
     if report.unhideable_measured:
         stats["unhideable_rows"] = {name: list(keys) for name, keys in report.unhideable_rows.items()}
+        # Same measured-flag discipline, same reason: the privacy loop that fills it ran, so empty is a
+        # finding that clears the alert (#116 — filters Plex itself cannot read).
+        stats["unreadable_filters"] = dict(report.unreadable_filters)
     # Accounts the owner left alone whose excludes could not be taken back off. Written only when
     # non-empty: an empty key would read as a measurement on every run that never got this far.
     # Accounts whose filter Shortlist wrote and Plex is not applying. Written on every run that

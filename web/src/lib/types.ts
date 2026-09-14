@@ -66,6 +66,7 @@ export type ConnectionTestResult = Schemas["ConnectionTestOut"];
 
 /** GET /api/settings/arr/{service}/options — dropdown data for a connected Sonarr/Radarr. */
 export type ArrOptions = Schemas["ArrOptionsOut"];
+export type SeerrOptions = Schemas["SeerrOptionsOut"];
 
 // --- Rows / collections ---
 
@@ -106,14 +107,21 @@ export type PosterMode = NonNullable<Schemas["PosterIn"]["mode"]>;
  */
 export type CollectionInput = Omit<
   Required<Schemas["CollectionIn"]>,
-  "hub_anchor"
+  "hub_anchor" | "dry_run"
 > & {
   hub_anchor: HubAnchorMap;
 };
 
 /** POST /api/collections and PATCH /api/collections/{id} body. Only `name` is required; every other
- *  field falls back to the row's stored value (PATCH) or the server default (POST). */
-export type CollectionBody = Partial<CollectionInput> & { name: string };
+ *  field falls back to the row's stored value (PATCH) or the server default (POST).
+ *
+ *  `dry_run` rides here rather than in {@link CollectionInput}: it is a mode for ONE request — preview
+ *  this edit and write nothing — not a field of the row the editor holds, so `toInput()` has nothing
+ *  to fill it from and a saved row has nowhere to put it back. */
+export type CollectionBody = Partial<CollectionInput> & {
+  name: string;
+  dry_run?: boolean;
+};
 
 /** A curated-row definition (GET/POST/PATCH /api/collections).
  *
@@ -192,10 +200,13 @@ export type TransferResult = Schemas["TransferOut"];
 /** A transfer that can still be undone (GET /api/watching-account/snapshots). */
 export type WatchSnapshot = Schemas["SnapshotOut"];
 
-/** What the watch-history panel is filtering by. "" = every type. */
+/** What the watch-history panel is filtering by. "" = every type, and every library. */
 export type WatchedFilters = {
   q: string;
   mediaType: "" | "movie" | "show";
+  /** A Plex library's display name. Selects which titles show; a shown row still names every
+   *  library it lives in, so filtering to "4K Movies" can return a row marked "Movies · 4K Movies". */
+  library: string;
   limit: number;
 };
 
@@ -385,6 +396,10 @@ export type AppNotification = Schemas["NotificationOut"];
  *  report one fact, so they dismiss as one. */
 export type NotificationsPage = Schemas["NotificationsOut"];
 
+/** `GET /api/notifications/whats-new` — the release notes the owner has not read since upgrading.
+ *  `version` is the running build; `releases` is newest first and empty when nothing is unread. */
+export type WhatsNew = Schemas["WhatsNewOut"];
+
 /** Report windows, in days. "all" is lifetime. */
 export type ReportWindow = Schemas["EffectivenessReportOut"]["window"];
 
@@ -416,6 +431,8 @@ export type LogPage = Schemas["LogsOut"];
 export type SyncsInfo = Schemas["SyncsOut"];
 
 export type Backup = Schemas["BackupOut"];
+/** The restore waiting for the next start, if any (it is applied at boot, see `backups.apply_pending_restore`). */
+export type PendingRestore = Schemas["PendingRestoreOut"];
 
 export type VersionInfo = Schemas["VersionOut"];
 
@@ -485,6 +502,12 @@ export type SyncFinishedEvent = Schemas["SyncFinishedEvent"];
 /** One title this person was recommended and then played (`/api/users/{id}/outcomes`). */
 export type UserPickOutcome = Schemas["UserPickOutcomeOut"];
 
+/** GET /api/privacy/status — every account's share filter as plex.tv reports it right now. */
+export type PrivacyStatus = Schemas["PrivacyStatusOut"];
+
+/** One account on that screen. `state` is decided server-side so the copy lives in one place. */
+export type AccountPrivacy = Schemas["AccountPrivacyOut"];
+
 // ---------------------------------------------------------------------------
 // Hand-written — the shapes the schema genuinely cannot describe.
 //
@@ -533,12 +556,15 @@ export interface RunStats {
       considered: number;
       /** What the caps allocated to this row — the figure that answers "did my row limit bind". */
       claimed: number;
-      /** Of those, how many the Arr accepted; a claim can still be skipped (no TheTVDB id). */
+      /** Of those, how many the Arr accepted; a claim can still fail at the send (the Arr refused it). */
       sent: number;
     }
   >;
   /** Total AI tokens this run cost (curate + the AI candidate sources). Absent on legacy runs. */
   llm_tokens?: number;
+  /** The output share of `llm_tokens`, billed at a higher rate than input. Absent on runs before it was
+   *  measured. */
+  llm_output_tokens?: number;
   /** That total split by where it went: { curate, llm_web, llm_library }. */
   llm_tokens_by_step?: Record<string, number>;
   /** External web searches run this run, whichever backend ran them (Exa or SearXNG). Counted per
@@ -775,12 +801,14 @@ export interface TraceSelection {
   library: string;
   /** `rebuilt` (built fresh) · `carried_forward` (redelivered untouched — not its refresh night) ·
    *  `refreshed` (kept the strongest two-thirds, swapped the rest) · `settings_changed` (rebuilt
-   *  early because a setting that decides contents was edited) · `cold_start`. */
+   *  early because a setting that decides contents was edited) · `held_idle` (it WAS its refresh
+   *  night, but the person has watched nothing since the row was built) · `cold_start`. */
   decision:
     | "rebuilt"
     | "carried_forward"
     | "refreshed"
     | "settings_changed"
+    | "held_idle"
     | "cold_start";
   size: number;
   delivered: number;
@@ -788,12 +816,20 @@ export interface TraceSelection {
   cut_cap?: number;
   carried?: number;
   new?: number;
+  /** What the CADENCE said, not what happened — a `held_idle` row is `true` here. */
   refresh_night?: boolean;
   rebuild_every_days?: number | null;
+  /** This row's idle ceiling in days; null when the hold is off for it. */
+  idle_hold_days?: number | null;
   recency?: number;
   watched_pct?: number;
   pick_order?: string;
   rewatch?: boolean;
+  /** Rewatch rows only: finished titles this library could offer tonight, and how many of those the
+   *  cooldown held back because they were finished within `rewatch_cooldown_days`. */
+  rewatches?: number;
+  cooling?: number;
+  rewatch_cooldown_days?: number;
   unstarted_only?: boolean;
 }
 
@@ -820,6 +856,7 @@ export type TraceFate =
   | "not_in_your_libraries"
   | "excluded_genre"
   | "lost_ranking_cutoff"
+  | "hidden_by_their_restrictions"
   | "not_returned";
 
 /** The services POST /api/settings/test/{service} accepts (a path parameter typed `str`). */
@@ -830,11 +867,15 @@ export type TestableService =
   | "llm"
   | "radarr"
   | "sonarr"
+  | "overseerr"
   | "mdblist"
   | "trakt"
   | "exa"
   | "searxng"
-  | "native_search";
+  | "native_search"
+  // Not a ping like the rest: it really posts a test message to the owner's webhook, deliberately, so
+  // the button exercises the same path a failed run does.
+  | "notify";
 
 /** Alias kept short for the components that render one line of this. */
 export type UserRun = UserRunSummary;
@@ -950,6 +991,11 @@ export interface SupportRowSetting {
   watched_pct_source: string;
   refresh_days: number;
   refresh_days_source: string;
+  /** The ceiling as the ENGINE applies it, so `0` here can mean "off", "forced off for a cycling
+   *  row" or "shared row" — `idle_hold_source` says which. */
+  idle_hold_days: number;
+  /** `row` · `global` · `forced` (cycling row, engine ignores the value) · `n/a` (shared row). */
+  idle_hold_source: string;
   rewatch: boolean;
   unstarted_only: boolean;
 }

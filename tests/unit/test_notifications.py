@@ -304,6 +304,58 @@ class TestRequestsFoundNothing:
 
         assert notif._requests_found_nothing(session) is None
 
+    def test_ignores_a_run_that_covered_fewer_people_than_its_own_demand_floor(self, session):
+        """The false positive this alert actually produced. `min_demand=2` counts DISTINCT wanters,
+        so a one-user manual run cannot fill the pool whatever the settings are — and the maintainer
+        was told six times to loosen floors that were never the reason, while the nightly 46-user run
+        was requesting normally (2026-09-03)."""
+        session.add_all(
+            [
+                self._event(wanted=650, pool_size=0, examined=0, users=1, demand_floor=2, demand_unreachable=True)
+                for _ in range(6)
+            ]
+        )
+        session.commit()
+
+        assert notif._requests_found_nothing(session) is None
+
+    def test_ignores_dry_runs(self, session):
+        """A dry run asked for nothing by definition, so it is no evidence that there was nothing to
+        ask for. Three of the maintainer's six false positives were dry runs."""
+        session.add_all([self._event(wanted=650, pool_size=0, examined=0, dry_run=True) for _ in range(3)])
+        session.commit()
+
+        assert notif._requests_found_nothing(session) is None
+
+    def test_still_fires_when_real_runs_hide_behind_a_burst_of_skipped_ones(self, session):
+        """The reason the fetch is widened before filtering. An afternoon of test runs is a burst of
+        events that say nothing, and the two real ones sit UNDER them — filtering a page of 5 would
+        have dropped exactly the evidence the alert exists for."""
+        now = datetime.now(UTC)
+        for i in range(20):
+            event = self._event(wanted=650, pool_size=0, examined=0, users=1, demand_floor=2, demand_unreachable=True)
+            event.ts = now - timedelta(minutes=i)
+            session.add(event)
+        for i in range(2):
+            real = self._event(wanted=11424, pool_size=0, examined=0, users=46, demand_floor=2)
+            real.ts = now - timedelta(hours=24 + i)
+            session.add(real)
+        session.commit()
+
+        result = notif._requests_found_nothing(session)
+
+        assert result is not None
+        assert "The last 2 runs" in result["body"], "only the real runs may be counted"
+        assert "11424 titles" in result["body"]
+
+    def test_counts_an_event_from_before_the_new_fields_existed(self, session):
+        """An event written by an older build carries neither `users` nor `demand_unreachable`. The
+        safe default for an alert whose job is to break a five-day silence is to still speak."""
+        session.add_all([self._event(wanted=702, pool_size=0, examined=0) for _ in range(2)])
+        session.commit()
+
+        assert notif._requests_found_nothing(session) is not None
+
 
 class TestFailedJobs:
     def test_fires_when_a_job_exhausts_its_retries(self, session):
@@ -334,6 +386,52 @@ class TestFailedJobs:
 
         assert result["id"] == f"failed-jobs-{second.id}"
         assert result["title"] == "2 background jobs failed"
+
+
+class TestAPrivacySyncFailureAFollowingPassRepaired:
+    """A privacy sync is a full pass that starts from scratch, so the next clean one IS the retry. Every 30
+    minutes, a short plex.tv outage otherwise leaves a failure card that nothing can clear."""
+
+    def test_a_failure_followed_by_a_successful_pass_is_not_reported(self, session):
+        now = datetime.now(UTC)
+        session.add(Job(kind="privacy.sync", status="failed", finished_at=now - timedelta(minutes=30)))
+        session.commit()
+        session.add(Job(kind="privacy.sync", status="done", finished_at=now))
+        session.commit()
+
+        assert notif._failed_jobs(session) is None
+
+    def test_a_failure_after_the_last_success_still_is(self, session):
+        now = datetime.now(UTC)
+        session.add(Job(kind="privacy.sync", status="done", finished_at=now - timedelta(minutes=30)))
+        session.commit()
+        failed = Job(kind="privacy.sync", status="failed", finished_at=now)
+        session.add(failed)
+        session.commit()
+
+        assert notif._failed_jobs(session)["id"] == f"failed-jobs-{failed.id}"
+
+    def test_a_failure_that_finished_after_the_last_success_still_is_even_if_queued_first(self, session):
+        """Ids follow queue order, not finish order: a pass retrying through an outage can fail after a later
+        one already succeeded."""
+        now = datetime.now(UTC)
+        failed = Job(kind="privacy.sync", status="failed", finished_at=now)
+        session.add(failed)
+        session.commit()
+        session.add(Job(kind="privacy.sync", status="done", finished_at=now - timedelta(minutes=4)))
+        session.commit()
+
+        assert notif._failed_jobs(session)["id"] == f"failed-jobs-{failed.id}"
+
+    def test_other_kinds_are_not_cleared_by_their_own_later_success(self, session):
+        """A user cleanup is per person: a later success for someone else repairs nothing."""
+        now = datetime.now(UTC)
+        session.add(Job(kind="user.cleanup", status="failed", finished_at=now - timedelta(minutes=30)))
+        session.commit()
+        session.add(Job(kind="user.cleanup", status="done", finished_at=now))
+        session.commit()
+
+        assert notif._failed_jobs(session) is not None
 
 
 class TestOwnerSeesAllRows:
@@ -402,6 +500,56 @@ class TestOwnerSeesAllRows:
         self._setup(session, row=False)
 
         assert notif._owner_sees_all_rows(session) is None
+
+
+class TestSecretsWeCannotRead:
+    """A lost /config/secret.key leaves credentials that cannot be decrypted OR recovered. Before the
+    fix, boot silently re-encrypted them with the new key and destroyed the originals; now they are
+    left untouched and the owner is told which ones."""
+
+    def _store_with_a_lost_key(self, session, tmp_path: Path):
+        from shortlist.server.services.secrets import SecretBox
+
+        box = SecretBox(tmp_path)
+        store = SettingsStore(session, box)
+        store.set("plex.token", "real-plex-token")
+        (tmp_path / "secret.key").unlink()
+        return SettingsStore(session, SecretBox(tmp_path))
+
+    def test_does_not_fire_when_every_secret_decrypts(self, session, tmp_path: Path):
+        from shortlist.server.services.secrets import SecretBox
+
+        store = SettingsStore(session, SecretBox(tmp_path))
+        store.set("plex.token", "real-plex-token")
+
+        assert notif._secrets_we_cannot_read(store) is None
+
+    def test_does_not_fire_when_nothing_is_stored(self, session, tmp_path: Path):
+        from shortlist.server.services.secrets import SecretBox
+
+        assert notif._secrets_we_cannot_read(SettingsStore(session, SecretBox(tmp_path))) is None
+
+    def test_fires_and_names_the_unreadable_keys(self, session, tmp_path: Path):
+        result = notif._secrets_we_cannot_read(self._store_with_a_lost_key(session, tmp_path))
+
+        assert result is not None
+        assert result["id"] == "secrets-we-cannot-read"
+        assert result["severity"] == "error"
+        assert "plex.token" in result["body"], "the owner cannot act without knowing WHICH credential"
+
+    def test_it_cannot_be_dismissed(self, session, tmp_path: Path):
+        """Same reason "runs are paused" cannot be: hiding it leaves an owner believing a server works
+        that does not, and the condition is still true right now."""
+        result = notif._secrets_we_cannot_read(self._store_with_a_lost_key(session, tmp_path))
+
+        assert result["dismissable"] is False
+
+    def test_the_copy_says_nothing_was_overwritten(self, session, tmp_path: Path):
+        """The recovery path depends on this being true and the owner believing it: restoring the old
+        secret.key still works, because the ciphertext was left byte-for-byte alone."""
+        result = notif._secrets_we_cannot_read(self._store_with_a_lost_key(session, tmp_path))
+
+        assert "overwritten" in result["body"].lower()
 
 
 class TestSeverityVocabulary:
@@ -692,15 +840,56 @@ class TestShelfContention:
     """
 
     @staticmethod
-    def _ordered(session, library: str, moved: list[str], *, when=None, dry_run: bool = False) -> None:
+    def _ordered(
+        session,
+        library: str,
+        moved: list[str],
+        *,
+        when=None,
+        dry_run: bool = False,
+        verified: bool = True,
+    ) -> None:
         session.add(
             Event(
                 scope="shelf.order",
                 level="info",
                 ts=when or datetime.now(UTC),
-                message={"library": library, "moved": moved, "verified": True, "dry_run": dry_run},
+                message={"library": library, "moved": moved, "verified": verified, "dry_run": dry_run},
             )
         )
+
+    def test_a_pass_that_never_landed_is_not_contention(self, session):
+        """`verified: False` means the shelf did NOT end up as we asked — so we never put the row back.
+
+        Measured on the maintainer's server (2026-09-08): 50 records in a day, every one of them
+        `verified: False`, and the bell said "Shortlist has had to put the same row back 50 times ...
+        so something else is moving it" and named Kometa and Agregarr. Nothing had moved it. Plex was
+        answering 200 to every move and applying none, and 50 failures were being read as 50
+        successes somebody else undid.
+
+        Contention is "our write landed and did not STAY". A write that never landed is a different
+        fault with a different remedy, and it belongs to `_shelf_unreachable`, not here.
+        """
+        for _ in range(5):
+            self._ordered(session, "Movies", ["Picked for You"], verified=False)
+        session.commit()
+
+        assert notif._shelf_contention(session) is None
+
+    def test_failed_passes_cannot_top_up_a_real_fight(self, session):
+        """The mixed shelf: two genuine re-placements and three that never landed.
+
+        Two is under the threshold, and the three failures must not carry it over — otherwise a shelf
+        Plex is refusing reads as a shelf another tool is contesting, which is the exact
+        misattribution this whole change exists to remove.
+        """
+        for _ in range(2):
+            self._ordered(session, "Movies", ["Picked for You"])
+        for _ in range(3):
+            self._ordered(session, "Movies", ["Picked for You"], verified=False)
+        session.commit()
+
+        assert notif._shelf_contention(session) is None
 
     def test_fires_when_the_same_row_keeps_being_put_back(self, session):
         for _ in range(3):
@@ -715,6 +904,63 @@ class TestShelfContention:
         # Names suspects, never asserts one — Plex does not report who moved a hub.
         assert "Kometa" in result["body"] and "Agregarr" in result["body"]
         assert result["action_url"] == "/settings#placement"
+
+    def test_two_people_sharing_one_seed_title_is_not_contention(self, session):
+        """Measured on the maintainer's server, where this fires for real.
+
+        A `{top_seed}` row renders the SAME title for everyone who watched that title, so two people
+        who both watched "Colin from Accounts" each get a collection called "Because you watched Colin
+        from Accounts". One ordering pass moves both, and counting occurrences records TWO moves of
+        one row — so two ordinary passes cross a threshold meant for three genuine re-moves, and the
+        alert accuses Kometa or Agregarr of something nothing did.
+
+        A pass counts once per row. That is what the code's own comment has always claimed.
+        """
+        for _ in range(2):  # two passes, well under the threshold
+            self._ordered(
+                session,
+                "Movies",
+                ["Because you watched Colin from Accounts", "Because you watched Colin from Accounts"],
+            )
+        session.commit()
+
+        assert notif._shelf_contention(session) is None
+
+    def test_a_row_genuinely_moved_three_times_still_fires(self, session):
+        """The other side of the same change: deduping within a pass must not blunt the real signal."""
+        for _ in range(3):
+            self._ordered(session, "Movies", ["Picked for You", "Picked for You"])
+        session.commit()
+
+        result = notif._shelf_contention(session)
+
+        assert result is not None and "3 times" in result["body"]
+
+    def test_a_flood_of_unplaceable_records_cannot_crowd_out_the_contention_evidence(self, session):
+        """The entire reason issue #106's "could not place" record got its own scope.
+
+        This query reads a BOUNDED window of the most recent shelf events. One stale anchor writes a
+        record on every pass, and `privacy.sync` fires on every who-sees-what change (31 in one day on
+        SFLIX), so sharing `shelf.order` would let a setting nobody has fixed push the repeated MOVES
+        out of the window — and contention would stop being detected on a genuinely contested shelf.
+        """
+        old = datetime.now(UTC) - timedelta(hours=1)
+        for _ in range(3):
+            self._ordered(session, "Movies", ["Picked for You"], when=old)
+        for _ in range(600):  # newer, and far past the query's limit
+            session.add(
+                Event(
+                    scope="shelf.unplaced",
+                    level="warning",
+                    ts=datetime.now(UTC),
+                    message={"library": "Movies", "moved": [], "reason": "anchor not found"},
+                )
+            )
+        session.commit()
+
+        result = notif._shelf_contention(session)
+
+        assert result is not None and "3 times" in result["body"]
 
     def test_points_agregarr_users_at_the_maintained_fork(self, session):
         """Shortlist no longer connects to agregarr, so this notification is where an owner is told
@@ -808,7 +1054,10 @@ class TestShelfContention:
                     scope="run.hub_order",
                     level="info",
                     ts=datetime.now(UTC),
-                    message={"library": "Movies", "moved": ["Picked for You"]},
+                    # Explicit `verified`, because the production writers always set it
+                    # (`run_persistence._emit_hub_ordering_events`) and only a landed move is
+                    # evidence of contention. This test is about the two SCOPES being one fact.
+                    message={"library": "Movies", "moved": ["Picked for You"], "verified": True},
                 )
             )
         session.commit()
@@ -879,6 +1128,31 @@ class TestRowsWithNoNameForNewcomers:
         # Says what to DO and that nothing was destroyed — the two things an alarmed operator needs.
         assert "Name for people with nothing watched yet" in got["body"]
         assert "Nothing has been deleted" in got["body"]
+
+    def test_the_title_names_the_row_without_its_placeholder_braces(self, session):
+        """Every row this alert can fire for has `{top_seed}` in its name by definition, so quoting
+        the name verbatim guaranteed a title with literal braces in it — "Because you watched
+        {top_seed} won't be built for…", in a sentence written for a person (audit, Sep 2026)."""
+        from shortlist.server.settings_store import SettingsStore
+
+        self._row(session, "because", "Because you watched {top_seed}")
+
+        got = notif._rows_with_no_name_for_newcomers(session, SettingsStore(session))
+
+        assert got is not None
+        assert "{" not in got["title"] and "}" not in got["title"]
+        assert "“Because you watched”" in got["title"]
+
+    def test_a_row_named_only_after_the_placeholder_still_gets_a_readable_title(self, session):
+        """Stripping leaves nothing at all here, and "“” won't be built" is worse than the braces."""
+        from shortlist.server.settings_store import SettingsStore
+
+        self._row(session, "seedonly", "{top_seed}")
+
+        got = notif._rows_with_no_name_for_newcomers(session, SettingsStore(session))
+
+        assert got is not None
+        assert got["title"].startswith("A row won")
 
     def test_it_goes_quiet_once_the_row_has_a_name(self, session):
         from shortlist.server.settings_store import SettingsStore
@@ -954,6 +1228,91 @@ class TestTheEnforcementAlertCanClearItself:
 
         assert "ONE account of each kind" in body
         assert "every shared or managed account" in body
+
+
+class TestFiltersPlexCannotRead:
+    """#116 review: an account whose own label has a literal `&` cannot be hidden, and Plex fails its Home
+    outright. Reported instead of blocking the server, so this card is the whole of the owner's warning."""
+
+    @staticmethod
+    def _run(session, unreadable, *, finished):
+        run = Run(trigger="schedule", status="ok", finished_at=finished, stats={"unreadable_filters": unreadable})
+        session.add(run)
+        session.commit()
+        return run
+
+    def test_it_names_the_account_and_passes_on_what_to_rename(self, session):
+        self._run(
+            session, {"sarah": "their Plex restriction uses the label 'Kids & Family'"}, finished=datetime.now(UTC)
+        )
+
+        card = notif._filters_plex_cannot_read(session)
+
+        assert card["severity"] == "error"
+        assert card["dismissable"] is False, "a live exposure must not be silenced"
+        assert "sarah" in card["body"] and "Kids & Family" in card["body"]
+
+    def test_a_later_run_that_never_looked_does_not_clear_it(self, session):
+        """Absent is not clean: a run that died before the privacy loop writes no key at all."""
+        self._run(session, {"sarah": "x"}, finished=datetime.now(UTC) - timedelta(hours=2))
+        session.add(Run(trigger="manual", status="error", finished_at=datetime.now(UTC), stats={}))
+        session.commit()
+
+        assert notif._filters_plex_cannot_read(session) is not None
+
+    def test_a_later_run_that_looked_and_found_none_clears_it(self, session):
+        self._run(session, {"sarah": "x"}, finished=datetime.now(UTC) - timedelta(hours=2))
+        self._run(session, {}, finished=datetime.now(UTC))
+
+        assert notif._filters_plex_cannot_read(session) is None
+
+
+class TestRestrictionsRestoredNotice:
+    """The #116 repair switches each affected account's OWN Plex restriction back on. The people on
+    those accounts will see less than they did yesterday; the owner should hear why from Shortlist.
+
+    Read from audit EVENTS, not run stats: `privacy.sync`, `user.restore` and the daily row-schedule job
+    all run the privacy pass without persisting a run, and any of them can be the one that repairs."""
+
+    @staticmethod
+    def _restored(session, username, *, at):
+        from shortlist.server.db.models import Event
+
+        event = Event(
+            scope="privacy.restriction_restored", level="info", ts=at, message={"account_id": 1, "username": username}
+        )
+        session.add(event)
+        session.commit()
+        return event
+
+    def test_it_names_the_accounts_whose_restriction_came_back(self, session):
+        self._restored(session, "sarah", at=datetime.now(UTC) - timedelta(hours=1))
+        latest = self._restored(session, "mike", at=datetime.now(UTC))
+
+        card = notif._restrictions_restored(session)
+
+        assert card["severity"] == "info"
+        assert card["dismissable"] is True
+        assert str(latest.id) in card["id"], "a later repair must not hide behind an earlier dismissal"
+        assert "mike and sarah" in card["body"]
+        assert card["action_url"] == "/sharing"
+
+    def test_the_copy_does_not_promise_an_allow_listed_friend_their_own_row(self, session):
+        """Recorded: an allow-list joined with `&` hides every collection without the allowed label —
+        including that person's own row. Saying "rows are hidden, nothing to do" would be wrong for them."""
+        self._restored(session, "sarah", at=datetime.now(UTC))
+
+        body = notif._restrictions_restored(session)["body"]
+
+        assert "allow" in body and "their own" in body
+
+    def test_nothing_restored_shows_nothing(self, session):
+        assert notif._restrictions_restored(session) is None
+
+    def test_it_stops_showing_a_week_after_the_repair(self, session):
+        self._restored(session, "sarah", at=datetime.now(UTC) - timedelta(days=8))
+
+        assert notif._restrictions_restored(session) is None
 
 
 class TestAFailedJobSaysOnlyWhatIsTrueOfIt:

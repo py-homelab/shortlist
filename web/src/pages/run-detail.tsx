@@ -32,7 +32,7 @@ import {
   useUsers,
 } from "@/lib/queries";
 import { mergeRunLog, stageBelongsToRun } from "@/lib/run-log";
-import { currentPhase, errorBucket } from "@/lib/run-format";
+import { currentPhase, errorBucket, inFlight } from "@/lib/run-format";
 import { useSSE } from "@/lib/sse";
 import type { RunDetail, RunLogEntry, RunUserStageEvent } from "@/lib/types";
 
@@ -239,6 +239,10 @@ export function RunDetailPage() {
   // run as well as the log: the people count comes off the run's own roster, not off log subjects —
   // the library index and shared rows narrate under names that are in nobody's roster.
   const phase = runQuery.data ? currentPhase(runQuery.data, liveLog) : null;
+  const working =
+    runQuery.data && !runQuery.data.finished_at
+      ? inFlight(runQuery.data, liveLog)
+      : [];
   // A failed log fetch with nothing to show is otherwise indistinguishable from "no log was ever
   // recorded" — RunLogPanel's own empty state says the latter, which is a lie when the former is
   // true. Live SSE stage events can still fill `liveLog` even if the initial snapshot failed, so
@@ -340,6 +344,25 @@ export function RunDetailPage() {
                     <span className="font-medium">{phase.label}</span>
                   </p>
                 )}
+                {/* The count says how far the run has got; this says what it is doing. One line per
+                    person it is on — at most the run's concurrency — each naming the row, the library
+                    and the write, or that they are queued behind someone else's Plex write. */}
+                {working.length > 0 && (
+                  <ul
+                    aria-label="In progress"
+                    className="space-y-0.5 pl-5 text-sm text-muted-foreground"
+                  >
+                    {working.map((person) => (
+                      <li key={person.slug} className="truncate" title={person.text}>
+                        <span className="font-medium text-foreground">
+                          {person.name}
+                        </span>
+                        {" — "}
+                        {person.text}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </header>
 
               <Segmented
@@ -375,11 +398,11 @@ export function RunDetailPage() {
                       Why a refresh can take a while
                     </p>
                     <p className="text-muted-foreground">
-                      Building everyone's rows means updating Plex one change at
-                      a time — Plex only accepts them one-by-one, and it's
-                      especially slow to update TV Shows. A big refresh across
-                      all users can take a while. It's much quicker after the
-                      first run, when most rows only need small tweaks.
+                      Plex removes titles from a collection one at a time, and
+                      on a very large TV library that is slow — a row dropping
+                      ten titles there can take a few minutes. Rows whose titles haven't
+                      changed skip that. Each person's panel shows what their
+                      row is adding and removing while it happens.
                     </p>
                   </div>
                 </div>

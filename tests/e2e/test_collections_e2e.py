@@ -30,16 +30,6 @@ def _add_a_row(page: Page) -> None:
     expect(page.get_by_role("heading", name="Add a row")).to_be_visible()
 
 
-def _open_section(page: Page, name: str) -> None:
-    """Expand one of the row editor's collapsible groups.
-
-    Most groups are open on the editor PAGE — only the genuinely optional ones (artwork, request
-    tags) start closed, so this is for reaching into those. Clicking an already-open group would
-    close it, so callers must only pass a group that starts folded.
-    """
-    page.get_by_text(name, exact=True).click()
-
-
 def _saved_row(page: Page, name: str):
     """The card for a saved row on the /rows list.
 
@@ -49,6 +39,18 @@ def _saved_row(page: Page, name: str):
     """
     expect(page).to_have_url(re.compile(r"/rows$"), timeout=LOAD)
     return page.get_by_text(name, exact=False).first
+
+
+def _edit_row(page: Page, name: str) -> None:
+    """Open THIS row's editor. `Edit.last` clicked whichever card rendered last — under load the list
+    from before the save, so the editor opened the default row instead (seen twice at load 27)."""
+    actions = (
+        page.locator("div")
+        .filter(has=page.get_by_role("link", name=f"Remove or delete {name}"))
+        .filter(has=page.get_by_role("button", name="Edit"))
+        .last
+    )
+    actions.get_by_role("button", name="Edit").click()
 
 
 def _open_rows(page: Page) -> None:
@@ -96,9 +98,9 @@ def test_a_row_can_be_given_a_built_in_text_poster(page: Page, app: ShortlistApp
     expect(_saved_row(page, "Poster Row")).to_be_visible(timeout=LOAD)
 
     # Re-open it and choose a built-in text poster — this needs no AI provider, so it works on any setup.
-    page.get_by_role("button", name="Edit").last.click()
+    _edit_row(page, "Poster Row")
     expect(page.get_by_label("Name", exact=True)).to_have_value("Poster Row")
-    _open_section(page, "Artwork")
+    # The poster sits in the open "How it looks on Plex" group, beside the name it belongs to.
     page.get_by_role("button", name="Text", exact=True).click()
     page.get_by_label("Title text").fill("Weekend Picks")
     page.get_by_role("button", name="Save changes").click()
@@ -110,6 +112,26 @@ def test_a_row_can_be_given_a_built_in_text_poster(page: Page, app: ShortlistApp
     image = app.api("GET", f"/api/collections/{created['id']}/poster/image")
     assert image.status_code == 200
     assert image.headers["content-type"].startswith("image/")
+
+
+def test_a_row_can_be_given_a_description_and_sort_title_prefix(page: Page, app: ShortlistApp):
+    """Issue #120: the description is set beside the name, the prefix beside the row's placement."""
+    _open_rows(page)
+    _add_a_row(page)
+    page.get_by_label("Name", exact=True).fill("Sorted Row")
+    page.get_by_role("button", name="Add row").click()
+    expect(_saved_row(page, "Sorted Row")).to_be_visible(timeout=LOAD)
+
+    _edit_row(page, "Sorted Row")
+    expect(page.get_by_label("Name", exact=True)).to_have_value("Sorted Row")
+    page.get_by_label("Description", exact=True).fill("Picked for {user}")
+    page.get_by_label("Sort title prefix").fill("!010_")
+    expect(page.get_by_text("!010_Sorted Row")).to_be_visible()
+    page.get_by_role("button", name="Save changes").click()
+    expect(page).to_have_url(re.compile(r"/rows$"), timeout=LOAD)
+
+    saved = next(c for c in app.api("GET", "/api/collections").json() if c["name"] == "Sorted Row")
+    assert (saved["description"], saved["sort_title_prefix"]) == ("Picked for {user}", "!010_")
 
 
 def test_the_default_rows_name_can_be_edited_and_updates_the_global_template(page: Page, app: ShortlistApp):
@@ -150,15 +172,17 @@ def test_the_default_row_can_be_deleted_like_any_other(page: Page, app: Shortlis
     picked = next(c for c in app.api("GET", "/api/collections").json() if c["slug"] == "picked")
 
     # Counted, not matched by name: the app is shared across this module and another test renames
-    # this row, so its rendered title is not stable. "Every row has a Delete button" is also the
-    # actual property — the bug was ONE card missing the control its neighbours had.
+    # this row, so its rendered title is not stable. "Every row has a way out" is also the actual
+    # property — the bug was ONE card missing the control its neighbours had.
     #
-    # Asserts the BUTTON only: deleting the seeded row here would pull it out from under every test
-    # that follows. The 204 and the row actually disappearing are covered in
-    # tests/integration/test_api_collections.py::test_the_default_row_can_be_deleted_like_any_other.
+    # A LINK now, not a button. "Remove from Plex" and "Delete" used to sit on the card side by
+    # side with nothing saying which one loses the row's settings; the card carries one honest
+    # "Remove or delete" that opens the editor's danger section, where that difference is already
+    # written out (audit finding, Sep 2026). The 204 and the row actually disappearing are covered
+    # in tests/integration/test_api_collections.py::test_the_default_row_can_be_deleted_like_any_other.
     assert picked, "the seeded default row must exist for this to mean anything"
     rows = app.api("GET", "/api/collections").json()
-    expect(page.get_by_role("button", name=re.compile(r"^Delete "))).to_have_count(len(rows))
+    expect(page.get_by_role("link", name=re.compile(r"^Remove or delete "))).to_have_count(len(rows))
 
 
 PLACEMENT_SWITCHES = (

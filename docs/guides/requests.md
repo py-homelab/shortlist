@@ -5,11 +5,19 @@ heading: Requests (Radarr and Sonarr)
 nav_order: 6
 ---
 
-## Requests (Radarr / Sonarr)
+## Requests (Radarr / Sonarr, or Overseerr)
 
 Off by default. When on, Shortlist notices the titles your people's taste surfaced that your library
 doesn't have yet. That means everything the recommendation sources turned up, not just what made it
-into a row. It then asks Radarr (movies) or Sonarr (shows) to grab a few of the best ones on each run.
+into a row. It then asks for a few of the best ones on each run.
+
+You choose **where requests go**, under Settings → Requests:
+
+- **Radarr & Sonarr** (the default) — Shortlist adds the title itself, using a quality profile and
+  folder you pick here.
+- **Overseerr / Jellyseerr** — Shortlist files a request instead, and Overseerr fetches it using its
+  own quality settings, folder rules and approvals. See
+  [Requesting through Overseerr](#requesting-through-overseerr) below.
 
 Set it up under **Settings → Requests**:
 
@@ -58,6 +66,54 @@ A title three people want ends up with the global tag plus each of those people'
 of every per-person row they're in. Missing tags are created in Radarr/Sonarr on first use, exactly
 like the global one.
 
+### Requesting through Overseerr
+
+If you already run **Overseerr**, **Jellyseerr** or **Seerr**, pointing Shortlist at it instead of at
+Radarr and Sonarr means what Shortlist asks for shows up alongside everything your users request, and
+gets the quality profile, folder and 4K routing you already configured there. All three share one
+API (`/api/v1`), so one setting covers them all — verified against Seerr 3.4.1.
+
+1. In Settings → **Connections**, fill in the **Overseerr / Jellyseerr** card with its address (e.g.
+   `http://localhost:5055`) and an **API key** (in Overseerr under _Settings → General_), and press
+   **Test**.
+2. In Settings → **Requests**, set **Where requests go** to **Overseerr / Jellyseerr**.
+3. Pick **Request as**.
+
+That third choice is the one worth thinking about. Your API key belongs to an admin, and admins
+normally auto-approve their own requests — so leaving it on **Server default** means Shortlist's
+picks go straight through to Radarr/Sonarr without anyone looking at them in Overseerr. That is fine
+if you want Shortlist's own guardrails and inbox to be the only gate.
+
+If you'd rather see them first, make a user in Overseerr called **Shortlist** with auto-approve
+turned off, and pick it here. Its requests then wait in Overseerr for your yes, clearly labelled as
+coming from Shortlist rather than from a person. Shortlist never creates that account for you — it
+only lists the accounts already there. On many servers every existing account can already
+auto-approve, in which case making one is the only way to get a queue in Overseerr at all.
+
+The picker lists every account on the instance, with accounts made for this first and people on your
+server after them, and tells you which ones auto-approve.
+
+**Picking a person has a cost, and the screen says so when you do.** A title Shortlist wants is
+usually wanted by several people at once, while an Overseerr request has exactly one requester — so
+choosing a person does not file each title under whoever wanted it. It puts that one name on
+_everything_, spends their request quota and notifies them each time. A local account avoids all
+three, which is why it is the recommendation — but on many servers a person is the only account that
+does not auto-approve, so the choice stays yours.
+
+**Two things work differently on this route:**
+
+- **Tags don't travel.** Overseerr's request API has no tags field, so the global **Tag added
+  items** setting and the per-person tags have nothing to attach to — those controls disappear from
+  the screen when you switch. The "Request as" account is the attribution instead.
+- **The blocklist is read, but only on the newer builds.** Overseerr, Jellyseerr and Seerr keep a
+  blocklist ("never fetch this"), and Shortlist reads it: a blocklisted title is never sent on its
+  own, and lands in your Requests inbox flagged with why. Older builds serve no blocklist endpoint,
+  and there Shortlist simply applies none — so turn those titles down in the Requests inbox instead.
+  Either way a rejected title is never asked for again, so one **No** is enough.
+
+Everything else is unchanged: the same guardrails, the same auto-send bar, the same inbox. The only
+difference is who does the fetching.
+
 ### The Requests inbox
 
 The **Requests** tab (in the sidebar) is your approval queue. Each run adds the wanted-but-missing
@@ -66,8 +122,13 @@ breakdown: one line per person and row that wanted it, with the reason (e.g. "Sa
 they watched Fawlty Towers"). That answers where a request came from and why, not just a count.
 The synopsis is there so a title you've never heard of can be judged without opening a tab for it;
 titles queued before Shortlist stored synopses show none until the next run re-surfaces them.
-A long queue can be narrowed by a minimum rating and vote count (and to movies or shows) and
-sorted by **Newest**, **Top rated**, or **Most wanted**, so the best picks triage first.
+Above the queue, **Waiting**, **Sent** and **Rejected** are tabs, and one toolbar narrows the list:
+movies or shows, a search that finds a title by name or by who wanted it (pick a name from its list to
+see every title of theirs on file), **Filters** for a minimum rating, a minimum vote count and a
+title's original language, and a sort by **Recent**, **Top rated** or **Most wanted**. The language
+choice lists only the languages on the tab you're on; titles with no language on record are under
+**Unknown**, never under a named language. Whatever is narrowing the list, the search text included,
+shows as a removable chip beside **Clear filters**, and switching tabs clears it all.
 Posters come straight from TMDB's image CDN (`image.tmdb.org`), the only third-party asset Shortlist's
 web UI fetches. An install behind a restrictive network, or a browser with an ad-blocker, will show a
 placeholder tile instead; so will a title TMDB has no artwork for, and one queued before posters existed
@@ -75,7 +136,8 @@ placeholder tile instead; so will a title TMDB has no artwork for, and one queue
 
 Every title carries its own **Send**, **Delete** and **Reject** buttons, so you can work straight down
 the list deciding one at a time. For a batch, tick the ones you want instead and use the same three
-buttons on the toolbar above the queue — they act on everything ticked. The two ways don't interfere:
+buttons on the action bar above the queue — they act on everything ticked, and **Clear selection**
+unticks them. The two ways don't interfere:
 deciding a single title from its own row leaves a selection you're part-way through assembling alone.
 
 For anything you're not sending you have two choices, and the difference is exactly what happens on
@@ -89,7 +151,7 @@ the next run:
   taste turns it up again on a later run, it comes back to Waiting. Use it to clear clutter without
   slamming the door.
 
-Both carry a hover hint wherever they appear, and an always-visible line under the queue spells out the difference.
+Both carry a hover hint wherever they appear, and a short line on the action bar spells out the difference.
 A title already in the library stops appearing on its own, and one that's already been sent (still
 downloading, say) never re-consumes an auto-request slot, so a slow grab can't starve the queue.
 Everything sent moves to the **Sent to Radarr & Sonarr** log, each entry keeping when
@@ -108,9 +170,11 @@ Requires Radarr v3+ / Sonarr v4+ reachable from the Shortlist container.
 
 ### Why is a title still waiting?
 
-The bar for sending on its own is higher than the bar for being requestable at all: a title is sent
-without asking only if it clears **both** `requests.auto_min_demand` (default 3 distinct people, counted **within one row**) and
-`requests.auto_min_rating` (default 8.0). A 7.9 wanted by twenty people still waits. Beyond that:
+The bar for sending on its own is higher than the bar for being requestable at all. Under
+**Settings → Requests → Send the strongest titles without asking**, a title has to clear **both**
+bars: **Send without asking when wanted by** (3 people by default, counted **within one row**) and
+**Send without asking when rated** (8.0 by default). A 7.9 wanted by twenty people still waits.
+Beyond that:
 
 - **On an exclusion list** — a past delete in Radarr/Sonarr leaves the title on an import-exclusion
   list, and Shortlist will never auto-send one (the app would refuse the add anyway). The card says
@@ -118,9 +182,10 @@ without asking only if it clears **both** `requests.auto_min_demand` (default 3 
 - **It's in another language** — if you've set a language preference (below), a title outside your
   languages has a higher bar to clear before it is sent on its own. Below that bar it waits here
   rather than being dropped, so you can still approve it. The card shows the language as a chip.
-- **Over the per-run cap** — `requests.max_per_run` auto-worthy titles go per run; the rest wait.
-- **The run never rated it** — when `requests.rating_source` is not `tmdb`, a run only rates as many
-  titles as its lookup budget allows (see below).
+- **Over the per-run cap** — **Most to send automatically in one run** caps how many go out at
+  once. The rest wait.
+- **The run never rated it** — when **Judge titles by** is set to anything other than TMDB, a run
+  only rates as many titles as its rating-lookup budget allows (see below).
 - **Already in Radarr/Sonarr** — the card shows a **Downloaded / Downloading / Searching / Not
   monitored** badge if either app already tracks it, which normally means it was added by hand after
   it landed here. **Not monitored** is also what a show added under **None** reads as, which is that
@@ -130,22 +195,33 @@ without asking only if it clears **both** `requests.auto_min_demand` (default 3 
 
 ### Nothing is being requested at all
 
-If runs keep finishing with **0 requested** and the inbox stays empty, the rating gate is rejecting
-everything it managed to rate. The run's stats carry the three numbers that tell you which:
+First, check whether the runs you are looking at covered **everybody**. **Wanted by at least** counts
+_different people_, so a run over one person can never produce a title wanted by two — nothing
+qualifies whatever your settings say. That is a fact about the run's scope rather than about your
+settings, so Shortlist doesn't count it against you: a run smaller than its own **Wanted by at
+least** never raises the **Nothing is being requested** notification. Judge the settings on a nightly
+run over everyone.
 
-- `requests_pool` — titles that cleared the base floors (`min_demand`, the year window). If this is
-  **0**, those floors are the problem, not the ratings: `requests.min_year` and `requests.min_demand`
-  are the ones to loosen.
-- `requests_examined` — how many of that pool the run actually rated.
-- `requests_lookups` — how many of those cost an MDBList API call. Cached ratings are free.
+If full runs keep finishing with **0 requested** and the inbox stays empty, open the run and read the
+**Requested** tile. Its second line says which of four things happened:
 
-When `examined` is well below `pool`, the run ran out of lookup budget before it reached anything
-good. That is the case to act on, and it is what `requests.none_qualified` in the event log means.
-Raise `requests.max_per_run` (the budget is 4x it, floor 20) so each run rates more, or lower
-`requests.min_rating`.
+- **"nothing new was missing"** — your library already has everything anyone was matched with, or
+  every missing title has already been sent or rejected. Nothing to fix.
+- **"nothing cleared the demand or year limits"** — no title even got as far as being rated.
+  **Wanted by at least** and **Released on or after** are the two to loosen, in Guardrails.
+- **"rated 80 of 400 — none good enough"** — the run ran out of rating lookups before it reached
+  anything worth sending. This is the one to act on.
+- **"rated all 400 — none cleared the rating limit"** — it rated everything and nothing was good
+  enough. The minimum-rating guardrail is the setting, named after whichever source you chose —
+  **Minimum IMDb rating**, say.
 
-Why the two can disagree so sharply: the run rates titles in **demand** order — most-wanted first —
-but judges them on **rating**. On a large library the most-wanted _missing_ titles are often the ones
+The "ran out of lookups" case has a fix. Raise **Most to send automatically in one run** — the run's
+rating budget is four times that number, never fewer than 100 lookups — or lower that minimum
+rating. The budget only binds when **Judge titles by** is something other than TMDB, because only
+those scores cost a lookup; already-known scores are reused free for a week.
+
+Why a run can rate so much less than it wanted to: it rates titles **most-wanted first** but judges
+them **on their score**. On a large library the most-wanted _missing_ titles are often the ones
 nobody thought worth adding, so the top of the list can be the worst-rated part of it, and the titles
 that would pass sit further down. A bigger budget reaches them.
 

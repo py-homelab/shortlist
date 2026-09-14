@@ -2,16 +2,22 @@
 Browsing this folder on github.com? You're in the right place — these .md files
 are the docs. They're also published as a website, which is easier to read:
 
-    https://stevezau.github.io/shortlist/
+    https://shortlistapp.dev/
 
 This file exists only for the github.com folder view. The website's home page is
 index.md, and _config.yml excludes this file from the build so the two don't
 fight over the `/` URL.
+
+Because no Liquid runs here, the two links below are written out in full rather
+than built from site.url/site.baseurl. They are therefore switch points if the
+site ever moves to a custom domain: change them by hand, along with the four in
+the repo's root README.md. The full day-of checklist, in the order that avoids an
+outage, is the comment above `url:` in _config.yml.
 -->
 
 # Shortlist documentation
 
-**[Read these as a website →](https://stevezau.github.io/shortlist/)**
+**[Read these as a website →](https://shortlistapp.dev/)**
 
 | Guide                                                     | What's in it                                                       |
 | --------------------------------------------------------- | ------------------------------------------------------------------ |
@@ -24,6 +30,6 @@ fight over the `/` URL.
 
 **The short version:** run the container, log in with Plex, pick your users, and every night each
 user gets a personal "✨ Picked for You" row built from their own watch history — visible only to
-them. Each row is delivered hidden, the exclusions that keep it private are merged into everyone
-else's share, and only then is it promoted onto Home — so a row is never visible before it's
-private. Your share filters are snapshotted first, so uninstalling puts them back exactly.
+them. Each row is delivered unpromoted, the exclusions that keep it private are merged into everyone
+else's share — straight away for someone's first row — and only then is it promoted onto Home. Your
+share filters are snapshotted first, so uninstalling puts them back exactly.

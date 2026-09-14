@@ -38,6 +38,9 @@ function UserRowCard({ userId, row }: { userId: number; row: UserRow }) {
   const muted =
     (mute.isPending ? mute.variables?.patch.muted : undefined) ?? row.muted;
 
+  // This person's override if they have one, else the row's own size. The ceiling, not a count.
+  const configuredSize = row.override.row_size ?? row.size;
+
   // The mute sends ONLY {muted} so it can never persist a half-changed size; the drawer sends only
   // the size (the server writes just the fields it receives).
   const setMuted = (nextMuted: boolean) =>
@@ -75,9 +78,21 @@ function UserRowCard({ userId, row }: { userId: number; row: UserRow }) {
               {row.is_default && <Badge variant="outline">default</Badge>}
               {muted && <Badge variant="secondary">muted</Badge>}
             </div>
+            {/* The configured size is a CEILING, and printing it bare put "15 titles" directly
+                above a list offering "Show all 10 (+5)" — one number apparently disagreeing with
+                itself. Say which is which: what they actually got, out of what the row allows.
+
+                `picks.length <= configuredSize` is the load-bearing half. `picks` came from the
+                LAST RUN and `configuredSize` is the setting as it stands now, so lowering the size
+                from 15 to 5 refetches this card immediately and would otherwise read "15 of 5
+                titles" until the next run rebuilt the row. The ceiling alone is honest there. */}
             <p className="text-sm text-muted-foreground">
-              {row.override.row_size ?? row.size} titles ·{" "}
-              {row.media === "both" ? "movies & shows" : `${row.media}s`}
+              {!muted &&
+              row.picks.length > 0 &&
+              row.picks.length <= configuredSize
+                ? `${row.picks.length} of ${configuredSize} titles`
+                : `up to ${configuredSize} titles`}{" "}
+              · {row.media === "both" ? "movies & shows" : `${row.media}s`}
             </p>
           </div>
           <label className="flex items-center gap-2 text-sm text-muted-foreground">

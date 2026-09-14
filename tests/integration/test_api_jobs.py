@@ -454,10 +454,15 @@ class TestBackupRestoreSaysWhatItChanges:
         # spelled out: a response model that dropped `privacy_note` would turn the one warning the
         # owner gets about a visibility change back into a silent restore.
         assert set(r.json()) == {"restored", "message", "privacy_note"}
+        # Queued, and audited when it is APPLIED at the next start, in the database it produced: written now,
+        # the audit would go into the database the restore is about to replace. The audit is pinned where a
+        # real restart happens: test_api_system.py::TestARestoreIsAppliedByTheRestartItAsksFor.
+        import json
+
+        queued = json.loads((client.app.state.config_dir / "restore-pending.json").read_text())
+        assert queued["backup"] == name
         with client.app.state.sessions() as session:
-            audit = session.query(Event).filter_by(scope="backup.restore").one()
-        assert audit.message["backup"] == name
-        assert audit.level == "warning"
+            assert session.query(Event).filter_by(scope="backup.restore").count() == 0
 
     def test_the_backup_list_names_each_file_with_its_size_and_age(self, client: TestClient):
         client.post("/api/system/backups", json={})
@@ -829,3 +834,79 @@ class TestJobStatusIsAClosedSet:
     def test_an_unknown_status_is_refused_rather_than_ignored(self, client: TestClient):
         """A typo'd filter must not silently return everything — that reads as "nothing failed"."""
         assert client.get("/api/system/jobs", params={"status": "explodey"}).status_code == 422
+
+
+class TestRoutineJobsCanBeExcluded:
+    """`watch.reconcile` is queued once per playback stop. Measured on the maintainer's 46-user
+    server: 165 of the 197 jobs queued in a day, 84% of the table — enough to own all five slots of
+    the header's "Recent" list permanently, so a privacy sync or a nightly run was never visible
+    there, and to pop a success toast every nine minutes for something nobody asked for.
+
+    Excluded by the SERVER for the same reason `status=` is: a client filter over a fetched page
+    cannot work when the noise outnumbers the news."""
+
+    def test_successful_routine_jobs_are_dropped_but_failures_are_kept(self, client: TestClient):
+        """A failure is never routine. A reconcile that fails is the only thing that would say a
+        partial watch went uncredited, so it must still reach the header's feed and failed badge."""
+        from shortlist.server.db.models import Job
+
+        with client.app.state.sessions() as session:
+            session.add(Job(kind="sync.users", status="done", payload={}, result={}))
+            session.add(Job(kind="watch.reconcile", status="failed", payload={}, result={}, error="boom"))
+            # Buried under enough successful reconciles that a newest-page fetch cannot reach either.
+            for _ in range(40):
+                session.add(Job(kind="watch.reconcile", status="done", payload={}, result={}))
+            session.commit()
+
+        unfiltered = client.get("/api/system/jobs", params={"limit": 30}).json()
+        assert {(j["kind"], j["status"]) for j in unfiltered} == {("watch.reconcile", "done")}, (
+            "fixture no longer buries the news under the noise"
+        )
+
+        rows = client.get("/api/system/jobs", params={"limit": 30, "exclude_routine": "true"}).json()
+
+        assert [(j["kind"], j["status"]) for j in rows] == [
+            ("watch.reconcile", "failed"),
+            ("sync.users", "done"),
+        ]
+
+    def test_a_privacy_sync_that_changed_nothing_stays_out_of_recent_and_any_other_does_not(self, client: TestClient):
+        """It runs every 30 minutes by default, and a scheduled pass that finds nothing to change is not
+        news — 48 a day would own the header's Recent list. Everything else is: a failure, a pass that
+        wrote filters or warned, and a pass the owner caused by changing a setting (its only feedback)."""
+        from shortlist.server.db.models import Job
+
+        with client.app.state.sessions() as session:
+            session.add(Job(kind="privacy.sync", status="failed", payload={}, result={}, error="plex.tv 503"))
+            session.add(
+                Job(kind="privacy.sync", status="done", payload={}, result={"detail": "merged; could NOT hide rows"})
+            )
+            session.add(Job(kind="privacy.sync", status="done", payload={}, result={"quiet": True}))
+            session.commit()
+
+        rows = client.get("/api/system/jobs", params={"limit": 30, "exclude_routine": "true"}).json()
+
+        assert [(j["kind"], j["status"], j["error"]) for j in rows] == [
+            ("privacy.sync", "done", None),
+            ("privacy.sync", "failed", "plex.tv 503"),
+        ]
+
+    def test_the_jobs_page_still_sees_every_one(self, client: TestClient):
+        """The flag is opt-in per caller. The Jobs page is where you go to look AT reconciles, so it
+        does not pass it, and asking for the kind by name must never come back empty."""
+        from shortlist.server.db.models import Job
+
+        with client.app.state.sessions() as session:
+            for _ in range(3):
+                session.add(Job(kind="watch.reconcile", status="done", payload={}, result={}))
+            session.commit()
+
+        assert len(client.get("/api/system/jobs").json()) == 3
+        assert len(client.get("/api/system/jobs", params={"kind": "watch.reconcile"}).json()) == 3
+
+    def test_only_deliberately_flagged_kinds_are_routine(self):
+        """A kind nobody classified must count as news. Defaulting the other way would silence a new
+        job kind from the operator's feed by accident — the feed exists to say something happened."""
+        from shortlist.server.services import jobs as jobs_service
+
+        assert jobs_service.routine_kinds() == ("watch.reconcile",)

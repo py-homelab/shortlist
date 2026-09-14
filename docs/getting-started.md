@@ -52,12 +52,20 @@ docker run -d --name shortlist \
   stevezzau/shortlist:latest
 ```
 
-The identical image is also on GHCR as `ghcr.io/stevezau/shortlist`, with the same tags. Use that
-one if you'd rather not hit Docker Hub's anonymous pull limits.
+The doubled **z** in `stevezzau` is deliberate — that is the project's Docker Hub account, even
+though the source lives at `github.com/stevezau/shortlist` with one. Don't "correct" it or the pull
+fails. The identical image is also on GHCR as `ghcr.io/stevezau/shortlist`, with the same tags; use
+that one if you'd rather not hit Docker Hub's anonymous pull limits.
 
 Open `http://your-host:5959`. A fresh install goes straight into the wizard. There is
 nothing to sign in to yet. Step 1 connects your Plex account (that's the sign-in, and it's
 what claims the instance for you); from then on Shortlist only opens for that account.
+
+<img src="{{ '/images/wizard.webp' | relative_url }}" width="1440" height="588"
+     alt="The Shortlist setup wizard on its Welcome step, with a seven-segment progress bar and a Get started button">
+
+Every screenshot on this page is of a throwaway test server, so no real account, address or
+library appears in one.
 
 > Set Shortlist up on your own network first. Until you sign in with Plex and link a server,
 > anyone who can open the page could claim it as theirs, so don't put it on the public internet
@@ -68,6 +76,13 @@ The wizard has **7 steps**, and the progress bar counts them the same way this l
 1. **Welcome** — a short intro screen. Read it and continue.
 2. **Connect Plex** — sign in with a PIN, then pick your server. Shortlist checks your Plex
    version, Plex Pass, and libraries, and tells you in plain English whether each one is OK.
+
+   <img src="{{ '/images/wizard-connect.webp' | relative_url }}" width="1440" height="783"
+        alt="The Connect Plex step after running checks: the discovered server with its reachable and unreachable addresses, and a checklist confirming the Plex version, Plex Pass and two libraries">
+
+   Every address Plex advertises for your server is tried from where Shortlist actually runs, and
+   the one that answered is preselected. You can always type a different one.
+
 3. **Recommendations & history**. Choose where picks come from (TMDB, Trakt, AI web search).
    Watch history comes straight from Plex with no setup. Tautulli is optional, and only improves
    the names people are shown by.
@@ -98,20 +113,23 @@ before you trust it. Two ways to do that:
 The **first real run is the slowest**: it builds every enabled user's rows and merges every account's
 share filter. Later runs are much faster. Most rows are unchanged and skipped.
 
-Every row is kept private automatically: it's a labeled collection excluded on every other
-account's share, delivered hidden and only promoted once those exclusions are in place. Your share
-filters are snapshotted before the first change, so **Uninstall** (Settings → Danger Zone) puts them
-back exactly as they were. This hiding relies on Plex Media Server ≥ 1.43.2.10687. Older builds
-ignore the label exclusion, which is why the wizard surfaces your version before you begin.
+Every row is hidden from every other account before it is ever put on a home screen, so nobody finds
+a row that was built for someone else. (You are the exception: Plex cannot hide anything from the
+server owner — see below.) Your share filters are copied before the first change, so **Uninstall**
+(Settings → Danger Zone) puts them back exactly as they were. The hiding relies on Plex Media Server
+1.43.2.10687 or newer — older builds ignore it, which is why the wizard surfaces your version before
+you begin.
 
 ## One thing you should know
 
 You're in the user list too, so you can give yourself a row like anyone else. On a one-person
 server that's the whole point.
 
-What Plex cannot do is hide collections from the **server owner**: your own Home shows every user's
-row, not just yours. If you share the server with other people and want a clean Home, watch on a
-Plex Home user and keep the admin account for administration.
+What Plex cannot do is hide collections from the **server owner**. Your own Home screen is fine —
+Shortlist puts each person's row only on their side — but the library's **Collections** tab shows you
+everyone's, and so does the Recommended shelf if you leave that on for a row. If that bothers you,
+take the rows off the Recommended shelf, or watch on a Plex Home user and keep the admin account for
+administration.
 
 ## You're set up. What now?
 

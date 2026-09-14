@@ -2,10 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import {
   currentPhase,
+  inFlight,
   errorBucket,
   webSearchSummary,
   friendlyError,
   rankClass,
+  rowTimingTitle,
+  runRefetchIntervalMs,
+  runsListRefetchIntervalMs,
   tokenStepBreakdown,
 } from "@/lib/run-format";
 import type { RunDetail, RunLogEntry } from "@/lib/types";
@@ -97,6 +101,39 @@ describe("webSearchSummary", () => {
     // The stat counts external searches whichever backend ran them; saying "Exa" here would be
     // simply false on a self-hosted server.
     expect(webSearchSummary(3)).not.toMatch(/Exa/i);
+  });
+});
+
+describe("rowTimingTitle", () => {
+  // The line on screen used to read "25ms · 8ms waiting · shared setup 159ms" — three numbers and
+  // two engineer concepts, neither of which the owner acts on (audit finding, Sep 2026). The total
+  // goes on screen; this is the explanation behind it.
+  const ms = (n: number) => `${n}ms`;
+
+  it("says nothing when there is nothing to explain", () => {
+    // A row with no waiting and no shared setup — the number on screen IS the whole story, and a
+    // tooltip restating it is noise.
+    expect(rowTimingTitle(25, 0, 0, ms)).toBe("");
+    expect(rowTimingTitle(25, 0, undefined, ms)).toBe("");
+  });
+
+  it("splits waiting out of the total, naming what it waited for", () => {
+    expect(rowTimingTitle(33, 8, 0, ms)).toBe(
+      "33ms for this row: 25ms working, 8ms waiting for the Plex write lock.",
+    );
+  });
+
+  it("keeps shared setup OUTSIDE the row's total, because it is not this row's alone", () => {
+    // Adding it in would count the same milliseconds once per person in the run.
+    const title = rowTimingTitle(33, 8, 159, ms);
+    expect(title).toContain("33ms for this row");
+    expect(title).toContain("a further 159ms of setup was shared across");
+  });
+
+  it("explains shared setup on its own when nothing waited", () => {
+    expect(rowTimingTitle(25, 0, 159, ms)).toBe(
+      "25ms for this row: a further 159ms of setup was shared across everyone in this run.",
+    );
   });
 });
 
@@ -416,5 +453,98 @@ describe("currentPhase — replaying run #10", () => {
         line("Shortlist", "finished", { ok: 46, failed: 0, seconds: 5666 }),
       ]),
     ).toBeNull();
+  });
+});
+
+/**
+ * The fallback poll for a run in flight, pinned.
+ *
+ * The ONLY other thing that refreshes a running run is the live SSE stream, and `EventSource`
+ * replays nothing it missed while disconnected — so when the stream itself is down, a finished run
+ * reads "Running" with a ticking timer until someone reloads. That is the SFLIX 2026-08-13 symptom
+ * (a cancel that HAD worked looked like one that was ignored), reachable through a dropped
+ * connection rather than through an idle one.
+ *
+ * The exported rule is asserted, never a copy of it — the same reasoning as
+ * `arr-status-polling.test.ts`, which pins the other polling predicate in this app.
+ */
+describe("run polling fallback", () => {
+  const running = { finished_at: null };
+  const finished = { finished_at: "2026-07-15T04:21:00Z" };
+
+  it("polls while a run has not finished", () => {
+    expect(runRefetchIntervalMs(running)).toBe(5_000);
+  });
+
+  it("stops polling once the run has a finished_at", () => {
+    // A settled run never changes again, so a timer here is a forever-fetch of a constant.
+    expect(runRefetchIntervalMs(finished)).toBe(false);
+  });
+
+  it("does not poll before the first answer arrives", () => {
+    expect(runRefetchIntervalMs(undefined)).toBe(false);
+  });
+
+  it("polls the list while ANY page holds an unfinished run", () => {
+    // The list is paged, and the running run sits on page one while older pages are all settled —
+    // so "every page is finished" is the only safe reason to stop.
+    expect(runsListRefetchIntervalMs([[finished], [running, finished]])).toBe(
+      5_000,
+    );
+  });
+
+  it("stops once every run on every page has finished", () => {
+    expect(runsListRefetchIntervalMs([[finished], [finished]])).toBe(false);
+  });
+
+  it("does not poll an empty or unloaded list", () => {
+    expect(runsListRefetchIntervalMs(undefined)).toBe(false);
+    expect(runsListRefetchIntervalMs([])).toBe(false);
+    expect(runsListRefetchIntervalMs([[]])).toBe(false);
+  });
+});
+
+describe("inFlight — who the run is on right now, and what it is doing for each", () => {
+  function runWithPending(slugs: string[], finished: string[]): RunDetail {
+    return {
+      stats: { expected_users: slugs.map((slug) => ({ slug })) },
+      users: slugs.map((slug) => ({
+        slug,
+        username: slug,
+        display_name: slug === "sam" ? "Samantha" : "",
+        status: finished.includes(slug) ? "ok" : "pending",
+      })),
+      shared_rows: [],
+    } as unknown as RunDetail;
+  }
+
+  it("lists each started, unfinished person with their latest line as a sentence", () => {
+    const people = inFlight(runWithPending(["sam", "mike", "zoe", "ann"], ["ann"]), [
+      entry({ user: "sam", stage: "queued" }),
+      entry({ user: "mike", stage: "queued" }),
+      entry({ user: "zoe", stage: "queued" }),
+      entry({ user: "sam", stage: "delivering" }),
+      entry({
+        user: "sam",
+        stage: "delivering",
+        counts: { row: "Picked", library: "TV Shows", adding: 1, removing: 0 },
+      }),
+      entry({ user: "mike", stage: "curating", counts: { row: "Picked" } }),
+      entry({ user: "ann", stage: "delivering", counts: { row: "Picked", library: "Movies", creating: 2 } }),
+    ]);
+    // zoe is still queued — not started, so not "in progress"; ann has finished.
+    expect(people).toEqual([
+      { slug: "mike", name: "mike", text: "curating with AI — Picked" },
+      { slug: "sam", name: "Samantha", text: "writing the row to Plex — Picked · TV Shows · adding 1 title" },
+    ]);
+  });
+
+  it("names no shared row or library subject as a person", () => {
+    expect(
+      inFlight(runWithPending(["sam"], []), [
+        entry({ user: "Movies", stage: "indexing" }),
+        entry({ user: "shared_popular", stage: "delivering", counts: { creating: 5 } }),
+      ]),
+    ).toEqual([]);
   });
 });

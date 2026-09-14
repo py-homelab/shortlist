@@ -170,20 +170,20 @@ Two details that are easy to get wrong:
 
 Every case, and where it is handled. **E** = eagerly (job, seconds). **R** = reconciled (next run).
 
-| Case                                | Their own row                                                   | Others' rows hidden from them                               |
-| ----------------------------------- | --------------------------------------------------------------- | ----------------------------------------------------------- |
-| Active user                         | built each run                                                  | E `filters.apply` + R                                       |
-| **Paused**                          | E `user.hide`; restored on unpause                              | unchanged — excludes still match, collection kept           |
-| **Disabled**                        | E `user.cleanup` (retried)                                      | E `filters.apply` with `hide_all_shared`                    |
-| **Removed from Plex**               | R — demote always; delete only when the roster read succeeded   | n/a (no share)                                              |
-| **New account**                     | next run builds it                                              | **E `filters.apply` immediately** — closes the leak in §1.1 |
-| **Not selected in a scoped run**    | untouched                                                       | R — excludes derive from server state, already correct      |
-| **Run errored / cancelled**         | delivered unpromoted (safe)                                     | R                                                           |
-| **Managed user**                    | none today (skipped) — see issue #20                            | ⚠️ **no excludes at all** — unresolved, see §9              |
-| **Per-person row, audience shrunk** | E delete their collection                                       | R                                                           |
-| **Shared row, audience shrunk**     | one collection, nothing to delete                               | **E `filters.apply`** for the dropped accounts              |
-| **Row disabled**                    | E `row.reconcile` (per-person today; shared rows are a gap, F5) | R — union-only, stays excluded                              |
-| **Owner**                           | own row only                                                    | ⚠️ **structurally impossible** — no share with yourself     |
+| Case                                | Their own row                                                   | Others' rows hidden from them                                                    |
+| ----------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Active user                         | built each run                                                  | E `filters.apply` + R                                                            |
+| **Paused**                          | E `user.hide`; restored on unpause                              | unchanged — excludes still match, collection kept                                |
+| **Disabled**                        | E `user.cleanup` (retried)                                      | E `filters.apply` with `hide_all_shared`                                         |
+| **Removed from Plex**               | R — demote always; delete only when the roster read succeeded   | n/a (no share)                                                                   |
+| **New account**                     | next run builds it                                              | **E `filters.apply` immediately** — closes the leak in §1.1                      |
+| **Not selected in a scoped run**    | untouched                                                       | R — excludes derive from server state, already correct                           |
+| **Run errored / cancelled**         | delivered unpromoted (safe)                                     | R                                                                                |
+| **Managed user**                    | none today (skipped) — see issue #20                            | ⚠️ **no excludes at all** — unresolved, see §9                                   |
+| **Per-person row, audience shrunk** | E delete their collection                                       | R                                                                                |
+| **Shared row, audience shrunk**     | one collection, nothing to delete                               | **E `filters.apply`** for the dropped accounts                                   |
+| **Row disabled**                    | E `row.reconcile` (per-person today; shared rows are a gap, F5) | R — union-only, stays excluded                                                   |
+| **Owner**                           | own row only                                                    | ⚠️ **structurally impossible** — no share with yourself                          |
 | **Left alone (`manage_sharing=0`)** | unaffected — they still get a row if enabled                    | **none, by request** — E removes ours; a RESTRICTED shared row's exclude is kept |
 
 ---
@@ -332,7 +332,7 @@ That is fine for most settings, but not for the ones that change what Plex shoul
 | Setting                                       | What should happen on change                                                                                                                                    |
 | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `privacy.hide_shared_from_disabled`           | every disabled account's filter needs rewriting → `privacy.sync`                                                                                                |
-| `rows.manage_shelf_order` / `rows.hub_anchor` | shelf order should be re-applied, or left alone if switched off                                                                                                 |
+| `rows.manage_shelf_order`                     | shelf order should be re-applied, or left alone if switched off (`rows.hub_anchor` was retired 2026-09-12 — placement is set per row)                            |
 | `row.name_template`                           | existing collections carry a title no future run will write (the rename reconcile exists for the per-user nickname case; the global template has no equivalent) |
 | `label_prefix` (if ever exposed)              | every label and every exclude in every filter changes — a migration, not a job                                                                                  |
 
@@ -391,6 +391,20 @@ _Lesson: the iteration before this gave every job a full card with its paragraph
 permanently on screen — nine of those is ~1800px of scroll, four of them jobs nobody can start. It
 also dropped the cross-job feed, which is the question "what has my server been doing?"; no number
 of per-job collapsibles answers it._
+
+**The header feed is not the Jobs page** (`JobKind.routine`, `exclude_routine` on `GET /jobs`). Both
+read the same table, but they answer different questions: the Jobs page is "show me this kind", the
+header is "tell me what happened". `watch.reconcile` is queued once per playback stop — measured on
+the maintainer's 46-user server, 165 of the 197 jobs queued in a day, 84% of the table — which meant
+it permanently owned all five slots of the header's Recent list (a privacy sync or a nightly run was
+never visible there) and popped a success toast every nine minutes for something nobody asked for.
+
+Dropped by the SERVER rather than filtered in the SPA, for the same reason `status=` is: a client
+filter over a fetched page cannot work when the noise outnumbers the page. Coming out of the poll
+entirely is also what silences the toasts — they never reach `jobTransitions`. Two rules hold:
+a FAILURE is never routine (a reconcile that fails is the only thing that would say a partial watch
+went uncredited, so it stays in the feed, the toasts and the failed badge), and a kind nobody
+classified counts as news, so a new kind is never silenced by accident.
 
 ---
 
@@ -522,9 +536,9 @@ It is bounded by CORROBORATION rather than by a veto, and that difference is the
 
 - **Three buckets, not two**, and they stay three all the way out to the API
   (`filters_skipped` / `filters_unreachable` / `filters_failed`) so no consumer has to match on an
-  error string to tell them apart. An account the roster omits is *departed* only if `user_sync`
+  error string to tell them apart. An account the roster omits is _departed_ only if `user_sync`
   already recorded it gone (`departed_at`/`removed_at`) — two independent observations, days apart.
-  Otherwise it is *unreachable*: our records say it is here, so the roster disagreeing with them is
+  Otherwise it is _unreachable_: our records say it is here, so the roster disagreeing with them is
   what a partial or empty read looks like. Unreachable is reported as retryable, never as gone.
 - **The preview says it too.** The dry run is the rehearsal the FAQ tells people to trust (rule 8),
   so "plex.tv could not see N of your accounts" belongs there most of all — it is the one signal that
@@ -896,7 +910,8 @@ It is exactly as right as the ledger is. Three guards bound that:
   (Kometa) collection. The label is untouched, so hiding and promotion are unaffected either way.
 - **Ambiguity.** `_delivered_keys` drops any ratingKey two rows claim rather than arbitrating; delivery
   falls back to the title, which is where it was before the ledger. Reachable if a run died between
-  the delete and the persist on the rebuild path, and it self-heals on the next successful run.
+  the delete and the persist on a repair that recreates a row (wrong type, or refusing every add), and
+  it self-heals on the next successful run.
 - **In-run reuse.** Plex ratingKeys are reused rowids. The sweep can free row A's id at the top of a
   run, row B create and be handed it, and row A then match B's brand-new collection. So a key this run
   has ALREADY delivered to is withheld — `_claimed_this_run` reads the run's own breakdown.
@@ -972,9 +987,16 @@ no rows at all, so it cannot depend on who ran. Only genuinely diverging rows ar
 durable ledger's ratingKeys. A test asserted the bug as a requirement
 (`test_order_phase_skips_an_overridden_row_with_no_delivered_titles`); it is now inverted.
 
-With both fixed, `privacy.sync` and `sync.check` order the shelf too — so Shortlist re-applies at the
-end of every run, at `privacy.sync_cron` (05:15 by default), at `sync.check_cron` (05:45, and
-off-able), and whenever a change to who-sees-what triggers a privacy sync.
+With both fixed, `sync.check` orders the shelf too — so Shortlist re-applies at the end of every run
+and at `sync.check_cron` (05:45, and off-able).
+
+`privacy.sync` ordered the shelf as well until 2026-09-10, and that was removed. It is the one job
+with BOTH a cron and a mutation trigger, so its pass count is set by the owner rather than by this
+design: on the maintainer's server `privacy.sync_cron` had been set to `*/30 * * * *`, which put the
+whole placement phase through 49 times a day — 200 hub-order writes in 24 hours against the nightly
+run's 5, every one of them failing, for a position that only changes when a row is built. The
+paragraph below that reasons about "three passes a night" assumed the 05:15 default; do not rely on
+it for a server whose owner has changed that cron.
 
 **That is roughly three passes a night against agregarr's forty-eight, so it is still a loss.** An
 earlier draft of this section said "every 30 minutes instead of once a night — an even fight"; there

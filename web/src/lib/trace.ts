@@ -295,6 +295,8 @@ export function fateLabel(fate: TraceFate): string {
       return "excluded genre";
     case "lost_ranking_cutoff":
       return "lost the ranking cut";
+    case "hidden_by_their_restrictions":
+      return "hidden by their Plex restrictions";
     case "not_returned":
       return "found by another source";
     default:

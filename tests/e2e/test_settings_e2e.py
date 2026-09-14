@@ -13,6 +13,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests.e2e.conftest import ShortlistApp, build_real_rows
+from tests.fakes.fake_plex import FakePlexState
 
 pytestmark = pytest.mark.e2e
 
@@ -36,7 +37,12 @@ class TestConnectionCards:
 
         plex = page.get_by_test_id("connection-plex")
         plex.get_by_role("button", name="Test").click()
-        expect(plex).to_contain_text("Connected to FakePlex (PMS 1.43.3.10793)", timeout=LOAD)
+        # Spelled out, not "PMS": the abbreviation is ours, and the owner reading this card has no
+        # reason to know it (audit finding, Sep 2026).
+        expect(plex).to_contain_text(
+            f"Connected to {FakePlexState.friendly_name} (Plex Media Server {FakePlexState.version})",
+            timeout=LOAD,
+        )
 
         tmdb = page.get_by_test_id("connection-tmdb")
         tmdb.get_by_role("button", name="Test").click()
@@ -73,16 +79,18 @@ class TestDefaults:
         type the address their server is known by, and have it persist under the right key (#7).
         """
         page.goto("/settings")
-        # The provider config lives on the "AI provider" connection card now (the old standalone
-        # "AI curator" section was removed — the provider only powers the web-search source).
-        title = page.get_by_text("AI provider").first
-        expect(title).to_be_visible(timeout=LOAD)
-        # Scope to the AI-provider card: every connection card has an identical Edit/Test pair.
-        card = title.locator('xpath=ancestor::div[contains(@class,"rounded")][1]')
+        # The provider config lives on the merged "AI & Web search" card (testId kept from when it
+        # was the standalone AI-provider card, so this scopes to it without matching field labels).
+        card = page.get_by_test_id("connection-llm")
+        expect(card).to_be_visible(timeout=LOAD)
         card.get_by_role("button", name=re.compile("^(Edit|Set up)$")).first.click()
 
-        # "Provider" renders as a segmented group, not a <select> — pick the option by its label.
-        page.get_by_label("Provider").get_by_role("button", name=re.compile(r"^Local")).click()
+        # A local model has no web search of its own, so it is only offered under a backend that
+        # does the searching for it. Choosing Exa first is what a real owner has to do, and picking
+        # the backend BEFORE the provider is the order the card asks for.
+        page.get_by_label("Where to search").get_by_role("button", name="Exa").click()
+        # "AI provider" renders as a segmented group, not a <select> — pick the option by its label.
+        page.get_by_label("AI provider").get_by_role("button", name=re.compile(r"^Local")).click()
         # The URL field must APPEAR — without it there is no way to say where the server is.
         url = page.get_by_label("Server URL")
         expect(url).to_be_visible(timeout=LOAD)
@@ -160,7 +168,7 @@ class TestDangerZone:
         build_real_rows(app)
         before_collections = {c.rating_key: c.title for c in state.collections.values()}
         before_filters = {user.id: dict(user.filters) for user in state.users.values()}
-        # 5 rows for 3 users: sarah and the cold-start canary each get one per library; mike watches only TV.
+        # 5 rows for 3 users: sarah and the cold-start jess each get one per library; mike watches only TV.
         assert len(before_collections) == 5
 
         _open_settings(page)

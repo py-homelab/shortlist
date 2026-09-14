@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -49,14 +55,18 @@ function row(patch: Partial<Collection> = {}): Collection {
     sort_order: 0,
     name_template: "",
     fallback_name: "",
+    description: "",
+    sort_title_prefix: "",
     min_watchers: 2,
     request_tag: "",
     candidate_sources: [],
     library_keys: [],
     watched_pct: null,
     rewatch: false,
+    rewatch_cooldown_days: 30,
     unstarted_only: false,
     refresh_days: null,
+    idle_hold_days: null,
     recency: null,
     recent_count: null,
     max_seeds: null,
@@ -82,6 +92,8 @@ function row(patch: Partial<Collection> = {}): Collection {
     pick_order: "best",
     placement: "both",
     placement_friends: "both",
+    show_days: [],
+    shown_today: true,
     pin_top: false,
     hub_anchor: {},
     poster: { mode: "", title: "", subtitle: "", style: "", has_image: false },
@@ -346,6 +358,26 @@ describe("RowEditor — the default row's name", () => {
       /Not applied yet/i,
     );
     expect(screen.getByRole("button", { name: /Rename/ })).toBeEnabled();
+  });
+
+  it("lists the {} placeholders beside an existing row's name, before and after you type", async () => {
+    // Only a NEW row's name box said {user}/{library_name}/{top_seed} could be used. An existing row's
+    // said "Renaming rewrites this row on Plex…" and nothing else, so the placeholders were invisible
+    // exactly where a rename is typed.
+    renderEditor(defaultRow());
+    // The hint is one sentence built from several spans, so match the paragraph as a whole.
+    const hint = () =>
+      screen.getByText(
+        (_, el) => el?.tagName === "P" && /for the Plex library the row lands in/.test(el.textContent ?? ""),
+      );
+    expect(hint()).toHaveTextContent("{user}");
+    expect(hint()).toHaveTextContent("{top_seed}");
+    expect(screen.getByText(/Renaming rewrites this row on Plex/)).toBeInTheDocument();
+
+    await userEvent.type(screen.getByDisplayValue("✨ {library_name} Picked for You"), "!");
+
+    expect(await screen.findByRole("status")).toHaveTextContent(/Not applied yet/i);
+    expect(hint()).toHaveTextContent("{library_name}");
   });
 
   it("keeps Rename disabled until the name actually changes", async () => {
@@ -740,6 +772,106 @@ describe("RowEditor — rebuild cadence", () => {
     expect(
       (updateCollection.mock.calls.at(0)?.[1] as Collection).refresh_days,
     ).toBe(8);
+  });
+});
+
+describe("RowEditor — idle hold", () => {
+  beforeEach(() => {
+    updateCollection.mockClear();
+  });
+
+  it("shows the row's own ceiling when it overrides the global", () => {
+    renderEditor(row({ idle_hold_days: 21 }));
+    expect(
+      screen.getByRole("spinbutton", {
+        name: /hold a row for an inactive viewer/i,
+      }),
+    ).toHaveValue(21);
+    expect(
+      screen.getByRole("switch", { name: /global hold/i }),
+    ).not.toBeChecked();
+  });
+
+  it("still offers the hold on a row that names its seed", async () => {
+    // The engine DOES hold a `{top_seed}` row: its cadence is forced nightly so it keeps answering
+    // to the watch it names, but the seed is drawn from history, so nobody who watched nothing can
+    // have moved it. Hiding the control here would repeat, in mirror image, the exact bug the
+    // cadence field shipped once — an editor promising one thing while the engine does another
+    // (issue #57). It is also the row the wizard creates, so hiding it guts the feature.
+    renderEditor(row({ name_template: "Because you watched {top_seed}" }));
+    expect(
+      screen.getByRole("switch", { name: /global hold/i }),
+    ).toBeInTheDocument();
+    // ...while the CADENCE control stays hidden for it, which is a different question.
+    expect(
+      screen.queryByRole("switch", { name: /global rebuild cadence/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not call the hold a no-op on a row the engine rebuilds nightly", async () => {
+    // The row the hold exists for, and the cell the warning got wrong. `effective_refresh_days`
+    // FORCES a `{top_seed}` row to nightly whatever its stored cadence says — which is exactly why
+    // an 8-day hold on it is a real 7-night hold. Judging it against the stored 8 called it a no-op
+    // and told the owner to raise a setting that was already working, quoting back a cadence the
+    // engine documents as ignored (and whose control is hidden on this very row).
+    settingsData.current = {
+      "recommendations.refresh_days": 8,
+      "recommendations.recency": 0.5,
+    };
+    renderEditor(
+      row({
+        name_template: "Because you watched {top_seed}",
+        idle_hold_days: 8,
+      }),
+    );
+
+    // Wait for something ONLY rendered once the settings query resolves — an inherited field's
+    // "global is …" hint. Awaiting the spinbutton is not enough: it renders from `input` regardless,
+    // so the absence assertion below would pass simply because no cadence had loaded yet, which is
+    // exactly how this test first went green against unfixed code.
+    expect(
+      await screen.findByText(/leans towards recent releases/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("spinbutton", {
+        name: /hold a row for an inactive viewer/i,
+      }),
+    ).toHaveValue(8);
+    expect(screen.queryByText(/no effect/i)).not.toBeInTheDocument();
+  });
+
+  it("does call it a no-op on an ordinary row the cadence already beats", async () => {
+    // The control cell: same numbers, but a row whose stored cadence is the one the engine uses.
+    settingsData.current = { "recommendations.refresh_days": 8 };
+    renderEditor(row({ idle_hold_days: 8 }));
+    expect(await screen.findByText(/no effect/i)).toBeInTheDocument();
+  });
+
+  it("hides the hold on a row that cycles its seed", async () => {
+    // That rotation advances one watch per rebuild by design, driven by the cadence and not by new
+    // watches, so `effective_idle_hold_days` forces it off however it is set. A control the engine
+    // overrides must not be on screen.
+    renderEditor(row({ seed_window: 3 }));
+    expect(
+      screen.queryByRole("switch", { name: /global hold/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stops inheriting at the global's own value, not at zero", async () => {
+    // Same trap as the cadence switch beside it: snapping to 0 would silently turn the hold OFF for
+    // this row, which reads as the switch doing something it did not say it would.
+    settingsData.current = { "recommendations.idle_hold_days": 30 };
+    renderEditor(row({ idle_hold_days: null }));
+
+    await userEvent.click(screen.getByRole("switch", { name: /global hold/i }));
+    await userEvent.click(
+      screen.getByRole("button", { name: /Save changes/i }),
+    );
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    expect(
+      (updateCollection.mock.calls.at(0)?.[1] as Collection).idle_hold_days,
+    ).toBe(30);
   });
 });
 
@@ -1232,7 +1364,15 @@ describe("RowEditor — rating source is answerable where the order is chosen", 
 
 describe("RowEditor — every group is on screen, only the optional ones fold", () => {
   const groupNamed = (title: string) =>
-    screen.getByText(title).closest("details");
+    screen.getByText(title, { selector: "summary span span" }).closest("details");
+  const GROUPS = [
+    "How it looks on Plex",
+    "Who gets it",
+    "What goes in it",
+    "When it updates",
+    "Where people see it",
+    "Requests",
+  ];
 
   it("leaves the groups that decide what a row does open", () => {
     renderEditor(row());
@@ -1243,17 +1383,52 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
 
     // Open, because a page has room for them. As a modal these were collapsed to fit inside the
     // viewport cap — which is how the movies-and-TV seed warning ended up somewhere nobody looks.
-    for (const group of ["The basics", "What goes in it", "Where it appears"]) {
+    for (const group of GROUPS.slice(0, -1)) {
       expect(groupNamed(group)).toHaveAttribute("open");
     }
   });
 
-  it("folds only the two groups most people never touch", () => {
+  it("folds only the group most people never touch", () => {
     renderEditor(row());
 
-    for (const group of ["Artwork", "Requests"]) {
-      expect(groupNamed(group)).not.toHaveAttribute("open");
-    }
+    expect(groupNamed("Requests")).not.toHaveAttribute("open");
+  });
+
+  it("asks its questions in order: how it looks, who gets it, what's in it, when it updates, where it shows", () => {
+    renderEditor(row());
+
+    const titles = Array.from(
+      document.querySelectorAll("details > summary span span:first-child"),
+    ).map((el) => el.textContent);
+    expect(titles).toEqual(GROUPS);
+  });
+
+  it("keeps everything people see about the row together at the top", () => {
+    // The name, description and poster used to be three groups apart — the last two folded near the
+    // bottom — so the settings that decide what someone sees on Plex were the hardest to find.
+    renderEditor(row());
+
+    const looks = groupNamed("How it looks on Plex")!;
+    expect(within(looks).getByLabelText("Name", { exact: true })).toBeInTheDocument();
+    expect(within(looks).getByLabelText("Description")).toBeInTheDocument();
+    expect(within(looks).getByRole("button", { name: "Plex default" })).toBeInTheDocument();
+    expect(within(looks).getByText("On Plex")).toBeInTheDocument();
+  });
+
+  it("puts each setting in the group that answers its question", () => {
+    renderEditor(row());
+
+    expect(within(groupNamed("What goes in it")!).getByText("How many titles")).toBeInTheDocument();
+    expect(
+      within(groupNamed("What goes in it")!).getByRole("button", { name: "Best match" }),
+    ).toBeInTheDocument();
+    expect(within(groupNamed("When it updates")!).getByText("Schedule")).toBeInTheDocument();
+    expect(
+      within(groupNamed("Where people see it")!).getByLabelText("Sort title prefix"),
+    ).toBeInTheDocument();
+    expect(
+      within(groupNamed("Where people see it")!).getByRole("button", { name: "Every day" }),
+    ).toBeInTheDocument();
   });
 
   it("a folded group still says what is inside it", () => {
@@ -1298,6 +1473,73 @@ describe("RowEditor — a typed row says so", () => {
     cleanup();
     renderEditor(row({ media: "both", library_keys: [] }));
     expect(screen.getByText(/every library/)).toBeInTheDocument();
+  });
+
+  it("saves a description and sort title prefix, and shows what the row sorts as", async () => {
+    renderEditor(row());
+
+    await userEvent.type(screen.getByLabelText("Description"), "Picked nightly");
+    await userEvent.type(screen.getByLabelText("Sort title prefix"), "!010_");
+    expect(screen.getByText("!010_Hidden Gems")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(-1)?.[1] as Collection;
+    expect(body.description).toBe("Picked nightly");
+    expect(body.sort_title_prefix).toBe("!010_");
+  });
+
+  it("shows a TV-only row sorting under a TV library's name, not a movie library's", () => {
+    // The editor has to hand the field the row's media: the field defaulted to "Movies" on its own.
+    renderEditor(
+      row({
+        media: "show",
+        name_template: "More {library_name} to watch",
+        sort_title_prefix: "!010_",
+      }),
+    );
+
+    expect(screen.getByText("!010_More TV Shows to watch")).toBeInTheDocument();
+    expect(screen.queryByText("!010_More Movies to watch")).not.toBeInTheDocument();
+  });
+
+  it("previews the description on the Plex card as the sample person would see it", async () => {
+    renderEditor(row());
+
+    await userEvent.type(
+      screen.getByLabelText("Description"),
+      "Picked for {{user}",
+    );
+
+    const looks = screen
+      .getByText("How it looks on Plex", { selector: "summary span span" })
+      .closest("details")!;
+    expect(within(looks).getByText("Picked for Sarah")).toBeInTheDocument();
+  });
+
+  it("offers the recently-finished cooldown only on a watch-it-again row", () => {
+    // It only changes a rewatch row; on any other row it would be a dial that does nothing.
+    renderEditor(row({ rewatch: false }));
+    expect(
+      screen.queryByLabelText(/Skip titles finished in the last/i),
+    ).not.toBeInTheDocument();
+
+    cleanup();
+    renderEditor(row({ rewatch: true, watched_pct: 1 }));
+    expect(screen.getByLabelText(/Skip titles finished in the last/i)).toHaveValue(30);
+  });
+
+  it("saves a changed cooldown", async () => {
+    renderEditor(row({ rewatch: true, watched_pct: 1 }));
+
+    const input = screen.getByLabelText(/Skip titles finished in the last/i);
+    await userEvent.clear(input);
+    await userEvent.type(input, "90");
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(-1)?.[1] as Collection;
+    expect(body.rewatch_cooldown_days).toBe(90);
   });
 
   it("names the rewatch switch after the row someone wants", () => {
@@ -1628,5 +1870,126 @@ describe("RowPreview — what a shared row says it will do", () => {
     expect(
       screen.queryByText("What people here have watched most"),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("RowEditor — which days a row appears", () => {
+  beforeEach(() => {
+    updateCollection.mockClear();
+  });
+
+  it("shows every day by default and says so", () => {
+    renderEditor(row({ show_days: [] }));
+
+    expect(
+      screen.getByRole("button", { name: "Every day" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(
+      screen.getByText(/This row appears every day/i),
+    ).toBeInTheDocument();
+  });
+
+  it("names the days it is hidden, which is the question people actually have", () => {
+    renderEditor(row({ show_days: [1, 3, 5] }));
+
+    expect(
+      screen.getByText(/Hidden on Tuesday, Thursday, Saturday and Sunday/i),
+    ).toBeInTheDocument();
+  });
+
+  it("round-trips chosen days into the PATCH body as ISO weekdays", async () => {
+    renderEditor(row({ show_days: [1] }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Wed" }));
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(0)?.[1] as Collection;
+    expect(body.show_days).toEqual([1, 3]);
+  });
+
+  it("clears the schedule back to every day", async () => {
+    renderEditor(row({ show_days: [1, 3] }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Every day" }));
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(0)?.[1] as Collection;
+    expect(body.show_days).toEqual([]);
+  });
+
+  it("refuses to deselect the last remaining day", async () => {
+    // [] means EVERY day to the API, so letting the last chip off would turn "only Mondays" into
+    // "always on" — the exact opposite of the click. Clearing is what "Every day" is for.
+    renderEditor(row({ show_days: [1] }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Mon" }));
+
+    expect(screen.getByRole("button", { name: "Mon" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+});
+
+describe("RowPreview — a row that only appears on some days says so", () => {
+  it("adds an Only on line naming the days", () => {
+    renderEditor(row({ show_days: [1, 3, 5] }));
+
+    // Scoped to the preview panel: the group's own collapsed summary says "Mon, Wed, Fri" too, and
+    // an unscoped query matches both — which would pass even if the panel line were missing.
+    const panel = document.querySelector("dl");
+    expect(panel).not.toBeNull();
+    const preview = within(panel as HTMLElement);
+    expect(preview.getByText("Only on")).toBeInTheDocument();
+    expect(preview.getByText("Mon, Wed, Fri")).toBeInTheDocument();
+  });
+
+  it("leaves the panel alone for a row that appears every day", () => {
+    // The panel claims to summarise the WHOLE row, so an always-on row must not grow a line that
+    // implies a restriction it does not have.
+    renderEditor(row({ show_days: [] }));
+
+    const panel = document.querySelector("dl");
+    expect(within(panel as HTMLElement).queryByText("Only on")).toBeNull();
+  });
+});
+
+describe("RowEditor — switching to a day schedule does not guess at today", () => {
+  beforeEach(() => {
+    updateCollection.mockClear();
+  });
+
+  it("ticks the whole week, which still means every day", async () => {
+    // It used to seed the BROWSER's weekday. Days turn over on the server's clock, so with the two
+    // either side of midnight that pre-selected a day which was not today on the server — and saving
+    // straight away hid the row. Seen live: browser on Wednesday, server already on Thursday.
+    renderEditor(row({ show_days: [] }));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Only on these days" }),
+    );
+
+    for (const name of ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]) {
+      expect(screen.getByRole("button", { name })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    }
+  });
+
+  it("narrows only when you untick a day", async () => {
+    renderEditor(row({ show_days: [] }));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Only on these days" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Sun" }));
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(0)?.[1] as Collection;
+    expect(body.show_days).toEqual([1, 2, 3, 4, 5, 6]);
   });
 });

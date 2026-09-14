@@ -6,10 +6,34 @@ description: >-
   person's Plex home screen — visible only to them. Self-hosted, one Docker
   container, no AI key required.
 
-url: https://stevezau.github.io
-baseurl: /shortlist
+# Where the site lives. Every page derives its links from these two through
+# `relative_url` / `absolute_url`, so moving the site is a change to these two lines
+# and nothing else INSIDE docs/. Verify that stays true with:
+#
+#     grep -rln "stevezau.github.io" docs/
+#
+# which should only ever match this file and docs/README.md — the latter is excluded
+# from the build, is the github.com folder view, and runs no Liquid.
+#
+# ---------------------------------------------------------------------------
+# Moved to shortlistapp.dev on 5 Sep 2026. DNS (Route 53) first, then docs/CNAME + the Pages
+# setting, then the two lines below, then the hand-written links in README.md and
+# docs/README.md and .github/dockerhub-overview.md.
+# Enforce HTTPS is on (verified 2026-09-11: http://shortlistapp.dev 301s to https).
+# Still outstanding for the owner: add the apex as a NEW Search Console property and re-submit
+# the sitemap — it is a different property from the old /shortlist/ subpath. The
+# google_site_verification tag below is already served on every page of the new domain, so the
+# property verifies on the spot; nothing here needs changing for it.
+
+url: https://shortlistapp.dev
+baseurl: ""
 
 repo: https://github.com/stevezau/shortlist
+
+# The host shown in the landing page's fake address bars. A `.local` name says
+# "this runs on your own network" without a sentence about it, and 5959 is the
+# real default port, so it doubles as a hint about where the app turns up.
+demo_host: shortlist.local:5959
 # NOT named `image` — that key is already taken further down by the social-preview card that
 # jekyll-seo-tag reads off each page. Two different meanings under one name would be a trap.
 # The Docker Hub namespace doubles the z and is NOT the GitHub username `stevezau`; the
@@ -23,15 +47,18 @@ ghcr: ghcr.io/stevezau/shortlist
 permalink: pretty
 
 # The card Reddit, Discord, Slack and X render when someone shares a docs link.
-# social-preview.png is the real Plex row with the name and pitch composited over
-# it, at the 2:1 those platforms actually want — the bare row screenshot is 3:1 and
-# gets its top and bottom cropped away. This has to go through `defaults` rather
-# than a top-level `image:` — jekyll-seo-tag only reads page.image, never site.image.
+# social-preview.jpg is the name and pitch over a shelf of cover art fading up from
+# the bottom, at the 2:1 those platforms actually want — a bare row screenshot is
+# 3:1 and gets its top and bottom cropped away. Built by
+# tests/e2e/test_marketing_assets.py from assets/social_preview.html. JPEG, not
+# WebP: this is the one image fetched by every unfurler, which is the last place
+# WebP support is safe to assume. This has to go through `defaults` rather than a
+# top-level `image:` — jekyll-seo-tag only reads page.image, never site.image.
 defaults:
   - scope:
       path: ""
     values:
-      image: /images/social-preview.png
+      image: /images/social-preview.jpg
       layout: doc
 
 # Ownership proof for Google Search Console (where the sitemap is submitted).
@@ -65,9 +92,18 @@ nav:
         url: /guides/troubleshooting/
       - title: On the internet
         url: /guides/security/
+  - title: What it works with
+    url: /integrations/
   - title: Reference
     url: /reference/
     blurb: Settings, API, env vars
+    children:
+      - title: Settings and env vars
+        url: /reference/settings/
+      - title: The API
+        url: /reference/api/
+      - title: How Shortlist decides things
+        url: /reference/concepts/
   - title: FAQ
     url: /faq/
     blurb: Privacy, Kometa, uninstall
@@ -108,3 +144,8 @@ exclude:
   - Gemfile
   - Gemfile.lock
   - vendor
+  # Implementation plans written by the planning skill land in docs/ because that is where
+  # the skill puts them, not because they belong on the site. Left in, Jekyll publishes each
+  # one as a page and jekyll-sitemap hands it to Google — a 69KB internal spec competing with
+  # the pages written for readers.
+  - superpowers/

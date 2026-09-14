@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -81,6 +81,9 @@ const LANDING = {
   matured_days: 30,
 };
 
+// Distinct from every other figure in the fixture, so a swapped slot renders as different text.
+const VIEWING_SHARE = { watched: 537, from_rows: 82, rate: 0.153 };
+
 const EMPTY = {
   window: "30" as ReportWindow,
   window_days: 30,
@@ -136,10 +139,22 @@ const REPORT: EffectivenessReport = {
     avg_days_to_watch: 3.5,
     avg_days_to_watch_delta: -0.8,
     landing: LANDING,
+    viewing_share: VIEWING_SHARE,
   },
   ...EMPTY,
   top_titles: [
-    { tmdb_id: 1, media_type: "movie", title: "Dune: Part Two", watchers: 3 },
+    {
+      tmdb_id: 693134,
+      media_type: "movie",
+      title: "Dune: Part Two",
+      watchers: 3,
+      rating_key: 7007,
+      year: 2024,
+      watcher_sample: [
+        { id: 42, name: "Sarah H" },
+        { id: 43, name: "Mike" },
+      ],
+    },
   ],
   trend: [{ week: "2026-28", watched: 4, finished: 3 }],
   per_user: [
@@ -187,6 +202,9 @@ const REPORT: EffectivenessReport = {
       display_name: "Sarah H",
       title: "Dune: Part Two",
       media_type: "movie",
+      tmdb_id: 693134,
+      rating_key: 7007,
+      year: 2024,
       row: "✨ Movies Picked for You",
       library: "Movies",
       seed_title: "Arrival",
@@ -211,15 +229,15 @@ describe("ImpactReport", () => {
     renderReport();
 
     expect(await screen.findByText(/watched · the last/i)).toBeTruthy();
-    expect(screen.getByText(/People who watched something/)).toBeTruthy();
+    expect(screen.getByText("People who watched a pick")).toBeTruthy();
     expect(screen.getByText("1 of 2")).toBeTruthy();
     // Each requests figure in its OWN slot. `/sent ·/` matched the label regardless of which number
     // sat beside it, and the fixture had two of the three equal — so any figure could appear in any
     // slot (mutation audit 2026-08-25). The three are now distinct and each is named.
-    const requestsLine = screen.getByText(/awaiting approval/).textContent ?? "";
-    expect(requestsLine).toMatch(/21\s*sent/);
-    expect(requestsLine).toMatch(/23\s*watched since/);
-    expect(requestsLine).toMatch(/22\s*awaiting approval/);
+    expect(screen.getByTestId("requests-sent")).toHaveTextContent(/^21\s*sent$/);
+    expect(screen.getByTestId("requests-watched")).toHaveTextContent(/^23\s*watched since$/);
+    expect(screen.getByTestId("requests-pending")).toHaveTextContent(/^22\s*awaiting approval$/);
+    expect(screen.getByRole("link", { name: /Review 22 waiting/ })).toHaveAttribute("href", "/requests");
     expect(
       screen.getByRole("link", { name: /full send log/i }),
     ).toHaveAttribute("href", "/requests?tab=sent"); // deep-links to the send-log tab
@@ -228,8 +246,13 @@ describe("ImpactReport", () => {
     expect(screen.queryByText("sarah")).toBeNull();
     // The feed times the WATCH, not the finish — a series finished weeks after it was started would
     // otherwise be filed under the wrong day.
-    expect(screen.getByText(/· 5h ago/)).toBeTruthy();
-    expect(screen.queryByText(/· 1h ago/)).toBeNull();
+    // How long ago, at a glance — the owner preferred it to a clock time. The exact time is on hover.
+    const clock = (iso: string) =>
+      new Date(iso).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    const watch = REPORT.recent[0]!;
+    const when = screen.getByText("5h ago");
+    expect(when).toHaveAttribute("title", clock(watch.watched_at!));
+    expect(screen.queryByText("1h ago")).toBeNull();
     // Counts, labelled — never "3 of 6". They are two different sets (watched-in-window vs
     // delivered-in-window), so a fraction makes "4 of 0" reachable when delivery paused.
     // Counts, labelled — never "3 of 6". Two different sets (watched-in-window vs
@@ -298,40 +321,6 @@ describe("ImpactReport", () => {
     expect(getReport).toHaveBeenCalledWith("90");
   });
 
-  it("states the landing rate over its matured cohort, not over every pick ever", async () => {
-    renderReport();
-
-    // It lives in the verdict now, not a card of its own — two cards printing the same ratio at two
-    // roundings (1% beside 0.5%) is how a dashboard comes to disagree with itself.
-    expect(await screen.findByText("40.0%")).toBeTruthy();
-    expect(screen.getByText(/4 of 10 ·/)).toBeTruthy();
-    // The caveat is the point — without it the percentage is a number with no meaning, because the
-    // denominator is not "every pick ever".
-    expect(
-      screen.getByText(/only picks that have had their full 30 days/i),
-    ).toBeTruthy();
-  });
-
-  it("says so plainly when no pick is old enough to have a landing rate yet", async () => {
-    getReport.mockResolvedValue({
-      ...REPORT,
-      overall: {
-        ...REPORT.overall,
-        landing: { ...LANDING, delivered: 0, watched: 0, rate: null },
-      },
-    });
-    renderReport();
-
-    expect(await screen.findByText(/Not enough time yet/i)).toBeTruthy();
-    // Two rewrites' worth of lessons, both pinned. "try a longer window" was advice that cannot
-    // work — no window reaches picks that do not exist. And stating the CUTOFF ("needs picks
-    // delivered before 12 Jul") read as though it wanted old picks, when what it needs is for the
-    // picks it has to get older. It must say when a score arrives instead.
-    expect(screen.queryByText(/longer window/i)).toBeNull();
-    expect(screen.queryByText(/needs picks delivered before/i)).toBeNull();
-    expect(screen.getByText(/starts showing a score around/i)).toBeTruthy();
-  });
-
   it("says there is no earlier period rather than dangling a comparison", async () => {
     // A server too new to have a full previous window. The API sends null rather than 0 (see
     // `TestADeltaNeedsAPreviousPeriodToCompareAgainst`) precisely so this can be said out loud —
@@ -377,8 +366,15 @@ describe("ImpactReport", () => {
     // this line never rendered and "with errors" / ", no errors" could be swapped freely.
     getReport.mockResolvedValue({
       ...REPORT,
-      runs: { ...REPORT.runs, last_finished: new Date(Date.now() - 3600_000).toISOString(), errors_last: 0 },
-      watch_sync: { ...REPORT.watch_sync, last: new Date(Date.now() - 7200_000).toISOString() },
+      runs: {
+        ...REPORT.runs,
+        last_finished: new Date(Date.now() - 3600_000).toISOString(),
+        errors_last: 0,
+      },
+      watch_sync: {
+        ...REPORT.watch_sync,
+        last: new Date(Date.now() - 7200_000).toISOString(),
+      },
     });
     renderReport();
 
@@ -386,19 +382,84 @@ describe("ImpactReport", () => {
     expect(screen.getByText(/Watch status synced 2h ago/)).toBeTruthy();
   });
 
-  it("says a run had errors when it did, and colours the dot for it", async () => {
+  // The three tiers of "how did the last run go" are the same three `notifications.py` already
+  // draws (`_last_run_problem`: whole-run `error` vs. per-user `warning`). A binary red/green dot
+  // reported a run that finished with two people un-rebuilt identically to a run that died — while
+  // the bell, on the same screen, called it a warning.
+  it("colours the dot amber and counts the people when the run itself succeeded", async () => {
     getReport.mockResolvedValue({
       ...REPORT,
-      runs: { ...REPORT.runs, last_finished: new Date(Date.now() - 3600_000).toISOString(), errors_last: 2 },
+      runs: {
+        ...REPORT.runs,
+        last_status: "ok",
+        last_finished: new Date(Date.now() - 3600_000).toISOString(),
+        errors_last: 2,
+      },
     });
     renderReport();
 
-    const line = await screen.findByText(/Last run 1h ago, with errors/);
-    // The dot beside it is the at-a-glance half of the same claim; green next to "with errors" is
-    // worse than no dot at all.
+    const line = await screen.findByText(/Last run 1h ago, 2 people failed/);
+    const dot = line.querySelector("span[class*='rounded-full']");
+    expect(dot?.className).toMatch(/warning/);
+    expect(dot?.className).not.toMatch(/destructive/);
+    expect(dot?.className).not.toMatch(/success/);
+  });
+
+  it("says one person, not 1 people", async () => {
+    getReport.mockResolvedValue({
+      ...REPORT,
+      runs: {
+        ...REPORT.runs,
+        last_status: "ok",
+        last_finished: new Date(Date.now() - 3600_000).toISOString(),
+        errors_last: 1,
+      },
+    });
+    renderReport();
+
+    expect(
+      await screen.findByText(/Last run 1h ago, 1 person failed/),
+    ).toBeTruthy();
+  });
+
+  it("colours the dot destructive when the RUN failed, with nobody's row attempted", async () => {
+    getReport.mockResolvedValue({
+      ...REPORT,
+      runs: {
+        ...REPORT.runs,
+        last_status: "error",
+        last_finished: new Date(Date.now() - 3600_000).toISOString(),
+        errors_last: 0,
+      },
+    });
+    renderReport();
+
+    const line = await screen.findByText(/Last run 1h ago, the run failed/);
     const dot = line.querySelector("span[class*='rounded-full']");
     expect(dot?.className).toMatch(/destructive/);
-    expect(dot?.className).not.toMatch(/success/);
+    expect(dot?.className).not.toMatch(/warning/);
+    // "0 people failed" is the sentence a count-first implementation writes here.
+    expect(screen.queryByText(/0 people failed/)).toBeNull();
+  });
+
+  it("still reads as a failure when the run died AFTER some people had already errored", async () => {
+    // The ordering guard: checking `errors_last` before `last_status` downgrades a dead run to
+    // amber the moment anyone errored on the way down, which is the common shape of a real failure.
+    getReport.mockResolvedValue({
+      ...REPORT,
+      runs: {
+        ...REPORT.runs,
+        last_status: "error",
+        last_finished: new Date(Date.now() - 3600_000).toISOString(),
+        errors_last: 3,
+      },
+    });
+    renderReport();
+
+    const line = await screen.findByText(/Last run 1h ago, the run failed/);
+    const dot = line.querySelector("span[class*='rounded-full']");
+    expect(dot?.className).toMatch(/destructive/);
+    expect(dot?.className).not.toMatch(/warning/);
   });
 
   it("draws a gain as a gain and a loss as a loss", async () => {
@@ -441,7 +502,11 @@ describe("ImpactReport", () => {
     // A fresh install has no listener yet, which is not a fault and must not render as one.
     getReport.mockResolvedValue({
       ...REPORT,
-      watch_sync: { ...REPORT.watch_sync, live_since: null, live_down_since: null },
+      watch_sync: {
+        ...REPORT.watch_sync,
+        live_since: null,
+        live_down_since: null,
+      },
     });
     renderReport();
 
@@ -457,9 +522,10 @@ describe("ImpactReport", () => {
     const links = await screen.findAllByRole("link", { name: "Sarah H" });
     expect(links.length).toBeGreaterThanOrEqual(2); // By person, and the recent-watches feed
     for (const link of links) {
-      // `?tab=history` — arriving from a watch figure onto their ROW list is a second click for
-      // something the first click already asked.
-      expect(link.getAttribute("href")).toBe("/users/42?tab=history");
+      // `?tab=watched` — arriving from a watch figure onto their ROW list is a second click for
+      // something the first click already asked. The key matches the tab's LABEL now; it used to
+      // say `history` against a tab called "Watched" (audit finding, Sep 2026).
+      expect(link.getAttribute("href")).toBe("/users/42?tab=watched");
     }
   });
 
@@ -468,7 +534,9 @@ describe("ImpactReport", () => {
     // a link to a page that 404s is worse than plain text.
     getReport.mockResolvedValue({
       ...REPORT,
-      recent: [{ ...REPORT.recent[0], user_id: null, display_name: "departed" }],
+      recent: [
+        { ...REPORT.recent[0], user_id: null, display_name: "departed" },
+      ],
     });
     renderReport();
 
@@ -951,6 +1019,79 @@ describe("ImpactReport — recently watched", () => {
   });
 });
 
+describe("ImpactReport — titles shown as titles", () => {
+  beforeEach(() => {
+    getReport.mockReset();
+    getReport.mockResolvedValue(REPORT);
+    getDeletedRows.mockReset();
+    getDeletedRows.mockResolvedValue([]);
+  });
+
+  it("shows Most watched as posters with rank, year, watchers and look-up links", async () => {
+    // It was a bare "Ted Lasso · 10 watchers" list: nothing said what a title was, and nothing let
+    // you look one up.
+    renderReport();
+
+    const shelf = await screen.findByRole("list", { name: "Most watched" });
+    const item = within(shelf).getAllByRole("listitem")[0]!;
+    expect(item.querySelector("img")?.getAttribute("src")).toBe("/api/picks/7007/poster");
+    expect(item).toHaveTextContent("1");
+    expect(item).toHaveTextContent("Dune: Part Two");
+    expect(item).toHaveTextContent("2024");
+    expect(item).toHaveTextContent("3 watchers");
+    // Faces for the first few watchers, named for screen readers and on hover.
+    expect(within(item).getByTitle("Sarah H")).toBeTruthy();
+    expect(within(item).getByTitle("Mike")).toBeTruthy();
+    expect(within(item).getByRole("link", { name: "Dune: Part Two on TMDB" })).toHaveAttribute(
+      "href",
+      "https://www.themoviedb.org/movie/693134",
+    );
+    expect(within(item).getByRole("link", { name: "Dune: Part Two on IMDb" })).toBeTruthy();
+    expect(within(item).getByRole("link", { name: "Dune: Part Two on Trakt" })).toBeTruthy();
+  });
+
+  it("gives each recent watch its poster and look-up links, grouped under its day", async () => {
+    // Local midday, and a watch two hours before it: "Today" in every timezone. Against the real clock
+    // a watch "5 hours ago" is Yesterday between midnight and 5am, so this failed for part of every day.
+    const midday = new Date();
+    midday.setHours(12, 0, 0, 0);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(midday);
+    getReport.mockResolvedValue({
+      ...REPORT,
+      recent: [
+        {
+          ...REPORT.recent[0]!,
+          watched_at: new Date(midday.getTime() - 2 * 3600_000).toISOString(),
+          finished_at: null,
+        },
+      ],
+    });
+    renderReport();
+
+    const feed = await screen.findByRole("list", { name: "Recently watched from Shortlist" });
+    vi.useRealTimers();
+    expect(within(feed).getByText("Today")).toBeTruthy();
+    const line = within(feed).getByText("Dune: Part Two").closest("li")!;
+    expect(line.querySelector("img")?.getAttribute("src")).toBe("/api/picks/7007/poster");
+    expect(line).toHaveTextContent("2024");
+    expect(within(line).getByRole("link", { name: "Dune: Part Two on TMDB" })).toBeTruthy();
+  });
+
+  it("stacks Requests under Worth a look, and gives the two long lists the full width below", async () => {
+    // "Recently watched" runs to twenty lines, so a Requests card beside it floated over a column of
+    // empty space. Beside the tall By-person list, under Worth a look, it fills a gap instead.
+    renderReport();
+
+    await screen.findByRole("list", { name: "Recently watched from Shortlist" });
+    const order = screen
+      .getAllByRole("heading")
+      .map((h) => h.textContent)
+      .filter((t) => ["Worth a look", "Requests", "Most watched", "Recently watched from Shortlist"].includes(t ?? ""));
+    expect(order).toEqual(["Worth a look", "Requests", "Most watched", "Recently watched from Shortlist"]);
+  });
+});
+
 describe("ImpactReport — the recent feed says which kind of watch it was", () => {
   beforeEach(() => {
     getReport.mockReset();
@@ -1045,15 +1186,37 @@ describe("ImpactReport — the engagement split", () => {
     expect(screen.queryByText(/gave up part-way/)).toBeNull();
   });
 
-  it("never reports a real rate as zero", async () => {
-    // The backend rounds `landing.rate` to three decimals before it leaves the server — a tenth of a
-    // percentage point. On a large library a genuine 0.03% arrives as 0.0, and "0.0%" reads as
-    // "nobody watched anything" when thirty people did. The counts are exact; the ratio is not.
+  it("says how much of what people watched was in their Shortlist row", async () => {
+    // Replaced "picks watched while their row still showed them" (0.7% on a real server), which divided
+    // by every title ever SHOWN and so stayed tiny whether Shortlist worked or not.
+    renderReport();
+
+    expect(await screen.findByText("15.3%")).toBeTruthy();
+    expect(screen.getByText("Watched from Shortlist rows")).toBeTruthy();
+    expect(
+      screen.getByText("82 of the 537 titles people watched were in their rows · the last 30 days"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Picks watched while their row still showed them/)).toBeNull();
+  });
+
+  it("tells the two rates apart: a share of TITLES, then a count of PEOPLE", async () => {
+    // Side by side, "Of what people watched, in their Shortlist row 18.2%" and "People who watched
+    // something 34 of 46" read as two takes on one number. The owner could not tell them apart.
+    renderReport();
+
+    expect(await screen.findByText("People who watched a pick")).toBeTruthy();
+    expect(
+      screen.getByText("watched at least one title from their rows · the last 30 days"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/People who watched something/)).toBeNull();
+  });
+
+  it("never reports a real share as zero", async () => {
     getReport.mockResolvedValue({
       ...REPORT,
       overall: {
         ...REPORT.overall,
-        landing: { ...LANDING, delivered: 100000, watched: 30, rate: 0.0 },
+        viewing_share: { watched: 100000, from_rows: 30, rate: 0.0 },
       },
     });
     renderReport();
@@ -1062,17 +1225,21 @@ describe("ImpactReport — the engagement split", () => {
     expect(screen.queryByText("0.0%")).toBeNull();
   });
 
-  it("still says nothing at all when nothing was delivered", async () => {
+  it("blames the missing watch history, not the people, when there is no share to show", async () => {
+    // The share reads the nightly watch sync; the Watched tile reads live credits. A pick credited today
+    // shows "41 watched" above a share of nothing, so "no one has watched anything" would contradict
+    // the headline on the same card. What is actually missing is synced history.
     getReport.mockResolvedValue({
       ...REPORT,
       overall: {
         ...REPORT.overall,
-        landing: { ...LANDING, delivered: 0, watched: 0, rate: null },
+        viewing_share: { watched: 0, from_rows: 0, rate: null },
       },
     });
     renderReport();
 
-    await screen.findByText(/Not enough time yet/i);
+    expect(await screen.findByText(/Nothing to count yet/i)).toBeTruthy();
+    expect(screen.queryByText(/has watched anything/i)).toBeNull();
     expect(screen.queryByText("<0.1%")).toBeNull();
   });
 });

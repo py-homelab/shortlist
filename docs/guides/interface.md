@@ -7,6 +7,10 @@ nav_order: 1
 
 Eight pages in the sidebar. This is what each one is for.
 
+After you update Shortlist, the next page you open shows **What's new**: the release notes for
+every version since you last read them. Close it and it stays closed, in every browser, until the
+next release.
+
 ## Dashboard
 
 The impact report: what Shortlist delivered versus what people actually watched, for a window you
@@ -93,11 +97,7 @@ collections and runs unattended: an **empty** roster is ignored entirely, and if
 your enabled accounts appear to vanish at once, nothing happens and an error is recorded instead.
 Both cases are far more likely to be a truncated response than a real mass departure.
 
-A departed row stays in the list so you can see what happened. **Remove** clears it out: their pick
-history and run history are deleted and the row disappears. What it deliberately keeps is that
-account's _original Plex share settings_, recorded before Shortlist ever touched them — so
-uninstalling Shortlist can still put the account back exactly as it found it. That record is the only
-copy, which is why Remove archives rather than deletes.
+A departed row stays in the list so you can see what happened. **Remove** deletes that person's pick history and run history, and their row disappears from the list. It keeps one thing: a copy of their original Plex share settings from before Shortlist touched them, so uninstalling can still put their account back exactly as it was.
 
 You do not have to clean up their share filters. Once their row is gone from the server, the next
 privacy pass drops the leftover `label!=` entry from everyone else's filters on its own — but only
@@ -241,11 +241,11 @@ Each row's run schedule lives in that row's editor, not here. See [Schedules](sc
 ## Reading the dashboard
 
 Everything on the dashboard is scoped to the window selected at the top, **the last 30 days** by
-default. That matters more than it sounds: these figures used to be lifetime totals, which made
-every ratio a measure of how long Shortlist had been installed rather than of how good the picks
-were. A pick can only ever be credited **while its row is still showing it**, but the old
-denominator kept every pick ever delivered, for ever, so each night added ~60 permanently
-uncreditable picks per person to the bottom of the fraction and the number could only sink.
+default. That matters more than it sounds. A pick can only ever be credited **while its row is
+still showing it**, so counting every pick ever delivered would measure how long Shortlist has been
+installed rather than how good the picks are — each night would add another ~60 picks per person
+that can no longer be credited, and the number could only sink. The window is what keeps these
+figures about the picks.
 
 **Watched** — picks people STARTED in the window. A pick delivered last month and watched this week
 counts here, as long as the row was still showing it: this figure is about watching, not delivery.
@@ -273,18 +273,21 @@ It counts only what Shortlist watched happen live, so it starts empty and fills 
 watch tracking is running. A title nobody has played since then is in neither count — unknown is not
 the same as zero.
 
-**People watching** — how many people watched at least one pick, out of everyone currently enabled.
+**People who watched a pick** — how many people watched at least one title from their rows in the
+window, out of everyone currently enabled. It counts people; **Watched from Shortlist rows** counts
+titles.
 
 **Avg to watch** — average days from a title first being recommended to it first being watched, over
 titles first watched in the window. Lower is better, and the change arrow is coloured accordingly.
 
-**Landing rate** — the one percentage, and the only one computed carefully enough to trust. It is the
-share of picks watched while their row was still showing them, measured over a **settled group**:
-picks delivered in the window _and_ at least 30 days ago. A pick delivered yesterday is still sitting
-in the row — it has not yet had its chance to be watched and dropped — so counting it would drag the
-rate toward zero for no reason. On a
-7-day window there is usually no settled group at all, and the card says so instead of showing a
-misleading number.
+**Watched from Shortlist rows** — the one percentage. Of the titles people watched
+in the window, the share a Shortlist row of theirs was showing when they watched it. Each person
+counts from their first pick, so viewing from before they had a row is left out, and people with no
+picks yet aren't counted. It says the rows are in front of what people choose, not that a row made the
+choice.
+
+It replaced a rate over every title ever _shown_, which stayed under 1% whether Shortlist worked or
+not: a row of 20 to 30 titles is mostly titles nobody will watch.
 
 **By person / By row** — counts, not percentages, sorted by what was actually watched, with the
 finished count beside each. At these sample sizes a percentage is noise: ranking by one put a person
@@ -298,6 +301,16 @@ Hiding a deleted row is the default because its picks are real history. If you w
 removes those picks from every total that counts them, here and on each person's page, and cannot be
 undone. Rows that still exist are never affected, whichever slug is named: Shortlist recomputes what is
 eligible on the server rather than trusting the request.
+
+**Requests** sits under **Worth a look**: how many titles were sent to be downloaded in the window,
+how many of those were watched since, and how many are waiting for your approval, with a link to each.
+
+**Most watched** is a shelf of posters: the titles with the most watchers in the window, each with its
+rank, year, the newest few people who watched it, and links to look it up on TMDB, IMDb and Trakt.
+
+**Recently watched from Shortlist** lists the newest watches under the day they happened. Each line
+leads with the poster and title, says whether it was **Watched** (a film), **Started** or **Finished**
+(a series), and names the person and the row it came from, with the same look-up links at the end.
 
 **Watches per week** is always the long view: the last 16 weeks, whatever window is
 selected. Each column is split: the solid part is what got finished, the faded part what is still

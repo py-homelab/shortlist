@@ -4,14 +4,23 @@ Every outbound call (TMDB, Tautulli, Trakt, Arr, OMDb, plex.tv reads) goes throu
 transient blip — a read timeout, a dropped connection, an HTTP 429/5xx — is retried with exponential
 backoff instead of failing the whole run. (Run 3 on SFLIX died on a single 30s PMS read timeout.)
 
-Two entry points, split by HTTP safety:
+Three entry points, split by HTTP safety:
 
 * ``get`` — for idempotent reads. Retries the widest set: any timeout or transport error, plus 429
   and 5xx responses. A GET can always be safely repeated.
+* ``idempotent_post`` — for a POST that is SAFE TO REPEAT, i.e. a search API that uses POST only to
+  carry a JSON body too large for a query string. Retries exactly what ``get`` does. Exa is the
+  reason this exists: its search went through ``request`` and so retried only 429, which meant a
+  read timeout or a 502 lost the search outright. On the first real 46-user run that cost 13 of 21
+  searches. Use this ONLY where repeating the call changes nothing on the far side.
 * ``request`` — for mutations (POST/PUT/DELETE). Retries ONLY when the request provably never
   reached the server (a connect error / connect timeout) or the server explicitly rate-limited it
   (429). Never on a read timeout or a 5xx, because the mutation may have already applied and a blind
-  retry would double it (a second Radarr add, a second filter write).
+  retry would double it (a second Radarr add, a second Overseerr request).
+
+  The share-filter PUT in ``plextv.py`` is the documented exception and does not use this path: it
+  carries a full pre-merged value rather than a delta, so re-sending it converges instead of
+  doubling — see the 5xx branch there for why that is safe and this is not.
 
 A server's ``Retry-After`` header is honoured (capped) over the computed backoff.
 """
@@ -108,9 +117,36 @@ _WRITE_RETRY_EXC: tuple[type[Exception], ...] = (httpx.ConnectError, httpx.Conne
 _WRITE_RETRY_STATUS = frozenset({429})
 
 
-def get(url: str, *, attempts: int = DEFAULT_ATTEMPTS, **kwargs) -> httpx.Response:
+def get(url: str, *, attempts: int = DEFAULT_ATTEMPTS, status_attempts: int | None = None, **kwargs) -> httpx.Response:
     """GET with full transient-failure retry (timeouts, connection errors, 429, 5xx)."""
-    return _send("GET", url, attempts=attempts, retry_exc=_GET_RETRY_EXC, retry_status=_GET_RETRY_STATUS, **kwargs)
+    return _send(
+        "GET",
+        url,
+        attempts=attempts,
+        status_attempts=status_attempts,
+        retry_exc=_GET_RETRY_EXC,
+        retry_status=_GET_RETRY_STATUS,
+        **kwargs,
+    )
+
+
+def idempotent_post(
+    url: str, *, attempts: int = DEFAULT_ATTEMPTS, status_attempts: int | None = None, **kwargs
+) -> httpx.Response:
+    """A POST that is safe to repeat — a search API whose body is just a query.
+
+    Same retry set as `get`: any timeout or transport error, plus 429 and 5xx. Never use this for a
+    call that changes state on the far side; that is what `request` is for.
+    """
+    return _send(
+        "POST",
+        url,
+        attempts=attempts,
+        status_attempts=status_attempts,
+        retry_exc=_GET_RETRY_EXC,
+        retry_status=_GET_RETRY_STATUS,
+        **kwargs,
+    )
 
 
 def request(method: str, url: str, *, attempts: int = DEFAULT_ATTEMPTS, **kwargs) -> httpx.Response:
@@ -126,24 +162,32 @@ def _send(
     attempts: int,
     retry_exc: tuple[type[Exception], ...],
     retry_status: frozenset[int],
+    status_attempts: int | None = None,
     base_backoff: float = BASE_BACKOFF_S,
     max_backoff: float = MAX_BACKOFF_S,
     **kwargs,
 ) -> httpx.Response:
+    """`attempts` bounds the EXPENSIVE failures — a timeout costs the caller's whole ceiling before
+    it even reports. `status_attempts` bounds the cheap ones: a 429 or a 503 comes back in
+    milliseconds, so giving it the same tiny budget throws away a nearly-free retry. They were one
+    number, which meant bounding Exa's 90s hang case to 2 attempts also capped its 429s at 2.
+    """
+    status_budget = attempts if status_attempts is None else status_attempts
+    ceiling = max(attempts, status_budget)
     host = _host(url)
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, ceiling + 1):
         started = time.monotonic()
         try:
             response = httpx.request(method, url, **kwargs)
         except retry_exc as exc:
-            if attempt >= attempts:
+            if attempt >= attempts:  # the expensive budget
                 raise
             _wait(_backoff(attempt, base_backoff, max_backoff), method, host, type(exc).__name__, attempt, attempts)
             continue
         # Host + status + latency only (never the URL — its query can carry an api_key, rule 9). This
         # is the per-call trail that answers "which service was slow tonight" at DEBUG.
         logger.debug("{} {} → {} in {:.2f}s", method, host, response.status_code, time.monotonic() - started)
-        if response.status_code in retry_status and attempt < attempts:
+        if response.status_code in retry_status and attempt < status_budget:  # the cheap budget
             delay = _retry_after(response) or _backoff(attempt, base_backoff, max_backoff)
             _wait(delay, method, host, f"HTTP {response.status_code}", attempt, attempts)
             continue
@@ -151,10 +195,24 @@ def _send(
     raise AssertionError("unreachable: the loop always returns or raises")  # pragma: no cover
 
 
+def jittered(delay: float) -> float:
+    """A delay spread by ±20%, for any retry loop that does its own backoff.
+
+    Runs process `run.concurrency` users at once (8 on the maintainer's server), so when a service
+    wobbles it wobbles for all of them within the same second. Without jitter every thread computes
+    the identical ladder and re-hits the service in lockstep, which is what turns a blip into a
+    thundering herd — and each synchronised wave makes the next failure more likely, not less.
+
+    Exported because three loops outside this module do their own backoff: the plex.tv filter write,
+    `plex_pms._retry_idempotent`, and the urllib3 Retry on the PMS session (which takes its own
+    `backoff_jitter`). They all used bare `delay * 2`.
+    """
+    return delay * random.uniform(0.8, 1.2)
+
+
 def _backoff(attempt: int, base: float, cap: float) -> float:
     """Exponential backoff with ±20% jitter so retries from many users don't thundering-herd a service."""
-    raw = min(cap, base * (2 ** (attempt - 1)))
-    return raw * random.uniform(0.8, 1.2)
+    return jittered(min(cap, base * (2 ** (attempt - 1))))
 
 
 def _retry_after(response: httpx.Response) -> float | None:

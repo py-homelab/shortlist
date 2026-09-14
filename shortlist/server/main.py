@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import logging
 import os
@@ -16,15 +17,17 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, HTMLResponse, Response
 
 import shortlist
 from shortlist.logging_config import configure_logging, normalize_level
-from shortlist.server import auth
+from shortlist.server import auth, whats_new
 from shortlist.server.api import (
     collections,
     events,
     notifications,
+    picks,
+    privacy,
     report,
     requests,
     runs,
@@ -37,10 +40,12 @@ from shortlist.server.api import (
     watching_account,
 )
 from shortlist.server.api import settings as settings_api
-from shortlist.server.db.models import Run, Server
+from shortlist.server.base_path import BasePathMiddleware, base_path_from_env, render_shell
+from shortlist.server.db.models import Event, Run, Server
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.scheduler import build_scheduler
-from shortlist.server.services.run_service import RunService
+from shortlist.server.services import backup as backups
+from shortlist.server.services.run_service import RunService, missed_by_restart
 from shortlist.server.services.secrets import SecretBox
 from shortlist.server.services.sse import EventBus
 from shortlist.server.services.watch_stream import WatchStream
@@ -74,6 +79,14 @@ def _instance_secret(config_dir: Path, name: str) -> str:
             fh.write(pysecrets.token_urlsafe(48))
         return path.read_text().strip()
     return existing
+
+
+#: How a restore applied (or not) at boot is audited: `backups.apply_pending_restore`'s status -> (scope, level).
+_RESTORE_AUDIT = {
+    "restored": ("backup.restore", "warning"),
+    "failed": ("backup.restore_failed", "error"),
+    "expired": ("backup.restore_expired", "warning"),
+}
 
 
 # Baseline response headers. Deliberately NOT a locked-down CSP: Shortlist renders Plex avatars and
@@ -127,6 +140,16 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # A restore the owner queued is swapped in here, before migrations or anything else opens the
+        # database: swapping it under open connections is how a restore used to be undone by the very
+        # restart it asked for (see `backups.restore_backup`). The notes they had closed are read first,
+        # so an older copy does not reopen them.
+        closed_notes = (
+            backups.read_setting(config_dir, whats_new.SEEN_KEY)
+            if (config_dir / backups.RESTORE_PENDING).exists()
+            else None
+        )
+        restore = backups.apply_pending_restore(config_dir)
         run_migrations(config_dir)
         engine = make_engine(config_dir)
         sessions = make_session_factory(engine)
@@ -196,27 +219,66 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             store = SettingsStore(session, secret_box)
             store.purge_legacy()  # drop stale rows from removed settings (e.g. old API-token hash)
             # Heal any secret still stored in the clear — `tmdb.apikey` was, on every install that
-            # predates it joining SECRET_KEYS (rule 9).
-            if healed := store.encrypt_plaintext_secrets():
-                logger.warning(
-                    "encrypted {} setting(s) that were stored in the clear: {}", len(healed), ", ".join(healed)
-                )
+            # predates it joining SECRET_KEYS (rule 9). Both results are REPORTED below, after the
+            # file sink exists: this used to log at this point, which is before `configure_logging`
+            # attaches /config/logs, so the one persistent trace of a credential problem was written
+            # to a sink that did not exist yet and never reached the log file at all.
+            healed = store.encrypt_plaintext_secrets()
+            unreadable = store.undecryptable_secrets()
             store.seed_from_env(dict(os.environ))
+            if restore is not None:
+                if restore["status"] == "restored":
+                    whats_new.keep_closed(store, closed_notes)
+                # Audited in the database the boot ended up on: the restored one, or the one it kept (rule 10).
+                scope, level = _RESTORE_AUDIT[restore["status"]]
+                session.add(
+                    Event(
+                        scope=scope,
+                        level=level,
+                        message={"backup": restore["backup"], "at": datetime.now(UTC).isoformat()},
+                    )
+                )
+                session.commit()
+            # Before the wizard can finish, so a fresh install starts with nothing to announce.
+            whats_new.initialise(store, shortlist.__version__)
             # Configure logging from the DB setting (seeded from LOG_LEVEL on first boot). The
             # rotating file sink under /config/logs always captures DEBUG, so a quiet console still
             # leaves a full on-disk trail to diagnose a run after the fact.
             (config_dir / "logs").mkdir(parents=True, exist_ok=True)
             configure_logging(store.get("log.level"), log_file=str(config_dir / "logs" / "shortlist.log"))
+            if healed:
+                logger.warning(
+                    "encrypted {} setting(s) that were stored in the clear: {}", len(healed), ", ".join(healed)
+                )
+            if unreadable:
+                # Boot DEGRADED rather than refusing to start. The irreversible damage is the
+                # overwrite (now prevented in `encrypt_plaintext_secrets`), not the boot — and a
+                # crash-loop is the worst possible diagnosis channel on a headless, auto-recreated
+                # host, because it removes the UI, which is exactly where these get re-entered.
+                logger.error(
+                    "{} saved credential(s) cannot be decrypted with this /config/secret.key: {}. "
+                    "They were encrypted with a different key — restore the original secret.key from "
+                    "a backup, or re-enter them in Settings. Nothing has been overwritten.",
+                    len(unreadable),
+                    ", ".join(unreadable),
+                )
             # State the console level plainly at boot, so `docker logs` answers "is DEBUG on?" at a
-            # glance (the file at /config/logs is always DEBUG regardless).
+            # glance (the log file is always DEBUG regardless).
             logger.info(
-                "logging ready — console at {} (docker logs), file always DEBUG at /config/logs/shortlist.log",
+                "logging ready — console at {} (docker logs), file always DEBUG at {}",
                 normalize_level(store.get("log.level")),
+                config_dir / "logs" / "shortlist.log",
             )
             stale = session.query(Run).filter(Run.status.in_(("queued", "running"))).all()
+            booted_at = datetime.now(UTC)
+            # Not after a restore: a run the BACKUP caught mid-flight is history, not a run this restart cut short.
+            restored = restore is not None and restore["status"] == "restored"
+            unfinished = (
+                [] if restored else [plan for run in stale if (plan := missed_by_restart(session, run, booted_at))]
+            )
             for run in stale:
                 run.status = "aborted"
-                run.finished_at = datetime.now(UTC)
+                run.finished_at = booted_at
             if stale:
                 logger.warning("aborted {} orphaned run(s) from a previous process", len(stale))
             session.commit()
@@ -240,14 +302,27 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             with contextlib.suppress(Exception):
                 enqueue(sessions, "privacy.sync", {})
                 logger.warning(
-                    "{} run(s) were interrupted by a restart — queued a privacy sync to make the "
-                    "server consistent; rows rebuild on the next scheduled run",
+                    "{} run(s) were interrupted by a restart — queued a privacy sync to make the server consistent",
                     crashed_runs,
                 )
 
         scheduler = build_scheduler(app)
         scheduler.start()
         app.state.scheduler = scheduler
+
+        # A scheduled run a restart cut short is finished once, for the people it never reached — an
+        # auto-updater replacing the container mid-run otherwise costs them a day (see `missed_by_restart`).
+        for user_ids, collection_ids in unfinished:
+            try:
+                await app.state.run_service.start_run(
+                    trigger="resume", dry_run=False, user_ids=user_ids, collection_ids=collection_ids
+                )
+                logger.warning(
+                    "a scheduled run was cut short by a restart — rebuilding the {} person(s) it never reached",
+                    len(user_ids),
+                )
+            except Exception:
+                logger.exception("could not start the run that finishes an interrupted scheduled run")
 
         # The live playback listener. A long-lived socket rather than a scheduled job, because the
         # thing it captures — someone STARTING something and giving up — exists nowhere else: Plex's
@@ -290,6 +365,8 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 await asyncio.wait_for(stream_task, timeout=5)
             except (TimeoutError, asyncio.CancelledError):
                 stream_task.cancel()
+            # Close the pool, so the WAL is checkpointed now rather than whenever the interpreter gets to it.
+            engine.dispose()
 
     # The interactive API docs + schema disclose the whole API surface unauthenticated. They're off
     # by default (nothing sensitive, but no reason to advertise); set SHORTLIST_ENABLE_DOCS=1 to
@@ -304,11 +381,23 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
     )
     app.add_middleware(_SecurityHeaders)
 
+    # Added last so it runs first, before routing.
+    app_base_path = base_path_from_env()
+    # Read by `auth` to scope the session cookie; always set, so nothing has to guess.
+    app.state.base_path = app_base_path
+    if app_base_path:
+        # Said out loud once at startup: when a subpath install is misconfigured the symptom is a
+        # blank page, and the first question is always "what does the app think its prefix is".
+        logger.info("serving under the base path {} (APP_BASE_PATH)", app_base_path)
+        app.add_middleware(BasePathMiddleware, base_path=app_base_path)
+
     app.include_router(auth.router, prefix="/api")
     for module in (
         setup,
         users,
         user_rows,
+        picks,
+        privacy,
         runs,
         collections,
         requests,
@@ -326,15 +415,42 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
     if WEB_DIST.exists():
         app.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
         web_root = WEB_DIST.resolve()
-        index = web_root / "index.html"
+        # `.resolve()`d because `target` is: the comparison below now decides whether the
+        # rewritten shell is served at all, and a symlinked index.html would fail it silently.
+        index = (web_root / "index.html").resolve()
         #: `index.html` is the only file that NAMES the hashed bundles, so it is the one file a
         #: browser must never reuse without asking. It was served with no `cache-control` at all,
         #: which leaves the browser to guess from `last-modified` — and a browser that guesses "still
         #: fresh" keeps both the old shell AND the old bundle it names, so a deploy is invisible
         #: until someone hard-refreshes. Reported 2026-08-25: an owner looking straight at wording
-        #: that had already shipped. `no-cache` means revalidate, not "do not store": the etag still
-        #: makes it a 304 on the overwhelmingly common unchanged case.
+        #: that had already shipped. `no-cache` means revalidate, not "do not store".
+        #: It does NOT currently save the round trip: `FileResponse` sets an `etag` but does no
+        #: conditional handling — `is_not_modified` lives in `StaticFiles`, which this route does
+        #: not use — so an unchanged shell is still answered with a full 200. The validator is worth
+        #: sending anyway, because a caching proxy in front of us can act on it even though we don't.
         SHELL_HEADERS = {"cache-control": "no-cache, must-revalidate"}
+
+        # Rendered once: APP_BASE_PATH cannot change without a restart. Only ever built when
+        # there IS a prefix to write in, so a root install keeps serving the file straight off disk
+        # — same bytes, same `etag`/`last-modified` headers, no behaviour to re-verify.
+        shell_html = (
+            render_shell(index.read_text(encoding="utf-8"), app_base_path)
+            if app_base_path and index.is_file()
+            else None
+        )
+        # A rewritten shell is not the file on disk, so `FileResponse`'s validators (built from
+        # mtime + size) would describe the wrong bytes. Hash what we actually serve instead: a
+        # caching proxy in front of a subpath install is the whole point of this feature, and a
+        # response with no validator is one it can never revalidate cheaply.
+        shell_headers = SHELL_HEADERS
+        if shell_html is not None:
+            digest = hashlib.md5(shell_html.encode("utf-8"), usedforsecurity=False).hexdigest()
+            shell_headers = SHELL_HEADERS | {"etag": f'"{digest}"'}
+
+        def shell_response() -> Response:
+            if shell_html is None:
+                return FileResponse(index, headers=SHELL_HEADERS)
+            return HTMLResponse(shell_html, headers=shell_headers)
 
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str):  # SPA fallback: every non-API path serves the app shell
@@ -345,11 +461,11 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 # web_root before serving it as a file (plex-safety: secrets never leave the box).
                 target = (web_root / path).resolve()
                 if target.is_relative_to(web_root) and target.is_file():
-                    # The shell by any other route (`/index.html`) gets the same treatment; the
-                    # hashed assets under /assets are content-addressed and may be cached freely.
-                    headers = SHELL_HEADERS if target == index else None
-                    return FileResponse(target, headers=headers)
-            return FileResponse(index, headers=SHELL_HEADERS)
+                    # `/index.html` needs the same rewrite as the fallback shell.
+                    if target == index:
+                        return shell_response()
+                    return FileResponse(target)
+            return shell_response()
 
     return app
 

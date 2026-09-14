@@ -1,13 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { Link } from "react-router";
+
 import { CronPicker } from "@/components/cron-picker";
 import { MutationAlert } from "@/components/mutation-alert";
 import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { describeCron } from "@/lib/cron";
-import { formatSize, timeAgo } from "@/lib/format";
+import { formatDate, formatSize, timeAgo } from "@/lib/format";
 import { queryKeys, useSaveSettings, useSettings } from "@/lib/queries";
 
 const RETENTION_OPTIONS = ["5", "10", "20", "30"];
@@ -27,6 +29,12 @@ function describeBackupSchedule(cron: string): string {
   return first.toLowerCase() + description.slice(1);
 }
 
+/** When a waiting restore stops being applied: a day after it was asked for (`RESTORE_EXPIRES_AFTER`,
+ *  server/services/backup.py). */
+function restoreDeadline(requestedAt: string): string {
+  return new Date(new Date(requestedAt).getTime() + 24 * 60 * 60 * 1000).toISOString();
+}
+
 /** Backups: what's in one, where it lives, how often, how many to keep, and the restore list. */
 export function BackupPanel() {
   const queryClient = useQueryClient();
@@ -36,8 +44,28 @@ export function BackupPanel() {
     queryKey: queryKeys.backups,
     queryFn: api.getBackups,
   });
-  const restore = useMutation({ mutationFn: api.restoreBackup });
+  // A restore is applied when the container next starts, so until then it is a thing that is still to
+  // come: said here for as long as it waits, with a way to take it back.
+  const pendingRestore = useQuery({
+    queryKey: queryKeys.pendingRestore,
+    queryFn: api.getPendingRestore,
+  });
+  const refreshPending = () =>
+    queryClient.invalidateQueries({ queryKey: queryKeys.pendingRestore });
+  const restore = useMutation({
+    mutationFn: api.restoreBackup,
+    onSuccess: refreshPending,
+  });
+  const cancelRestore = useMutation({
+    mutationFn: api.cancelRestore,
+    onSuccess: () => {
+      // Or the "Ready to restore" receipt from before comes back once the waiting notice goes.
+      restore.reset();
+      return refreshPending();
+    },
+  });
   const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
+  const waiting = pendingRestore.data?.pending ?? null;
 
   const backupCron = ((settings.data ?? {})["backup.cron"] as string) ?? "";
   const backupMaxKeep =
@@ -101,7 +129,45 @@ export function BackupPanel() {
         </div>
       </div>
 
-      {restore.isSuccess && (
+      {waiting && (
+        <div
+          role="status"
+          aria-label="Restore waiting for a restart"
+          className="space-y-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-sm"
+        >
+          <p>
+            <span className="font-medium">Restore waiting.</span> Restart the
+            container to swap in{" "}
+            <span className="font-mono text-xs">
+              {waiting.backup.replace("shortlist_", "").replace(".db", "")}
+            </span>
+            ; a copy of the current database is saved first. Until then
+            Shortlist keeps running as it is, and if it has not restarted by{" "}
+            {formatDate(restoreDeadline(waiting.requested_at))} the restore is
+            dropped.
+          </p>
+          <p className="text-muted-foreground">
+            It also puts back who could see which rows at the time of the
+            backup, so check Rows before restarting.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            loading={cancelRestore.isPending}
+            onClick={() => cancelRestore.mutate()}
+          >
+            Cancel the restore
+          </Button>
+          {cancelRestore.isError && (
+            <MutationAlert
+              error={cancelRestore.error}
+              fallback="Couldn’t cancel the restore."
+            />
+          )}
+        </div>
+      )}
+
+      {restore.isSuccess && !waiting && (
         <div className="space-y-1.5">
           <p className="text-sm text-success">{restore.data.message}</p>
           {/* A restore is not a neutral rollback: the database decides who may see which rows, so
@@ -116,8 +182,38 @@ export function BackupPanel() {
           )}
         </div>
       )}
+      {/* "Restore failed." was the whole message. The two ways this actually fails are worth
+          naming, because they have different answers: the file is gone (the retention limit above
+          cleared it out from under an open page), or Shortlist could not write over the live
+          database. Neither is guessable from two words. */}
       {restore.isError && (
-        <MutationAlert error={restore.error} fallback="Restore failed." />
+        <div className="space-y-1">
+          <MutationAlert
+            error={restore.error}
+            fallback="Couldn’t restore that backup."
+          />
+          {/* NO reassurance about your current database, in either direction. An earlier draft
+              promised a `pre-restore` copy "either way"; it is not taken either way. A missing file
+              returns before `take_backup` is ever called (`backup.py`), and when the disk is full
+              `take_backup` returns None and `restore_backup` carries on regardless — unlinking the
+              WAL and copying over the live database. So the one case that most needs a guarantee is
+              the one case that has none. Say what to check; claim nothing about the outcome. */}
+          <p className="text-xs text-muted-foreground">
+            The backup may have been cleared out by the &ldquo;Keep&rdquo;
+            limit above &mdash; reload this page and pick another.
+            If it&rsquo;s still listed, check{" "}
+            <span className="font-mono">/config</span> is writable and has room,
+            then try again. If it keeps failing, restore the file by hand rather
+            than retrying: the{" "}
+            <Link
+              to="/logs"
+              className="font-medium underline underline-offset-2"
+            >
+              Logs page
+            </Link>{" "}
+            has the reason it gave.
+          </p>
+        </div>
       )}
 
       {/* Shown BEFORE the confirm, not after it — the un-hiding happens on the next run, long after

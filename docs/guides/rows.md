@@ -30,6 +30,12 @@ the row is built:
 - `{top_seed}` — the title that most drove their recommendations. `Because you watched {top_seed}`
   becomes "Because you watched The Bear".
 
+Two rows can have the same name as long as they never build in the same library — a movies-only
+row and a TV-only row can both be called "Picked for You". Two rows that could land in one library
+can't share a name, because Plex would hold them as a single collection there; Shortlist refuses the
+save and tells you which row already has it. Rows set to "every library of this type" count as
+reaching libraries you add later, so pick specific libraries if you want to reuse a name.
+
 The seed is the strongest pick that came from something they watched. Some sources suggest a title
 without following one — what's trending, what's popular on your server, a web-search find — so those
 contribute picks but no seed. The name uses the strongest pick that has one.
@@ -92,6 +98,23 @@ it writes to Plex most nights, per person, per library, where an ordinary row on
 writes about weekly. It does not cost any extra AI usage: candidates are gathered once per run
 however often a row refreshes, so how often a row refreshes has no bearing on it.
 
+## Watch-it-again rows
+
+Turn on **Make this a "watch it again" row** (the _Happy to see again_ template does) and the row is
+built from what each person has already **finished** in that library — not from titles similar to
+what they watch. New suggestions only fill the row when they haven't finished enough titles.
+
+What leads the row:
+
+1. Titles they rated 4 stars or more in Plex, highest first (when Plex ratings are switched on).
+2. Titles close to what they've been watching lately.
+3. Whatever they've gone longest without seeing.
+
+What stays out: anything they finished in the last **30 days** (change it with **Skip titles
+finished in the last**, or set 0 to allow everything), titles they rated low (again, only when Plex
+ratings are on), and genres you excluded for them. Someone with too little history still gets their
+finished titles first, with the server's top-rated titles filling any room left.
+
 ## People without enough watch history
 
 Someone new to the server, or someone who barely watches, has too little history for Shortlist to
@@ -100,7 +123,7 @@ recommend from. **Settings → Finding titles → Enough watch history** is wher
 
 | Choice                                     | What lands on their Plex                                                                                                  |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
-| **Show the server's highest-rated titles** | They still get the row, filled with what rates highest on this server. The default, and how Shortlist has always behaved. |
+| **Show the server's highest-rated titles** | They still get the row, filled with what rates highest on this server. This is the default.                                 |
 | **Don't build their row**                  | No row is created — and any row they already have is **removed**, so "skip" means gone rather than left to go stale.      |
 
 Either way it resolves itself: the row appears (or returns) on its own the night they cross the
@@ -194,35 +217,73 @@ shelf, everyone else gets theirs on their Home, and nobody's row clutters anybod
 
 By default Plex adds new collections at the **end** of a library's _Recommended_ shelf, so if another
 tool (like **Kometa**) manages collections on the same server, Shortlist's rows can end up buried at
-the bottom. Settings → **Row placement** sets a server-wide default; you get three choices per library:
+the bottom.
 
-- **Wherever Plex puts them**. Leave the order alone (the default).
-- **Top of the shelf** — put Shortlist's rows at the very top. No anchor needed. (This replaces the
-  old "pin to top" switch.)
-- **Right before / after a collection**. Pick an existing collection and sit the rows next to it.
+Each row chooses its own spot, per library, in the **Row editor** under "Where it sits":
 
-Any individual row can override the default in the **Row editor** ("Position in the Recommended
-shelf"), per library, so "Picked for You" can sit at the top while another row sits right after New
-Series. Since each person only sees their own row, moving rows up lifts everyone's at once.
+- **Top of the shelf** — the default, and the one position that always works.
+- **Right after / before a collection**. Pick an existing collection and sit the row next to it. It
+  has to be a collection that is actually showing on one of that library's shelves — one switched off
+  in Plex's *Manage Recommendations* has no position to sit beside, and Shortlist tells you so rather
+  than guessing a spot.
+- **Right after / before another Shortlist row**, so "Because you watched" can follow "Picked for
+  You" wherever that ends up — including when that row is itself anchored to a collection. The other
+  row needs its own position switched on in that library too: Shortlist can only hold two rows
+  together if it is placing both. If it isn't, this row goes to the top instead, in your Rows order.
+- **Don't place this row**. Shortlist never positions it, so it stays wherever Plex put it. Be aware
+  that Plex adds new collections at the end of the shelf, so a new row that nothing places starts at
+  the bottom.
 
-Behind the scenes Shortlist re-applies your choice at the end of every run (so a co-managing tool
-can't re-bury the rows), only ever moves its own rows, and never touches the collection you anchored
-to. It works with or without Kometa. Kometa is only _why_ this matters, because it fills the shelf, not
-_how_ it works; the anchor can be any collection, Kometa's or one of Plex's own.
+Settings → **Row placement** now holds one switch, **Let Shortlist order the Recommended shelf**.
+Turn it off and Shortlist leaves the order entirely alone. (It used to also hold a per-library
+default, which was a second place to set the same thing and disagreed with the engine about what its
+own "Wherever Plex puts them" option meant.)
+
+Since each person only sees their own row, moving rows up lifts everyone's at once.
+
+Behind the scenes Shortlist re-applies your choice at the end of every run, and checks the shelf
+first — if it is already right, it writes nothing at all.
+
+When it does have work to do, it rebuilds the whole shelf in one pass, so other tools' rows are
+moved too. Their order **relative to each other** is preserved exactly; they shift only as far as
+placing your rows among them requires. Nothing else about them is touched — no collection is edited,
+renamed or promoted, only positions. The reason it works this way is the next section.
+
+### Why every move goes to the bottom
+
+Plex stores each row's shelf position as a decimal number, and "put this row after that one" works by
+picking the number halfway between two neighbours. Halve a gap fifty times and there is no number
+left that fits: from then on Plex accepts every move and applies none, for every tool including its
+own web app, until that library's positions are spread out again.
+
+Two moves never halve anything. "To the very top" takes a number below the lowest, and "after
+whichever row is currently last" takes one above the highest. The top one is not usable, because a
+library's built-in row — "Recently Added" — can hold the lowest number and refuses to be moved, so
+everything sent above it lands *on* its number instead. One rebuild done that way collapsed 72 rows
+onto a single value.
+
+So Shortlist builds the arrangement from the **bottom**: it walks your wanted order and sends each
+row to the end of the shelf in turn. The shelf finishes in exactly that order with the numbers spread
+1000 apart, which means the pass repairs a library whose numbers have collapsed rather than wearing
+it down further.
+
+The trade-off is that it repositions every row on that shelf, not only Shortlist's. Their order
+relative to each other is preserved exactly — the only thing that changes is where Shortlist's rows
+sit among them — and it is the only way to honour "put my row after that collection" without the
+halving insert. Rows that are on no shelf at all are left alone.
 
 ### If you also run Agregarr
 
 Agregarr arranges the same shelf, and it re-applies its own stored order roughly every 30 minutes.
-Shortlist re-applies yours at the end of every run and at the nightly privacy sync — roughly three
-passes a night against Agregarr's forty-eight. So the two take turns, and Agregarr wins on volume:
-what you see during the day is Agregarr's layout.
+Shortlist applies yours once, at the end of the nightly run, and does nothing at all if the shelf is
+already right. So Agregarr wins on volume: what you see during the day is Agregarr's layout.
 
 There are two ways to settle it, and both are configuration rather than something Shortlist can do
 for you:
 
 - **Exclude Shortlist's rows in Agregarr**, or stop its "Randomize Home Order" job, so it stops
   moving collections labelled `shortlist_*`.
-- **Set Row placement to "Wherever Plex puts them"** so Shortlist never touches the shelf order and
+- **Turn off "Let Shortlist order the Recommended shelf"** so Shortlist never touches the order and
   Agregarr owns it outright.
 
 Either way your rows are still built, delivered and kept private — only their position on the shelf
@@ -245,7 +306,7 @@ still reorders the shelf, so the two options above still apply.
 
 ## Row posters
 
-Each row can have its own artwork on Plex. In the **Row editor** → **Artwork**, pick one of:
+Each row can have its own artwork on Plex. In the **Row editor** → **How it looks on Plex** → **Poster**, pick one of:
 
 - **Plex default** — leave Plex's own collection artwork alone (the default). Switching a row _back_
   to this after it had a custom poster reverts the artwork on Plex on save.
@@ -260,3 +321,30 @@ Each row can have its own artwork on Plex. In the **Row editor** → **Artwork**
 Hit **Preview** to see a sample before saving. Generated images are made once and reused across
 runs (they refresh when you change the text or style), so posters don't slow a run down or cost per
 user. Posters are cosmetic. A poster that can't be made never blocks a row from building.
+
+## Description and sort order
+
+Each row can also set two of its Plex collection's own fields in the **Row editor**:
+
+- **Description**, under **How it looks on Plex** — the summary Plex shows when someone opens the
+  row. It fills in `{user}`, `{library_name}` and `{top_seed}` the same way the row's name does, so
+  every person's copy can say something about them. A `{top_seed}` description for someone with
+  nothing watched is left empty. The **On Plex** card beside it shows the name, description and
+  poster filled in for a sample person.
+- **Sort title prefix**, under **Where people see it** — text put in front of the row's name to make its Plex sort title, such as
+  `!010_`. It decides where the row sorts in the library's **Collections** tab (`!` sorts before
+  letters). It does not move the row on Home or the Recommended shelf; that is
+  [Row placement](#row-placement-recommended-shelf). The prefix always goes in front of the row's
+  current name, so a renamed row, or one named after `{top_seed}`, keeps sorting under it.
+
+Both are empty by default, and empty means Shortlist leaves that field on Plex alone. Changes reach
+Plex the next time the row runs, and replace whatever that field held — including a value another
+tool set. Clearing a field hands it back to Plex: no description, and a sort title Plex builds from
+the row's name. That only happens where Plex still holds the value Shortlist wrote; if someone changed
+it in Plex or another tool since, it is left alone. A value another tool had before Shortlist set the
+field is not brought back.
+
+Set each field in one tool only. Agregarr and Kometa can set a collection's summary and sort title
+too, and two tools setting the same field overwrite each other on every sync. If Shortlist sets them,
+leave them unset for Shortlist's rows in the other tool. Agregarr can skip Shortlist's rows entirely
+if you add the `shortlist` label to its excluded labels.

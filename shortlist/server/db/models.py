@@ -189,6 +189,9 @@ class Collection(Base):
     # A REWATCH row: already-finished titles lead it, unwatched ones only fill what's left. Not
     # expressible with `watched_pct`, which is a ceiling that never PROMOTES a finished title.
     rewatch: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
+    # Rewatch rows only: leave out titles finished within this many days (0 = no cooldown), so the
+    # shelf holds old favourites rather than last night's film.
+    rewatch_cooldown_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False, server_default="30")
     # Shows only: drop any series this person has STARTED, however little. Stricter than the normal
     # filter, which only drops FINISHED ones — so this is what makes "a series to start" true.
     unstarted_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
@@ -196,6 +199,12 @@ class Collection(Base):
     # inherit the global recommendations.refresh_days. Was `freshness`, a 0..1 fraction a curve
     # stretched onto 1..14 days; migration 0065 converted every value through that same curve.
     refresh_days: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    # How long this row may wait when the person it belongs to has watched nothing since it was last
+    # built, in days. None -> inherit the global `recommendations.idle_hold_days`; an explicit 0 means
+    # "always rebuild this row on cadence", which is how one row stays lively on a server that holds
+    # the rest. Same inheritance shape as `refresh_days` above, because it is the other half of the
+    # same decision.
+    idle_hold_days: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     # Per-row weight on a title's RELEASE DATE when ranking it (0.0 ignore age .. 1.0 strongly prefer
     # new). NULL -> inherit the global recommendations.recency. Nullable rather than defaulting to
     # 0.0 because "never touched" and "deliberately off" must stay distinguishable: every row that
@@ -228,10 +237,18 @@ class Collection(Base):
     placement: Mapped[str] = mapped_column(String(16), default="both")
     # Where the row shows for friends (shared users): "both" (Friends Home + Library), "home", or "library".
     placement_friends: Mapped[str] = mapped_column(String(16), default="both")
+    # Which weekdays this row is SHOWN, as ISO weekday numbers (1=Mon .. 7=Sun). [] -> every day,
+    # which is what every row carries after migration 0088, so an upgrade changes nothing.
+    #
+    # Distinct from `schedule`, and the pair is the whole feature: `schedule` is when this row
+    # REBUILDS, this is when people can SEE it. A row can rebuild nightly and show on Fridays.
+    # There is no way to spell "never" — `enabled` already means that.
+    show_days: Mapped[list] = mapped_column(JSON, default=list, nullable=False, server_default="[]")
     # Pin the row to the TOP of its library's Recommended shelf (server-wide order, not per-user).
     pin_top: Mapped[bool] = mapped_column(Boolean, default=False)
     # Per-library override of where THIS row sits in the Recommended shelf: {sectionKey: {anchor, before}}.
-    # {} -> inherit the global default (settings `rows.hub_anchor`). A library absent here inherits too.
+    # {} -> the default for every library this row builds in, which is the top of the shelf. A
+    # library absent here gets that default too; `{"enabled": false}` is how a row opts out.
     hub_anchor: Mapped[dict] = mapped_column(JSON, default=dict)
     # Dead as of the curate removal (migration 0036 clears it): the LLM no longer ranks a candidate
     # pool, so there is no per-row curation recipe. Column kept — dropping it would rebuild the whole
@@ -289,6 +306,12 @@ class Collection(Base):
     # {"mode": "upload"|"generate", "title", "subtitle", "style"}. No image bytes live here — an
     # uploaded/generated image is stored in the `poster_assets` table, keyed by collection id / prompt.
     poster: Mapped[dict] = mapped_column(JSON, default=dict)
+    # The collection's Plex summary, with the row name's placeholders (issue #120). "" -> Shortlist leaves
+    # the summary on Plex alone, so a value another tool set survives.
+    description: Mapped[str] = mapped_column(Text, default="", nullable=False, server_default="")
+    # Put before the row's name to make its Plex sort title, e.g. "!010_" — orders the row in the
+    # library's Collections tab, not on Home. "" -> the sort title is left alone.
+    sort_title_prefix: Mapped[str] = mapped_column(String(64), default="", nullable=False, server_default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -343,7 +366,7 @@ class Run(Base):
     __tablename__ = "runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    trigger: Mapped[str] = mapped_column(String(16))  # schedule | manual | wizard
+    trigger: Mapped[str] = mapped_column(String(16))  # schedule | manual | wizard | resume
     #: When the run was QUEUED — this row is created the moment someone presses Run.
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     #: When the engine actually began, which is not the same moment: a run waits here behind whatever
@@ -513,6 +536,13 @@ class PickRow(Base):
     # The row_recipe (settings fingerprint) this pick was built under; NULL on picks written
     # before recipes existed, which reads as "unknown" and does not force a rebuild.
     recipe: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    # When this row's CONTENTS were last chosen. Distinct from `created_at` below, which is stamped on
+    # every run because a carried-forward row is re-persisted each time: that one says "last
+    # delivered", this one says "last decided". The idle hold (`rows._held_for_idle`) measures both
+    # the row's age and "have they watched anything since" against it, so a stamp that moved with
+    # delivery would make the ceiling unreachable. NULL on picks written before 0086 — read as
+    # "unknown", which falls back to the plain refresh cadence.
+    built_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     # Both indexed: the effectiveness report is windowed, so every aggregate on it filters by one of
     # these two, over the largest table in this schema (retention prunes it, but only by whole runs).
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
@@ -617,7 +647,15 @@ class Delivery(Base):
     # read back — it is here so the ledger is legible in an audit ("which row was this?") without
     # joining anything. Deliberately not used as a fallback: a title match is exactly the mechanism
     # this table replaced, and having two answers would hide which one was wrong.
+    # It IS read as a CLAIM, though: `collection_reconcile._claimed_titles` uses a `{top_seed}` row's
+    # recorded title to stop ANOTHER row's removal, rename or poster reset matching it in that library
+    # (issue #121). It narrows a match and never selects a collection — but blanking it drops that guard.
     title: Mapped[str] = mapped_column(String(512), default="")
+    # What Shortlist last wrote to this collection's summary and sort title; NULL = nothing (issue #120).
+    # Clearing a row's field hands a value back only while Plex still holds exactly this, so a value a
+    # person or another tool put there since is never wiped.
+    summary_written: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    title_sort_written: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -655,6 +693,12 @@ class WatchedTitle(Base):
     # CASCADE: this is a cache of what the PMS already knows. See User's cascade policy.
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     section_key: Mapped[str] = mapped_column(String(64))
+    # The library's DISPLAY name ("4K Movies"), beside the stable key — the same pair `Pick` carries.
+    # Stored rather than resolved on read because the name lives on the PMS, and the watched page is
+    # deliberately a pure DB read: looking it up would make the page fail whenever Plex is down.
+    # "" on rows written before 0087 and on any row whose sync did not know the name; the page shows
+    # no library for those rather than a guess, and the next sync fills them in.
+    library: Mapped[str] = mapped_column(String(255), default="", server_default="")
     # Plex's own id for the item in this library — the stable key within a section, and what an
     # incremental upsert matches on.
     rating_key: Mapped[int] = mapped_column(Integer)
@@ -816,10 +860,13 @@ class RequestCandidate(Base):
     detail: Mapped[str] = mapped_column(String(512), default="")  # send outcome, or why it's queued
     # The arr's titleSlug, captured when the title is sent, so the inbox deep-links straight to its
     # Sonarr/Radarr page (Sonarr has only `/series/<slug>`, no id URL). None for titles queued/sent
-    # before this was recorded — the inbox falls back to the arr's home page for those.
+    # before this was recorded — the inbox falls back to the arr's home page for those — and always
+    # None on the Overseerr route, which addresses both media types by TMDB id and needs no slug.
     arr_slug: Mapped[str | None] = mapped_column(String(256), nullable=True)
     # On Sonarr/Radarr's import-exclusion list (usually from a past delete): surfaced in the inbox so
-    # the owner knows approving it is a no-op until they remove the exclusion in the Arr.
+    # the owner knows approving it is a no-op until they remove the exclusion in the Arr. On the
+    # Overseerr route it carries the same fact from that instance's BLOCKLIST, which is what it calls
+    # the same list — so the flag means "the app was told never to fetch this" on both routes.
     excluded: Mapped[bool] = mapped_column(Boolean, default=False)
     # Owner cleared this from the Sent log. The row STAYS `status="sent"` — a load-bearing tombstone
     # that stops a still-downloading title being re-requested (see delete_requests / _persist_request_queue)

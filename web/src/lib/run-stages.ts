@@ -108,7 +108,7 @@ export function matchesLogFilter(
  * titles — never shown as "28 seeds").
  */
 export function countLabel(key: string, value: number | string): string {
-  if (key === "row") return String(value);
+  if (key === "row" || key === "library") return String(value);
   switch (key) {
     case "position":
       return `#${value} in line`;
@@ -136,9 +136,38 @@ export function countLabel(key: string, value: number | string): string {
       return `${value} taken down`;
     case "removed":
       return `${value} removed`;
+    // A row's pending write, announced before it starts — an in-place update on a big library
+    // runs for minutes, so the log says what is changing while it happens.
+    case "creating":
+      return `new row, ${titles(value)}`;
+    case "adding":
+      return `adding ${titles(value)}`;
+    case "removing":
+      return `removing ${titles(value)}`;
     default:
       return `${value} ${key}`;
   }
+}
+
+const UPDATE_KEYS = new Set(["adding", "removing"]);
+
+function titles(count: number | string): string {
+  return `${count} ${count === 1 ? "title" : "titles"}`;
+}
+
+/** One log event's counts as a readable phrase: "3/5" for a counted phase, otherwise each count in
+ *  plain English joined with " · ". */
+export function describeCounts(
+  counts: Record<string, number | string>,
+): string {
+  return (
+    progressLabel(counts) ??
+    Object.entries(counts)
+      // An update that only removes should not also claim to be "adding 0 titles".
+      .filter(([key, value]) => !(UPDATE_KEYS.has(key) && value === 0))
+      .map(([key, value]) => countLabel(key, value))
+      .join(" · ")
+  );
 }
 
 /** "3/5" for the phases that count out per-account work, so a long phase reads as moving rather
@@ -148,4 +177,32 @@ export function progressLabel(counts: Record<string, unknown>): string | null {
   const total = counts.total;
   if (typeof done !== "number" || typeof total !== "number") return null;
   return `${done}/${total}`;
+}
+
+/** A row name as the engine sent it. The pre-write `delivering` and `curating` lines carry the row's
+ *  TEMPLATE, not its rendered title, so "{top_seed}" is elided rather than shown as code. */
+function rowName(value: unknown): string {
+  return typeof value === "string" ? value.replace(/\{\w+\}/g, "…") : "";
+}
+
+/**
+ * A person's latest log line as one status sentence — what the run is doing for them right now.
+ *
+ * `delivering` arrives twice per row. First with just the row, BEFORE the write lock: every person's
+ * Plex writes queue on that lock, and the row's current membership is read under it, so that line
+ * means "waiting for Plex". Calling it "writing the row to Plex" is what left one name beside those
+ * words in the sidebar for minutes. Then, once the change is known, with the `library` and what it
+ * is adding/removing/creating — that one really is the write, and it is spelled out.
+ */
+export function describeStage(
+  stage: string,
+  counts: Record<string, number | string> = {},
+): string {
+  const label = STAGE_LABELS[stage] ?? stage;
+  if (stage === "delivering" && counts.library) {
+    return `${label} — ${describeCounts(counts)}`;
+  }
+  const row = rowName(counts.row);
+  const lead = stage === "delivering" ? "waiting for Plex" : label;
+  return row ? `${lead} — ${row}` : lead;
 }

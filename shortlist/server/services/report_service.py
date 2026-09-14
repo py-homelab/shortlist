@@ -30,6 +30,7 @@ from shortlist.server.db.models import (
     RunUser,
     SharedRowWatch,
     User,
+    WatchedTitle,
     WatchSession,
     iso_utc,
 )
@@ -311,6 +312,83 @@ def _avg_days_to_watch(session: Session, start, end=None) -> float | None:
         .scalar()
     )
     return round(value, 1) if value is not None else None
+
+
+def _viewing_share(session: Session, since: datetime | None) -> dict:
+    """Of the titles people watched in the window, how many their Shortlist row had shown them.
+
+    The dashboard's rate. The landing rate it replaced there divides by every title ever SHOWN, and a
+    20-to-30 title row is mostly titles nobody will watch, so it sat under 1% whether Shortlist was
+    working or not (71 of 10,898 on a real server). What a recommendation competes for is what people
+    actually watch, so that is the denominator here.
+
+    Each person counts from their OWN first pick, never from before it: viewing from before a row existed
+    for them is not something a row could have shown. A server-wide start got this wrong twice: a 90-day window reached
+    back before the install (1,412 titles watched against 804 for all time on a real server), and a
+    person enabled last week had their whole window counted. Dry runs write no picks, so time in safe
+    mode never counts. Only people Shortlist builds rows for (enabled) count, on both sides.
+
+    People with no picks are left out entirely, even if a shared row reaches them. Their shared-row
+    credits still count for everyone who IS counted, but a credit must never decide who is: starting
+    someone at their first shared-row watch selects people by outcome, and turned a real 1 of 51 into
+    100%. Also kept rather than modelled: viewing in a library none of their rows target still counts
+    (a Movies-only row competes with their TV too) — an understatement.
+
+    Cost: the per-person first pick is a GROUP BY over `picks`, about as expensive as
+    `_avg_days_to_watch` (1.45s at 500k picks). A `(user_id, created_at)` index would fix it if the
+    dashboard ever gets slow.
+
+    A watch is dated by `source_viewed_at` when it has one. A history transfer scrobbles every title
+    "now" and keeps the true date there, and 2,000 titles watched today would bury the real ones. The
+    cost: a transferred title REWATCHED later keeps its transfer-era date (`watch_cache._upsert` never
+    rewrites that column), so on an account that had a transfer, a rewatch of a transferred title is
+    missed on both sides.
+
+    `from_rows` is taken INSIDE `watched`: a pick the live listener credited before the nightly sync has
+    recorded the watch would otherwise count as more than all of it. It reads as "a title their row gave
+    them", not as proof the row caused this particular watch.
+
+    The credit is NOT windowed, only the watch is. A title counts on both sides when it was watched in
+    the window, and `watched` dates it by its LATEST view, which moves with every new episode, while the
+    credit is stamped once, on the first watch. Windowing the credit too dropped a series someone started
+    from their row before the window, and is still watching, out of "from rows" on the short windows only.
+    """
+    enabled = [uid for (uid,) in session.query(User.id).filter(User.enabled.is_(True))]
+    first = {
+        uid: _as_utc(at)
+        for uid, at in session.query(PickRow.user_id, func.min(PickRow.created_at))
+        .filter(PickRow.user_id.in_(enabled))
+        .group_by(PickRow.user_id)
+    }
+    if not first:
+        return {"watched": 0, "from_rows": 0, "rate": None}
+    start_for = {uid: at if since is None else max(since, at) for uid, at in first.items()}
+    earliest = min(start_for.values())
+
+    when = func.coalesce(WatchedTitle.source_viewed_at, WatchedTitle.viewed_at)
+    watched: set[tuple] = set()
+    for uid, tmdb_id, title, year, media, viewed in session.query(
+        WatchedTitle.user_id, WatchedTitle.tmdb_id, WatchedTitle.title, WatchedTitle.year, WatchedTitle.media_type, when
+    ).filter(WatchedTitle.user_id.in_(list(start_for)), when >= earliest):
+        if _as_utc(viewed) < start_for[uid]:
+            continue
+        # A title Plex never matched to TMDB is still a title they watched; it just cannot be a pick. Keyed
+        # on its name, not its ratingKey, which is only unique within one library — the same film in
+        # "Movies" and "4K Movies" is one title.
+        watched.add((uid, media, tmdb_id) if tmdb_id is not None else (uid, media, "title", title.lower(), year))
+    credited = {
+        (uid, media, tmdb_id)
+        for uid, media, tmdb_id in session.query(PickRow.user_id, PickRow.media_type, PickRow.tmdb_id).filter(
+            PickRow.user_id.in_(list(start_for)), PickRow.watched_at.isnot(None)
+        )
+    } | {
+        (uid, media, tmdb_id)
+        for uid, media, tmdb_id in session.query(
+            SharedRowWatch.user_id, SharedRowWatch.media_type, SharedRowWatch.tmdb_id
+        ).filter(SharedRowWatch.user_id.in_(list(start_for)), SharedRowWatch.watched_at.isnot(None))
+    }
+    from_rows = len(watched & credited)
+    return {"watched": len(watched), "from_rows": from_rows, "rate": _rate(from_rows, len(watched))}
 
 
 def _landing(session: Session, now: datetime, days: int | None) -> dict:
@@ -735,6 +813,49 @@ def _engagement_split(session: Session, since: datetime | None) -> tuple[int, in
     return outcomes.count("bounced"), outcomes.count("dropped")
 
 
+def _title_art(session: Session, keys: set[tuple[int, str]], history_of: dict[tuple[int, str], set[int]]) -> dict:
+    """{(tmdb_id, media_type): (rating_key, year)} for the dashboard's poster and year, 0/None when unknown.
+
+    A delivered pick carries both, but a title reached only through a shared row has no pick at all —
+    shared rows write none — so its Plex key comes from watch history: that of anyone who watched one of
+    these titles (`history_of` names them). Not per title, on purpose: Plex ratingKeys are server-wide,
+    so any history row for the title points at the same artwork, and narrowing further buys nothing.
+    A key of 0 or below is no key — the watch cache stores `-tmdb_id` when a source gave none.
+    """
+    if not keys:
+        return {}
+    ids = {tmdb_id for tmdb_id, _mt in keys}
+    art: dict[tuple[int, str], tuple[int, int | None]] = {}
+    for tmdb_id, media_type, rating_key, year in (
+        session.query(PickRow.tmdb_id, PickRow.media_type, func.max(PickRow.rating_key), func.max(PickRow.year))
+        .filter(PickRow.tmdb_id.in_(ids))
+        .group_by(PickRow.tmdb_id, PickRow.media_type)
+    ):
+        if (tmdb_id, media_type) in keys:
+            art[(tmdb_id, media_type)] = (rating_key if rating_key and rating_key > 0 else 0, year)
+    missing = {key for key in keys if not art.get(key, (0, None))[0]}
+    watchers = {uid for key in missing for uid in history_of.get(key, set())}
+    if missing and watchers:
+        for tmdb_id, media_type, rating_key, year in (
+            session.query(
+                WatchedTitle.tmdb_id,
+                WatchedTitle.media_type,
+                func.max(WatchedTitle.rating_key),
+                func.max(WatchedTitle.year),
+            )
+            .filter(
+                WatchedTitle.tmdb_id.in_({tmdb_id for tmdb_id, _mt in missing}),
+                WatchedTitle.user_id.in_(watchers),
+                WatchedTitle.rating_key > 0,
+            )
+            .group_by(WatchedTitle.tmdb_id, WatchedTitle.media_type)
+        ):
+            key = (tmdb_id, media_type)
+            if key in missing and rating_key:
+                art[key] = (rating_key, art.get(key, (0, None))[1] or year)
+    return art
+
+
 def _recent_watches(session: Session, users: dict[int, User], namer: _RowNamer, since: datetime | None) -> list[dict]:
     """The recent-watches feed: one line per (person, title), like every other figure here.
 
@@ -777,6 +898,7 @@ def _recent_watches(session: Session, users: dict[int, User], namer: _RowNamer, 
             "username": user.username if user else "unknown",
             "display_name": user.display_name if user else "unknown",
             "media_type": media_type,
+            "tmdb_id": tmdb_id,
             **fields,
         }
 
@@ -787,6 +909,8 @@ def _recent_watches(session: Session, users: dict[int, User], namer: _RowNamer, 
             p.media_type,
             watched,
             title=p.title,
+            rating_key=p.rating_key or 0,
+            year=p.year,
             row=namer.label(p.collection_slug, p.library),
             library=p.library,
             seed_title=p.seed_title or "",
@@ -823,6 +947,8 @@ def _recent_watches(session: Session, users: dict[int, User], namer: _RowNamer, 
                 w.media_type,
                 w.watched_at,
                 title=w.title,
+                rating_key=0,
+                year=None,
                 row=namer.label(w.collection_slug, ""),
                 library="",
                 seed_title="",
@@ -835,7 +961,18 @@ def _recent_watches(session: Session, users: dict[int, User], namer: _RowNamer, 
     # (the first differing character is `+` against `.`, and `'+' < '.'`) but only by accident, and
     # nothing would tell the next editor which property they had to preserve.
     feed.sort(key=lambda row: row["_at"], reverse=True)
-    return [{k: v for k, v in row.items() if not k.startswith("_")} for row in feed[:20]]
+    feed = feed[:20]
+    # A shared-row line has no pick to take a poster key or year from; fill both from what is on record.
+    unfilled = [row for row in feed if not row["rating_key"]]
+    if unfilled:
+        history_of: dict[tuple[int, str], set[int]] = {}
+        for row in unfilled:
+            history_of.setdefault((row["tmdb_id"], row["media_type"]), set()).add(row["_key"][0])
+        art = _title_art(session, set(history_of), history_of)
+        for row in unfilled:
+            rating_key, year = art.get((row["tmdb_id"], row["media_type"]), (0, None))
+            row["rating_key"], row["year"] = rating_key, row["year"] or year
+    return [{k: v for k, v in row.items() if not k.startswith("_")} for row in feed]
 
 
 def effectiveness(session: Session, window: str, *, next_watch_sync: str | None = None) -> dict:
@@ -909,6 +1046,7 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
         or 0
     )
     landing = _landing(session, now, days)
+    viewing_share = _viewing_share(session, since)
 
     # The trend ignores the window on purpose — see TREND_WEEKS. SHARED rows are folded in like
     # everywhere else that counts a WATCH: the chart sits directly under the Watched tile, and a bar
@@ -1028,6 +1166,30 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
                 titles[(tmdb_id, media_type)] = title
     top_rows = [(key[0], key[1], titles.get(key, ""), watchers) for key, watchers in top_keys]
 
+    # Who watched each of those eight, newest first — faces beside the count. Windowed exactly like the
+    # count it sits beside, and over the same two sources, so the faces are always a subset of it.
+    latest_watch: dict[tuple[int, str], dict[int, datetime]] = {}
+    if wanted:
+        ids = {tmdb_id for tmdb_id, _mt in wanted}
+        for tmdb_id, media_type, user_id, at in (
+            *session.query(PickRow.tmdb_id, PickRow.media_type, PickRow.user_id, PickRow.watched_at).filter(
+                PickRow.tmdb_id.in_(ids), *_watched_in(since)
+            ),
+            *session.query(
+                SharedRowWatch.tmdb_id, SharedRowWatch.media_type, SharedRowWatch.user_id, SharedRowWatch.watched_at
+            ).filter(SharedRowWatch.tmdb_id.in_(ids), *_shared_watched_in(since)),
+        ):
+            per_title = latest_watch.setdefault((tmdb_id, media_type), {})
+            at = _as_utc(at)
+            per_title[user_id] = max(per_title.get(user_id, at), at)
+    top_art = _title_art(
+        session, set(wanted), {key: set(who) for key, who in latest_watch.items() if key in set(wanted)}
+    )
+
+    def watcher_sample(key: tuple[int, str]) -> list[dict]:
+        newest = sorted(latest_watch.get(key, {}).items(), key=lambda item: item[1], reverse=True)
+        return [{"id": uid, "name": users[uid].display_name if uid in users else "unknown"} for uid, _at in newest[:3]]
+
     per_user = _breakdown(
         per_user_raw,
         lambda uid: (
@@ -1096,6 +1258,7 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
             "avg_days_to_watch": avg_now,
             "avg_days_to_watch_delta": _delta(avg_now, avg_prev),
             "landing": landing,
+            "viewing_share": viewing_share,
         },
         "watch_sync": {
             "last": last_watch_sync,
@@ -1131,7 +1294,18 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
         "trend": [{"week": week, "watched": n, "finished": finished_by_week.get(week, 0)} for week, n in trend_rows],
         "per_user": per_user,
         "per_row": per_row,
-        "top_titles": [{"tmdb_id": tid, "media_type": mt, "title": ttl, "watchers": n} for tid, mt, ttl, n in top_rows],
+        "top_titles": [
+            {
+                "tmdb_id": tid,
+                "media_type": mt,
+                "title": ttl,
+                "watchers": n,
+                "rating_key": top_art.get((tid, mt), (0, None))[0],
+                "year": top_art.get((tid, mt), (0, None))[1],
+                "watcher_sample": watcher_sample((tid, mt)),
+            }
+            for tid, mt, ttl, n in top_rows
+        ],
         "recent": recent,
     }
 

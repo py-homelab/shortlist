@@ -103,7 +103,20 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Delete Collection */
+        /**
+         * Delete Collection
+         * @description Delete a row, or with ``dry_run=true`` report what deleting it would do and write nothing.
+         *
+         *     A query parameter rather than a body: `DELETE` bodies are awkward through both `fetch` and
+         *     FastAPI, and this works with the SPA's existing `request()` helper unchanged.
+         *
+         *     `POST /{id}/cleanup?dry_run=true` already previews the PLEX half. What only this can show is the
+         *     LOCAL half, and one part of it is a genuine surprise: deleting this row silently strips every
+         *     OTHER row's shelf placement that was positioned relative to it, changing where two other people's
+         *     rows appear. That was logged after the fact and warned about nowhere.
+         *
+         *     A preview answers 200 with :class:`RowDeletePreviewOut` instead of the delete's 204.
+         */
         delete: operations["delete_collection_api_collections__collection_id__delete"];
         options?: never;
         head?: never;
@@ -344,6 +357,111 @@ export interface paths {
          *     stays hidden but a new failure or a newer release surfaces again on its own.
          */
         post: operations["dismiss_api_notifications_dismiss_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/notifications/whats-new": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Whats New
+         * @description The release notes the owner has not read since upgrading, for the What's new dialog.
+         */
+        get: operations["whats_new_api_notifications_whats_new_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/notifications/whats-new/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Whats New Seen
+         * @description Close the What's new dialog for good: record the version whose notes it showed.
+         */
+        post: operations["whats_new_seen_api_notifications_whats_new_seen_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/picks/{rating_key}/poster": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Pick Poster
+         * @description One delivered pick's artwork, streamed from the PMS.
+         *
+         *     404 rather than a placeholder image when the item or its artwork is gone: a pick's ratingKey goes
+         *     stale when a title is removed and re-added, and the SPA already renders a tile of the right size
+         *     for that. Answering with a picture would make a missing item indistinguishable from a real one.
+         *     502 when the PMS itself failed, for the same reason — an outage is not "this title has no art".
+         *
+         *     Args:
+         *         rating_key: The pick's Plex ratingKey. `0` means the pipeline never matched the title.
+         *         request: The live request, for the app state and `If-None-Match`.
+         *
+         *     Returns:
+         *         The image bytes with the PMS's own content type, or a `304` when the browser's copy is
+         *         current.
+         *
+         *     Raises:
+         *         HTTPException: `404` when there is no artwork to serve, `502` when Plex could not be read.
+         */
+        get: operations["pick_poster_api_picks__rating_key__poster_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/privacy/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Privacy Status Endpoint
+         * @description Every account's live share filter, plus the last enforcement spot-check.
+         *
+         *     Costs one plex.tv roster read and one PMS collections read. Writes nothing and mints no token, so
+         *     it is safe to call from a screen the owner leaves open.
+         *
+         *     Args:
+         *         request: The live request, for app state.
+         *
+         *     Returns:
+         *         The whole server's sharing state as of now, with the enforcement measurement beside it.
+         */
+        get: operations["privacy_status_endpoint_api_privacy_status_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -931,6 +1049,30 @@ export interface paths {
          *     endpoint returns an empty list, and the UI falls back to the free-text override.
          */
         post: operations["curator_models_api_settings_curator_models_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/settings/overseerr/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Overseerr Options
+         * @description The instance's accounts, so the UI can offer a "request as" dropdown.
+         *
+         *     The *seerr equivalent of ``arr_options``, and deliberately much smaller: quality profiles and
+         *     root folders are Overseerr's business on this route, so the only choice left to Shortlist is
+         *     whose name the request goes out under.
+         */
+        get: operations["overseerr_options_api_settings_overseerr_options_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1789,11 +1931,22 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Pending Restore Endpoint
+         * @description The restore waiting for the next start, so the owner can see it is still to come, or cancel it.
+         */
+        get: operations["pending_restore_endpoint_api_system_backups_restore_get"];
         put?: never;
         /**
          * Restore Backup Endpoint
-         * @description Restore from a named backup. The app will need to be restarted after.
+         * @description Queue a restore from a named backup. It is applied when the app next starts.
+         *
+         *     Not applied here: the running app has the database open, and swapping the file under its pooled
+         *     connections let the shutdown checkpoint write the old database back over the restored one, so the
+         *     restart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the
+         *     pre-restore copy there (so it holds everything written until the restart), and audits it in the
+         *     database it restored. Until then it can be seen and cancelled (`GET`/`DELETE` below), and one left
+         *     waiting for over a day is not applied.
          *
          *     A restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a
          *     copy taken before a shared row's audience was narrowed puts the wider audience back, and the
@@ -1805,7 +1958,11 @@ export interface paths {
          *     discovered on someone's Home screen.
          */
         post: operations["restore_backup_endpoint_api_system_backups_restore_post"];
-        delete?: never;
+        /**
+         * Cancel Restore Endpoint
+         * @description Cancel the restore waiting for the next start. Nothing has been changed yet, so nothing is undone.
+         */
+        delete: operations["cancel_restore_endpoint_api_system_backups_restore_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1899,6 +2056,15 @@ export interface paths {
          *     Measured on a real server: 8 failures, all `privacy.sync`, at ids 587-596 — the newest hundred
          *     jobs started at id 680, so filtering a fetched page client-side answered "8 failed" with an
          *     empty list. A count over the whole table needs a filter over the whole table.
+         *
+         *     `exclude_routine` also drops a finished job whose result says it was `quiet` — a scheduled privacy sync
+         *     that found nothing to change. And it drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,
+         *     and exists for the same reason `status` does: a client filter over a fetched page cannot work
+         *     when the noise outnumbers the news. Measured on a 46-user server, `watch.reconcile` was 165 of
+         *     the 197 jobs queued in a day, so the newest 30 rows the header polls were almost all reconciles
+         *     and nothing else could be seen behind them. The Jobs page does not pass it — that is where you
+         *     go to look at reconciles — and a failure is never dropped, because a reconcile that fails is the
+         *     only thing that would say a partial watch went uncredited.
          */
         get: operations["list_jobs_api_system_jobs_get"];
         put?: never;
@@ -2453,7 +2619,8 @@ export interface paths {
          *
          *     Reads the local `watched_titles` cache, so unlike `/history` it never touches Plex: it is a DB
          *     query, it can search the WHOLE set rather than the page on screen, and it shows the same titles
-         *     the recommender excludes from.
+         *     the recommender excludes from. One row per TITLE — a title held in two libraries is merged, and
+         *     names both.
          */
         get: operations["user_watched_api_users__user_id__watched_get"];
         put?: never;
@@ -2569,6 +2736,40 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * AccountPrivacyOut
+         * @description One Plex account's share filter, as plex.tv reports it RIGHT NOW.
+         */
+        AccountPrivacyOut: {
+            /** Account Id */
+            account_id: number;
+            /** Display Name */
+            display_name: string;
+            /** Hides */
+            hides: string[];
+            /** Manage Sharing */
+            manage_sharing: boolean;
+            /** Missing */
+            missing: string[];
+            /** Other Conditions */
+            other_conditions: string[];
+            /** Restriction Profile */
+            restriction_profile: string;
+            /** Should Hide */
+            should_hide: string[];
+            /** Slug */
+            slug: string;
+            /** State */
+            state: string;
+            /** User */
+            user: string;
+            /** User Id */
+            user_id: number | null;
+            /** User Type */
+            user_type: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** ApiTokenCreatedOut */
         ApiTokenCreatedOut: {
             /** Created At */
@@ -2619,6 +2820,12 @@ export interface components {
          *     badges, for ever, with nothing anywhere saying why.
          */
         ArrStatusOut: {
+            /**
+             * Overseerr
+             * @default off
+             * @enum {string}
+             */
+            overseerr: "ok" | "unreachable" | "off";
             /**
              * Radarr
              * @enum {string}
@@ -2824,6 +3031,17 @@ export interface components {
              */
             defer_rename: boolean;
             /**
+             * Description
+             * @description The collection's Plex summary; takes {user}, {library_name} and {top_seed}. Empty leaves the summary on Plex alone.
+             * @default
+             */
+            description: string;
+            /**
+             * Dry Run
+             * @default false
+             */
+            dry_run: boolean;
+            /**
              * Enabled
              * @default true
              */
@@ -2837,6 +3055,8 @@ export interface components {
             hub_anchor?: {
                 [key: string]: components["schemas"]["HubAnchorIn"];
             };
+            /** Idle Hold Days */
+            idle_hold_days?: number | null;
             /** Library Keys */
             library_keys?: string[];
             /** Max Seeds */
@@ -2946,6 +3166,11 @@ export interface components {
              */
             rewatch: boolean;
             /**
+             * Rewatch Cooldown Days
+             * @default 30
+             */
+            rewatch_cooldown_days: number;
+            /**
              * Schedule
              * @default 30 3 * * *
              */
@@ -2956,6 +3181,11 @@ export interface components {
              */
             seed_window: number;
             /**
+             * Show Days
+             * @description Days this row appears, as ISO weekdays (1=Monday .. 7=Sunday). Empty means every day.
+             */
+            show_days?: number[];
+            /**
              * Size
              * @default 15
              */
@@ -2965,6 +3195,12 @@ export interface components {
              * @default 0
              */
             sort_order: number;
+            /**
+             * Sort Title Prefix
+             * @description Put before the row's name to make its Plex sort title, e.g. '!010_'. Orders the row in the library's Collections tab, not on Home. Empty leaves the sort title alone.
+             * @default
+             */
+            sort_title_prefix: string;
             /**
              * Unstarted Only
              * @default false
@@ -3000,6 +3236,10 @@ export interface components {
              * @enum {unknown}
              */
             cold_start: "popular" | "skip" | null;
+            /** Description */
+            description: string;
+            /** Dry Run */
+            dry_run?: boolean | null;
             /** Enabled */
             enabled: boolean;
             /** Fallback Name */
@@ -3010,6 +3250,8 @@ export interface components {
             };
             /** Id */
             id: number;
+            /** Idle Hold Days */
+            idle_hold_days: number | null;
             /** Last Run Id */
             last_run_id: number | null;
             /** Library Keys */
@@ -3048,7 +3290,11 @@ export interface components {
              * @enum {string}
              */
             placement_friends: "both" | "home" | "library" | "off";
+            /** Plan */
+            plan?: components["schemas"]["PlanEntryOut"][] | null;
             poster: components["schemas"]["PosterOut"];
+            /** Preview Incomplete */
+            preview_incomplete?: string | null;
             /** Recency */
             recency: number | null;
             /** Recent Count */
@@ -3112,16 +3358,30 @@ export interface components {
             request_tag: string;
             /** Rewatch */
             rewatch: boolean;
+            /** Rewatch Cooldown Days */
+            rewatch_cooldown_days: number;
             /** Schedule */
             schedule: string;
             /** Seed Window */
             seed_window: number;
+            /**
+             * Show Days
+             * @description Days this row appears, as ISO weekdays (1=Monday .. 7=Sunday). Empty means every day.
+             */
+            show_days: number[];
+            /**
+             * Shown Today
+             * @description Whether this row is on its surfaces today, judged on the SERVER's clock — which is the clock the midnight schedule and Plex follow, not the viewer's.
+             */
+            shown_today: boolean;
             /** Size */
             size: number;
             /** Slug */
             slug: string;
             /** Sort Order */
             sort_order: number;
+            /** Sort Title Prefix */
+            sort_title_prefix: string;
             /** Unstarted Only */
             unstarted_only: boolean;
             /** Watched Pct */
@@ -3261,6 +3521,37 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * EnforcementOut
+         * @description The last time a run looked through a real account's eyes at their Home screen.
+         *
+         *     `measured` is the whole point. An empty `not_enforced` on an unmeasured run is not "all clear" —
+         *     it is "nobody looked", and rendering the two the same is how a live alert gets cleared.
+         */
+        EnforcementOut: {
+            /** Measured */
+            measured: boolean;
+            /** Measured At */
+            measured_at: string | null;
+            /** Not Enforced */
+            not_enforced: {
+                [key: string]: number[];
+            };
+            /** Run Id */
+            run_id: number | null;
+            /** Unhideable */
+            unhideable: {
+                [key: string]: number[];
+            };
+            /** Unhideable Measured */
+            unhideable_measured: boolean;
+            /** Unhideable Measured At */
+            unhideable_measured_at: string | null;
+            /** Unhideable Run Id */
+            unhideable_run_id: number | null;
+        } & {
+            [key: string]: unknown;
+        };
         /** EngagementOut */
         EngagementOut: {
             /** Losing */
@@ -3349,7 +3640,8 @@ export interface components {
          * HubAnchorIn
          * @description A per-library shelf placement for one row: the very TOP (``top``), or after/before either
          *     another Shortlist ROW (``row``, a row slug) or a foreign collection (``anchor``, a title).
-         *     ``top`` needs neither; otherwise exactly one of ``row``/``anchor`` must be set.
+         *     ``top`` needs neither; otherwise exactly one of ``row``/``anchor`` must be set. ``enabled``
+         *     false is a placement in its own right — "never position this row" — and needs neither.
          *
          *     ``row`` is a slug rather than a title because a per-person row is one Plex collection PER PERSON:
          *     a title names one account's copy and is meaningless for everyone else, which is what made the
@@ -3366,6 +3658,11 @@ export interface components {
              * @default false
              */
             before: boolean;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
             /**
              * Row
              * @default
@@ -3543,9 +3840,12 @@ export interface components {
         };
         /**
          * LibraryCollectionOut
-         * @description A candidate anchor title. Title only — the shelf is ordered by title, not by rating key.
+         * @description A candidate anchor. Title, because the shelf is ordered by title, not by rating key — plus
+         *     whether it has a position on a Plex shelf at all, which decides if it can anchor anything.
          */
         LibraryCollectionOut: {
+            /** On Shelf */
+            on_shelf: boolean;
             /** Title */
             title: string;
         } & {
@@ -3728,6 +4028,7 @@ export interface components {
             /** Finished */
             finished: number;
             landing: components["schemas"]["LandingOut"];
+            viewing_share: components["schemas"]["ViewingShareOut"];
             /** Watched */
             watched: number;
             /** Watched Delta */
@@ -3767,6 +4068,24 @@ export interface components {
             orphans: number;
             /** Total */
             total: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /** PendingRestore */
+        PendingRestore: {
+            /** Backup */
+            backup: string;
+            /** Requested At */
+            requested_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * PendingRestoreOut
+         * @description The restore waiting for a restart, if any.
+         */
+        PendingRestoreOut: {
+            pending: components["schemas"]["PendingRestore"] | null;
         } & {
             [key: string]: unknown;
         };
@@ -3824,6 +4143,11 @@ export interface components {
             rank: number;
             /** Rating */
             rating?: number | null;
+            /**
+             * Rating Key
+             * @default 0
+             */
+            rating_key: number;
             /** Reason */
             reason: string;
             /** Seed Title */
@@ -3869,6 +4193,28 @@ export interface components {
             linked: boolean;
             /** Username */
             username?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * PlanEntryOut
+         * @description One unit of Plex work an edit would cause.
+         */
+        PlanEntryOut: {
+            /** Collections */
+            collections: string[];
+            /** In Sections */
+            in_sections: string[];
+            /**
+             * Kind
+             * @description What this step would do.
+             * @enum {string}
+             */
+            kind: "poster_reset" | "privacy_sync" | "reconcile" | "rename" | "visibility";
+            /** Only User Ids */
+            only_user_ids: number[];
+            /** Reason */
+            reason: string;
         } & {
             [key: string]: unknown;
         };
@@ -3949,6 +4295,27 @@ export interface components {
             mode: string;
             /** Ok */
             ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * PrivacyStatusOut
+         * @description One live reading of the whole server's sharing state.
+         */
+        PrivacyStatusOut: {
+            /** Accounts */
+            accounts: components["schemas"]["AccountPrivacyOut"][];
+            enforcement: components["schemas"]["EnforcementOut"];
+            /** Error */
+            error: string | null;
+            /** Read At */
+            read_at: string;
+            /** Rows Error */
+            rows_error: string | null;
+            /** Rows On Plex */
+            rows_on_plex: string[];
+            /** Summary */
+            summary: string;
         } & {
             [key: string]: unknown;
         };
@@ -4034,18 +4401,24 @@ export interface components {
             library: string;
             /** Media Type */
             media_type: string;
+            /** Rating Key */
+            rating_key: number;
             /** Row */
             row: string;
             /** Seed Title */
             seed_title: string;
             /** Title */
             title: string;
+            /** Tmdb Id */
+            tmdb_id: number;
             /** User Id */
             user_id: number | null;
             /** Username */
             username: string;
             /** Watched At */
             watched_at: string | null;
+            /** Year */
+            year: number | null;
         } & {
             [key: string]: unknown;
         };
@@ -4061,6 +4434,19 @@ export interface components {
         RejectedOut: {
             /** Rejected */
             rejected: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /** ReleaseNotesOut */
+        ReleaseNotesOut: {
+            /** Notes */
+            notes: string;
+            /** Published At */
+            published_at: string;
+            /** Url */
+            url: string;
+            /** Version */
+            version: string;
         } & {
             [key: string]: unknown;
         };
@@ -4231,6 +4617,28 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * RowDeletePreviewOut
+         * @description What `DELETE /collections/{id}?dry_run=true` WOULD do. Nothing is written.
+         */
+        RowDeletePreviewOut: {
+            /** Anchors Cleared */
+            anchors_cleared: string[];
+            /** Collections */
+            collections: string[];
+            /** Dry Run */
+            dry_run: boolean;
+            /** Message */
+            message: string;
+            /** Preview Incomplete */
+            preview_incomplete: string | null;
+            /** Privacy Sync */
+            privacy_sync: boolean;
+            /** Schedule Cleared */
+            schedule_cleared: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
          * RowEffectivenessOut
          * @description Whether one row is working, for the panel beside its settings.
          */
@@ -4375,7 +4783,7 @@ export interface components {
              * Trigger
              * @enum {string}
              */
-            trigger: "schedule" | "manual" | "wizard";
+            trigger: "schedule" | "manual" | "wizard" | "resume";
             /** Users */
             users: components["schemas"]["RunUserOut"][];
         } & {
@@ -4553,7 +4961,7 @@ export interface components {
              * Trigger
              * @enum {string}
              */
-            trigger: "schedule" | "manual" | "wizard";
+            trigger: "schedule" | "manual" | "wizard" | "resume";
         } & {
             [key: string]: unknown;
         };
@@ -4734,6 +5142,44 @@ export interface components {
             rows: components["schemas"]["ScheduleRowOut"][];
             /** Type */
             type: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** SeenRelease */
+        SeenRelease: {
+            /** Version */
+            version: string;
+        };
+        /** SeerrOptionsOut */
+        SeerrOptionsOut: {
+            /** Default User Id */
+            default_user_id?: number | null;
+            /** Users */
+            users: components["schemas"]["SeerrUserOut"][];
+        } & {
+            [key: string]: unknown;
+        };
+        /** SeerrUserOut */
+        SeerrUserOut: {
+            /**
+             * Auto Approve Movies
+             * @default false
+             */
+            auto_approve_movies: boolean;
+            /**
+             * Auto Approve Tv
+             * @default false
+             */
+            auto_approve_tv: boolean;
+            /** Id */
+            id: number;
+            /**
+             * Is Plex User
+             * @default false
+             */
+            is_plex_user: boolean;
+            /** Name */
+            name: string;
         } & {
             [key: string]: unknown;
         };
@@ -4964,12 +5410,18 @@ export interface components {
         TopTitleOut: {
             /** Media Type */
             media_type: string;
+            /** Rating Key */
+            rating_key: number;
             /** Title */
             title: string;
             /** Tmdb Id */
             tmdb_id: number;
+            /** Watcher Sample */
+            watcher_sample: components["schemas"]["WatcherOut"][];
             /** Watchers */
             watchers: number;
+            /** Year */
+            year: number | null;
         } & {
             [key: string]: unknown;
         };
@@ -5256,6 +5708,8 @@ export interface components {
             rank: number;
             /** Rating */
             rating: number | null;
+            /** Rating Key */
+            rating_key: number;
             /** Reason */
             reason: string;
             /** Section Key */
@@ -5434,6 +5888,20 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * ViewingShareOut
+         * @description Of the titles people watched in the window, how many their Shortlist row had shown them.
+         */
+        ViewingShareOut: {
+            /** From Rows */
+            from_rows: number;
+            /** Rate */
+            rate: number | null;
+            /** Watched */
+            watched: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
          * WatchItemOut
          * @description One recent watch, from the same source recommendations are built from.
          */
@@ -5471,6 +5939,22 @@ export interface components {
             [key: string]: unknown;
         };
         /**
+         * WatchedLibraryOut
+         * @description One Plex library this person has a cached watch in.
+         *
+         *     The `media_type` is what lets the page decide whether a library filter is worth showing: one
+         *     library per type means the Movies/Shows buttons already draw every distinction a library choice
+         *     could, and a second control offering the same two words is noise (#111).
+         */
+        WatchedLibraryOut: {
+            /** Media Type */
+            media_type: string;
+            /** Name */
+            name: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
          * WatchedPageOut
          * @description A page of the watched set, plus how complete the set behind it is.
          *
@@ -5485,6 +5969,8 @@ export interface components {
             items: components["schemas"]["WatchedTitleOut"][];
             /** Last Full Sync At */
             last_full_sync_at: string | null;
+            /** Libraries */
+            libraries: components["schemas"]["WatchedLibraryOut"][];
             /** Rated Count */
             rated_count: number;
             /** Ratings Trusted */
@@ -5498,13 +5984,21 @@ export interface components {
         };
         /**
          * WatchedTitleOut
-         * @description One title from the cached watched set — the set recommendations are actually filtered against.
+         * @description One TITLE from the cached watched set — the set recommendations are actually filtered against.
+         *
+         *     One title, not one stored row: a title held in two Plex libraries is cached once per library, and
+         *     those copies are merged here (issue #111). `libraries` names the ones it was found in, and every
+         *     other field is merged to the claim the engine acts on — see `_merge_watched_copies`.
          */
         WatchedTitleOut: {
             /** Leaf Count */
             leaf_count: number | null;
+            /** Libraries */
+            libraries: string[];
             /** Media Type */
             media_type: string;
+            /** Rating Key */
+            rating_key: number;
             /** Title */
             title: string;
             /** Tmdb Id */
@@ -5519,6 +6013,24 @@ export interface components {
             watched_at: string;
             /** Year */
             year: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** WatcherOut */
+        WatcherOut: {
+            /** Id */
+            id: number;
+            /** Name */
+            name: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** WhatsNewOut */
+        WhatsNewOut: {
+            /** Releases */
+            releases: components["schemas"]["ReleaseNotesOut"][];
+            /** Version */
+            version: string;
         } & {
             [key: string]: unknown;
         };
@@ -5723,7 +6235,9 @@ export interface operations {
     };
     delete_collection_api_collections__collection_id__delete: {
         parameters: {
-            query?: never;
+            query?: {
+                dry_run?: boolean;
+            };
             header?: never;
             path: {
                 collection_id: number;
@@ -5732,6 +6246,15 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
+            /** @description A dry-run preview; nothing was deleted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowDeletePreviewOut"];
+                };
+            };
             /** @description Successful Response */
             204: {
                 headers: {
@@ -6120,6 +6643,110 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    whats_new_api_notifications_whats_new_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhatsNewOut"];
+                };
+            };
+        };
+    };
+    whats_new_seen_api_notifications_whats_new_seen_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SeenRelease"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DismissedOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    pick_poster_api_picks__rating_key__poster_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rating_key: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    privacy_status_endpoint_api_privacy_status_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrivacyStatusOut"];
                 };
             };
         };
@@ -6875,6 +7502,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    overseerr_options_api_settings_overseerr_options_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeerrOptionsOut"];
                 };
             };
         };
@@ -7869,6 +8516,26 @@ export interface operations {
             };
         };
     };
+    pending_restore_endpoint_api_system_backups_restore_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingRestoreOut"];
+                };
+            };
+        };
+    };
     restore_backup_endpoint_api_system_backups_restore_post: {
         parameters: {
             query?: never;
@@ -7898,6 +8565,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_restore_endpoint_api_system_backups_restore_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingRestoreOut"];
                 };
             };
         };
@@ -7969,6 +8656,7 @@ export interface operations {
                 kind?: string | null;
                 before_id?: number | null;
                 status?: ("queued" | "running" | "done" | "failed") | null;
+                exclude_routine?: boolean;
             };
             header?: never;
             path?: never;
@@ -8685,6 +9373,8 @@ export interface operations {
                 /** @description Case-insensitive substring of the title. */
                 q?: string;
                 media_type?: string;
+                /** @description Display name of a Plex library; empty for all. */
+                library?: string;
                 limit?: number;
                 offset?: number;
             };

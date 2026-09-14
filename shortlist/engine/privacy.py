@@ -15,11 +15,19 @@ between values, all round-trip byte-identical. plex.tv normalizes nothing, so th
 whichever writer last touched that account — Plex Web writes `&` with encoded values, plexapi writes
 `|` with `%2C`, Shortlist writes plain — and a parser that understands only its own dialect corrupts
 the other two (issue #77).
+
+Stored is not enforced, and the separators are why (#116, measured 2026-09-13 —
+`tests/fixtures/pms_share_filter_boolean_semantics.json`). A PMS reads `|` as OR and `&` as AND, so
+`contentRating!=R|label!=shortlist_x` hides nothing of ours (a collection has no rating, so the first
+half is true for it) and switches the owner's own rating exclude off too. Our excludes therefore live
+only where no `|` joins them or anything after them: that position is ANDed with the whole filter
+under every grouping the recording allows.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
@@ -51,6 +59,16 @@ _PIPE_SEP = re.compile(r"([|])")
 # `%2C` is a comma that Plex Web encoded. Splitting on the bare comma alone left `A%2CB` as ONE value,
 # so a merge appended to it and produced a value no reader could split back apart.
 _VALUE_SEP = re.compile(r"(%2C|%2c|,)")
+
+
+class AmbiguousFilterError(FilterParseError):
+    """A share filter Plex itself cannot read, so no exclude of ours can be written into it and verified.
+
+    One shape: a literal `&` inside one of the owner's labels ("Kids & Family") — measured, that account's
+    Home answers HTTP 500. Raised per FIELD, and by owner decision it does not block promotion: the run
+    records the account in `RunReport.unreadable_filters` and writes the other field if it can. A subclass
+    of `FilterParseError` so a caller that does not handle it specially still refuses it.
+    """
 
 
 @dataclass(frozen=True)
@@ -187,70 +205,449 @@ def _house_style(conditions: list[FilterCondition]) -> tuple[str, str]:
     return condition_sep, value_sep
 
 
-def merge_label_excludes(raw: str, labels: set[str]) -> str:
-    """Union `labels` into the first ``label!=`` condition, byte-preserving everything else.
+def _enforced_positions(conditions: list[FilterCondition]) -> list[bool]:
+    """Per condition: is it ANDed with the whole filter, i.e. does no `|` join it or anything after it?
+
+    That is the only position a real PMS provably applies an exclude from. The recording rules out `&`
+    binding tighter than `|` and cannot tell strict left-to-right from `|` binding tighter; this
+    position is a top-level AND under both, so nothing here depends on which one Plex uses.
+    """
+    enforced = [False] * len(conditions)
+    rest_is_and = True
+    for i in range(len(conditions) - 1, -1, -1):
+        joined_by_and = i == 0 or conditions[i].sep == "&"
+        enforced[i] = rest_is_and and joined_by_and
+        rest_is_and = rest_is_and and joined_by_and
+    return enforced
+
+
+def _is_exclude(condition: FilterCondition) -> bool:
+    return condition.field == "label" and condition.op == "!="
+
+
+def _is_ours(value: str, label_prefix: str) -> bool:
+    """Matched decoded and case-folded, WITH the underscore — `shortlist` alone would claim the constant
+    label and every foreign label that merely starts with the word (plex-safety rule 4)."""
+    return unquote(value).lower().startswith(f"{label_prefix}_".lower())
+
+
+def _enforced_exclude_values(conditions: list[FilterCondition]) -> list[str]:
+    """Every `label!=` value sitting where Plex applies it."""
+    return [
+        value
+        for condition, enforced in zip(conditions, _enforced_positions(conditions), strict=True)
+        if enforced and _is_exclude(condition)
+        for value in condition.values
+    ]
+
+
+def _literal_ampersand_values(conditions: list[FilterCondition]) -> list[str]:
+    """Values holding a raw `&`. Measured 2026-09-13: Plex answers that account's Home with HTTP 500 for
+    any of these, so a filter carrying one hides nothing we could vouch for. `%26` is fine."""
+    return sorted({value for condition in conditions for value in condition.values if "&" in value})
+
+
+def plex_cannot_read(raw: str) -> bool:
+    """Whether Plex itself fails on this filter (a raw `&` inside a value) — see `_literal_ampersand_values`."""
+    return bool(_literal_ampersand_values(parse_filter(raw)))
+
+
+def unenforced_excludes(raw: str, labels: Iterable[str]) -> set[str]:
+    """The `labels` this filter does NOT make Plex hide — absent, or present only where a `|` voids them.
+
+    The question every "is this row hidden" check has to ask. Presence alone is what plex.tv's
+    read-back proves, and it is exactly what looked healthy while #116 leaked every row.
+
+    Args:
+        raw: The share filter string.
+        labels: Labels that should be hidden.
+
+    Returns:
+        The subset of `labels` Plex would still show.
+
+    Raises:
+        FilterParseError: If the filter cannot be parsed.
+    """
+    applied = _enforced_exclude_values(parse_filter(raw))
+    return {label for label in labels if not any(_same_value(label, present) for present in applied)}
+
+
+def voids_owner_restriction(raw: str, label_prefix: str) -> bool:
+    """Whether a clause of ours is OR-joined to a restriction the OWNER set, switching that restriction off.
+
+    `X|label!=shortlist_a` means "X, or not ours" — true for nearly everything — so the owner's X stops
+    applying. The pre-#116 merge wrote exactly that onto every account with a restriction of its own,
+    and the run reports each account it repairs, because the people on it will see less afterwards.
+
+    Counted only where the `|` touches our clause directly (its own separator, or the one after it when
+    it is first) and the filter holds a condition of the owner's. `A&label!=ours|B` is not counted: under
+    left-to-right grouping it voids nothing, and the recording cannot say Plex groups it otherwise.
+
+    Args:
+        raw: The share filter string.
+        label_prefix: The label prefix Shortlist owns.
+
+    Returns:
+        True when the owner's own restriction is being ORed away by one of our excludes.
+    """
+    if not raw:
+        return False
+    conditions = parse_filter(raw)
+    ours_only = [
+        _is_exclude(c) and bool(c.values) and all(_is_ours(v, label_prefix) for v in c.values) for c in conditions
+    ]
+    owner_condition = any(not flag for flag in ours_only)
+    or_joined = any(
+        flag and ((i > 0 and conditions[i].sep == "|") or (i == 0 and len(conditions) > 1 and conditions[1].sep == "|"))
+        for i, flag in enumerate(ours_only)
+    )
+    return owner_condition and or_joined
+
+
+def _without_values(condition: FilterCondition, drop) -> FilterCondition | None:
+    """`condition` minus every value `drop` matches, keeping each survivor's separators; None if emptied."""
+    seps = condition._padded_seps()
+    kept = [(value, index) for index, value in enumerate(condition.values) if not drop(value)]
+    if not kept:
+        return None
+    return replace(
+        condition,
+        values=tuple(value for value, _ in kept),
+        value_seps=tuple(seps[index - 1] for _, index in kept[1:]),
+    )
+
+
+def _lift_unenforced_labels(
+    conditions: list[FilterCondition], label_prefix: str
+) -> tuple[list[FilterCondition], list[str], bool]:
+    """Take our labels out of every position Plex does not enforce, so the merge can re-add them where it does.
+
+    Returns ``(conditions, carried, changed)``. Every label of ours found unenforced is CARRIED, never
+    dropped: one that is not in tonight's wanted set may belong to a live row a failed enumeration
+    missed, and removing an exclude is the prune's decision under its own guards.
+
+    Only two edits are made, and both are safe whichever way Plex groups a mixed filter. Our values
+    come out of a clause that also holds the owner's labels (the clause stays where it is). An
+    ours-only clause is dropped when it is FIRST or joined by `|` — for anything not ours such a clause
+    is always true, so dropping it can only restore what the owner's own conditions hid, never show
+    more. An ours-only clause joined by `&` with a `|` after it is left in place: dropping that one
+    would regroup the owner's conditions differently under the two groupings the recording allows.
+    """
+    enforced = _enforced_positions(conditions)
+    kept: list[FilterCondition] = []
+    carried: list[str] = []
+    changed = False
+    for i, condition in enumerate(conditions):
+        mine = [value for value in condition.values if _is_ours(value, label_prefix)]
+        if enforced[i] or not _is_exclude(condition) or not mine:
+            kept.append(condition)
+            continue
+        carried.extend(mine)
+        remainder = _without_values(condition, lambda value: _is_ours(value, label_prefix))
+        if remainder is not None:
+            kept.append(remainder)
+            changed = True
+        elif i == 0 or condition.sep == "|":
+            changed = True
+        else:
+            kept.append(condition)
+    return kept, carried, changed
+
+
+def _place_excludes(conditions: list[FilterCondition], missing: list[str], value_sep: str) -> None:
+    """Add `missing` to the first enforced `label!=` clause, or append a new one joined with `&`. In place."""
+    enforced = _enforced_positions(conditions)
+    target = next((i for i, c in enumerate(conditions) if enforced[i] and _is_exclude(c)), None)
+    if target is None:
+        conditions.append(
+            FilterCondition("label", "!=", tuple(missing), sep="&", value_seps=(value_sep,) * (len(missing) - 1))
+        )
+        return
+    cond = conditions[target]
+    # Which separator to join the NEW labels with. The clause's own, when it has one. When it holds a
+    # single value it has none, and defaulting to a plain comma there put a `,` inside a filter written
+    # entirely with `%2C` — so fall back to the encoding the rest of this filter uses, not to ours.
+    # Existing gaps keep exactly the separators they were read with.
+    existing = cond._padded_seps()
+    fill = cond.value_seps[-1] if cond.value_seps else value_sep
+    grown = cond.values + tuple(missing)
+    conditions[target] = replace(cond, values=grown, value_seps=existing + (fill,) * (len(grown) - 1 - len(existing)))
+
+
+def merge_label_excludes(raw: str, labels: set[str], *, label_prefix: str = LABEL_PREFIX) -> str:
+    """Make Plex hide `labels` from this filter, byte-preserving every condition the owner wrote.
+
+    Labels go into a ``label!=`` clause that Plex ANDs with the whole filter: the first such clause
+    already in an enforced position, or a new one appended with `&`. Never with `|` — a real PMS reads
+    that as OR, and the merged filter then hides nothing and voids the owner's own restriction (#116).
+    Our labels found anywhere Plex ignores them are moved too (`_lift_unenforced_labels`), which is what
+    repairs a filter the old merge wrote: nothing is "missing" from one, only unenforced.
 
     Membership is case-insensitive (Plex tag matching is) and encoding-insensitive, so a case- or
     percent-encoded variant of an already excluded label is never appended as a duplicate.
+
+    Args:
+        raw: The account's current share filter.
+        labels: Labels to hide.
+        label_prefix: The label prefix Shortlist owns.
+
+    Returns:
+        The merged filter, or `raw` itself (the same object) when nothing needs to change.
+
+    Raises:
+        AmbiguousFilterError: A raw `&` sits inside one of the owner's values — Plex itself cannot read
+            the filter, so nothing written into it could be verified.
+        FilterParseError: The filter cannot be parsed, or the merged result fails its own check (a bug
+            here, which must block promotion rather than be reported as a label to rename).
     """
-    conditions = parse_filter(raw)
-    _, house_value_sep = _house_style(conditions)
-    for i, cond in enumerate(conditions):
-        if cond.field == "label" and cond.op == "!=":
-            missing = [v for v in sorted(labels) if not any(_same_value(v, present) for present in cond.values)]
-            if not missing:
-                return raw
-            # Which separator to join the NEW labels with. The clause's own, when it has one. When it
-            # holds a single value it has none, and defaulting to a plain comma there put a `,` inside
-            # a filter written entirely with `%2C` — so fall back to the encoding the rest of this
-            # filter uses, not to ours. Existing gaps keep exactly the separators they were read with.
-            existing = cond._padded_seps()
-            fill = cond.value_seps[-1] if cond.value_seps else house_value_sep
-            grown = cond.values + tuple(missing)
-            conditions[i] = replace(
-                cond,
-                values=grown,
-                value_seps=existing + (fill,) * (len(grown) - 1 - len(existing)),
-            )
-            return serialize_filter(conditions)
-    if labels:
-        condition_sep, value_sep = _house_style(conditions)
-        ordered = tuple(sorted(labels))
-        conditions.append(
-            FilterCondition(
-                "label",
-                "!=",
-                ordered,
-                sep=condition_sep,
-                value_seps=(value_sep,) * max(0, len(ordered) - 1),
-            )
+    original = parse_filter(raw)
+    literal = _literal_ampersand_values(original)
+    if literal:
+        raise AmbiguousFilterError(
+            f"{', '.join(repr(unquote(v)) for v in literal)} has an '&' in it, which Plex can't read in a restriction"
         )
-    return serialize_filter(conditions)
+    _, house_value_sep = _house_style(original)
+    conditions, carried, changed = _lift_unenforced_labels(original, label_prefix)
+    wanted: list[str] = []
+    for label in [*carried, *sorted(labels)]:
+        if not any(_same_value(label, seen) for seen in wanted):
+            wanted.append(label)
+    applied = _enforced_exclude_values(conditions)
+    missing = [label for label in wanted if not any(_same_value(label, present) for present in applied)]
+    if not missing and not changed:
+        return raw
+    if missing:
+        _place_excludes(conditions, missing, house_value_sep)
+    merged = serialize_filter(conditions)
+    try:
+        unreadable = unenforced_excludes(merged, wanted)
+    except FilterParseError:
+        unreadable = set(wanted)
+    if unreadable:
+        raise FilterParseError(f"the merged filter does not enforce {sorted(unreadable)}: {merged!r}")
+    return merged
 
 
 def remove_label_excludes(raw: str, labels: set[str]) -> str:
-    """Remove exactly `labels` from ``label!=`` conditions; drop the condition if it empties."""
+    """Remove exactly `labels` from ``label!=`` conditions; drop the condition if it empties.
+
+    Except where dropping it would regroup the owner's conditions: an emptied clause joined by `&` with a
+    `|` somewhere after it (`A&label!=x|B` would become `A|B`, wider than `A&(T|B)` if Plex binds `|`
+    tighter — which the recording cannot rule out). It is left as it was; an exclude of a label nothing
+    carries hides nothing.
+    """
     conditions = parse_filter(raw)
     out = []
-    for cond in conditions:
-        if cond.field == "label" and cond.op == "!=":
-            seps = cond._padded_seps()
-            kept = [
-                (value, index)
-                for index, value in enumerate(cond.values)
-                if not any(_same_value(value, t) for t in labels)
-            ]
-            if not kept:
+    for i, cond in enumerate(conditions):
+        if _is_exclude(cond):
+            remainder = _without_values(cond, lambda value: any(_same_value(value, t) for t in labels))
+            if remainder is None:
+                if i > 0 and cond.sep == "&" and any(later.sep == "|" for later in conditions[i + 1 :]):
+                    out.append(cond)
                 continue
-            # Keep the separator that PRECEDED each surviving value (the first has none), so removing
-            # a value out of the middle cannot change the encoding of the ones left behind.
-            cond = replace(
-                cond,
-                values=tuple(value for value, _ in kept),
-                value_seps=tuple(seps[index - 1] for _, index in kept[1:]),
-            )
+            cond = remainder
         out.append(cond)
     return serialize_filter(out)
+
+
+def _allow_groups(conditions: list[FilterCondition]) -> list[list[int]]:
+    """Condition indices per `&`-separated group of `|`-separated alternatives.
+
+    How a real PMS groups a filter: `(A|B)&C` — `|` binds tighter than `&`. Measured 2026-09-13
+    (`tests/fixtures/pms_share_filter_allow_lists.json`): `contentRating=XYZNOPE&label=recommended|
+    contentRating=G` showed 0 movies, where left-to-right would have shown 401.
+    """
+    groups: list[list[int]] = []
+    for i, condition in enumerate(conditions):
+        if i == 0 or condition.sep == "&":
+            groups.append([i])
+        else:
+            groups[-1].append(i)
+    return groups
+
+
+def _drop_condition(conditions: list[FilterCondition], i: int) -> list[FilterCondition]:
+    """`conditions` without condition `i`, its neighbours still grouped as they were (see `_allow_groups`).
+
+    A side of the dropped condition that was `&` was a group boundary, so the gap it leaves stays one.
+    """
+    rest = conditions[:i] + conditions[i + 1 :]
+    if 0 < i < len(conditions) - 1:
+        joined = "&" if "&" in (conditions[i].sep, conditions[i + 1].sep) else "|"
+        rest[i] = replace(rest[i], sep=joined)
+    return rest
+
+
+def _is_allow(condition: FilterCondition) -> bool:
+    return condition.op == "="
+
+
+def _admits(condition: FilterCondition, row_labels: tuple[str, ...]) -> bool:
+    """Does this condition hold for a Shortlist row — a collection with these labels and no content rating?"""
+    if condition.field != "label":
+        return condition.op == "!="
+    hit = any(_same_value(value, label) for value in condition.values for label in row_labels)
+    return hit if condition.op == "=" else not hit
+
+
+def allowed_shortlist_labels(raw: str, label_prefix: str = LABEL_PREFIX) -> set[str]:
+    """The Shortlist labels this filter ALLOWS (``label=`` values) — what `admit_own_rows` writes."""
+    return {
+        v
+        for c in parse_filter(raw)
+        if c.field == "label" and _is_allow(c)
+        for v in c.values
+        if _is_ours(v, label_prefix)
+    }
+
+
+def admit_own_rows(raw: str, own_label: str, *, show: bool, label_prefix: str = LABEL_PREFIX) -> str:
+    """Let an account whose owner set an "allow only" list see its OWN Shortlist rows (#115).
+
+    An allow list shows only what it names. A Shortlist row is a collection carrying `shortlist_<slug>`
+    and the constant `shortlist` label, with no content rating — so `label=Kids` or `contentRating=G`
+    hides a person's own rows from them. With `show`, the row's label is added as one more alternative in
+    every allow group that would otherwise hide it: into the group's `label=` clause when it has one, else
+    as `|label=<own>` after the group. Measured on a real server: the rows then show on Home and in the
+    library, holding exactly the items the allow list admits, and a label added to only one of two ANDed
+    allow groups leaves the row hidden (`tests/fixtures/pms_share_filter_allow_lists.json`).
+
+    Touches `own_label` and nothing else. Every other allow value is the owner's (rule 3) — Shortlist never
+    wrote one before #115, so a shared row or a sibling's row in an allow list is a choice they made — and
+    stays byte-identical; the excludes still decide which rows show. Of `own_label`, it converges: added
+    where a group needs it, taken out of a clause where no allow condition of the owner's is left beside
+    it (Plex Web re-saves what its form shows, so an owner who removes "Kids" but not our label would
+    otherwise leave "allow only this person's rows" — the whole library hidden), and taken out entirely
+    without `show`, handing back the owner's filter byte for byte.
+
+    Args:
+        raw: The account's share filter, BEFORE `merge_label_excludes` (see `plan_share_filter`).
+        own_label: The label this account's rows carry (`shortlist_<slug>`, any case).
+        show: Whether the account has rows to show. False takes `own_label` back out.
+        label_prefix: The label prefix Shortlist owns.
+
+    Returns:
+        The new filter, or `raw` itself (the same object) when nothing needs to change.
+
+    Raises:
+        AmbiguousFilterError: A raw `&` sits inside a value — Plex itself cannot read the filter.
+    """
+    conditions = parse_filter(raw)
+    literal = _literal_ampersand_values(conditions)
+    if literal:
+        raise AmbiguousFilterError(
+            f"{', '.join(repr(unquote(v)) for v in literal)} has an '&' in it, which Plex can't read in a restriction"
+        )
+    _, house_value_sep = _house_style(conditions)
+
+    def mine(value: str) -> bool:
+        return _same_value(value, own_label)
+
+    def repair_pending(index: int) -> bool:
+        """Whether this condition's group still holds one of OUR excludes behind a `|`. Dropping a whole
+        clause there regroups what `merge_label_excludes` has yet to lift out — review 2026-09-13 found
+        that switching an owner's own exclude off — so the drop waits for `plan_share_filter`'s next pass."""
+        group = next(g for g in _allow_groups(conditions) if index in g)
+        return len(group) > 1 and any(
+            _is_exclude(conditions[j]) and any(_is_ours(v, label_prefix) for v in conditions[j].values) for j in group
+        )
+
+    def owners_allow(condition: FilterCondition) -> bool:
+        return _is_allow(condition) and not all(mine(value) for value in condition.values)
+
+    if not show:
+        i = 0
+        while i < len(conditions):
+            condition = conditions[i]
+            if condition.field == "label" and _is_allow(condition):
+                remainder = _without_values(condition, mine)
+                if remainder is None:
+                    if repair_pending(i):
+                        i += 1
+                        continue
+                    conditions = _drop_condition(conditions, i)
+                    continue
+                conditions[i] = remainder
+            i += 1
+    else:
+        for group in reversed(_allow_groups(conditions)):
+            if any(owners_allow(conditions[j]) for j in group):
+                continue
+            for j in reversed(group):
+                if (
+                    conditions[j].field == "label"
+                    and _is_allow(conditions[j])
+                    and all(mine(v) for v in conditions[j].values)
+                    and not repair_pending(j)
+                ):
+                    conditions = _drop_condition(conditions, j)
+        row_labels = (own_label, label_prefix)
+        for group in reversed(_allow_groups(conditions)):
+            if any(_admits(conditions[j], row_labels) for j in group) or not any(
+                owners_allow(conditions[j]) for j in group
+            ):
+                continue
+            clause = next((j for j in group if conditions[j].field == "label" and _is_allow(conditions[j])), None)
+            if clause is None:
+                conditions.insert(group[-1] + 1, FilterCondition("label", "=", (own_label,), sep="|"))
+                continue
+            cond = conditions[clause]
+            existing = cond._padded_seps()
+            fill = cond.value_seps[-1] if cond.value_seps else house_value_sep
+            grown = (*cond.values, own_label)
+            conditions[clause] = replace(
+                cond, values=grown, value_seps=existing + (fill,) * (len(grown) - 1 - len(existing))
+            )
+
+    admitted = serialize_filter(conditions)
+    return raw if admitted == raw else admitted
+
+
+#: How many admit→merge passes one write may take. A filter the pre-#116 merge left behind needs the
+#: merge to lift our `|`-joined exclude out of a group before that group can be judged for the own row.
+_PLAN_PASSES = 4
+
+
+def plan_share_filter(
+    current: str,
+    wanted: set[str],
+    *,
+    own_row_label: str | None,
+    show: bool,
+    label_prefix: str = LABEL_PREFIX,
+) -> str:
+    """The filter one account should carry: its own rows admitted (#115), everyone else's excluded (#116).
+
+    Admit FIRST, then merge. `merge_label_excludes` trusts no exclude a `|` follows, so an own-row `|`
+    inserted behind an exclude it had just placed would make it move that exclude again the next night.
+    Repeated until nothing changes, so a filter the old merge damaged is settled in ONE write rather
+    than a write a night with the person's row hidden in between.
+
+    Args:
+        current: The account's filter as plex.tv holds it now.
+        wanted: The Shortlist labels this account must not see.
+        own_row_label: The label this account's rows carry, or None to leave the allow list alone.
+        show: Whether those rows exist (see `admit_own_rows`).
+        label_prefix: The label prefix Shortlist owns.
+
+    Returns:
+        The planned filter, or `current` itself when nothing needs to change.
+
+    Raises:
+        AmbiguousFilterError, FilterParseError: As `merge_label_excludes` / `admit_own_rows`.
+    """
+    planned = current
+    for _ in range(_PLAN_PASSES):
+        admitted = (
+            planned
+            if own_row_label is None
+            else admit_own_rows(planned, own_row_label, show=show, label_prefix=label_prefix)
+        )
+        merged = merge_label_excludes(admitted, wanted, label_prefix=label_prefix)
+        if merged == planned:
+            break
+        planned = merged
+    return current if planned == current else planned
 
 
 def shortlist_labels_in(raw: str, label_prefix: str) -> set[str]:
@@ -260,12 +657,7 @@ def shortlist_labels_in(raw: str, label_prefix: str) -> set[str]:
     that encodes everything still hands them back percent-encoded, and reading them as foreign made
     Shortlist blind to its OWN excludes — so it could neither count them nor remove them at uninstall.
     """
-    prefix = f"{label_prefix}_".lower()
-    found = set()
-    for cond in parse_filter(raw):
-        if cond.field == "label" and cond.op == "!=":
-            found.update(v for v in cond.values if unquote(v).lower().startswith(prefix))
-    return found
+    return {v for cond in parse_filter(raw) if _is_exclude(cond) for v in cond.values if _is_ours(v, label_prefix)}
 
 
 class SnapshotStore(Protocol):
@@ -358,6 +750,9 @@ def sync_user_restrictions(
     snapshots: SnapshotStore,
     *,
     own_label: str | None = None,
+    # The label this account's rows WOULD carry (`shortlist_<slug>`), known even when it has none, so a
+    # row that is gone takes its allow label with it (#115). None: the caller does not know the slug.
+    own_row_label: str | None = None,
     label_prefix: str = LABEL_PREFIX,
     shared_labels: dict[str, set[int] | None] | None = None,
     hide_all_shared: bool = False,
@@ -367,6 +762,9 @@ def sync_user_restrictions(
     # independent source `dead_private` needs before it removes another account's private exclude
     # (rule 4). None = "we could not read it", which never licenses a removal.
     marker_present_slugs: set[str] | None = None,
+    # {field: why} filled with every field Plex itself cannot read; that field is skipped and the rest
+    # written. None raises `AmbiguousFilterError` instead.
+    refused: dict[str, str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, tuple[str, str]] | None:
     """Merge the desired shortlist excludes into one user's share filters.
@@ -563,10 +961,26 @@ def sync_user_restrictions(
             if stale_shared or excluded_from_self or dead_private:
                 prunable.add(lbl)
 
+    # The label this account's own rows carry, for its allow list (#115). Taken back out only when the
+    # server's collections were COMPLETELY enumerated: a row missing from a read we cannot vouch for is
+    # not evidence it is gone, and removing the allow label would hide it until the next pass.
+    admit_label = own_label or own_row_label
+    if own_label is None and not collections_known:
+        admit_label = None
     desired_fields = {}
     for fieldname in RESTRICTED_FILTER_FIELDS:
         current = remote.filters[fieldname]
-        merged = merge_label_excludes(current, wanted)
+        try:
+            merged = plan_share_filter(
+                current, wanted, own_row_label=admit_label, show=own_label is not None, label_prefix=label_prefix
+            )
+        except AmbiguousFilterError as e:
+            # Per field: the other one may be perfectly readable, and leaving it unwritten would promote
+            # rows that field could hide (review 2026-09-13). Without a `refused` sink, refuse outright.
+            if refused is None:
+                raise
+            refused[fieldname] = str(e)
+            continue
         if prunable:
             merged = remove_label_excludes(merged, prunable)
         if merged != current:
@@ -672,9 +1086,30 @@ def clear_our_excludes(
             for label in shortlist_labels_in(current, label_prefix)
             if not unquote(label).lower().startswith(SHARED_LABEL_PREFIX.lower())
         }
-        if not ours:
-            continue
-        cleaned = remove_label_excludes(current, ours)
+        cleaned = remove_label_excludes(current, ours) if ours else current
+        # The shared-row excludes that stay must also stay ENFORCED. The pre-#116 merge left them behind
+        # a `|`, where Plex ignores them and the owner's own restriction is switched off; a left-alone
+        # account is never merged into again, so this is the only pass that can move them.
+        # SHARED labels only: a per-person clause the removal had to leave in place (it would regroup the
+        # owner's conditions) must not be carried somewhere Plex applies it — the owner asked for these
+        # excludes to go, so the move is undone for every per-person label it touched.
+        kept = {
+            label
+            for label in shortlist_labels_in(cleaned, label_prefix)
+            if unquote(label).lower().startswith(SHARED_LABEL_PREFIX.lower())
+        }
+        if kept and unenforced_excludes(cleaned, kept):
+            try:
+                moved = merge_label_excludes(cleaned, set(), label_prefix=label_prefix)
+            except AmbiguousFilterError:
+                # Plex cannot read this filter (a literal `&` label), so the shared exclude cannot be moved
+                # anywhere verifiable. The per-person excludes the owner asked to remove still come out.
+                moved = None
+            if moved is not None:
+                cleaned = remove_label_excludes(moved, ours) if ours else moved
+        # Allow values are NOT touched here, the account's own row label (#115) included. The owner may
+        # have typed it — Shortlist wrote none before #115, and the "leave alone" warning practically
+        # suggests it — and keeping it hides nothing from anyone: it only lets this person see their row.
         if cleaned != current:
             changed[fieldname] = (current, cleaned)
     if not changed:
@@ -709,7 +1144,16 @@ def summarise_filter_diff(diff: dict[str, tuple[str, str]], label_prefix: str) -
         was = shortlist_labels_in(before, label_prefix)
         now = shortlist_labels_in(after, label_prefix)
         added, removed = sorted(now - was), sorted(was - now)
+        allowed_before = allowed_shortlist_labels(before, label_prefix)
+        allowed_after = allowed_shortlist_labels(after, label_prefix)
+        if allowed_before != allowed_after:
+            parts.append(f"{fieldname} own row {'allowed' if allowed_after else 'no longer allowed'}")
+            if not added and not removed:
+                continue
         if not added and not removed:
+            if now and unenforced_excludes(before, now) and not unenforced_excludes(after, now):
+                parts.append(f"{fieldname} excludes moved to where Plex applies them")
+                continue
             # A change outside our own excludes (pruning a shared row's label leaves the set equal).
             parts.append(f"{fieldname} rewritten")
             continue
@@ -846,8 +1290,9 @@ def restore_user_restrictions(
         # Field names only: a restore payload is the user's ENTIRE original filter string per field.
         logger.info("[dry-run] {}: would restore {} from the snapshot", snapshot.username, ", ".join(sorted(changed)))
         return True
-    # The PUT is INSIDE the try, not before it. `update_user_filters` retries the failures that
-    # provably never reached plex.tv (connect errors, pool timeouts) and deliberately lets a READ
+    # The PUT is INSIDE the try, not before it. `update_user_filters` retries connect errors, pool
+    # timeouts, 429 and a short ladder of 5xx — every one of them safe because the PUT carries a full
+    # pre-merged value, so a repeat converges rather than doubling. It deliberately lets a READ
     # timeout propagate, precisely because "the write may have applied" — so at or past this line the
     # account's filters may already have changed. Every failure from here therefore carries
     # `changed`: the caller has to audit a write it could not confirm (rule 10), and the ambiguous

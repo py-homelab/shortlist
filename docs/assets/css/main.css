@@ -1,5 +1,7 @@
 /* Shortlist docs — the site dresses like the app it documents: near-black
    surfaces, one amber accent (Plex's own #e5a00d), no second hue competing.
+   One exception, also the app's: the coffee link's cup is pink (--cup), because
+   every other hue here already means something. It colours that icon only.
    Dark is the default because the product is dark; light exists because the
    reference page is 68k of prose and some people read long docs in daylight. */
 
@@ -17,7 +19,6 @@
   --amber-bright: #f5c04a;
   --amber-deep: #b87d05;
 
-  --step: clamp(1rem, 0.6rem + 1.6vw, 1.5rem);
   --gutter: clamp(1.25rem, 1rem + 2vw, 2.5rem);
   --measure: 68ch;
   --wide: 1200px;
@@ -39,8 +40,11 @@
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #f4f4f5;
   --text-soft: #c9c9d1;
+  /* Three text tones, not four. A fainter tertiary grey used to sit below --muted and failed WCAG AA
+     wherever it was used — footer headings, frame titles, sidebar labels, all 12-13px (3.15:1 light,
+     3.69:1 dark on --bg-soft). Any tone dark/light enough to pass is indistinguishable from --muted,
+     so there is nothing between --muted and the background. */
   --muted: #94949f;
-  --faint: #6b6b76;
   --accent: var(--amber);
   --accent-text: var(--amber-bright);
   --accent-quiet: rgba(229, 160, 13, 0.12);
@@ -51,6 +55,8 @@
   --code-bg: #0f0f13;
   --good: #4ade80;
   --warn: #fbbf24;
+  --star: var(--amber);
+  --cup: #e882b4;
   color-scheme: dark;
 }
 
@@ -65,7 +71,6 @@
   --text: #18181b;
   --text-soft: #33333a;
   --muted: #5f5f6b;
-  --faint: #8a8a96;
   --accent: var(--amber-deep);
   --accent-text: #93630a;
   --accent-quiet: rgba(229, 160, 13, 0.14);
@@ -77,6 +82,8 @@
   --code-bg: #f6f6f4;
   --good: #15803d;
   --warn: #a16207;
+  --star: var(--amber-deep);
+  --cup: #b8327a;
   color-scheme: light;
 }
 
@@ -314,7 +321,7 @@ hr {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--surface);
-  color: var(--faint);
+  color: var(--muted);
   font: inherit;
   font-size: 0.85rem;
   cursor: pointer;
@@ -328,6 +335,45 @@ hr {
   border-color: var(--border-strong);
 }
 
+.nav-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  height: 34px;
+  flex: none;
+  padding: 0 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 520;
+  text-decoration: none;
+  transition: border-color 0.15s var(--ease);
+}
+
+.nav-pill:hover {
+  border-color: var(--border-strong);
+}
+
+.nav-pill svg {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+
+.nav-pill--star svg,
+.footer__star {
+  color: var(--star);
+  fill: var(--star);
+}
+
+.nav-pill--coffee svg,
+.footer__cup {
+  color: var(--cup);
+}
+
+
 .search-btn svg {
   width: 14px;
   height: 14px;
@@ -339,7 +385,7 @@ hr {
   border-radius: 4px;
   padding: 0.05rem 0.3rem;
   font-size: 0.72rem;
-  color: var(--faint);
+  color: var(--muted);
   background: var(--surface-2);
 }
 
@@ -354,6 +400,45 @@ hr {
   }
   .nav__burger {
     display: inline-grid;
+  }
+}
+
+/* Measured at 320: the brand, a worded search button and four 34px icons want
+   387px inside a 275px bar, and the row pushed every page 86px sideways. Shed
+   the parts that say something twice, widest first. The word goes before the
+   icon, which keeps its aria-label; the coffee goes before anything
+   structural, and it is still in the footer. */
+/* The Star and Coffee words need ~110px the full nav row does not have below 1180px (measured: 24px
+   over at 1100, 215px at 901). Once the nav links collapse into the burger at 900 there is room for
+   the words again, until the 600px pass sheds every label. */
+@media (min-width: 901px) and (max-width: 1180px), (max-width: 600px) {
+  .nav-pill {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+  .nav-pill__label {
+    display: none;
+  }
+}
+
+@media (max-width: 600px) {
+  .search-btn {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+  .search-btn__label {
+    display: none;
+  }
+}
+
+@media (max-width: 420px) {
+  .nav__inner {
+    gap: 0.4rem;
+  }
+  .nav-pill--coffee {
+    display: none;
   }
 }
 
@@ -588,8 +673,12 @@ hr {
 
 .frame__title {
   margin-left: 0.5rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 0.76rem;
-  color: var(--faint);
+  color: var(--muted);
   font-family: var(--font-mono);
 }
 
@@ -823,141 +912,454 @@ figcaption {
   line-height: 1.5;
 }
 
-/* ---------------------------------------------------------------- steps -- */
+/* ------------------------------------------------------------ stat band -- */
+/* Four numbers under the hero. Column counts are fixed rather than auto-fit
+   because auto-fit put three across and left the fourth alone on a second row
+   through the whole 900-1000px range. */
 
-.steps {
-  counter-reset: step;
+.stats-band {
+  background: var(--bg-soft);
+  border-block: 1px solid var(--border);
+  padding-block: clamp(1.75rem, 1rem + 2.5vw, 2.75rem);
+}
+
+.stats {
   display: grid;
-  gap: 1.1rem;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr));
-}
-
-.step {
-  position: relative;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 1.4rem;
-}
-
-.step::before {
-  counter-increment: step;
-  content: counter(step);
-  display: grid;
-  place-items: center;
-  width: 27px;
-  height: 27px;
-  border-radius: 50%;
-  background: var(--accent);
-  color: #1a1200;
-  font-size: 0.82rem;
-  font-weight: 700;
-  margin-bottom: 0.9rem;
-}
-
-.step h3 {
-  font-size: 1rem;
-  margin-bottom: 0.4rem;
-}
-
-.step p {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.9rem;
-}
-
-/* ------------------------------------------------------------- privacy -- */
-
-.privacy {
-  display: grid;
-  gap: clamp(1.5rem, 1rem + 3vw, 3rem);
-  align-items: center;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
-}
-
-.order {
-  display: grid;
-  gap: 0.6rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(1.5rem, 0.75rem + 2vw, 2.25rem);
   margin: 0;
   padding: 0;
   list-style: none;
-  counter-reset: order;
 }
 
-.order li {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.85rem;
-  align-items: start;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-left: 3px solid var(--accent-line);
-  border-radius: var(--radius-sm);
-  padding: 0.85rem 1rem;
-  font-size: 0.92rem;
-}
-
-.order li::before {
-  counter-increment: order;
-  content: counter(order, lower-alpha);
-  display: grid;
-  place-items: center;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: var(--accent-quiet);
-  color: var(--accent-text);
-  font-size: 0.75rem;
-  font-weight: 700;
-  font-family: var(--font-mono);
-}
-
-.order strong {
-  display: block;
-  color: var(--text);
-}
-
-.order span {
-  color: var(--muted);
-}
-
-/* ------------------------------------------------------------ showcase -- */
-
-.shots {
-  display: grid;
-  gap: clamp(1.75rem, 1rem + 3vw, 3rem);
-}
-
-.shot {
-  display: grid;
-  gap: clamp(1.25rem, 0.75rem + 2.5vw, 2.75rem);
-  align-items: center;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.55fr);
-}
-
-.shot:nth-child(even) .shot__text {
-  order: 2;
-}
-
-.shot h3 {
-  font-size: clamp(1.15rem, 1rem + 0.6vw, 1.4rem);
-  margin-bottom: 0.55rem;
-}
-
-.shot p {
+.stat__value {
   margin: 0;
+  font-size: clamp(2.1rem, 1.6rem + 2.2vw, 3rem);
+  line-height: 1;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  color: var(--accent-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat__unit {
+  margin-left: 0.22em;
+  font-size: 0.4em;
+  font-weight: 600;
+  letter-spacing: 0;
   color: var(--muted);
-  font-size: 0.95rem;
+}
+
+.stat__label {
+  margin: 0.5rem 0 0;
+  font-size: 0.98rem;
+  font-weight: 640;
+}
+
+.stat__note {
+  margin: 0.3rem 0 0;
+  color: var(--muted);
+  font-size: 0.86rem;
   text-wrap: pretty;
 }
 
-@media (max-width: 780px) {
-  .shot {
+@media (max-width: 479px) {
+  .stats {
     grid-template-columns: 1fr;
   }
-  .shot:nth-child(even) .shot__text {
-    order: 0;
+}
+
+@media (min-width: 1000px) {
+  .stats {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0;
   }
+  .stat {
+    padding-inline: clamp(1rem, 0.4rem + 1.6vw, 2rem);
+  }
+  .stat + .stat {
+    border-left: 1px solid var(--border);
+  }
+  .stat:first-child {
+    padding-left: 0;
+  }
+  .stat:last-child {
+    padding-right: 0;
+  }
+}
+
+/* ----------------------------------------------------------------- tour -- */
+/* One grid, three layouts, no duplicated content. The steps and the pictures are
+   siblings in reading order, so:
+     narrow            one column, each step followed by its own picture
+     wide, no script   two columns, each step beside its own picture
+     wide, with script every picture moves into one pinned frame that changes
+   Only the third is scoped under .js-tour-ready, and only site.js adds that class
+   (after proving it can drive it — same contract as .reveal at the foot of this
+   file). Nothing here is hidden or dimmed by CSS alone, so a blocked script leaves
+   five readable steps and five visible pictures instead of a page of grey. */
+
+/* `minmax(0, 1fr)`, not the implicit `auto`: an auto column is at least as wide
+   as its widest item's min-content, and at 320 the address bar's monospace path
+   pushed that to 321px inside a 275px page. Measured. */
+.tour {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: clamp(2rem, 1.25rem + 3vw, 3.25rem);
+}
+
+/* Decoration for the pinned layout only. Hidden until site.js turns that on, so
+   nobody else gets an empty groove down the page. */
+.tour__rail {
+  display: none;
+}
+
+.tour-step {
+  display: grid;
+  grid-template-columns: 2.25rem minmax(0, 1fr);
+  column-gap: 1.05rem;
+  row-gap: 0.5rem;
+  align-content: start;
+}
+
+.tour-step__num {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  margin: 0;
+  width: 2.25rem;
+  height: 2.25rem;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: 0.95rem;
+  font-weight: 680;
+  font-variant-numeric: tabular-nums;
+}
+
+.tour-step__title {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: center;
+  margin: 0;
+  font-size: clamp(1.2rem, 1.05rem + 0.7vw, 1.5rem);
+  text-wrap: balance;
+}
+
+.tour-step__body {
+  grid-column: 2;
+  grid-row: 2;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.97rem;
+  text-wrap: pretty;
+}
+
+.tour-panel {
+  margin: 0;
+}
+
+.tour-panel img {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+@media (min-width: 901px) {
+  .tour {
+    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+    column-gap: clamp(2rem, 1rem + 3.5vw, 4rem);
+    align-items: center;
+  }
+
+  .tour-step {
+    grid-column: 1;
+  }
+
+  .tour-panel {
+    grid-column: 2;
+  }
+
+  /* --- pinned layout, script only ------------------------------------- */
+
+  .js-tour-ready .tour {
+    grid-template-rows: repeat(var(--tour-steps), auto);
+    align-items: start;
+  }
+
+  .js-tour-ready .tour__rail {
+    display: block;
+    position: absolute;
+    left: calc(1.125rem - 1px);
+    top: 0.5rem;
+    bottom: 0.5rem;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--border);
+    overflow: hidden;
+  }
+
+  .js-tour-ready .tour__rail-fill {
+    display: block;
+    width: 100%;
+    height: 0;
+    background: var(--accent);
+    transition: height 0.12s linear;
+  }
+
+  .js-tour-ready .tour-step {
+    min-height: 66vh;
+    align-content: center;
+    opacity: 0.42;
+    transition: opacity 0.35s var(--ease);
+  }
+
+  .js-tour-ready .tour-step.is-active {
+    opacity: 1;
+  }
+
+  .js-tour-ready .tour-step.is-active .tour-step__num {
+    background: var(--accent);
+    border-color: transparent;
+    color: #1a1200;
+  }
+
+  /* Every panel occupies the whole second column and sticks inside it. `1 / -1`
+     needs the rows to be explicit, which is what --tour-steps is for. */
+  /* Stacked in one grid area, so each is its own box and none of them affects
+     any other's size. Measured: giving them all ONE fixed shape is the trap. The
+     five pictures run from 1.25:1 to 1.84:1, and a 16:10 frame shrank the
+     tallest until the app's own text was unreadable — `object-fit: contain`
+     stops it being cropped, not being shrunk. Each panel keeps its own shape
+     instead; only the height cap below ever makes one letterbox, and only on a
+     viewport too short to show it whole. */
+  .js-tour-ready .tour-panel {
+    grid-column: 2;
+    grid-row: 1 / -1;
+    align-self: start;
+    position: sticky;
+    top: calc(var(--nav-h) + 7vh);
+    /* One box for all five, with the picture centred in it, so the frame stops
+       jumping up and down the viewport as the pictures swap. */
+    height: calc(100vh - var(--nav-h) - 14vh);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity 0.35s var(--ease),
+      visibility 0.35s;
+  }
+
+  .js-tour-ready .tour-panel.is-active {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  .js-tour-ready .tour-panel .frame {
+    min-height: 0;
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-2);
+  }
+
+  /* Only bites on a viewport too short to show a picture whole: the frame hits
+     the box height, the picture shrinks inside it, and `contain` letterboxes it
+     rather than cropping. */
+  .js-tour-ready .tour-panel img {
+    min-height: 0;
+    object-fit: contain;
+  }
+}
+
+/* ------------------------------------------------- privacy-order flow -- */
+/* The four-step diagram used by /faq/ and by the landing page's privacy
+   section, from one file, so the site can never end up describing the write
+   order two different ways. Each step also states who can see the row at that
+   moment, which is the part the prose could never show at a glance. */
+
+.flow {
+  margin: 1.75rem 0;
+}
+
+.flow__steps {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.flow__step {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.25rem 0.9rem;
+  padding: 0 0 1.35rem 0;
+}
+
+.flow__step:last-child {
+  padding-bottom: 0;
+}
+
+/* The spine: the order is the whole point, so the steps are drawn as one run
+   rather than four separate cards. It stops at the last badge. */
+.flow__step:not(:last-child)::before {
+  content: "";
+  position: absolute;
+  left: 15px;
+  top: 34px;
+  bottom: 6px;
+  width: 2px;
+  background: var(--accent-line);
+}
+
+.flow__num {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--accent-quiet);
+  color: var(--accent-text);
+  border: 1px solid var(--accent-line);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 700;
+}
+
+.flow__step--final .flow__num {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #1a1200; /* same near-black the amber buttons use; white on amber is 2.2:1 */
+}
+
+.flow__body strong {
+  display: block;
+  color: var(--text);
+  font-size: 1rem;
+  /* Not typography: 1rem x 1.9 is the 32px badge beside it, so the step title
+     sits on the badge's centre line without a second alignment rule. */
+  line-height: 1.9;
+}
+
+.flow__body span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.flow__state {
+  grid-column: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0.6rem 0 0;
+  padding: 0.3rem 0.65rem 0.3rem 0.5rem;
+  justify-self: start;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.flow__state svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
+
+.flow__state--on {
+  border-color: var(--accent-line);
+  background: var(--accent-quiet);
+  color: var(--accent-text);
+}
+
+.flow figcaption {
+  margin-top: 1.4rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.6;
+  text-align: left; /* the site centres figcaptions under centred images; this figure is prose-aligned */
+  text-wrap: pretty;
+}
+
+/* Wide enough for the state to sit beside its step instead of under it. The
+   breakpoint is the content's, not the viewport's: `.prose` is capped at 68ch,
+   so this fires on a desktop docs page and never on a phone. */
+@media (min-width: 900px) {
+  .flow__step {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 1rem;
+  }
+  .flow__state {
+    grid-column: 3;
+    grid-row: 1;
+    margin-top: 0.3rem;
+    /* A width, not a max-width: each step is its own grid, so an auto column
+       sizes to that row's own text and the chips come out ragged down the
+       left. Fixing the width lines all four up into one rail. */
+    width: 13rem;
+  }
+}
+
+/* -------------------------------------------------------- closing call -- */
+
+.cta {
+  position: relative;
+  overflow: hidden;
+  max-width: 46rem;
+  margin-inline: auto;
+  padding: clamp(2rem, 1.25rem + 3vw, 3.25rem)
+    clamp(1.25rem, 0.75rem + 2vw, 2.5rem);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  text-align: center;
+}
+
+/* The same warm bloom as the hero, so the page opens and closes on one light
+   source rather than fading out into a plain box. */
+.cta::before {
+  content: "";
+  position: absolute;
+  inset: -55% 15% auto;
+  height: 18rem;
+  background: radial-gradient(closest-side, var(--accent-quiet), transparent);
+  pointer-events: none;
+}
+
+.cta > * {
+  position: relative;
+}
+
+.cta h2 {
+  font-size: clamp(1.5rem, 1.2rem + 1.4vw, 2.1rem);
+  margin-bottom: 0.75rem;
+}
+
+.cta p {
+  margin: 0 auto;
+  max-width: 34rem;
+  color: var(--muted);
+  text-wrap: pretty;
+}
+
+.cta .hero__cta {
+  margin-top: 1.75rem;
 }
 
 /* --------------------------------------------------------------- table -- */
@@ -1015,7 +1417,7 @@ figcaption {
 }
 
 .no {
-  color: var(--faint);
+  color: var(--muted);
 }
 
 /* ---------------------------------------------------------------- code -- */
@@ -1196,13 +1598,6 @@ figcaption {
   margin-bottom: 2.25rem;
 }
 
-.icon-btn--heart:hover svg {
-  /* Fills on hover only — a permanently red heart in the header reads as a notification badge, and
-     an unread count is the last thing a docs page should imply. */
-  fill: currentColor;
-  color: #e25555;
-}
-
 .footer h4 a {
   /* "Plex how-to" is both a column heading and a real page, so its heading is a link. It must still
      read as a heading rather than as the first item in its own list. */
@@ -1211,14 +1606,14 @@ figcaption {
 }
 
 .footer h4 a:hover {
-  color: var(--ink);
+  color: var(--text);
 }
 
 .footer h4 {
   font-size: 0.78rem;
   letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
   margin-bottom: 0.85rem;
   font-weight: 640;
 }
@@ -1234,6 +1629,18 @@ figcaption {
 .footer a {
   color: var(--muted);
   text-decoration: none;
+}
+
+.footer__support {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.footer__support svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
 }
 
 /* Sub-pages sit under their section rather than reading as siblings of it. */
@@ -1261,7 +1668,7 @@ figcaption {
   align-items: center;
   border-top: 1px solid var(--border);
   padding-top: 1.5rem;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 0.85rem;
 }
 
@@ -1292,7 +1699,7 @@ figcaption {
   font-size: 0.74rem;
   letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: var(--faint);
+  color: var(--muted);
   margin: 0 0 0.75rem;
   font-weight: 640;
 }
@@ -1485,7 +1892,11 @@ figcaption {
   border-radius: 5px;
   padding: 0.1em 0.38em;
   color: var(--accent-text);
-  white-space: nowrap;
+  /* NOT `nowrap`. It defeated the `overflow-wrap` beside it, so a long inline code span — an API
+     path, or the ranking formula — set a min-content width wider than a phone and panned the whole
+     page sideways. Reference was 555px of content in a 316px viewport. */
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .prose pre {
@@ -1552,7 +1963,7 @@ figcaption {
 .prose .anchor {
   opacity: 0;
   margin-left: 0.4rem;
-  color: var(--faint);
+  color: var(--muted);
   text-decoration: none;
   font-weight: 400;
   transition: opacity 0.15s var(--ease);
@@ -1593,7 +2004,7 @@ figcaption {
 
 .pager small {
   display: block;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 0.78rem;
   margin-bottom: 0.2rem;
 }
@@ -1657,7 +2068,7 @@ figcaption {
 .search-dialog__input svg {
   width: 17px;
   height: 17px;
-  color: var(--faint);
+  color: var(--muted);
   flex: none;
 }
 
@@ -1737,4 +2148,39 @@ figcaption {
 
 .mt-lg {
   margin-top: clamp(1.75rem, 1rem + 2.5vw, 2.75rem);
+}
+
+/* --------------------------------------------------------------- reveal -- */
+/* Fade-up for section reveals. Visible at rest by design: `.reveal` on its own
+   carries no hidden state, so this file plus no JS (or JS that threw, or a
+   browser with no IntersectionObserver) renders every section normally. Only
+   site.js adds `.js-reveal-ready` to <html>, and only after it has confirmed it
+   can un-hide again — CSS never hides content on its own.
+
+   No prefers-reduced-motion block here: the sitewide rule near the top of this
+   file already forces transition-duration to 0.01ms on every element, so this
+   transition is already imperceptible under it. site.js skips the observer
+   entirely in that case, so the class is never even added. */
+.reveal {
+  opacity: 1;
+  transform: none;
+}
+
+.js-reveal-ready .reveal {
+  opacity: 0;
+  transform: translateY(16px);
+}
+
+/* The transition lives on the VISIBLE state, not the hidden one. Put it on the
+   hidden rule and the browser animates INTO it: site.js adds .js-reveal-ready
+   after first paint, every section below the fold fades out over half a second,
+   and only then fades back in. Measured, not guessed — an offscreen section
+   read opacity 0.0166 mid-fade-out. Here the hide is instantaneous and only the
+   reveal animates, because a transition is read from the after-change style. */
+.js-reveal-ready .reveal.is-visible {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity 0.5s var(--ease),
+    transform 0.5s var(--ease);
 }

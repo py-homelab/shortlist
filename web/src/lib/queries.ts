@@ -6,7 +6,9 @@ import {
 } from "@tanstack/react-query";
 
 import { api } from "./api";
+import { runRefetchIntervalMs, runsListRefetchIntervalMs } from "./run-format";
 import { useSSE } from "./sse";
+import { useLiveClock } from "./use-live-clock";
 import type {
   ArrStatus,
   CollectionInput,
@@ -43,6 +45,7 @@ export const queryKeys = {
   requests: ["requests"] as const,
   arrOptions: (service: "radarr" | "sonarr") =>
     ["arr-options", service] as const,
+  seerrOptions: ["seerr-options"] as const,
   arrStatus: ["arrStatus"] as const,
   curatorModels: (provider: string, credential: string) =>
     ["curator-models", provider, credential] as const,
@@ -71,15 +74,34 @@ export const queryKeys = {
   libraryCollections: (key: string) => ["library-collections", key] as const,
   ownedCollections: ["owned-collections"] as const,
   notifications: ["notifications"] as const,
+  whatsNew: ["whats-new"] as const,
   syncs: ["syncs"] as const,
   version: ["version"] as const,
   imageProvider: ["image-provider"] as const,
   backups: ["backups"] as const,
+  pendingRestore: ["backups", "restore"] as const,
   // The base key ("jobs") covers every job-queue query for a broad "something changed" invalidation
   // (fired after every mutation — App.tsx); `jobsCatalog` is what the catalogue query itself uses.
   jobs: ["jobs"] as const,
   jobsCatalog: ["jobs", "catalog"] as const,
+  privacyStatus: ["privacy", "status"] as const,
 };
+
+/**
+ * Every account's share filter, read live from plex.tv on each call.
+ *
+ * `staleTime` is 60s because this costs a plex.tv roster read AND a PMS collections read per call,
+ * and TanStack refetches on window focus — an owner alt-tabbing would otherwise hammer both. It is
+ * short enough that the page stays a reading rather than a cache: the timestamp on screen is
+ * `read_at` from the response, so an older answer says so itself.
+ */
+export function usePrivacyStatus() {
+  return useQuery({
+    queryKey: queryKeys.privacyStatus,
+    queryFn: api.getPrivacyStatus,
+    staleTime: 60_000,
+  });
+}
 
 export function useSession() {
   return useQuery({
@@ -133,6 +155,15 @@ export function useRunsPaged(collection?: string) {
       lastPage.length < RUNS_PAGE
         ? undefined
         : lastPage[lastPage.length - 1]?.id,
+    // Same safety net as `useRun`: the list's SSE handler in `runs.tsx` only fires while the stream
+    // is up. A tick refetches every page loaded so far, which after a few "Load more" presses is
+    // several requests per 5s — accepted deliberately over the two ways to trim it, because both
+    // cost correctness. `maxPages` would evict the older pages the operator just asked for, and
+    // gating on `pages[0]` alone would stop polling a run that is still going but has been pushed
+    // off the newest page by 50 later ones. It only ticks while a run is genuinely unfinished, and
+    // React Query's default `refetchIntervalInBackground: false` pauses it on an unfocused tab.
+    refetchInterval: (query) =>
+      runsListRefetchIntervalMs(query.state.data?.pages),
   });
 }
 
@@ -205,6 +236,10 @@ export function useRun(id: number, enabled = true) {
     queryKey: queryKeys.run(id),
     queryFn: () => api.getRun(id),
     enabled,
+    // The safety net for a stream that is down: see `runRefetchIntervalMs`. Without it this page's
+    // only refresh is `run.finished` over SSE, so a dropped connection leaves a finished run
+    // reading "Running" — and a cancelled one stuck on "Stopping…" — until someone reloads.
+    refetchInterval: (query) => runRefetchIntervalMs(query.state.data),
   });
 }
 
@@ -321,8 +356,17 @@ export function useCancelRun() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: number) => api.cancelRun(id),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.runs }),
+    // Both keys named, rather than leaning on `["runs"]` reaching `["runs", id]` by prefix match.
+    // That match is real (checked against the installed @tanstack/query-core), but it is implicit:
+    // renaming a key could silently stop the detail page refreshing with nothing to catch it.
+    //
+    // This only ever reports "cancel requested" — cancellation is cooperative, so the run finishes
+    // the person it is on and then bails. What the run SETTLED as arrives later, over SSE or via
+    // `runRefetchIntervalMs`; this invalidation is not a substitute for either.
+    onSuccess: (_data, id) => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.runs });
+      queryClient.invalidateQueries({ queryKey: queryKeys.run(id) });
+    },
   });
 }
 
@@ -392,6 +436,16 @@ export function useDeleteCollection() {
 }
 
 /** Quality profiles + root folders for a Sonarr/Radarr — only fetched once it's connected. */
+export function useSeerrOptions(enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.seerrOptions,
+    queryFn: () => api.getSeerrOptions(),
+    enabled,
+    staleTime: 60_000,
+    retry: false,
+  });
+}
+
 export function useArrOptions(service: "radarr" | "sonarr", enabled: boolean) {
   return useQuery({
     queryKey: queryKeys.arrOptions(service),
@@ -426,7 +480,12 @@ export function useCuratorModels(
   // BOTH inputs, not whichever is set first: a local/OpenAI-compatible server can now carry a key
   // as well as a URL, and keying on the key alone would serve a cached list from the previous
   // server when only the URL changed.
-  const credential = `${params.apiKey ?? ""} ${params.ollamaUrl ?? ""}`;
+  // `\u0000` as an escape, not a literal NUL byte in the source. Written literally it makes
+  // the file binary to every tool that reads it: `file` reports "data", and `grep` returns
+  // NOTHING for the whole file rather than erroring, so a search for any symbol in here comes
+  // back silently empty. The separator still has to be a character that cannot appear in a
+  // key or a URL, so the value stays the same.
+  const credential = `${params.apiKey ?? ""}\u0000${params.ollamaUrl ?? ""}`;
   return useQuery({
     queryKey: queryKeys.curatorModels(params.provider, fingerprint(credential)),
     queryFn: () =>
@@ -644,14 +703,33 @@ export function arrStatusInterval(
   status: ArrStatus | undefined,
 ): number | false {
   if (!status) return false;
+  // The fast pace is for a title that will change within seconds. On the Overseerr route nothing
+  // reports that, so it never earns one — the same reasoning that already excludes `queued`.
+  //
+  // Overseerr's status enum has no "downloading right now": PROCESSING means "approved and handed
+  // to the Arr", which is the resting state of an approved-but-unreleased film, and
+  // PARTIALLY_AVAILABLE is the resting state of every currently-airing series. Both read as
+  // `downloading` here — permanently — so this would poll for ever. And one poll costs far more
+  // than on the Arr route: `RadarrClient.status_by_tmdb` is a single request, while Overseerr has
+  // no bulk lookup and must be walked a page at a time across the whole library — 27 requests on a
+  // real 26,941-row instance, against Radarr's one. An unreachable
+  // instance still earns the recovery timer below, because that is the state that cannot clear
+  // itself.
+  // Tested against the live values, never `!== "off"`: the field is absent from a response
+  // predating it, and `undefined !== "off"` would silently stop the fast poll on every Arr install.
+  const viaSeerr =
+    status.overseerr === "ok" || status.overseerr === "unreachable";
   if (
+    !viaSeerr &&
     Object.values(status.statuses ?? {}).some(
       (title) => title === ARR_DOWNLOADING,
     )
   ) {
     return ARR_FAST_MS;
   }
-  return status.radarr === ARR_UNREACHABLE || status.sonarr === ARR_UNREACHABLE
+  return status.radarr === ARR_UNREACHABLE ||
+    status.sonarr === ARR_UNREACHABLE ||
+    status.overseerr === ARR_UNREACHABLE
     ? ARR_RECOVER_MS
     : false;
 }
@@ -703,6 +781,25 @@ export function useDismissNotification() {
   });
 }
 
+export function useWhatsNew() {
+  return useQuery({
+    queryKey: queryKeys.whatsNew,
+    queryFn: api.getWhatsNew,
+    // Once per page load. An upgrade restarts the server, and the app is reloaded to reach it.
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useMarkWhatsNewSeen() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (version: string) => api.markWhatsNewSeen(version),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: queryKeys.whatsNew }),
+  });
+}
+
 export function useVersion() {
   return useQuery({
     queryKey: queryKeys.version,
@@ -725,6 +822,41 @@ export function useReport(window: ReportWindow = "30") {
     queryFn: () => api.getReport(window),
     staleTime: 60_000,
   });
+}
+
+/**
+ * Has enough time passed for a per-person "picks watched" figure to mean anything?
+ *
+ * A pick only counts once it has had its full `matured_days` to be watched — the rule the dashboard's
+ * "Needs a look" card states when it holds its warnings back. Until the OLDEST pick on
+ * the server reaches that age, no pick anywhere has had its chance, so every person's rate is 0 and
+ * says nothing about them. `formatHitRate` renders those as "—".
+ *
+ * Install-wide rather than per person, because that is the granularity the data supports: the users
+ * payload carries a rate but no pick dates. It is also monotonic — once the first pick is old
+ * enough this is true for good — which the windowed `landing.rate === null` would not be, since a
+ * quiet fortnight can empty that cohort on a mature server and hide rates that do mean something.
+ *
+ * Defaults to FALSE while the report is loading, so a 0 is withheld until it is known to be real
+ * rather than shown and then retracted.
+ *
+ * The clock comes from `useLiveClock`, not from `Date.now()` in the body: `Date.now()` is impure,
+ * and calling it while rendering makes the answer depend on when React happens to re-render
+ * (`react-hooks/purity` rejects it outright). The idle cadence is a minute, which is ample for a
+ * threshold measured in days — and it means a page left open across the boundary starts showing
+ * real rates without a reload.
+ *
+ * @returns True once picks are old enough for a zero to be a finding rather than a formality.
+ */
+export function useHitRatesMatured(): boolean {
+  const report = useReport();
+  const now = useLiveClock(false);
+  const firstPick = report.data?.first_pick;
+  const maturedDays = report.data?.overall.landing.matured_days;
+  if (!firstPick || maturedDays === undefined) return false;
+  const first = Date.parse(firstPick);
+  if (Number.isNaN(first)) return false;
+  return now - first >= maturedDays * 86_400_000;
 }
 
 /**

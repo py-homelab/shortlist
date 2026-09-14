@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from shortlist.engine.clients.search import EXA_SEARCH_TYPES
 from shortlist.server.db.models import User
 from shortlist.server.settings_store import SettingsStore
 
@@ -228,20 +229,15 @@ class TestSettingsValidation:
         assert client.put("/api/settings", json={"values": {"row.size": 41}}).status_code == 422
         assert client.put("/api/settings", json={"values": {"row.size": 4}}).status_code == 422
 
-    def test_hub_anchor_shape_is_validated(self, client: TestClient):
-        # Bad shapes used to reach the engine and skip ordering silently.
-        bad = {"2": {"before": True}}  # missing 'anchor'
-        assert client.put("/api/settings", json={"values": {"rows.hub_anchor": bad}}).status_code == 422
-        assert (
-            client.put("/api/settings", json={"values": {"rows.hub_anchor": {"2": {"anchor": ""}}}}).status_code == 422
-        )
-        good = {"2": {"anchor": "New Series (Unwatched)", "before": False}}
-        assert client.put("/api/settings", json={"values": {"rows.hub_anchor": good}}).status_code == 200
-        # A 'top' entry is valid without an anchor.
-        assert (
-            client.put("/api/settings", json={"values": {"rows.hub_anchor": {"2": {"top": True}}}}).status_code == 200
-        )
-        assert client.put("/api/settings", json={"values": {"rows.hub_anchor": {}}}).status_code == 200  # clears it
+    def test_the_retired_hub_anchor_setting_is_no_longer_writable(self, client):
+        """`rows.hub_anchor` was a per-LIBRARY default for shelf placement. It was a second source of
+        truth for the same decision and disagreed with its own screen — "Wherever Plex puts them"
+        wrote no entry, and no entry anywhere meant *top of the shelf*, while the moment one library
+        was configured every other one silently meant *leave alone*. Placement now lives on the row,
+        so the key is refused rather than quietly accepted and ignored."""
+        entry = {"2": {"anchor": "New Series (Unwatched)", "before": False}}
+
+        assert client.put("/api/settings", json={"values": {"rows.hub_anchor": entry}}).status_code == 422
 
     def test_request_year_bounds_are_validated(self, client: TestClient):
         # Both ends of the request year window share the 0..2100 bound (0 = that end disabled).
@@ -522,11 +518,86 @@ class TestSettingsApi:
         assert no_key["ok"] is False and "Exa" in no_key["message"]
         # With a key, it pings Exa (mocked — no test may touch the network).
         client.put("/api/settings", json={"values": {"exa.apikey": "exa-secret-123"}})
-        monkeypatch.setattr("shortlist.engine.clients.search.ExaClient.ping", lambda self: "ok — 1 result")
+        # Capture the MODE the probe runs on, which is the one parameter this endpoint controls.
+        # It hardcoded "fast"; when that mode was dropped, `ExaClient` silently CLAMPED the unknown
+        # value to the default, so every auto-test on the Settings page quietly ran `deep-lite` at
+        # ~1.7x the price. Nothing failed — the only evidence was a log line — and this test passed
+        # throughout, because it asserted the message and never the argument.
+        seen: list[str] = []
+        monkeypatch.setattr(
+            "shortlist.engine.clients.search.ExaClient.ping",
+            lambda self: seen.append(self._search_type) or "Exa key works",
+        )
         ok = client.post("/api/settings/test/exa").json()
-        assert ok["ok"] is True and "ok" in ok["message"]
+        assert ok["ok"] is True and "Exa key works" in ok["message"]
+        assert seen == [EXA_SEARCH_TYPES[0]], "the probe must use the cheapest OFFERED mode, never a literal"
         # Both branches build their own dict, so both are checked against the response model.
         assert set(no_key) == {"ok", "message"} and set(ok) == {"ok", "message"}
+
+    def test_overseerr_test_connection_needs_both_halves_then_pings(self, client: TestClient, monkeypatch):
+        half = client.post("/api/settings/test/overseerr").json()
+        assert half["ok"] is False and "Overseerr" in half["message"]
+
+        client.put(
+            "/api/settings",
+            json={"values": {"requests.overseerr.url": "http://overseerr:5055", "requests.overseerr.apikey": "ok-123"}},
+        )
+        # The key is a secret like any other: encrypted at rest, redacted on read (rule 9).
+        assert client.get("/api/settings").json()["requests.overseerr.apikey"] == "•••••"
+
+        monkeypatch.setattr(
+            "shortlist.engine.clients.seerr.SeerrClient.ping", lambda self: "Connected to Overseerr as serverowner"
+        )
+        ok = client.post("/api/settings/test/overseerr").json()
+        assert ok["ok"] is True and "serverowner" in ok["message"]
+        assert set(half) == {"ok", "message"} and set(ok) == {"ok", "message"}
+
+    def test_overseerr_options_lists_the_accounts_and_says_when_it_cannot(self, client: TestClient, monkeypatch):
+        """The "Request as" dropdown's source. 409 before it is connected — the UI shows its own
+        "connect it first" panel on that, rather than an error it cannot act on."""
+        assert client.get("/api/settings/overseerr/options").status_code == 409
+
+        client.put(
+            "/api/settings",
+            json={"values": {"requests.overseerr.url": "http://overseerr:5055", "requests.overseerr.apikey": "ok-123"}},
+        )
+        users = [
+            {
+                "id": 1,
+                "name": "serverowner",
+                "auto_approve_movies": True,
+                "auto_approve_tv": True,
+                "is_plex_user": True,
+            },
+            {
+                "id": 4,
+                "name": "Shortlist",
+                "auto_approve_movies": False,
+                "auto_approve_tv": False,
+                "is_plex_user": False,
+            },
+        ]
+        monkeypatch.setattr("shortlist.engine.clients.seerr.SeerrClient.users", lambda self: users)
+        monkeypatch.setattr("shortlist.engine.clients.seerr.SeerrClient.whoami", lambda self: 1)
+        body = client.get("/api/settings/overseerr/options").json()
+        # `default_user_id` is what lets the screen resolve "Server default" to a real account and
+        # say whether it approves — without it the commonest setting is an unknown.
+        assert body == {"users": users, "default_user_id": 1}
+
+        def boom(self):
+            raise RuntimeError("Overseerr unreachable (ConnectError)")
+
+        monkeypatch.setattr("shortlist.engine.clients.seerr.SeerrClient.users", boom)
+        down = client.get("/api/settings/overseerr/options")
+        assert down.status_code == 502
+        # The card keeps its picker usable on this, so the message has to say what to do.
+        assert "Overseerr" in down.json()["detail"]
+
+    def test_the_request_target_only_accepts_a_known_route(self, client: TestClient):
+        """A typo here would silently route every request to the wrong app, or to none."""
+        assert client.put("/api/settings", json={"values": {"requests.target": "radarr"}}).status_code == 422
+        assert client.put("/api/settings", json={"values": {"requests.target": "overseerr"}}).status_code == 200
+        assert client.get("/api/settings").json()["requests.target"] == "overseerr"
 
     def test_the_removed_agregarr_connection_is_gone_from_every_surface(self, client: TestClient):
         """The Agregarr connection was removed. Three surfaces had to stop knowing about it, and a
@@ -687,9 +758,12 @@ class TestSettingsApi:
         no_url = client.post("/api/settings/test/searxng").json()
         assert no_url["ok"] is False and "SearXNG" in no_url["message"]
         client.put("/api/settings", json={"values": {"searxng.url": "http://searx:8080"}})
-        monkeypatch.setattr("shortlist.engine.clients.search.SearxngClient.ping", lambda self: "ok — 8 results")
+        monkeypatch.setattr(
+            "shortlist.engine.clients.search.SearxngClient.ping",
+            lambda self: "SearXNG responded — 8 results",
+        )
         ok = client.post("/api/settings/test/searxng").json()
-        assert ok["ok"] is True and "ok" in ok["message"]
+        assert ok["ok"] is True and "SearXNG responded" in ok["message"]
         assert set(no_url) == {"ok", "message"} and set(ok) == {"ok", "message"}
 
     def test_searxng_json_misconfiguration_reaches_the_owner_verbatim(self, client: TestClient, monkeypatch):
@@ -703,6 +777,87 @@ class TestSettingsApi:
         monkeypatch.setattr("shortlist.engine.clients.search.SearxngClient.ping", _raise)
         body = client.post("/api/settings/test/searxng").json()
         assert body["ok"] is False and "search.formats" in body["message"]
+
+    def test_notify_test_button_really_sends_down_the_3am_path(self, client: TestClient):
+        """The deliberate antidote to a Test that proves nothing.
+
+        A notifier whose Test succeeds while the nightly path is unwired is worse than no notifier: it
+        is one the owner now trusts. So this button does not ping — it builds an item and hands it to
+        the SAME `notify.deliver` a failed run reaches, with the same body builder, the same settings
+        read and the same HTTP call. The body is asserted here, not merely the fact of a call.
+        """
+        import json
+
+        import httpx
+        import respx
+
+        from shortlist.server.services import notify
+
+        webhook = "https://discord.com/api/webhooks/123/tok-en"
+
+        off = client.post("/api/settings/test/notify").json()
+        assert off["ok"] is False and "switched off" in off["message"]
+
+        client.put("/api/settings", json={"values": {"notify.webhook.enabled": True}})
+        blank = client.post("/api/settings/test/notify").json()
+        assert blank["ok"] is False and "address" in blank["message"]
+
+        client.put("/api/settings", json={"values": {"notify.webhook.url": webhook}})
+        # The address is a bearer token in a URL, so it is redacted on read like any other secret.
+        assert client.get("/api/settings").json()["notify.webhook.url"] == "•••••"
+
+        with respx.mock:
+            route = respx.post(webhook).mock(return_value=httpx.Response(204))
+            ok = client.post("/api/settings/test/notify").json()
+        assert ok["ok"] is True and "204" in ok["message"]
+        sent = json.loads(route.calls.last.request.content)
+        assert sent | {"sent_at": ""} == notify.webhook_body(notify.test_item(), now=None) | {"sent_at": ""}
+        assert sent["source"] == "shortlist" and sent["id"] == "notify-test"
+        assert set(off) == {"ok", "message"} and set(ok) == {"ok", "message"}
+
+    def test_the_webhook_address_is_ssrf_checked_but_the_sentinel_still_round_trips(self, client: TestClient):
+        """Both halves, because adding this key to `_FETCHED_URL_KEYS` creates a new combination.
+
+        It is the first setting that is BOTH a URL the server fetches AND a secret, so the redacted
+        sentinel now reaches the SSRF guard. Checked as an address it fails ("must start with http"),
+        which would 422 the entire settings save every time the owner pressed Save with a webhook
+        configured — a guard breaking the page it was added to protect.
+        """
+        blocked = client.put(
+            "/api/settings",
+            json={"values": {"notify.webhook.url": "http://169.254.169.254/latest/meta-data/"}},
+        )
+        assert blocked.status_code == 422
+
+        client.put("/api/settings", json={"values": {"notify.webhook.url": "https://hooks.example.com/abc"}})
+        # Saving again with the sentinel the UI echoes back must be accepted AND leave the value alone.
+        again = client.put(
+            "/api/settings",
+            json={"values": {"notify.webhook.url": "•••••", "notify.webhook.enabled": True}},
+        )
+        assert again.status_code == 200
+        with client.app.state.sessions() as session:
+            store = SettingsStore(session, client.app.state.secrets)
+            assert store.get("notify.webhook.url") == "https://hooks.example.com/abc"
+
+    def test_a_failing_notify_test_never_echoes_the_webhook_token(self, client: TestClient):
+        """`api/settings.py` ends its probe with `redact(...)`, which does NOT know this URL shape —
+        so the scrubbing has to happen where the exception is born, in `notify.deliver`. If it moves
+        or is removed, the owner's token is served straight back in an API response (rule 9).
+        """
+        import httpx
+        import respx
+
+        webhook = "https://discord.com/api/webhooks/123456789/S3cr3t-T0ken-Value"
+        client.put(
+            "/api/settings",
+            json={"values": {"notify.webhook.enabled": True, "notify.webhook.url": webhook}},
+        )
+        with respx.mock:
+            respx.post(webhook).mock(return_value=httpx.Response(403, text="nope"))
+            body = client.post("/api/settings/test/notify").json()
+        assert body["ok"] is False and "403" in body["message"]
+        assert webhook not in body["message"] and "S3cr3t-T0ken-Value" not in body["message"]
 
     def test_arr_options_serve_the_dropdowns_the_settings_form_needs(self, client: TestClient, monkeypatch):
         """Quality profiles and root folders, so a non-technical owner picks from a list instead of
@@ -787,7 +942,7 @@ class TestSettingsThatDoRealWork:
         col = MagicMock(title="✨ Movies Picked for You" + row_marker(acct))
         col.editTitle.side_effect = lambda new: renames.append((col.title, new))
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: [col] if label == f"shortlist_{uslug}" else []
         ctx = SimpleNamespace(plex=plex, config=EngineConfig())
         monkeypatch.setattr(client.app.state.run_service, "build_context", lambda **kw: ctx)

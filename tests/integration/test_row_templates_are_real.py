@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -40,6 +41,7 @@ import pytest
 from shortlist.engine.context import EngineContext
 from shortlist.engine.models import EngineConfig, MediaType, RowSpec
 from tests.conftest import MemorySnapshotStore, fake_media_item, make_profile, make_watched, plextv_user
+from tests.fakes.fake_plex import movie_title, show_title
 
 # The `client` fixture comes from tests/integration/conftest.py — the same app fixture the
 # `test_api_*.py` files use, so the two can never drift apart.
@@ -166,7 +168,24 @@ def engine_ctx(engine_config: EngineConfig, mock_plextv, mock_tmdb, mock_curator
     }
     plex.owned_collections.return_value = {}
     plex.find_owned_collections.return_value = []
-    plex.stored_label.side_effect = lambda collection, label: label.replace("shortlist", "Shortlist", 1)
+
+    def _stored_label(collection, label, *, extra=None):
+        """Leave the labels ON the collection, as the real client does.
+
+        Returning the casing without touching the object left every row tripping
+        `_apply_shortlist_label`'s "owner label is not in the labels Plex returned" guard — a state a
+        real PMS cannot produce, and the exact easier-than-real fake `test_delivery` avoids.
+        `extra` lands in the same write, because on a new row it does.
+        """
+        current = list(getattr(collection, "_labels", []))
+        for name in (label, extra):
+            if name is not None and not any(t.tag.lower() == name.lower() for t in current):
+                current.append(SimpleNamespace(tag=name.replace("shortlist", "Shortlist", 1)))
+        collection._labels = current
+        collection.labels = current
+        return label.replace("shortlist", "Shortlist", 1)
+
+    plex.stored_label.side_effect = _stored_label
     # (items, missing) — see PlexClient.fetch_items: a partial batch drops dead keys silently.
     plex.fetch_items.side_effect = lambda keys: ([fake_media_item(k, f"item{k}") for k in keys], [])
 
@@ -286,7 +305,7 @@ class TestEveryTemplateDelivers:
         engine_ctx.history_source.fetch.return_value = [
             *[make_watched("Seed", days_ago=i, rating_key=999) for i in range(1, 5)],
             # Already finished, and the LOWEST rated — only the rewatch preference can put it first.
-            make_watched("Movie 20", days_ago=8, tmdb_id=20),
+            make_watched(movie_title(20), days_ago=8, tmdb_id=20),
         ]
         engine_ctx.tmdb.suggestions.return_value = _movies(10, 20)
         engine_ctx.config.rows = [_spec("seen-it-already")]
@@ -306,7 +325,7 @@ class TestEveryTemplateDelivers:
         engine_ctx.config.max_seeds = 1
         engine_ctx.history_source.fetch.return_value = [
             *[make_watched("Seed", days_ago=i, rating_key=999) for i in range(1, 5)],
-            make_watched("Movie 20", days_ago=8, tmdb_id=20),  # finished
+            make_watched(movie_title(20), days_ago=8, tmdb_id=20),  # finished
         ]
         engine_ctx.tmdb.suggestions.return_value = _movies(10, 20)
         spec = _spec("fresh-finds")
@@ -396,7 +415,7 @@ class TestEveryTemplateDelivers:
             *_mixed_history(),
             # One episode of forty: STARTED, nowhere near finished, so only `unstarted_only` excludes it.
             make_watched(
-                "Show 30", days_ago=8, media_type=MediaType.SHOW, tmdb_id=30, viewed_leaf_count=1, leaf_count=40
+                show_title(30), days_ago=8, media_type=MediaType.SHOW, tmdb_id=30, viewed_leaf_count=1, leaf_count=40
             ),
         ]
         engine_ctx.tmdb.suggestions.side_effect = _both_types

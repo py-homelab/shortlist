@@ -3,6 +3,7 @@ import { useState } from "react";
 
 import { QueryBoundary, EmptyState } from "@/components/query-boundary";
 import { Segmented } from "@/components/segmented";
+import { TitlePoster } from "@/components/title-poster";
 import { WatchRating } from "@/components/user-detail/watch-rating";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -12,6 +13,7 @@ import { useBlockSeed, useUserWatched } from "@/lib/queries";
 import { blockedSeeds } from "@/lib/types";
 import type { User, WatchedPage, WatchedTitle } from "@/lib/types";
 import { useDebouncedValue } from "@/lib/use-debounced-value";
+import { libraryOptions } from "@/lib/watched-libraries";
 
 const PAGE = 25;
 
@@ -29,6 +31,18 @@ export function watchDepth(item: WatchedTitle): string | null {
     return `${item.viewed_leaf_count} of ${item.leaf_count} episodes`;
   }
   return item.watch_count > 1 ? `watched ${item.watch_count}×` : null;
+}
+
+/** Why an active filter found nothing, in the words of the filters that are on.
+ *
+ *  The combination worth naming is a type and a library that can't both be true — a TV library holds
+ *  no movies — which otherwise looks like a broken page rather than an impossible question.
+ */
+function emptyFilterHint(mediaType: string, library: string): string {
+  const type = mediaType === "movie" ? "movies" : "shows";
+  if (mediaType && library) return `No ${type} watched in ${library}.`;
+  if (library) return `Nothing watched in ${library} yet.`;
+  return "No watched title of that type yet.";
 }
 
 /** A user's watched set, searchable — read from Shortlist's cache rather than live from Plex.
@@ -52,9 +66,15 @@ export function WatchHistory({
 }) {
   const [search, setSearch] = useState("");
   const [mediaType, setMediaType] = useState<"" | "movie" | "show">("");
+  const [library, setLibrary] = useState("");
   const [limit, setLimit] = useState(PAGE);
   const debounced = useDebouncedValue(search, 250);
-  const query = useUserWatched(userId, { q: debounced, mediaType, limit });
+  const query = useUserWatched(userId, {
+    q: debounced,
+    mediaType,
+    library,
+    limit,
+  });
   const block = useBlockSeed(userId);
   const alreadyBlocked = new Set(
     blockedSeeds(user?.prefs).map((seed) => seed.tmdb_id),
@@ -66,6 +86,14 @@ export function WatchHistory({
     setLimit(PAGE);
     next();
   };
+
+  // Read off the last page rather than a second request: the response carries every library this
+  // person has watched in, unnarrowed by the current filter.
+  const libraries = libraryOptions(
+    query.data?.libraries ?? [],
+    mediaType,
+    library,
+  );
 
   return (
     <div className="space-y-4">
@@ -84,16 +112,44 @@ export function WatchHistory({
             onChange={(e) => reset(() => setSearch(e.target.value))}
           />
         </div>
-        <Segmented<"" | "movie" | "show">
-          value={mediaType}
-          ariaLabel="Filter by type"
-          options={[
-            { value: "", label: "All" },
-            { value: "movie", label: "Movies" },
-            { value: "show", label: "Shows" },
-          ]}
-          onChange={(value) => reset(() => setMediaType(value))}
-        />
+        {/* Wraps rather than overflows: a phone at 320px cannot hold the type buttons and the
+            library dropdown on one line, and a toolbar that scrolls sideways is worse than one that
+            takes two rows. */}
+        <div className="flex flex-wrap items-center gap-2">
+          <Segmented<"" | "movie" | "show">
+            value={mediaType}
+            ariaLabel="Filter by type"
+            options={[
+              { value: "", label: "All" },
+              { value: "movie", label: "Movies" },
+              { value: "show", label: "Shows" },
+            ]}
+            onChange={(value) => reset(() => setMediaType(value))}
+          />
+          {/* A dropdown rather than more buttons: library counts vary from two to a dozen between
+              servers, and a segmented row of a dozen wrecks the toolbar. Absent entirely on a server
+              where it would only repeat the Movies/Shows buttons — see `libraryOptions`. */}
+          {libraries.length > 1 && (
+            <select
+              value={library}
+              onChange={(e) => reset(() => setLibrary(e.target.value))}
+              aria-label="Filter by library"
+              /* A native select sizes itself to its WIDEST option, and a Plex library can be called
+                 anything — "4K HDR Remux Collection — Director's Cuts and Extended Editions"
+                 measured 470px, which ran 212px off a 320px phone. Capped and truncated instead;
+                 the open dropdown is drawn by the browser outside the page box, so full names stay
+                 readable while choosing. `min-w-0` is what lets it shrink inside the flex row. */
+              className="h-9 min-w-0 max-w-[11rem] truncate rounded-md border bg-background px-2 text-sm"
+            >
+              <option value="">All libraries</option>
+              {libraries.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
       </div>
 
       <QueryBoundary
@@ -101,13 +157,13 @@ export function WatchHistory({
         skeleton={<Skeleton className="h-40 w-full" />}
         isEmpty={(page) => page.items.length === 0}
         empty={
-          debounced || mediaType ? (
+          debounced || mediaType || library ? (
             <EmptyState
               title="Nothing matches that"
               hint={
                 debounced
                   ? `No watched title contains “${debounced}”. Their history may not have synced yet — check the count below the list.`
-                  : "No watched title of that type yet."
+                  : emptyFilterHint(mediaType, library)
               }
             />
           ) : (
@@ -124,56 +180,95 @@ export function WatchHistory({
               {page.items.map((item, i) => {
                 const depth = watchDepth(item);
                 return (
-                  <li
-                    key={i}
-                    className="flex items-baseline justify-between gap-3 py-2"
-                  >
-                    <span className="min-w-0 text-sm">
-                      <span className="font-medium">{item.title}</span>
-                      {item.year ? (
-                        <span className="text-muted-foreground">
-                          {" "}
-                          ({item.year})
-                        </span>
-                      ) : null}
-                    </span>
-                    <span className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-                      {item.media_type === "show" ? "Show" : "Movie"}
-                      {depth ? ` · ${depth}` : ""} · {timeAgo(item.watched_at)}
-                      <WatchRating rating={item.user_rating} page={page} />
-                      {/* No tmdb:// GUID means nothing a block could key on, so no button rather than one
-                          that fails. */}
-                      {item.tmdb_id !== null &&
-                        (alreadyBlocked.has(item.tmdb_id) ? (
-                          <span
-                            className="inline-flex items-center gap-1 text-muted-foreground/70"
-                            title="Already blocked — it stays in their history but no longer shapes their picks"
-                          >
-                            <Ban className="h-3 w-3" aria-hidden />
-                            blocked
+                  <li key={i} className="flex items-center gap-3 py-2">
+                    {/* The artwork is how you recognise a title you only half-remember watching,
+                        which is the question this list exists to answer. Smaller than the 58x87 the
+                        pick lists use: this page shows 25 rows at once, and a full-size tile turns
+                        that into three screens of scrolling for the same information.
+
+                        `items-center` rather than the baseline this row used before — with a tile in
+                        it there is no shared baseline to align to, and the meta column would hang off
+                        the top of the poster. */}
+                    <TitlePoster
+                      ratingKey={item.rating_key}
+                      className="h-[45px] w-[30px] sm:h-[54px] sm:w-[36px]"
+                    />
+                    {/* Title over meta below `sm`, side by side above it. The meta column cannot
+                        shrink — it holds a Block button — so on a 320px screen the poster's 42px
+                        pushed it 2px past the viewport (measured) and the whole page scrolled
+                        sideways. Stacking is what buys those pixels back without shrinking the
+                        artwork to something you cannot recognise a film by. */}
+                    <div className="flex min-w-0 flex-1 flex-col gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+                      <span className="min-w-0 text-sm">
+                        <span className="font-medium">{item.title}</span>
+                        {item.year ? (
+                          <span className="text-muted-foreground">
+                            {" "}
+                            ({item.year})
                           </span>
-                        ) : (
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-6 px-1.5 text-xs text-muted-foreground hover:text-foreground"
-                            disabled={block.isPending}
-                            title={`Stop "${item.title}" shaping their picks`}
-                            aria-label={`Block ${item.title} — stop it shaping their picks`}
-                            onClick={() =>
-                              block.mutate({
-                                tmdbId: item.tmdb_id as number,
-                                title: item.title,
-                                mediaType: item.media_type,
-                                year: item.year ?? undefined,
-                              })
-                            }
+                        ) : null}
+                        {/* Which Plex libraries hold it — on EVERY row, not only where it
+                            disambiguates. Two tags is a title stored twice: this row used to be two
+                            rows, each with its own Block button that did the same thing. Absent only
+                            for a watch cached before the name was recorded; the next sync fills that
+                            in, and no tag is better than a guessed one.
+
+                            `flex-wrap` because a title can sit in many libraries (nine, on a server
+                            built to test it) and the tags must wrap inside the row rather than push
+                            the page sideways. */}
+                        {/* `align-middle`, not a length: the tag is bigger than the text beside it, so
+                            aligning their BASELINES leaves it floating ~5px high (measured). Centring
+                            the box lands within 1.5px of the title's optical centre and stays right if
+                            the tag's padding or font size ever change — a tuned `align-[-0.4em]` hits
+                            0.3px today and drifts the moment either does. */}
+                        {item.libraries.map((name) => (
+                          <span
+                            key={name}
+                            className="ml-1.5 inline-block max-w-full truncate rounded border border-border bg-elevated px-1.5 py-px align-middle text-[0.7rem] leading-4 text-muted-foreground"
+                            title={name}
                           >
-                            <Ban className="h-3 w-3" aria-hidden />
-                            Block
-                          </Button>
+                            {name}
+                          </span>
                         ))}
-                    </span>
+                      </span>
+                      <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground sm:shrink-0">
+                        {item.media_type === "show" ? "Show" : "Movie"}
+                        {depth ? ` · ${depth}` : ""} · {timeAgo(item.watched_at)}
+                        <WatchRating rating={item.user_rating} page={page} />
+                        {/* No tmdb:// GUID means nothing a block could key on, so no button rather than one
+                            that fails. */}
+                        {item.tmdb_id !== null &&
+                          (alreadyBlocked.has(item.tmdb_id) ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-muted-foreground/70"
+                              title="Already blocked — it stays in their history but no longer shapes their picks"
+                            >
+                              <Ban className="h-3 w-3" aria-hidden />
+                              blocked
+                            </span>
+                          ) : (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 px-1.5 text-xs text-muted-foreground hover:text-foreground"
+                              disabled={block.isPending}
+                              title={`Stop "${item.title}" shaping their picks`}
+                              aria-label={`Block ${item.title} — stop it shaping their picks`}
+                              onClick={() =>
+                                block.mutate({
+                                  tmdbId: item.tmdb_id as number,
+                                  title: item.title,
+                                  mediaType: item.media_type,
+                                  year: item.year ?? undefined,
+                                })
+                              }
+                            >
+                              <Ban className="h-3 w-3" aria-hidden />
+                              Block
+                            </Button>
+                          ))}
+                      </span>
+                    </div>
                   </li>
                 );
               })}
@@ -205,10 +300,14 @@ function SyncFooter({ page, shown }: { page: WatchedPage; shown: number }) {
   return (
     <div className="space-y-1.5 border-t pt-3 text-xs text-muted-foreground">
       <p>
-        Showing {shown} of {page.total}
+        Showing {shown} of {page.total} titles
+        {/* "library copies", not "titles": this is a sum of per-library row counts, so a server
+            holding anything twice makes it larger than the total above. Two numbers that look like
+            the same number and disagree read as a bug. */}
         {page.synced_titles
-          ? ` · ${page.synced_titles} titles synced`
-          : ""} ·{" "}
+          ? ` · ${page.synced_titles} library copies synced`
+          : ""}{" "}
+        ·{" "}
         {page.last_full_sync_at ? (
           <>last full sync {timeAgo(page.last_full_sync_at)}</>
         ) : (

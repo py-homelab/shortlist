@@ -8,8 +8,10 @@ modules from importing each other.
 from __future__ import annotations
 
 import threading
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from loguru import logger
 
@@ -22,7 +24,7 @@ from shortlist.engine.clients.tmdb import Cache, NullCache, TmdbClient
 from shortlist.engine.clients.trakt import TraktClient
 from shortlist.engine.curator import Curator
 from shortlist.engine.history import HistorySource
-from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport
+from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport, WrittenDetails
 from shortlist.engine.privacy import SnapshotStore
 
 
@@ -60,6 +62,9 @@ class EngineContext:
     # Empty for direct engine runs and for rows delivered before the ledger existed — the count-based
     # fallback still covers those.
     delivered_keys: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    # Same key -> what Shortlist last wrote to that collection's summary and sort title. Empty (direct
+    # engine runs, rows delivered before issue #120) only means clearing a field reverts nothing.
+    delivered_details: dict[tuple[str, str, str], WrittenDetails] = field(default_factory=dict)
     # Build a PMS client that sees the server AS one user, or None when no token can be had. Used to
     # CHECK what an account Plex refuses a hide-list for can actually see, rather than assume. None on
     # direct engine runs, where the check is simply skipped.
@@ -92,6 +97,12 @@ class EngineContext:
     # Every library rows may be delivered to (all movie + show sections), for resolving a row's
     # library_keys to real sections. Built by _build_indexes each run.
     delivery_sections: list = field(default_factory=list)
+    # How many titles in the libraries THIS run can deliver to carry each genre — the population a
+    # person's own genre mix is compared against (`candidates.genre_avoidance_profile`). Tallied
+    # during the index scan that already happens, because a real PMS serves <Genre> inline in a
+    # section listing; it costs no extra request. Empty when genre avoidance is off, so nothing is
+    # computed for an owner who never asked for it.
+    library_genre_counts: Counter[str] = field(default_factory=Counter)
     # plex account id -> the slug Shortlist assigned that account, for EVERY user it knows (not just
     # tonight's). This is how "whose row is this?" is answered. It cannot be answered from a name:
     # people rename themselves, and two display names can slugify to the same string — either
@@ -149,6 +160,11 @@ class EngineContext:
     # Day number of this run (date.toordinal()), the phase for refresh rotation so a row shifts
     # day to day but is reproducible within a day. Set at the start of run(); 0 disables rotation.
     run_day: int = 0
+    # When this run started, the clock the idle hold measures against (`rows._held_for_idle`): is
+    # this row older than its ceiling, and has its owner watched anything since it was built. Set at
+    # the start of run() beside `run_day`; None on direct engine calls, which — exactly like
+    # `run_day = 0` — means "never hold", so a library caller keeps the plain cadence.
+    run_at: datetime | None = None
     # How many users to process concurrently. 1 = fully sequential (the safe engine/test default).
     # The server sets this from `run.concurrency`. Only the READ + LLM work overlaps; every Plex and
     # plex.tv write is serialized by ``write_lock``, so the leak-safe ordering is preserved exactly.

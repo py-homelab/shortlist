@@ -369,6 +369,27 @@ export function rowSummary(group: RunRowGroup): string {
   return parts.join(" · ");
 }
 
+/** How long a row took, for its card header — or null when there is no honest number to show.
+ *
+ *  A shared row is one build and carries its own time. A per-person row is many small builds, and its
+ *  card used to show no time at all, so three row cards on one run read as two with a figure missing.
+ *  Its time is each person's own work on the row added up — the same `duration_ms - blocked_ms` their
+ *  line in the person list shows — which at a run's concurrency is more than the wall clock, so the
+ *  card labels it as a total. Null while anyone is still pending (a partial sum reads as final) and on
+ *  a run that never measured per-row cost. */
+export function rowTimeMs(group: RunRowGroup): number | null {
+  if (group.kind === "shared") return group.shared?.duration_ms || null;
+  if (group.pending > 0) return null;
+  let total = 0;
+  let measured = false;
+  for (const person of group.people) {
+    if (!person.cost || person.built === false) continue;
+    total += person.cost.duration_ms - person.cost.blocked_ms;
+    measured = true;
+  }
+  return measured ? total : null;
+}
+
 /** "Movies · TV Shows", or "" when the row delivered nothing to name. */
 export function libraryLabel(group: RunRowGroup): string {
   return group.libraries.join(" · ");

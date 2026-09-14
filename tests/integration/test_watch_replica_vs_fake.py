@@ -25,7 +25,7 @@ import uvicorn
 from shortlist.engine.clients.plex_pms import PlexClient
 from shortlist.engine.models import MediaType
 from shortlist.engine.watch_replica import build_plan
-from tests.fakes.fake_plex import FakeMovie, FakePlexState, make_fake_plex, seed_state
+from tests.fakes.fake_plex import FakeHistoryEntry, FakeMovie, FakePlexState, make_fake_plex, seed_state
 
 OWNER_TOKEN = "owner-token"
 TARGET_TOKEN = "server-203"  # the Home canary; `watched_account_id` maps it to account 203
@@ -92,6 +92,80 @@ def pms():
 
 def _sections(state: FakePlexState) -> list[tuple[str, MediaType]]:
     return [(str(s.key), MediaType.MOVIE if s.type == "movie" else MediaType.SHOW) for s in state.sections.values()]
+
+
+class TestTheShowReadSeesWhatUnwatchedZeroHides:
+    """Issue #108, end to end over real HTTP: a series `?type=2&unwatched=0` cannot see.
+
+    That query filters on the show's own watch-state row, which marking a series or a season never
+    establishes — so a finished series is absent from it while its episode counts are correct.
+    `viewedLeafCount!=0` filters on the counts and returns it. Measured on two independent servers:
+    533 shows against 491, with 20 shows missing from `unwatched=0` entirely.
+
+    The fake makes the two queries DISAGREE (`FakePlexState.invisible_to_show_read`) because
+    otherwise they answer from the same set, the distinction is unrepresentable, and this test would
+    pass against either query — the rule that a fake must be no easier than the real server.
+    """
+
+    def test_a_show_hidden_from_unwatched_0_still_comes_back(self, pms):
+        state, client, _episodes = pms
+        state.history.append(FakeHistoryEntry(account_id=1, rating_key=SHOW_KEY, viewed_at=1_700_000_000))
+        state.watch_episodes(1, SHOW_KEY, 4)  # four episodes in
+        section = state.section_of(SHOW_KEY)
+
+        before = client.watched_titles(str(section.key), MediaType.SHOW, OWNER_TOKEN)
+        assert SHOW_KEY in {i.rating_key for i in before.items}, "precondition: normally visible"
+
+        # Now Plex stops returning it from `unwatched=0`, exactly as it does for a series marked
+        # watched rather than played. The read asks `viewedLeafCount!=0` instead, so it still lands.
+        state.invisible_to_show_read.add(SHOW_KEY)
+        after = client.watched_titles(str(section.key), MediaType.SHOW, OWNER_TOKEN)
+
+        still_there = {i.rating_key: i for i in after.items}
+        assert SHOW_KEY in still_there, "the show vanished with the query that hides it"
+        assert still_there[SHOW_KEY].viewed_leaf_count == 4, "its watched episode count was lost"
+
+    def test_a_show_with_nothing_watched_is_not_returned(self, pms):
+        """`viewedLeafCount!=0` means what it says — and it is applied client-side too, so a server
+        that ignores the filter and answers with the whole library still yields the same set."""
+        state, client, _episodes = pms
+        state.history.append(FakeHistoryEntry(account_id=1, rating_key=SHOW_KEY, viewed_at=1_700_000_000))
+        state.watch_episodes(1, SHOW_KEY, 0)  # watched nothing of it
+        section = state.section_of(SHOW_KEY)
+
+        read = client.watched_titles(str(section.key), MediaType.SHOW, OWNER_TOKEN)
+
+        assert SHOW_KEY not in {i.rating_key for i in read.items}
+
+    def test_a_show_the_read_cannot_date_takes_its_newest_EPISODE_date(self, pms):
+        """The other half of the same Plex behaviour, end to end over real HTTP.
+
+        A show marked watched carries no `lastViewedAt` of its own — `viewedLeafCount` is right and
+        the date is simply absent, which `_watched_item` has to read as 1970. That is not cosmetic: a
+        1970 date weighs zero as a seed, so the show never seeds again, and the effectiveness report
+        showed a series finished minutes ago as "finished 20697d ago" (reported on #108). The repair
+        reads the library's episodes and takes the newest.
+
+        The fake omits the attribute for shows in `undated_in_show_read`, because otherwise every
+        watched show it serves is dated, the undated shape is unrepresentable, and the repair is dead
+        code in every full-stack test.
+        """
+        state, client, episodes = pms
+        state.history.append(FakeHistoryEntry(account_id=1, rating_key=SHOW_KEY, viewed_at=1_700_000_000))
+        # Episodes 2 and 7, deliberately not the first or the last: the repair must take the NEWEST
+        # of the watched episodes, not whichever the walk happened to see first or last.
+        state.leaf(1, episodes[1])[0] = 1
+        state.leaf(1, episodes[6])[0] = 1
+        state.watch_episodes(1, SHOW_KEY, 2)
+        section = state.section_of(SHOW_KEY)
+
+        state.undated_in_show_read.add(SHOW_KEY)
+        read = client.watched_titles(str(section.key), MediaType.SHOW, OWNER_TOKEN)
+
+        found = {i.rating_key: i for i in read.items}[SHOW_KEY]
+        assert found.watched_at.year > 1970, "the show kept the epoch — the episode date repair did not run"
+        newest = max(state.section_of(SHOW_KEY).items[key].added_at for key in (episodes[1], episodes[6]))
+        assert int(found.watched_at.timestamp()) == newest
 
 
 class TestTheLeafReadsOverRealHttp:

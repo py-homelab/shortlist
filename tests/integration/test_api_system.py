@@ -2,15 +2,68 @@
 
 from __future__ import annotations
 
+import contextlib
+from typing import ClassVar
+
 import pytest
 from fastapi.testclient import TestClient
 
 from shortlist.server.api.settings import REDACTED_PLACEHOLDER
 from shortlist.server.auth import SESSION_COOKIE
+from shortlist.server.db.models import Setting
+from shortlist.server.main import create_app
 from shortlist.server.settings_store import SettingsStore
 from tests.conftest import plextv_user
 
 pytestmark = pytest.mark.integration
+
+
+_HUB_IDS = iter(range(500, 999))
+
+
+def _builtin(title: str, identifier: str, *, promoted: bool = True):
+    """One of Plex's OWN hubs, as `managedHubs()` really returns it.
+
+    Carries the three promotion flags, because plexapi's `ManagedHub._loadData` always sets them —
+    `utils.cast(bool, data.attrib.get(flag, False))` — so a real built-in hub object never lacks
+    them, whatever the XML said. A flagless `SimpleNamespace` stood here instead and is the shape
+    that hid a live bug: every built-in read as promoted-nowhere, so the rule "judge collections only"
+    looked necessary, and an owner could pick a switched-off built-in as an anchor the engine would
+    then silently never place (testing rule: the fake must be no easier than the real server).
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        title=title,
+        identifier=identifier,
+        promotedToSharedHome=promoted,
+        promotedToOwnHome=False,
+        promotedToRecommended=False,
+    )
+
+
+def _hub(title: str, *, promoted: bool = True, recommended: bool = False):
+    """A COLLECTION's managed hub, as `managedHubs()` really returns one.
+
+    Two things a lazier fake would leave out, both of which the endpoint now reads (testing rule: the
+    fake must be no easier than the real server). The three promotion flags — without them it reads as
+    promoted-nowhere, the very state being told apart. And an identifier in the `custom.collection`
+    FAMILY, which is how a collection's hub is told from one of Plex's built-ins; a built-in is
+    modelled by a plain `SimpleNamespace(title=...)` carrying an identifier of another kind. The exact
+    string below is one arbitrary member of that family — see `is_collection_hub`, which matches the
+    family precisely because the recorded shapes disagree on everything after it.
+
+    Default promoted-on-shared-Home, because that is what a collection on the shelf looks like.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        title=title,
+        identifier=f"custom.collection.1.{next(_HUB_IDS)}",
+        promotedToSharedHome=promoted,
+        promotedToOwnHome=False,
+        promotedToRecommended=recommended,
+    )
 
 
 class TestLogsApi:
@@ -204,6 +257,122 @@ class TestNotifications:
         assert "SUPERSECRETTOKEN" not in text  # ...but the token itself is never in the bundle
 
 
+class TestWhatsNew:
+    """The dialog that shows an owner the release notes once after an upgrade, and never again once closed."""
+
+    RELEASES: ClassVar[list[dict]] = [
+        {
+            "version": "1.8.0",
+            "url": "https://github.com/x/releases/tag/v1.8.0",
+            "published_at": "2026-08-26",
+            "notes": "## B",
+        },
+        {
+            "version": "1.7.0",
+            "url": "https://github.com/x/releases/tag/v1.7.0",
+            "published_at": "2026-08-18",
+            "notes": "## A",
+        },
+    ]
+
+    @pytest.fixture(autouse=True)
+    def _releases(self, monkeypatch):
+        import shortlist
+        import shortlist.server.whats_new as whats_new
+
+        monkeypatch.setattr(shortlist, "__version__", "1.8.0")
+        monkeypatch.setattr(whats_new, "published_releases", lambda: self.RELEASES)
+
+    @staticmethod
+    def _upgraded_from(client: TestClient, version: str) -> None:
+        from shortlist.server.whats_new import SEEN_KEY
+
+        with client.app.state.sessions() as session:
+            SettingsStore(session).set(SEEN_KEY, version)
+            session.commit()
+
+    def test_a_fresh_install_has_nothing_to_announce_even_once_setup_is_finished(self, client: TestClient):
+        """The client fixture is a brand-new config dir, so its first boot saw an unfinished wizard.
+        Finishing setup afterwards must not turn that into "upgraded from an unknown version"."""
+        assert client.get("/api/notifications/whats-new").json() == {"version": "1.8.0", "releases": []}
+
+        with client.app.state.sessions() as session:
+            SettingsStore(session).set("setup.completed", True)
+            session.commit()
+        with self._restarted(client) as restarted:
+            assert restarted.get("/api/notifications/whats-new").json()["releases"] == []
+
+    def test_an_upgrade_serves_the_notes_for_every_release_since_the_last_one_read(self, client: TestClient):
+        self._upgraded_from(client, "1.6.1")
+
+        body = client.get("/api/notifications/whats-new").json()
+
+        assert body == {"version": "1.8.0", "releases": self.RELEASES}
+
+    def test_an_install_set_up_before_this_existed_is_shown_the_running_version_after_a_restart(
+        self, client: TestClient
+    ):
+        """The first boot of the upgraded build on a server whose setup was long finished."""
+        from shortlist.server.whats_new import SEEN_KEY
+
+        with client.app.state.sessions() as session:
+            store = SettingsStore(session)
+            store.set("setup.completed", True)
+            session.query(Setting).filter(Setting.key == SEEN_KEY).delete()
+            session.commit()
+
+        with self._restarted(client) as restarted:
+            releases = restarted.get("/api/notifications/whats-new").json()["releases"]
+
+        assert [r["version"] for r in releases] == ["1.8.0"]
+
+    def test_closing_it_stays_closed_after_a_refresh_and_a_restart(self, client: TestClient):
+        self._upgraded_from(client, "1.6.1")
+
+        assert client.post("/api/notifications/whats-new/seen", json={"version": "1.8.0"}).json() == {"ok": True}
+
+        assert client.get("/api/notifications/whats-new").json()["releases"] == []
+        with self._restarted(client) as restarted:
+            assert restarted.get("/api/notifications/whats-new").json()["releases"] == []
+
+    def test_the_next_upgrade_announces_itself_again(self, client: TestClient, monkeypatch):
+        import shortlist
+
+        monkeypatch.setattr(shortlist, "__version__", "1.7.0")
+        self._upgraded_from(client, "1.6.1")
+        client.post("/api/notifications/whats-new/seen", json={"version": "1.7.0"})
+        assert client.get("/api/notifications/whats-new").json()["releases"] == []
+
+        monkeypatch.setattr(shortlist, "__version__", "1.8.0")
+
+        with self._restarted(client) as restarted:
+            releases = restarted.get("/api/notifications/whats-new").json()["releases"]
+
+        assert [r["version"] for r in releases] == ["1.8.0"]
+
+    def test_a_version_newer_than_the_running_build_is_refused(self, client: TestClient):
+        self._upgraded_from(client, "1.6.1")
+
+        response = client.post("/api/notifications/whats-new/seen", json={"version": "9.9.9"})
+
+        assert response.status_code == 422
+        assert len(client.get("/api/notifications/whats-new").json()["releases"]) == 2
+
+    def test_whats_new_is_owner_only(self, client: TestClient):
+        client.cookies.delete(SESSION_COOKIE)
+
+        assert client.get("/api/notifications/whats-new").status_code == 401
+        assert client.post("/api/notifications/whats-new/seen", json={"version": "1.8.0"}).status_code == 401
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _restarted(client: TestClient):
+        """A second process on the same config dir — the owner's session cookie still signs in."""
+        app = create_app(config_dir=client.app.state.config_dir)
+        with TestClient(app, cookies=dict(client.cookies), headers=dict(client.headers)) as restarted:
+            yield restarted
+
+
 class TestSystemResponseShapes:
     """The endpoints now declare Pydantic response models, and a model that misses a key DROPS it
     from the payload — silently, in production, blanking whatever read it. So each key set is
@@ -328,8 +497,8 @@ class TestSystemResponseShapes:
             title="Movies",
             type="movie",
             managedHubs=lambda: [
-                SimpleNamespace(title="Picked for You" + row_marker(100)),
-                SimpleNamespace(title="New Series (Unwatched)"),
+                _hub("Picked for You" + row_marker(100)),
+                _hub("New Series (Unwatched)"),
             ],
         )
 
@@ -344,8 +513,8 @@ class TestSystemResponseShapes:
 
         body = client.get("/api/system/libraries/1/collections").json()
 
-        assert body == [{"title": "New Series (Unwatched)"}]
-        assert set(body[0]) == {"title"}
+        assert body == [{"title": "New Series (Unwatched)", "on_shelf": True}]
+        assert set(body[0]) == {"title", "on_shelf"}
 
     def test_library_collections_excludes_our_rows_even_when_plex_reports_no_labels(
         self, client: TestClient, monkeypatch
@@ -362,10 +531,13 @@ class TestSystemResponseShapes:
             key=1,
             title="Movies",
             type="movie",
-            collections=lambda: [SimpleNamespace(title="Picked for You" + row_marker(100), labels=[])],
-            managedHubs=lambda: [
-                SimpleNamespace(title="Picked for You" + row_marker(100)),
+            collections=lambda: [
+                SimpleNamespace(title="Picked for You" + row_marker(100), labels=[]),
                 SimpleNamespace(title="Kometa Genre"),
+            ],
+            managedHubs=lambda: [
+                _hub("Picked for You" + row_marker(100)),
+                _hub("Kometa Genre"),
             ],
         )
 
@@ -378,7 +550,71 @@ class TestSystemResponseShapes:
 
         monkeypatch.setattr("shortlist.engine.clients.plex_pms.PlexClient", FakePlex)
 
-        assert client.get("/api/system/libraries/1/collections").json() == [{"title": "Kometa Genre"}]
+        assert client.get("/api/system/libraries/1/collections").json() == [{"title": "Kometa Genre", "on_shelf": True}]
+
+    def test_library_collections_flags_a_collection_with_no_shelf_position(self, client: TestClient, monkeypatch):
+        """Issue #106. `managedHubs()` lists every hub the library CAN manage, promoted or not, so the
+        picker was offering collections with no position on the shelf — and the engine followed one
+        and buried the row underneath every standard Plex hub. The flag is what lets the editor say
+        so; it is NOT filtered out here, because an owner whose saved anchor vanished from the list
+        cannot tell "not on the shelf" from "deleted".
+
+        The matrix that matters is COLLECTION vs BUILT-IN x on-shelf vs off, told apart by the hub's
+        own `custom.collection.*` identifier rather than by title — titles collide, and a title check
+        would refuse a real anchor.
+
+        A built-in used to be exempt from the judgement entirely, on the reasoning that the engine
+        never refuses one. The engine now does, because accepting one placed NOTHING: `place_rows`
+        builds its backbone from promoted hubs only, so a row spliced onto a switched-off built-in
+        dropped out of the arrangement and the pass answered "already in place" every night in
+        silence. Both sides read `can_anchor`, so both say the same thing.
+        """
+        from types import SimpleNamespace
+
+        self._connect_plex(client)
+        section = SimpleNamespace(
+            key=1,
+            title="Movies",
+            type="movie",
+            managedHubs=lambda: [
+                # A built-in Plex hub the owner has left ON, with an identifier of another family.
+                _builtin("Recently Added", "home.television.recentlyadded"),
+                # ...and one they switched OFF in Manage Recommendations (recorded: it reads with all
+                # three flags at 0). It occupies no position, so it is no anchor.
+                _builtin("By Genre", "movie.genre", promoted=False),
+                _hub("New Series (Unwatched)"),
+                _hub("Archive 2019", promoted=False),
+                # Any ONE flag is a real, visible position — a Kometa anchor is usually this one.
+                _hub("Kometa Genre", promoted=False, recommended=True),
+                # TITLE COLLISION, both orders. The engine takes the first hub with this title that is
+                # usable, so the answer must be OR-ed across all of them rather than first-hub-wins —
+                # otherwise the API greys out an anchor the engine places happily. "Top Rated" is a
+                # stock Plex hub and a stock Kometa collection; "Trending" is the same, reversed.
+                _builtin("Top Rated", "home.movies.toprated"),
+                _hub("Top Rated", promoted=False),
+                _hub("Trending", promoted=False),
+                _builtin("Trending", "home.movies.trending"),
+            ],
+        )
+
+        class FakePlex:
+            def __init__(self, *a, **k):
+                pass
+
+            def sections(self):
+                return [section]
+
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.PlexClient", FakePlex)
+
+        assert client.get("/api/system/libraries/1/collections").json() == [
+            {"title": "Recently Added", "on_shelf": True},
+            {"title": "By Genre", "on_shelf": False},
+            {"title": "New Series (Unwatched)", "on_shelf": True},
+            {"title": "Archive 2019", "on_shelf": False},
+            {"title": "Kometa Genre", "on_shelf": True},
+            {"title": "Top Rated", "on_shelf": True},
+            {"title": "Trending", "on_shelf": True},
+        ]
 
     def test_the_library_list_is_read_from_plex_once_not_once_per_page_load(self, client: TestClient, monkeypatch):
         """`/libraries` backs every row card, the library picker and the placement settings, and each
@@ -726,3 +962,293 @@ class TestSseEventPayloadsAreDocumented:
         assert any("done" in f for f in frames), "the per-user restore line carries the progress count"
         for data in frames:
             assert set(UninstallProgressEvent.model_validate(data).model_dump(exclude_unset=True)) == set(data), data
+
+
+class TestARestoreIsAppliedByTheRestartItAsksFor:
+    """The endpoint used to promise "Restart the container to pick up the restored database".
+
+    It used to copy the backup over `shortlist.db` and unlink the WAL while the running app still held
+    pooled connections to both. Those connections kept writing to the deleted WAL, and closing them on
+    the way out checkpointed it straight back over the restored file: the restart the owner was told to
+    do UNDID the restore (measured: every row written since the backup came back), and on a database that
+    had changed more, left pages of one database spliced into another. The restore now waits for the
+    boot, where nothing has the database open yet.
+    """
+
+    @staticmethod
+    def _boot(config_dir):
+        from contextlib import contextmanager
+
+        from shortlist.server.auth import CSRF_HEADER, session_serializer
+        from shortlist.server.db.models import Server
+
+        @contextmanager
+        def running():
+            app = create_app(config_dir=config_dir)
+            with TestClient(app) as test_client:
+                with app.state.sessions() as session:
+                    if session.query(Server).first() is None:
+                        session.add(
+                            Server(
+                                machine_id="m1",
+                                url="http://pms:32400",
+                                token_enc="x",
+                                owner_account_id=555000001,
+                                plex_pass=True,
+                                capabilities={},
+                            )
+                        )
+                        session.commit()
+                cookie = session_serializer(app.state.session_secret).dumps(
+                    {"account_id": 555000001, "username": "owner"}
+                )
+                test_client.cookies.set(SESSION_COOKIE, cookie)
+                test_client.headers[CSRF_HEADER] = "1"
+                yield test_client
+
+        return running()
+
+    @staticmethod
+    def _set(client: TestClient, key: str, value) -> None:
+        with client.app.state.sessions() as session:
+            if value is None:
+                session.query(Setting).filter(Setting.key == key).delete()
+                session.commit()
+            else:
+                SettingsStore(session).set(key, value)
+
+    @staticmethod
+    def _get(client: TestClient, key: str):
+        with client.app.state.sessions() as session:
+            return SettingsStore(session).get(key)
+
+    @classmethod
+    def _on_disk(cls, config_dir, key: str):
+        return cls._on_disk_file(config_dir / "shortlist.db", key)
+
+    @staticmethod
+    def _on_disk_file(path, key: str):
+        import json
+        import sqlite3
+
+        con = sqlite3.connect(path)
+        try:
+            assert con.execute("pragma integrity_check").fetchone() == ("ok",)
+            row = con.execute("select value from settings where key = ?", (key,)).fetchone()
+        finally:
+            con.close()
+        return None if row is None else json.loads(row[0])["v"]
+
+    def _backup_then_diverge(self, config_dir, *, backed_up="in the backup", later="written after it"):
+        from shortlist.server.db.models import Event
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(config_dir) as client:
+            self._set(client, "app.probe", backed_up)
+            backup = take_backup(config_dir, label="manual")
+            self._set(client, "app.probe", later)
+            with client.app.state.sessions() as session:
+                session.add_all(Event(scope="probe", level="info", message={"pad": "x" * 500}) for _ in range(200))
+                session.commit()
+            response = client.post("/api/system/backups/restore", json={"name": backup.name})
+            assert response.status_code == 200, response.text
+            assert "Restart" in response.json()["message"]
+            # Nothing changes until the restart: this app keeps the database it opened.
+            assert self._get(client, "app.probe") == later
+        return backup
+
+    def test_the_restart_leaves_the_restored_database_in_place(self, tmp_path):
+        self._backup_then_diverge(tmp_path)
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "in the backup"
+        assert self._on_disk(tmp_path, "app.probe") == "in the backup", "the shutdown checkpoint undid the restore"
+
+    def test_a_restore_is_applied_once_not_on_every_boot(self, tmp_path):
+        self._backup_then_diverge(tmp_path)
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.probe", "written after the restore")
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "written after the restore"
+
+    def test_the_copy_taken_first_holds_everything_written_until_the_restart(self, tmp_path):
+        from shortlist.server.services.backup import list_backups
+
+        backup = self._backup_then_diverge(tmp_path, later="the last write before the restart")
+
+        with self._boot(tmp_path):
+            pass
+        pre = [b["name"] for b in list_backups(tmp_path) if "pre-restore" in b["name"]]
+        assert len(pre) == 1 and pre[0] != backup.name
+        assert self._on_disk_file(tmp_path / "backups" / pre[0], "app.probe") == "the last write before the restart"
+
+    def test_the_restore_is_recorded_in_the_database_it_restored(self, tmp_path):
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+
+        with self._boot(tmp_path) as client, client.app.state.sessions() as session:
+            restores = session.query(Event).filter(Event.scope == "backup.restore").all()
+            assert [e.message["backup"] for e in restores] == [backup.name]
+
+    def test_a_backup_deleted_before_the_restart_leaves_the_database_alone(self, tmp_path):
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+        (tmp_path / "backups" / backup.name).unlink()
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "written after it"
+            with client.app.state.sessions() as session:
+                failed = session.query(Event).filter(Event.scope == "backup.restore_failed").all()
+                assert [e.level for e in failed] == ["error"]
+
+    def test_a_restore_that_names_no_backup_is_refused_up_front(self, tmp_path):
+        with self._boot(tmp_path) as client:
+            assert client.post("/api/system/backups/restore", json={"name": "shortlist_nope.db"}).status_code == 404
+            assert client.post("/api/system/backups/restore", json={"name": "../shortlist.db"}).status_code == 404
+        assert not (tmp_path / "restore-pending.json").exists()
+
+    @pytest.mark.parametrize("in_backup", [None, "", "1.6.0"], ids=["before-the-dialog", "never-read", "older"])
+    def test_release_notes_the_owner_closed_stay_closed(self, tmp_path, in_backup):
+        """The closed notes live in the database, so a backup from before they were read, or before the
+        dialog existed, opened the running version's notes again after a restore."""
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.release_notes_seen", in_backup)
+            backup = take_backup(tmp_path, label="manual")
+            self._set(client, "app.release_notes_seen", "1.8.0")
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.release_notes_seen") == "1.8.0"
+
+    def test_release_notes_closed_are_never_moved_backwards_by_a_restore(self, tmp_path):
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.release_notes_seen", "1.8.0")
+            backup = take_backup(tmp_path, label="manual")
+            self._set(client, "app.release_notes_seen", "1.7.0")
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.release_notes_seen") == "1.8.0"
+
+    @staticmethod
+    def _fill_backups(config_dir, count: int, *, first_value: str) -> list[str]:
+        """`count` backups, oldest first, the oldest holding `app.probe = first_value`."""
+        import os
+        import shutil
+        import time
+
+        from shortlist.server.services.backup import take_backup
+
+        oldest = take_backup(config_dir, label="manual")
+        names = [oldest.name]
+        base = time.time() - 10_000
+        os.utime(oldest, (base, base))
+        for i in range(1, count):
+            copy = oldest.with_name(f"shortlist_20260101_0000{i:02d}_filler.db")
+            shutil.copy2(oldest, copy)
+            os.utime(copy, (base + i, base + i))
+            names.append(copy.name)
+        assert first_value  # the value the oldest was taken with is set by the caller before this
+        return names
+
+    def test_restoring_the_oldest_backup_survives_the_copy_taken_first(self, tmp_path):
+        """Architecture review 2026-09-14. The pre-restore copy rotates the backups, and the one it rotates
+        out is the oldest: the very file being restored. The copy that followed raised, the boot failed,
+        and the owner's restore point was gone."""
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.probe", "the oldest backup")
+            names = self._fill_backups(tmp_path, 10, first_value="the oldest backup")
+            self._set(client, "app.probe", "current")
+            assert client.post("/api/system/backups/restore", json={"name": names[0]}).status_code == 200
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "the oldest backup"
+
+    def test_a_restore_keeps_the_owners_backup_limit(self, tmp_path):
+        from shortlist.server.services.backup import list_backups
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "backup.max_keep", 20)
+            self._set(client, "app.probe", "in the backup")
+            names = self._fill_backups(tmp_path, 12, first_value="in the backup")
+            client.post("/api/system/backups/restore", json={"name": names[-1]})
+
+        with self._boot(tmp_path):
+            pass
+        assert len(list_backups(tmp_path)) == 13, "a restore trimmed the backups to the default of 10"
+
+    def test_a_restore_that_fails_at_boot_leaves_the_database_alone_and_says_so(self, tmp_path):
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+        (tmp_path / "backups" / backup.name).chmod(0)
+        try:
+            with self._boot(tmp_path) as client:
+                assert self._get(client, "app.probe") == "written after it"
+                with client.app.state.sessions() as session:
+                    assert [e.scope for e in session.query(Event).filter(Event.scope.like("backup.restore%"))] == [
+                        "backup.restore_requested",
+                        "backup.restore_failed",
+                    ]
+        finally:
+            (tmp_path / "backups" / backup.name).chmod(0o644)
+        assert not (tmp_path / "shortlist.db.restoring").exists(), "a half-copied database was left behind"
+
+    def test_asking_for_a_restore_is_audited_before_the_restart(self, tmp_path):
+        from shortlist.server.db.models import Event
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            backup = take_backup(tmp_path, label="manual")
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+            with client.app.state.sessions() as session:
+                requested = session.query(Event).filter(Event.scope == "backup.restore_requested").one()
+                assert requested.message["backup"] == backup.name
+
+    def test_a_waiting_restore_can_be_seen_and_cancelled(self, tmp_path):
+        from shortlist.server.db.models import Event
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.probe", "in the backup")
+            backup = take_backup(tmp_path, label="manual")
+            self._set(client, "app.probe", "current")
+            assert client.get("/api/system/backups/restore").json() == {"pending": None}
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+
+            pending = client.get("/api/system/backups/restore").json()["pending"]
+            assert pending["backup"] == backup.name and pending["requested_at"]
+
+            assert client.delete("/api/system/backups/restore").status_code == 200
+            assert client.get("/api/system/backups/restore").json() == {"pending": None}
+            with client.app.state.sessions() as session:
+                assert session.query(Event).filter(Event.scope == "backup.restore_cancelled").count() == 1
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "current"
+
+    def test_a_restore_left_waiting_more_than_a_day_is_not_applied(self, tmp_path):
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+        marker = tmp_path / "restore-pending.json"
+        queued = json.loads(marker.read_text())
+        queued["requested_at"] = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+        marker.write_text(json.dumps(queued))
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "written after it"
+            with client.app.state.sessions() as session:
+                expired = session.query(Event).filter(Event.scope == "backup.restore_expired").one()
+                assert expired.message["backup"] == backup.name
+        assert not marker.exists()

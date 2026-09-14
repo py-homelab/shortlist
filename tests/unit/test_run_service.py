@@ -24,7 +24,7 @@ from shortlist.engine.models import (
     UserRunReport,
 )
 from shortlist.server.db.adapters import DbCache, DbSnapshotStore
-from shortlist.server.db.models import Delivery, Event, PickRow, Run, RunUser, User
+from shortlist.server.db.models import Delivery, Event, Job, PickRow, Run, RunUser, User
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.services.context_builder import ContextBuilder
 from shortlist.server.services.run_service import RunService
@@ -243,12 +243,14 @@ class TestRunExecution:
             "requests_examined": 0,
             "requests_lookups": 0,
             "llm_tokens": 0,
+            "llm_output_tokens": 0,
             "llm_tokens_by_step": {},
             "exa_searches": 0,
             "exa_cache_hits": 0,
             "error": None,
             "promotion_blockers": [],
             "unhideable_rows": {},
+            "unreadable_filters": {},
         }
         with sessions() as session:
             run_users = session.query(RunUser).filter_by(run_id=run.id).all()
@@ -259,6 +261,79 @@ class TestRunExecution:
             events = session.query(Event).filter_by(scope="run.user").all()
             assert len(events) == 2
             assert any(e.level == "error" for e in events)
+
+    def test_a_failed_run_queues_the_external_alert(self, sessions, tmp_path, monkeypatch):
+        """The wiring, driven through the real `RunService` rather than by calling the hook.
+
+        The hook itself is covered in `test_notify_delivery.py`; what only this can show is that
+        `_run_locked` actually calls it, on the path where the engine RETURNS a not-ok report.
+        """
+        service = RunService(sessions, EventBus(), tmp_path, SecretBox(tmp_path))
+        monkeypatch.setattr(service, "build_context", lambda **kw: _fake_ctx())
+        monkeypatch.setattr(run_service_mod, "engine_run", lambda ctx, profiles: fake_report())
+        with sessions() as session:
+            SettingsStore(session).set("notify.webhook.enabled", True)
+
+        async def scenario():
+            run_id = await service.start_run(trigger="schedule", dry_run=False)
+            return await _wait_for_run(sessions, run_id)
+
+        run = asyncio.run(scenario())
+        assert run.status == "error"
+        with sessions() as session:
+            queued = session.query(Job).filter(Job.kind == "notify.send").all()
+        assert len(queued) == 1
+        # The payload is the bell's own alert for THIS run, not a message written twice.
+        assert queued[0].payload["item"]["id"] == f"run-failed-{run.id}"
+
+    def test_a_run_that_crashes_queues_the_alert_too(self, sessions, tmp_path, monkeypatch):
+        """The other path to `error`, and the one worth waking up for: the engine RAISED.
+
+        Hooking only the tidy path would stay silent exactly when Plex or plex.tv fell over.
+        """
+        service = RunService(sessions, EventBus(), tmp_path, SecretBox(tmp_path))
+        monkeypatch.setattr(service, "build_context", lambda **kw: _fake_ctx())
+
+        def _boom(ctx, profiles):
+            raise RuntimeError("plex.tv went away")
+
+        monkeypatch.setattr(run_service_mod, "engine_run", _boom)
+        with sessions() as session:
+            SettingsStore(session).set("notify.webhook.enabled", True)
+
+        async def scenario():
+            run_id = await service.start_run(trigger="schedule", dry_run=False)
+            return await _wait_for_run(sessions, run_id)
+
+        run = asyncio.run(scenario())
+        assert run.status == "error"
+        with sessions() as session:
+            queued = session.query(Job).filter(Job.kind == "notify.send").all()
+        assert len(queued) == 1 and queued[0].payload["item"]["id"] == f"run-failed-{run.id}"
+
+    def test_a_healthy_run_queues_no_alert(self, sessions, tmp_path, monkeypatch):
+        """The guard at the call site. Without it the hook fires on every run and the owner mutes it."""
+        service = RunService(sessions, EventBus(), tmp_path, SecretBox(tmp_path))
+        monkeypatch.setattr(service, "build_context", lambda **kw: _fake_ctx())
+        healthy = RunReport(
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            dry_run=False,
+            users=[UserRunReport(username="sarah", slug="sarah", status="ok", diff=CollectionDiff(added=["Movie"]))],
+            unhideable_measured=True,
+        )
+        monkeypatch.setattr(run_service_mod, "engine_run", lambda ctx, profiles: healthy)
+        with sessions() as session:
+            SettingsStore(session).set("notify.webhook.enabled", True)
+
+        async def scenario():
+            run_id = await service.start_run(trigger="schedule", dry_run=False)
+            return await _wait_for_run(sessions, run_id)
+
+        run = asyncio.run(scenario())
+        assert run.status == "ok"
+        with sessions() as session:
+            assert session.query(Job).filter(Job.kind == "notify.send").count() == 0
 
     def test_shortlist_dry_run_env_forces_dry_run(self, sessions, tmp_path, monkeypatch):
         """SHORTLIST_DRY_RUN forces even a non-dry 'Run now' to dry-run — the safety a demo/test
@@ -351,6 +426,31 @@ class TestRunExecution:
             assert s.query(RunUser).filter_by(run_id=run_id).count() == 1
             assert s.query(PickRow).filter_by(run_id=run_id).count() == 1
 
+    def test_an_unreadable_filter_is_recorded_on_every_run_that_looked_empty_included(self, sessions, tmp_path):
+        """Empty must be written too, or one bad night pins the alert through every fixed run after it —
+        the shape `filters_not_enforced` already had to be fixed for."""
+        service = RunService(sessions, EventBus(), tmp_path, SecretBox(tmp_path))
+        run_id = self._new_run(sessions)
+        report = self._report(self._one_user_report("sarah"))
+        report.unhideable_measured = True
+
+        service._persist_report(run_id, report)
+
+        with sessions() as s:
+            assert s.get(Run, run_id).stats["unreadable_filters"] == {}
+
+    def test_a_run_that_restored_an_owners_restriction_records_who(self, sessions, tmp_path):
+        service = RunService(sessions, EventBus(), tmp_path, SecretBox(tmp_path))
+        run_id = self._new_run(sessions)
+        report = self._report(self._one_user_report("sarah"))
+        report.restrictions_restored = {201: "sarah"}
+
+        service._persist_report(run_id, report)
+
+        with sessions() as s:
+            events = s.query(Event).filter_by(scope="privacy.restriction_restored").all()
+            assert [e.message for e in events] == [{"account_id": 201, "username": "sarah"}]
+
     def test_a_shared_rows_write_is_audited(self, sessions, tmp_path, monkeypatch):
         """A shared row files its report under `shared_<slug>`, which is nobody's user slug — so
         _persist_report's `if user is None: continue` dropped it whole. A real Plex collection was
@@ -424,6 +524,7 @@ class TestRunExecution:
             diff=CollectionDiff(added=["Dune"]),
             duration_s=0.5,
             llm_tokens=120,
+            llm_output_tokens=20,
             trace={"gathers": [{"source": "popular"}]},
             breakdown=[{"row_slug": "popular", "row_title": "👥 Popular on SFLIX", "library_key": "1"}],
         )
@@ -444,6 +545,9 @@ class TestRunExecution:
             assert row.status == "ok"
             assert row.trace == {"gathers": [{"source": "popular"}]}, "the trace is the whole point"
             assert row.llm_tokens == 120
+            # The run's output share, summed like its total: output is billed at several times the input rate.
+            assert run.stats["llm_tokens"] == 120
+            assert run.stats["llm_output_tokens"] == 20
             assert [p["title"] for p in row.picks] == ["Dune"], "its picks are on the row — never in `picks`"
             assert session.query(PickRow).filter_by(run_id=run.id).count() == 0, (
                 "PickRow.user_id is RESTRICT-keyed to a real account; a shared row must not invent one"

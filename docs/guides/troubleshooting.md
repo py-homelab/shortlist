@@ -52,9 +52,9 @@ server's own address and machine id, and secrets. Not people's names.
 
 **Treat that as a good first pass, not a guarantee.** Logs are free text: they carry whatever a
 library, a plugin or an error message decided to print, and something unusual can still get through
-a filter written for the shapes we know about. Give the report a skim before posting it anywhere
-public — and if you find something that should have been masked and wasn't, that is worth an issue of
-its own.
+a filter written for the shapes Shortlist knows about. Give the report a skim before posting it
+anywhere public — and if you find something that should have been masked and wasn't, that is worth
+an issue of its own.
 
 If someone is reporting a problem on a server you don't administer, sending them there is usually
 faster than a list of questions: _"open /issue, switch the checks on, type the title, press Copy."_
@@ -74,6 +74,9 @@ faster than a list of questions: _"open /issue, switch the checks on, type the t
   re-merges the `label!=` exclusions into each account's share filters. Check whether the share
   was edited by hand in plex.tv (Shortlist re-merges but never deletes filter conditions it
   didn't add), and confirm Plex Media Server is ≥ 1.43.2.10687 (older builds ignore the exclusion).
+  If the account has a restriction of your own (a content rating or label rule) and you're on an
+  older Shortlist, update: earlier versions joined the exclusion to your restriction in a way Plex
+  ignores.
 - **Rows not appearing for anyone** — promoted rows land in Plex's hub order; users may
   need to scroll, or pin the row via "Manage Home Screen" on their client.
 - **Rows keep drifting to the bottom of the Recommended shelf** — something else on your server is
@@ -110,9 +113,9 @@ faster than a list of questions: _"open /issue, switch the checks on, type the t
      titles on a rebuild night — every 8 days by default — so a change can take
      until then to show. The **"When does each row next rebuild?"** check gives the date.
 
-  Before 1.2 there was a fourth cause: a 0% row excluded only shows you had _finished_, so one you
-  were two episodes into could come back as a suggestion. It no longer can. See
-  [what "already watched" means for a show](../reference.md#what-already-watched-means-for-a-show).
+  Being part-way through a series is not one of them: a show you have only started already counts as
+  watched for a row left at 0%, so two episodes in is enough to keep it out. See
+  [what "already watched" means for a show](../reference/concepts.md#what-already-watched-means-for-a-show).
 
 - **Everything broke, get me out** — Settings → Danger Zone → **Uninstall** restores every
   user's share filters from the pre-Shortlist snapshots and deletes every shortlist-labeled
@@ -129,8 +132,14 @@ Shortlist copies its whole database to `/config/backups` on a schedule (Jobs →
 3 AM by default), before every upgrade, and before any restore. It keeps the newest 10 by default.
 
 A backup holds everything Shortlist knows: settings and connections, your rows and their audiences,
-the people it tracks, run history and each run's picks, the request inbox, and most importantly
-the `restriction_snapshots` of each user's original Plex share filters.
+the people it tracks, run history and each run's picks, the request inbox, and most importantly the
+copies of each user's original Plex share filters that an uninstall restores from.
+
+Restoring one takes effect when you restart the container: Shortlist saves a copy of the current
+database and swaps the backup in as it starts, before anything else opens the database. Until that
+restart it keeps running on the database it has, and Jobs → Backups says a restore is waiting, with a
+button to cancel it. A restore still waiting a day later is dropped rather than applied by whatever
+restarts the container next.
 
 Because a backup holds your rows' **audiences**, restoring one also restores who could see which
 rows at that moment. If you have narrowed a shared row's audience since the backup was taken,

@@ -327,6 +327,9 @@ class FakeSocket:
         self._frames = list(frames)
         self._fail_after = fail_after
         self.sent = 0
+        #: True once the listener has drained every frame and come back for more — the observable
+        #: proof it survived them, which no fixed sleep can give.
+        self.idle = False
 
     async def __aenter__(self):
         return self
@@ -340,6 +343,7 @@ class FakeSocket:
         if self._frames:
             self.sent += 1
             return self._frames.pop(0)
+        self.idle = True
         await asyncio.sleep(3600)  # idle, like a real quiet server
 
 
@@ -456,8 +460,11 @@ class TestConnectionLifecycle:
             {
                 "NotificationContainer": {
                     "type": "playing",
+                    # A session the snapshot DOES know (556, in `ctx`), so the frame reaches `int(ratingKey)`.
+                    # It used sessionKey "1", which the snapshot does not hold: `_open` returned before
+                    # parsing anything, and the test passed with the per-event guard deleted.
                     "PlaySessionStateNotification": [
-                        {"sessionKey": "1", "ratingKey": "/library/metadata/1", "viewOffset": 5, "state": "playing"}
+                        {"sessionKey": "556", "ratingKey": "/library/metadata/1", "viewOffset": 5, "state": "playing"}
                     ],
                 }
             }
@@ -469,13 +476,18 @@ class TestConnectionLifecycle:
 
         async def scenario():
             task = asyncio.ensure_future(stream.run())
-            await asyncio.sleep(0.15)
+            # A CONDITION, not `sleep(0.15)`: startup hops through the listener's single-thread pool twice
+            # before it connects, and on a loaded CI runner that outlasted the sleep — `stop()` landed
+            # first, nothing ever connected, and this failed as `0 == 1` (see `until`). Coming back to
+            # `recv` after the bad frame is the listener surviving it; a frame that broke it never does.
+            await until(lambda: socket.idle)
             stream.stop()
             await asyncio.wait_for(task, timeout=2)
 
         asyncio.run(scenario())
 
         assert connect.calls["n"] == 1, "a bad frame must not cause a reconnect"
+        assert stream._delay == 5, "a bad frame must not be treated as a dropped socket"
 
 
 class TestCloseAllIsAllOrNothingInMemory:

@@ -1,10 +1,52 @@
 import type { RunDetail, RunLogEntry } from "@/lib/types";
 import {
+  describeStage,
   isServerStage,
   isTailStage,
   progressLabel,
   STAGE_LABELS,
 } from "@/lib/run-stages";
+
+/** How often a run that has not finished is re-fetched when the live stream tells us nothing. */
+const RUN_POLL_FALLBACK_MS = 5_000;
+
+/** A run as the poll predicates read it — only whether it has settled matters. */
+type Settleable = { finished_at: string | null };
+
+/**
+ * How often to re-fetch ONE run, or `false` once it has settled.
+ *
+ * Exists because the only other thing that refreshes an in-flight run is the live SSE stream
+ * (`run-detail.tsx` and `runs.tsx` both wire `run.finished` to `invalidateQueries`) — and
+ * `EventSource` replays nothing it missed while it was disconnected. Its `onerror` retries with
+ * backoff up to 30s forever, and until it reconnects `run.finished` is never delivered, so a run
+ * that has ended still reads "Running" with a ticking timer. That is the SFLIX 2026-08-13 symptom
+ * (`runs.tsx`) reached through a dropped connection rather than an idle one, and it is also what
+ * leaves a cancelled run stuck on "Stopping…": cancelling records `cancel_requested`, and only the
+ * stream ever reports that the run then actually stopped.
+ *
+ * `false` once `finished_at` is set, so a settled run is never re-fetched for nothing.
+ */
+export function runRefetchIntervalMs(
+  run: Settleable | undefined,
+): number | false {
+  return run && !run.finished_at ? RUN_POLL_FALLBACK_MS : false;
+}
+
+/**
+ * {@link runRefetchIntervalMs} for the paged runs list: poll while ANY page holds an unfinished run.
+ *
+ * Every page, not just the first: the list is fetched in chunks and "Load more" keeps the older,
+ * already-settled pages in the cache beside the live one.
+ */
+export function runsListRefetchIntervalMs(
+  pages: Settleable[][] | undefined,
+): number | false {
+  if (!pages) return false;
+  return pages.some((page) => page.some((run) => !run.finished_at))
+    ? RUN_POLL_FALLBACK_MS
+    : false;
+}
 
 /** The one recognised failure class a raw engine/Plex error belongs to, or `null` for anything
  *  unrecognised. The single source of truth both `friendlyError` (what to SAY) and `errorBucket`
@@ -57,16 +99,20 @@ const STEP_LABELS: Record<string, string> = {
   llm_library: "library scan",
 };
 
+/** ["final picks 12,340", "web search 4,100"] for a by-step token map, largest first, zeros dropped. */
+export function tokenSteps(byStep?: Record<string, number>): string[] {
+  if (!byStep) return [];
+  return Object.entries(byStep)
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([step, n]) => `${STEP_LABELS[step] ?? step} ${n.toLocaleString()}`);
+}
+
 /** "final picks 12,340 · web search 4,100" for a by-step token map, or "" when empty. Callers wrap
  *  it in parentheses or not, whichever their sentence needs — the two previous copies differed only
  *  by that punctuation. */
 export function tokenStepBreakdown(byStep?: Record<string, number>): string {
-  if (!byStep) return "";
-  return Object.entries(byStep)
-    .filter(([, n]) => n > 0)
-    .sort((a, b) => b[1] - a[1])
-    .map(([step, n]) => `${STEP_LABELS[step] ?? step} ${n.toLocaleString()}`)
-    .join(" · ");
+  return tokenSteps(byStep).join(" · ");
 }
 
 /** " · N web search(es)" when any ran, else "". Shown apart from tokens because an external search is
@@ -75,6 +121,43 @@ export function tokenStepBreakdown(byStep?: Record<string, number>): string {
 export function webSearchSummary(count?: number): string {
   if (!count) return "";
   return ` · ${count} web search${count === 1 ? "" : "es"}`;
+}
+
+/**
+ * The breakdown behind a row's total time, as one sentence for a `title`.
+ *
+ * The line used to read "25ms · 8ms waiting · shared setup 159ms", which is three numbers and two
+ * engineer concepts: "waiting" is blocked on the Plex write lock, and "shared setup" is work
+ * amortised across everyone in the run. Neither is something the owner acts on, and neither is
+ * guessable. The total is what belongs on screen; this is what belongs behind it.
+ *
+ * @param durationMs This row's wall time, waiting included.
+ * @param blockedMs Of that, time spent waiting for the Plex write lock.
+ * @param setupMs Shared setup this row drew on, or 0/undefined when there was none. NOT part of
+ *   `durationMs` — it is one cost spread over every person in the run, so adding them would count
+ *   the same milliseconds once per person.
+ * @param format How to render a duration, so this stays consistent with the number on screen.
+ * @returns The sentence, or "" when there is nothing worth explaining.
+ */
+export function rowTimingTitle(
+  durationMs: number,
+  blockedMs: number,
+  setupMs: number | undefined,
+  format: (ms: number) => string,
+): string {
+  const parts: string[] = [];
+  if (blockedMs > 0) {
+    parts.push(
+      `${format(durationMs - blockedMs)} working, ${format(blockedMs)} waiting for the Plex write lock`,
+    );
+  }
+  if (setupMs && setupMs > 0) {
+    parts.push(
+      `a further ${format(setupMs)} of setup was shared across everyone in this run`,
+    );
+  }
+  if (parts.length === 0) return "";
+  return `${format(durationMs)} for this row: ${parts.join("; ")}.`;
 }
 
 /** What the run is doing right now, and whether that is the server-wide tail. */
@@ -143,6 +226,33 @@ function peopleProgress(
     (user) => roster.has(user.slug) && user.status !== "pending",
   ).length;
   return { done, total: roster.size };
+}
+
+/** One person the run is working on right now, and what it is doing for them. */
+export type InFlightPerson = { slug: string; name: string; text: string };
+
+/** Everyone started but not finished, each with their latest line as a sentence — sorted by name.
+ *
+ *  "43 of 46 people done" says how far the run has got, not what it is doing, and a run's last three
+ *  people are exactly when the owner is watching and wondering why it is slow. Roster-filtered like
+ *  `peopleProgress`, so a library index or a shared row is never mistaken for a person. */
+export function inFlight(run: RunDetail, entries: RunLogEntry[]): InFlightPerson[] {
+  const roster = rosterOf(run);
+  const latest = new Map<string, RunLogEntry>();
+  for (const entry of entries) {
+    if (roster.has(entry.user) && entry.stage !== "queued") latest.set(entry.user, entry);
+  }
+  return run.users
+    .filter((user) => user.status === "pending" && latest.has(user.slug))
+    .map((user) => {
+      const entry = latest.get(user.slug)!;
+      return {
+        slug: user.slug,
+        name: user.display_name || user.username || user.slug,
+        text: describeStage(entry.stage, entry.counts ?? {}),
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** The stage the run is in RIGHT NOW, phrased for the header.

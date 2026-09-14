@@ -3,7 +3,7 @@ import { useRef, useState } from "react";
 import { NavLink } from "react-router";
 
 import { runOutcome } from "@/lib/run-outcome";
-import { STAGE_LABELS } from "@/lib/run-stages";
+import { describeStage } from "@/lib/run-stages";
 import { useSSE } from "@/lib/sse";
 import { cn } from "@/lib/utils";
 
@@ -48,7 +48,7 @@ export function ActivityPill() {
   useSSE({
     onRunUserStage: (event) =>
       show({
-        text: `${event.user} — ${STAGE_LABELS[event.stage] ?? event.stage}`,
+        text: `${event.user} — ${describeStage(event.stage, event.counts ?? {})}`,
         tone: "active",
       }),
     onRunFinished: (event) =>
@@ -66,7 +66,9 @@ export function ActivityPill() {
   return (
     <NavLink
       to="/runs"
-      title="Live activity — click for the Runs page"
+      // The pill truncates to the sidebar's width, and the useful half of the sentence — which row,
+      // which library, what the write is — is the half that gets cut.
+      title={activity.text}
       className={cn(
         "mx-3 mb-1 flex items-center gap-2 rounded-lg border px-3 py-2 text-xs transition-colors",
         activity.tone === "active" &&
@@ -89,7 +91,7 @@ export function ActivityPill() {
           )}
         />
       )}
-      <span className="min-w-0 truncate">{activity.text}</span>
+      <span className="line-clamp-2 min-w-0 break-words">{activity.text}</span>
     </NavLink>
   );
 }

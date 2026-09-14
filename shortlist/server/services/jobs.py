@@ -34,10 +34,10 @@ from loguru import logger
 from sqlalchemy import text
 
 from shortlist.engine.clients.http_retry import redact
-from shortlist.engine.delivery import row_marker
+from shortlist.engine.delivery import FREED_NAME_HELPER_KEY, row_marker
 from shortlist.engine.models import LABEL_PREFIX
 from shortlist.server.db.models import Job
-from shortlist.server.services.audit import add_audit, write_audit
+from shortlist.server.services.audit import add_audit, audit_restored_restrictions, write_audit
 from shortlist.server.settings_store import SettingsStore
 
 # A job still marked `running` this long after it started is presumed dead — its process is gone.
@@ -48,6 +48,20 @@ STALE_AFTER = timedelta(minutes=30)
 # Backoff between attempts, indexed by attempt number. A Plex/plex.tv outage is usually minutes, so
 # the tail is deliberately long rather than hammering a server that is already unhappy.
 _BACKOFF_S = (30, 300, 900)
+
+# `notify.send` is the exception, because it reaches a THIRD PARTY. Plex is on the same LAN and comes
+# back in minutes; Discord, Slack or a home-automation box can be unreachable for hours, and the
+# shared schedule at the default 3 attempts gives up after 5.5 minutes — long before the channel is
+# back, on the one job whose entire purpose is to reach somebody. This spans ~4.6 hours instead. When
+# it finally does give up, the `failed` state raises the existing `_failed_jobs` alert in the bell, so
+# the news is not lost — it falls back to the channel that cannot be broken by the thing that broke.
+#
+# The `+ 1` is not padding. A job waits between attempts, so N waits need N+1 attempts: `_finish`
+# retires the job the moment `attempts == max_attempts`, and `_claim` charges wait `schedule[n-1]`
+# before attempt n. Sized as `len(...)` the last and longest entry is never reached, which quietly
+# made this 1.6 hours while every comment and the Jobs page description said 4.6.
+NOTIFY_BACKOFF_S = (60, 300, 1800, 3600, 10800)
+NOTIFY_ATTEMPTS = len(NOTIFY_BACKOFF_S) + 1
 
 Handler = Callable[[object, dict], dict]  # (app.state, payload) -> result
 
@@ -85,6 +99,23 @@ class JobKind:
     # — running those on a timer is a choice to make, not a default to inherit.
     schedule_optional: bool = False
     trigger: str = ""  # what causes it, for the kinds no button can start
+    # Queued so often that a SUCCESSFUL one carries no news. Measured on a 46-user server: 165
+    # `watch.reconcile` in 24 hours, 84% of every job queued — enough to own all five slots of the
+    # header's "Recent" list permanently, so a privacy sync or a nightly run was never visible
+    # there, and to pop a success toast every nine minutes for something nobody asked for.
+    #
+    # Suppresses nothing on its own: it only makes a kind eligible for `exclude_routine` on
+    # `GET /jobs`, which the header's activity poll passes and the Jobs page does not. A FAILURE is
+    # never routine and is never dropped — a reconcile that fails is the only thing that would say a
+    # partial watch went uncredited.
+    routine: bool = False
+    # This kind's own retry schedule, when the shared `_BACKOFF_S` is wrong for it. Empty means the
+    # shared one. Per-kind because how long to keep trying is a property of what is being called, not
+    # of the queue: see `NOTIFY_BACKOFF_S`.
+    backoff_s: tuple[int, ...] = ()
+    # A kind whose every run redoes the whole job, so a later success means an earlier failure is repaired
+    # and no longer worth an error card. Not true of per-target kinds (a cleanup for one person).
+    later_success_clears_failure: bool = False
 
 
 # Every registered kind, in the order the Jobs page shows them. `manual` is a deliberate allow-list,
@@ -124,11 +155,13 @@ CATALOG: tuple[JobKind, ...] = (
             "every recommendation is built from, and it is also how Shortlist notices that a title it "
             "put in front of someone was actually watched — the numbers on your dashboard come from "
             "it. Reads only: nothing on Plex changes and nobody's rows move."
-            "\n\nRuns at 04:17 by default. Normally it reads only what changed since the last pass, "
-            "with one complete re-read a week. On servers that report a full result count the nightly "
-            "pass spots a title un-watched recently; "
-            "that weekly one is what notices an un-watch further back than it reaches, or a title "
-            "removed from the library."
+            "\n\nRuns at 04:17 by default, and reads every watched title each time rather than only "
+            "what changed. Measured on a 47-user server, reading everything took the same time as "
+            "reading the recent slice — Plex sends a whole page either way — and reading only the "
+            "recent slice missed a series you marked as watched by hand, because Plex leaves those "
+            "without a date. A library the read cannot see in full is topped up rather than replaced, "
+            "and un-watching is handled separately, on a slower schedule — so one thin answer from Plex "
+            "cannot be mistaken for a pile of things being un-watched."
         ),
         manual=True,
         writes_plex=False,  # "Reads only — nothing on Plex changes", as the description says
@@ -174,15 +207,19 @@ CATALOG: tuple[JobKind, ...] = (
             "\n\nIt builds no rows, delivers nothing, puts nothing on anyone's Home screen and deletes "
             "nothing, so the worst it can do to who-sees-what is make your server more private — which "
             "is why it is safe to press at any time."
-            "\n\nThe one other thing it does is cosmetic: it puts your rows back where you asked for "
-            "them in each library's Recommended shelf, if something has shuffled them. That changes "
-            "the order they appear in, never who can see them."
-            "\n\nRuns at 05:15 by default, after the two syncs above, so it works from a list of "
-            "people that has just been refreshed."
+            "\n\nIt does NOT move your rows around the Recommended shelf — the nightly run does that, "
+            "and so does Check and fix rows on Plex. This pass only ever changes who can see a row, "
+            "never where it sits."
+            "\n\nRuns every 30 minutes by default. It reads the list of accounts from Plex each time, "
+            "so someone you have just shared your server with stops seeing other people's rows within "
+            "half an hour. A pass that changes nothing is not listed under Recent."
         ),
         manual=True,
         schedule_job_id="privacy-sync",
         schedule_setting="privacy.sync_cron",
+        # A full pass from scratch, so the next clean one is the retry of a failed one. Every 30 minutes, a
+        # short plex.tv outage would otherwise leave a failure card nothing can clear.
+        later_success_clears_failure=True,
         trigger=(
             "Also runs on its own whenever something changes who should see what: someone switched "
             "on or off, a row's audience changed, or a new account turning up on your server."
@@ -220,6 +257,7 @@ CATALOG: tuple[JobKind, ...] = (
         ),
         manual=False,
         writes_plex=False,  # local database only
+        routine=True,  # one per playback stop; see JobKind.routine
         trigger=(
             "Runs when a playback session ends — nothing schedules it, and there is nothing to run by "
             "hand. If it never runs (Shortlist restarted mid-playback, say), nothing is lost: the "
@@ -282,6 +320,20 @@ CATALOG: tuple[JobKind, ...] = (
         trigger="Queued when you pause somebody.",
     ),
     JobKind(
+        kind="rows.visibility",
+        label="Show and hide rows for today",
+        description=(
+            "Puts each row on the Plex shelves its own day schedule asks for. A row on its day off is "
+            "hidden, not deleted — it keeps its titles, so it comes straight back on its next day "
+            "without being built again. Everybody's privacy filters are re-merged before anything is "
+            "shown, and if that fails nothing appears."
+        ),
+        manual=True,
+        schedule_job_id="rows-visibility",
+        schedule_setting="rows.visibility_cron",
+        trigger="Runs at midnight, and whenever you change which days a row appears on.",
+    ),
+    JobKind(
         kind="user.restore",
         label="Put an un-paused person's rows back",
         description=(
@@ -338,6 +390,23 @@ CATALOG: tuple[JobKind, ...] = (
             "Queued when you delete a row, switch one off, change how it is built, narrow who gets "
             "it, or drop one of its libraries."
         ),
+    ),
+    JobKind(
+        kind="notify.send",
+        label="Send an alert to your webhook",
+        description=(
+            "Posts one of Shortlist's own alerts to the webhook address you saved in Settings, so a "
+            "run that fails at 3am reaches you without you having to open the app and look. The "
+            "message is the same one the bell shows, and it never names anybody."
+            "\n\nIt keeps trying for about four and a half hours, because a chat service or an "
+            "automation box can be down far longer than Plex ever is. If it still cannot get through, "
+            "it gives up and the bell tells you a job failed — the one place that always works."
+        ),
+        # Not manual: the payload IS the message, so a generic "run it" button would send an empty one.
+        manual=False,
+        writes_plex=False,  # an HTTP POST to the owner's own webhook; nothing on Plex is touched
+        trigger="Queued when a whole run fails, and when you press Send a test in Settings.",
+        backoff_s=NOTIFY_BACKOFF_S,
     ),
 )
 
@@ -473,6 +542,25 @@ def writes_plex(kind: str) -> bool:
     return True if entry is None else entry.writes_plex
 
 
+def routine_kinds() -> tuple[str, ...]:
+    """The kinds a successful one of which carries no news — see :attr:`JobKind.routine`.
+
+    Unknown kinds are absent, so anything the catalogue doesn't describe is treated as newsworthy:
+    the safe default for a feed whose job is to tell an operator that something happened.
+    """
+    return tuple(entry.kind for entry in CATALOG if entry.routine)
+
+
+def _backoff_for(kind: str) -> tuple[int, ...]:
+    """How long this kind waits between attempts. The shared schedule unless the catalogue overrides it.
+
+    Unknown kinds get the shared one — the conservative direction, since an unknown kind is by
+    definition not one we have decided needs longer.
+    """
+    entry = BY_KIND.get(kind)
+    return (entry.backoff_s if entry else ()) or _BACKOFF_S
+
+
 def _claimable(kind: str, *, allow_writers: bool, allow_history: bool) -> bool:
     """May a job of this kind START right now?
 
@@ -509,7 +597,8 @@ def _claim(
                     ready_at = job.finished_at or job.created_at
                     if ready_at is not None and ready_at.tzinfo is None:
                         ready_at = ready_at.replace(tzinfo=UTC)
-                    wait = _BACKOFF_S[min(job.attempts - 1, len(_BACKOFF_S) - 1)]
+                    schedule = _backoff_for(job.kind)
+                    wait = schedule[min(job.attempts - 1, len(schedule) - 1)]
                     if ready_at is not None and now - ready_at < timedelta(seconds=wait):
                         continue  # still backing off after a failure
                 job.status = "running"
@@ -589,6 +678,12 @@ _DRAIN_LOCK = asyncio.Lock()
 #: calls `asyncio.run()` per test does not, and the failure mode is silent (the second writer raises,
 #: the drain swallows it, and the job simply never runs). Keyed by loop, pruned as loops close.
 _WRITER_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
+
+
+def plex_writer_busy(state) -> bool:
+    """Is a run or a writer job writing to Plex right now? For work that runs OUTSIDE the lock (a rename from
+    the row editor) and must not create anything a run could mistake for a row while it delivers."""
+    return _plex_busy(state) or any(lock.locked() for lock in list(_WRITER_LOCKS.values()))
 
 
 def plex_writer_lock() -> asyncio.Lock:
@@ -872,7 +967,7 @@ def _sync_check(state, payload: dict) -> dict:
     # A row stranded at the bottom of the Recommended shelf IS a row "in the wrong place", which is
     # what this button says it fixes — so put the shelf right here too, not only on a full run. It is
     # cosmetic and privacy-neutral (positions only, on hubs already promoted and browse-hidden), so it
-    # needs no privacy gate and `_apply_order` swallows its own failures. `_build_indexes` with no
+    # needs no privacy gate and `_apply_placement` swallows its own failures. `_build_indexes` with no
     # users names the libraries rows live in without reading a single item inside them.
     _build_indexes(ctx, [], ctx.plex.sections())
     _order_phase(ctx, report)
@@ -888,9 +983,15 @@ def _sync_check(state, payload: dict) -> dict:
             if confirmed and not dry_run
             else f"; {len(removed)} orphaned collection(s) to remove"
         )
-    if report.hub_orderings:
-        libraries = ", ".join(entry.get("library", "?") for entry in report.hub_orderings)
+    moved_in = [e for e in report.hub_orderings if e.get("placed") is not False]
+    if moved_in:
+        libraries = ", ".join(entry.get("library", "?") for entry in moved_in)
         detail += f"; {'would reposition' if dry_run else 'repositioned'} rows on the shelf in {libraries}"
+    # Placements we could NOT honour (`place_rows`'s `refused`). Said out loud rather than folded into
+    # the line above, which would report a burial as a reposition.
+    unplaced = [e for e in report.hub_orderings if e.get("placed") is False]
+    if unplaced:
+        detail += f"; could NOT place rows in {', '.join(e.get('library', '?') for e in unplaced)}"
     return {"fixed": report.converged, "orphans": removed, "detail": detail}
 
 
@@ -914,28 +1015,44 @@ def _require_filters_merged(report, what: str) -> None:
     expected), so this cannot fire nightly over an account Plex will never accept filters for.
     """
     if report.error or report.promotion_blockers:
-        why = report.error or "; ".join(report.promotion_blockers)
+        why = "; ".join(filter(None, [report.error, *report.promotion_blockers]))
         raise RuntimeError(f"share filters were not merged, so {what} is unsafe: {why}")
 
 
 def _audit_hub_orderings(state, report, dry_run: bool) -> None:
-    """Audit each library whose Recommended-shelf order we moved (plex-safety rule 10).
+    """Audit each library whose Recommended-shelf order we moved, and each one whose configured
+    placement could not be applied at all (an anchor that is on no shelf) — plex-safety rule 10.
 
     `run_persistence._emit_hub_ordering_events` only fires for a persisted RUN, and the two handlers
     that now order — `privacy.sync` and `sync.check` — persist no run. Without this the `verified: False`
     record exists only on the one path that never needed it, and a shelf we lost to another tool would
     go unrecorded on both paths this was fixed for.
+
+    An unplaceable entry gets its OWN scope. `_shelf_contention` reads `shelf.order`/`run.hub_order`
+    within a 500-event budget looking for rows moved over and over; one stale anchor writes a record
+    every pass, and `privacy.sync` fires on every who-sees-what change, so sharing the scope would let
+    a setting nobody has fixed crowd out the evidence contention detection actually needs.
     """
     for entry in report.hub_orderings:
         verified = entry.get("verified")
+        unplaced = entry.get("placed") is False
         write_audit(
             state,
-            "shelf.order",
-            "warning" if verified is False else "info",
+            "shelf.unplaced" if unplaced else "shelf.order",
+            # A dry run asked Plex for nothing, so it is a preview either way, never a warning.
+            "info" if dry_run else ("warning" if unplaced or verified is False else "info"),
             library=entry.get("library"),
             anchor=entry.get("anchor"),
             moved=entry.get("moved", []),
+            # How many hubs the pass repositioned in TOTAL. A bottom-build writes to the backbone as
+            # well as to our rows, and `moved` names only ours — so without this the feed understates
+            # what reached Plex (plex-safety rule 10).
+            repositioned=entry.get("repositioned"),
             verified=verified,
+            reason=entry.get("reason"),
+            # The row that could not be placed, when the record is about one. Kept apart from
+            # `anchor`, which everywhere else names what we anchored TO (rule 10).
+            row=entry.get("row"),
             dry_run=dry_run,
         )
 
@@ -960,21 +1077,36 @@ def _privacy_sync(state, payload: dict) -> dict:
     touches nobody else's filter, so every other account still excludes that person's row. Anything else that
     widens visibility needs its own argument; rule 1 does not cover it.
 
-    It DOES write one more thing to Plex: the Recommended-shelf position of our own hubs. That is a
-    real PUT, so it is named here rather than left to be discovered — but it is position-only, on hubs
-    already promoted and already covered by the excludes this pass merges, so it cannot make anything
-    visible to anyone. Before 2026-08-12 this pass ordered nothing at all, which is why a shelf left in
-    pieces could not be repaired by any job.
+    It writes NOTHING to Plex beyond the share filters. It used to also move our hubs on the
+    Recommended shelf — added 2026-08-12 so a shelf left in pieces could be repaired by a job rather
+    than only by a run — and that was removed on 2026-09-10. On a server whose owner had set
+    `privacy.sync_cron` to `*/30 * * * *` it ran the whole placement phase 49 times a day (measured on
+    SFLIX: 200 hub-order writes in 24h against the nightly run's 5) for a position that only changes
+    when a row is built. `sync.check` still repairs a broken shelf on demand, which is the job that
+    advertises it.
     """
     from shortlist.engine.pipeline import run as engine_run
 
     requested = payload.get("dry_run", False)
     ctx = state.run_service.build_context(dry_run=requested)
     dry_run = ctx.config.dry_run or requested
+    # The shelf ORDER is not this job's business — the nightly run owns it, exactly as
+    # `rows.visibility` already says of itself. This job has BOTH a cron and a mutation trigger, so an
+    # owner who sets `privacy.sync_cron` to `*/30 * * * *` gets the whole placement phase 49 times a
+    # day on top of the run — measured on SFLIX 2026-09-10: 200 hub-order records in 24 hours against
+    # the nightly run's 5, each pass re-issuing every move three times. Who can SEE a row is this
+    # job's business and still runs; where it sits on the shelf is not.
+    ctx.config.manage_shelf_order = False
     report = engine_run(ctx, [])
+    # Before the check that may raise: an account repaired in a pass that another account blocked is
+    # still repaired, and the retry will find nothing left to report.
+    audit_restored_restrictions(state, report)
     _require_filters_merged(report, "reporting the filters as merged")
     _audit_hub_orderings(state, report, dry_run)
-    swept = sum(len(titles) for titles in report.swept_rows.values())
+    swept = sum(len(titles) for key, titles in report.swept_rows.items() if not key.startswith(FREED_NAME_HELPER_KEY))
+    helpers_removed = sum(
+        len(titles) for key, titles in report.swept_rows.items() if key.startswith(FREED_NAME_HELPER_KEY)
+    )
     # The reason is carried through to the detail line so the Jobs page answers "why did this fire?"
     # — "someone was removed from a shared row" reads very differently from a nightly housekeeping
     # pass, and an operator seeing filters rewritten deserves to know which.
@@ -984,20 +1116,89 @@ def _privacy_sync(state, payload: dict) -> dict:
         detail += f" after {reason}"
     if swept:
         detail += f"; swept {swept} unhidable row(s)"
+    # Not rows: collections a run that was stopped left behind while freeing a row's name. This job writes no
+    # run, so this line is the only record of deleting them (rule 10).
+    if helpers_removed:
+        detail += f"; removed {helpers_removed} leftover name-freeing helper collection(s)"
     # `privacy.sync` persists no run, so `report.left_alone_failures` has nowhere else to surface —
     # and this handler is the one the "leave their sharing alone" PATCH fires. Without this the toast
     # says the filters were merged while that account kept every exclude we promised to remove.
     if report.left_alone_failures:
         failed = len(report.left_alone_failures)
         detail += f"; could NOT clear Shortlist's exclusions from {failed} left-alone account(s)"
-    # This job repositions rows on the shelf now, and its own description promises it does. Reported
-    # here in the same words `sync.check` uses, so the two jobs do not describe the same write
-    # differently — the audit event is written either way (`_audit_hub_orderings`, rule 10); this is
-    # the line an operator actually reads on the Jobs page.
-    if report.hub_orderings:
-        libraries = ", ".join(entry.get("library", "?") for entry in report.hub_orderings)
+    # Said on the Jobs page too: this job persists no run, and it is often the pass that repairs a #116
+    # filter first (flipping who-sees-what queues it).
+    if report.restrictions_restored:
+        names = ", ".join(sorted(report.restrictions_restored.values()))
+        detail += f"; switched the Plex restriction you set back on for {names}"
+    if report.unreadable_filters:
+        names = ", ".join(sorted(report.unreadable_filters))
+        detail += f"; could NOT hide rows from {names} — Plex can't read their share filter (a label with '&')"
+    # Kept, though this job no longer orders: `report.hub_orderings` is empty when
+    # `manage_shelf_order` is off, so this adds nothing to the detail line — and it is the one place
+    # that would say so if that ever changed back. The audit event is written either way
+    # (`_audit_hub_orderings`, rule 10).
+    moved_in = [e for e in report.hub_orderings if e.get("placed") is not False]
+    if moved_in:
+        libraries = ", ".join(entry.get("library", "?") for entry in moved_in)
         detail += f"; {'would reposition' if dry_run else 'repositioned'} rows on the shelf in {libraries}"
-    return {"swept": swept, "converged": report.converged, "reason": reason, "dry_run": dry_run, "detail": detail}
+    # Placements we could NOT honour (`place_rows`'s `refused`). Said out loud rather than folded into
+    # the line above, which would report a burial as a reposition.
+    unplaced = [e for e in report.hub_orderings if e.get("placed") is False]
+    if unplaced:
+        detail += f"; could NOT place rows in {', '.join(e.get('library', '?') for e in unplaced)}"
+    if report.converged:
+        detail += f"; took {len(report.converged)} row(s) off Home that nothing should have promoted"
+    if report.filters_not_enforced or report.unhideable_rows:
+        seeing = sorted({*report.filters_not_enforced, *report.unhideable_rows})
+        detail += f"; {', '.join(seeing)} can still see other people's rows"
+    # Quiet = started by the schedule, and nothing changed or went wrong. Only a quiet pass is kept out of
+    # the header's Recent list: at every 30 minutes it would otherwise own it. Anything someone started —
+    # the Jobs page button sends no `scheduled` — is their feedback.
+    #
+    # A standing warning (an account Plex will not take a hide-list for, a filter it ignores or cannot read)
+    # is reported by EVERY pass, so it is news only when it differs from the last successful pass's. A read
+    # that fails for one pass drops a warning and the next brings it back: two extra Recent entries, never
+    # a hidden warning.
+    standing = sorted(
+        {f"unreadable: {name}" for name in report.unreadable_filters}
+        | {f"not enforced: {name}" for name in report.filters_not_enforced}
+        | {f"can see others' rows: {name}" for name in report.unhideable_rows}
+    )
+    quiet = bool(payload.get("scheduled")) and not (
+        reason
+        or swept
+        or helpers_removed
+        or report.filter_writes
+        or report.converged
+        or report.left_alone_failures
+        or report.restrictions_restored
+        or report.hub_orderings
+        or standing != _last_privacy_sync_standing(state)
+    )
+    return {
+        "swept": swept,
+        "converged": report.converged,
+        "reason": reason,
+        "dry_run": dry_run,
+        "detail": detail,
+        "quiet": quiet,
+        "standing": standing,
+    }
+
+
+def _last_privacy_sync_standing(state) -> list[str]:
+    """The standing warnings the newest successful privacy sync recorded (empty when there is none)."""
+    from shortlist.server.db.models import Job
+
+    with state.sessions() as session:
+        last = (
+            session.query(Job)
+            .filter(Job.kind == "privacy.sync", Job.status == "done")
+            .order_by(Job.finished_at.desc(), Job.id.desc())
+            .first()
+        )
+        return list((last.result or {}).get("standing", [])) if last is not None else []
 
 
 @handler("sync.users")
@@ -1225,7 +1426,7 @@ def _user_restore(state, payload: dict) -> dict:
     report and raises. The whole job is then retried, and nothing is promoted meanwhile.
     """
     from shortlist.engine.models import UserProfile, UserType
-    from shortlist.engine.pipeline import promote_user_rows
+    from shortlist.engine.pipeline import identity_map, promote_user_rows
     from shortlist.engine.pipeline import run as engine_run
     from shortlist.server.db.models import Delivery, Run, RunUser, User
 
@@ -1251,7 +1452,7 @@ def _user_restore(state, payload: dict) -> dict:
             # on a surface their row's placement may have switched off.
             row_name_template=(user.prefs or {}).get("row_name_tpl"),
         )
-        # {delivered title -> row slug} rebuilt from the last run's breakdown, which is the same map
+        # {(library, delivered title) -> row slug} rebuilt from the last run's breakdown — the same map
         # `_promote_phase` passes. It is the only way to place a `{top_seed}` row: its title is
         # different every run, so it cannot be re-rendered from the template here.
         marker = row_marker(user.plex_account_id)
@@ -1259,23 +1460,26 @@ def _user_restore(state, payload: dict) -> dict:
         run_user = (
             session.query(RunUser).filter_by(run_id=latest.id, user_id=user.id).first() if latest is not None else None
         )
+        # Keyed by LIBRARY and title, as `promote_user_rows` reads it: two of one person's rows may share
+        # a title in different libraries (issue #121). An entry recorded without its library can't be
+        # placed safely by title, so it is left to the ledger and the rendered-title fallback.
         placements = {
-            entry["row_title"] + marker: entry["row_slug"]
+            (str(entry["library_key"]), entry["row_title"] + marker): entry["row_slug"]
             for entry in ((run_user.breakdown if run_user else None) or [])
-            if entry.get("row_slug") and entry.get("row_title")
+            if entry.get("row_slug") and entry.get("row_title") and entry.get("library_key")
         }
         # The AUTHORITATIVE map: {ratingKey -> row slug} straight from the delivery ledger. Titles
         # above are a fallback for rows delivered before the ledger existed; a `{top_seed}` row has no
         # renderable title at all, so without this it lands on `_promote_one`'s no-spec branch and gets
         # its audience's Home rather than the placement the row actually asks for.
         ledger = [d for d in session.query(Delivery).filter_by(user_slug=slug) if d.rating_key]
-        # An AMBIGUOUS ratingKey — two rows claiming the same collection — falls through to the title
-        # map rather than letting whichever row the query returned last win arbitrarily. Reachable if a
-        # run crashed between the delete and the persist on delivery's rebuild path.
-        claims: dict[int, int] = {}
-        for d in ledger:
-            claims[d.rating_key] = claims.get(d.rating_key, 0) + 1
-        keys = {d.rating_key: d.collection_slug for d in ledger if claims[d.rating_key] == 1}
+        # Through the engine's shared rule rather than a second copy of it: a ratingKey two rows claim
+        # is DROPPED and falls back to the title map, instead of whichever row the query returned last
+        # winning arbitrarily. Reachable if a run crashed between the delete and the persist on
+        # a repair that recreates a row (wrong type, or refusing every add).
+        keys = identity_map({(d.user_slug, d.collection_slug, d.library_key): d.rating_key for d in ledger}).get(
+            slug, {}
+        )
         if len(keys) != len(ledger):
             logger.warning(
                 "{}: {} ledger key(s) claimed by more than one row — placing those by title",
@@ -1287,7 +1491,16 @@ def _user_restore(state, payload: dict) -> dict:
     # merge is CHECKED, not assumed. `promote_user_rows` has no `filters_ok` guard of its own (only
     # `_promote_phase` does), so an unchecked failure here promotes a private row with nothing
     # hiding it.
+    # The shelf ORDER is not this job's business — the nightly run owns it, as `privacy.sync` and
+    # `rows.visibility` already say of themselves. Left on, un-pausing one person ran the whole
+    # placement phase, moved hubs on Plex, and wrote NO audit event, because this handler never calls
+    # `_audit_hub_orderings` (plex-safety rule 10). Restoring someone's rows is about who can see
+    # them, not where they sit.
+    ctx.config.manage_shelf_order = False
     report = engine_run(ctx, [])
+    # Before the check that may raise: an account repaired in a pass that another account blocked is
+    # still repaired, and the retry will find nothing left to report.
+    audit_restored_restrictions(state, report)
     _require_filters_merged(report, f"promoting {slug}'s rows")
     restored = promote_user_rows(ctx, profile, placements, placement_keys=keys)
     # `dry_run` recorded, not assumed False: `promote_user_rows` carries its own safe-mode guard, so
@@ -1490,3 +1703,195 @@ def _watching_account_undo(state, payload: dict, job_id: int | None = None) -> d
     if report.errors:
         out["detail"] = report.errors[0]
     return out
+
+
+@handler("rows.visibility")
+def _rows_visibility(state, payload: dict) -> dict:
+    """Make Plex match today's row day-schedules ("When it appears", issue #102).
+
+    Rows build at 03:30, so a run cannot be what turns a row over: a Monday row would sit on people's
+    Home until 03:30 Tuesday, and a weekly-rebuilding row for days. This is what makes a day schedule
+    mean anything, and it is why the schedule is a MIDNIGHT job rather than a flag a run reads.
+
+    **This handler keeps no state of its own.** Today's answer is ``row_is_shown(show_days, now)`` —
+    schedule plus calendar, nothing else — so there is nothing to cache, nothing to keep in sync, and
+    no ordering rule about when to record it. An earlier version cached the last-applied answer per
+    row to skip work, and that cache produced two bugs by itself: it recorded rows as converged under
+    ``paused_all``, and again for a collection the pass had SKIPPED. Both left a row visible on a day
+    its schedule said to hide it, permanently, because the cache then agreed that there was nothing to
+    do. Recomputing is simpler AND self-healing — whatever one pass cannot do, the next one does.
+
+    **The gate comes first, before anything is built.** ``build_context`` constructs a PMS client (an
+    HTTP fetch), plex.tv, TMDB and the curator, so deciding whether there is work AFTER it would make
+    the advertised "a quiet night costs nothing" false on every night of the year. A server where no
+    row narrows its days — every server, until somebody uses this — does one query and stops.
+
+    The converging night is NOT free, and the docs say so: it runs ``engine_run(ctx, [])``, which is
+    a whole privacy sync, then re-promotes every row. That is the price of holding no
+    state, and it is paid only by servers that actually schedule a row.
+
+    plex-safety rule 1: this can make a row MORE visible, so every account's excludes are merged and
+    CHECKED first, exactly as ``user.restore`` does. Someone may have joined the server while a row was
+    hidden, and their share carries no `label!=` exclude for it yet. A failed merge raises, and the
+    durable queue retries the whole pass.
+
+    The roster comes from ``enabled_profiles``, NOT a query written here: that is the one place the
+    three exclusions live — the Danger Zone's ``paused_all`` kill switch, an account with a parental
+    restriction profile (Plex refuses it a label filter, so it can never have a private row), and a
+    individually paused person. This is the first scheduled task that writes to people's shelves, so a
+    kill switch it did not honour would be a kill switch in name only.
+    """
+    from shortlist.engine.pipeline import identity_map, promote_shared_row, promote_user_rows
+    from shortlist.engine.pipeline import run as engine_run
+    from shortlist.engine.rows import row_is_shown
+    from shortlist.server.db.models import Collection, Delivery
+    from shortlist.server.services.context_builder import local_now
+
+    requested = bool(payload.get("dry_run", False))
+    now = local_now()
+
+    # --- the gate: pure DB, no clients, no network -----------------------------------------
+    with state.sessions() as session:
+        scheduled = {
+            row.slug: row_is_shown(row.show_days, now)
+            for row in session.query(Collection).filter_by(enabled=True)
+            if row.show_days
+        }
+        paused_all = bool(SettingsStore(session, state.secrets).get("paused_all"))
+
+    # `payload["row"]` is set when the ROW EDITOR queued this because a row's days changed. It is what
+    # puts a row back when its LAST schedule is cleared: `scheduled` no longer holds it, so the gate
+    # alone would skip the very pass that shows it again.
+    if not scheduled and not payload.get("row"):
+        return {"changed": [], "dry_run": requested, "detail": "No row narrows the days it appears on"}
+
+    if paused_all:
+        # The Danger Zone kill switch, honoured like every other scheduled task. Nothing is recorded
+        # anywhere, so the pass is simply recomputed on the next tick — which is the whole reason this
+        # handler keeps no state of its own.
+        logger.info("all runs are paused (Settings → Danger Zone) — leaving today's row schedule unapplied")
+        return {
+            "changed": [],
+            "dry_run": requested,
+            "detail": f"{len(scheduled)} row(s) are waiting for today's schedule — everything is paused",
+        }
+
+    changed = sorted(scheduled)
+    shown = [slug for slug in changed if scheduled[slug]]
+    hidden = [slug for slug in changed if not scheduled[slug]]
+    parts = []
+    if shown:
+        parts.append(f"showing {', '.join(shown)}")
+    if hidden:
+        parts.append(f"hiding {', '.join(hidden)}")
+    summary = f"Today's schedule: {' and '.join(parts)}" if parts else "Applying today's row schedule"
+
+    ctx = state.run_service.build_context(dry_run=requested)
+    dry_run = ctx.config.dry_run or requested
+
+    if dry_run:
+        # Audited like every other preview (rule 10): a visibility change nobody can account for is
+        # the thing the events feed exists to prevent, and `user.hide`/`user.restore` both record one.
+        write_audit(
+            state,
+            "rows.visibility",
+            "info",
+            scheduled=changed,
+            row=payload.get("row") or None,
+            collections=0,
+            dry_run=True,
+        )
+        logger.info("[dry-run] rows.visibility: would converge {}", ", ".join(changed))
+        return {"changed": changed, "dry_run": True, "detail": f"Would update {len(changed)} row(s) for today"}
+
+    # Rule 1's ordering, in straight-line code — see the docstring. `engine_run(ctx, [])` merges every
+    # account's filter and creates/promotes nothing; it reports failure by RETURN VALUE, so it is
+    # checked rather than assumed.
+    # The shelf ORDER is not this job's business — the 03:30 run owns it. Left on, `engine_run` would
+    # run `_order_phase` here every night, writing the `shelf.order` events that
+    # `notifications._shelf_contention` counts (3 in 24h reads as another tool fighting us, issue
+    # #106). It would also order BEFORE promoting, the inverse of a run, so a row being shown today is
+    # not yet on the shelf when the ordering happens and moves again at 03:30 — a second recorded move
+    # for one turnover. Rows shown at midnight therefore sit in their library's default slot until the
+    # run places them, which is a position, never a visibility.
+    ctx.config.manage_shelf_order = False
+    report = engine_run(ctx, [])
+    # Before the check that may raise: an account repaired in a pass that another account blocked is
+    # still repaired, and the retry will find nothing left to report.
+    audit_restored_restrictions(state, report)
+    _require_filters_merged(report, "applying today's row schedule")
+
+    touched: set[int] = set()
+    with state.sessions() as session:
+        profiles = [p for p in state.run_service.enabled_profiles(session) if p.plex_account_id]
+        # {ratingKey -> row slug} per user, from the delivery ledger. The AUTHORITATIVE answer to
+        # "which of this person's rows is this collection": a per-person row's Plex label names the
+        # PERSON, not the row (all of Sarah's rows carry `shortlist_sarah`).
+        #
+        # Through the engine's `identity_map`, not a second copy of the rule written here: an ambiguous
+        # key must be DROPPED rather than arbitrated, and that is the branch where guessing wrong
+        # promotes a row today's schedule says to hide. One implementation, one set of tests.
+        ledger_by_user = identity_map(
+            {(d.user_slug, d.collection_slug, d.library_key): d.rating_key for d in session.query(Delivery)}
+        )
+
+    for profile in profiles:
+        # All-or-nothing on purpose: raising leaves the whole pass owed, and the durable queue retries
+        # it with backoff. Carrying on would report a converge that only partly happened.
+        promote_user_rows(
+            ctx,
+            profile,
+            {},
+            placement_keys=ledger_by_user.get(profile.slug, {}),
+            into=touched,
+            # A collection this cannot identify is LEFT ALONE. Promotion's no-spec fallback shows the
+            # row, which is right for a run and exactly wrong here: a `{top_seed}` row with no ledger
+            # key would be promoted onto Home on a day its schedule says to hide it.
+            skip_unmatched=True,
+        )
+
+    for spec in ctx.config.shared_rows():
+        promote_shared_row(ctx, spec, into=touched)
+
+    # `scheduled`, not "changed": this pass applies today's answer for every scheduled row rather than
+    # tracking which ones moved, so calling it "changed" would overstate what the event records
+    # (rule 10 — the feed has to be readable as what happened).
+    write_audit(
+        state,
+        "rows.visibility",
+        "info",
+        scheduled=changed,
+        row=payload.get("row") or None,
+        collections=len(touched),
+        dry_run=False,
+    )
+    return {"changed": changed, "collections": len(touched), "dry_run": False, "detail": summary}
+
+
+@handler("notify.send")
+def _notify_send(state, payload: dict) -> dict:
+    """Post one of the bell's alerts to the owner's webhook.
+
+    The queue's half of `services/notify.py`: decrypt the address, hand the item to the one sender,
+    and let anything that goes wrong become an ordinary job failure so the existing backoff and
+    dead-letter path apply unchanged. `notify.deliver` has already scrubbed its own error text, so
+    `_execute` writes a `Job.error` with no webhook token in it (plex-safety rule 9).
+
+    Idempotent in the sense the queue needs — a replay re-sends the same message rather than doing
+    something new — and a duplicate alert is the harmless direction for the failure it reports.
+    """
+    from shortlist.server.services import notify
+
+    with state.sessions() as session:
+        store = SettingsStore(session, state.secrets)
+        try:
+            detail = notify.deliver(store, payload.get("item") or {})
+        except notify.NotifyNotConfigured as e:
+            # NOT a failure. A failed job dead-letters and raises the in-app "jobs have failed" alert,
+            # which would be Shortlist reporting a fault because the owner switched something off
+            # between the run failing and this job running. That is a change of mind, not a problem.
+            logger.info("notify.send skipped — {}", e)
+            # The exception already says WHICH of the two reasons it was — switched off, or no address
+            # saved — so naming one here produced two contradictory sentences on the Jobs page.
+            return {"sent": False, "detail": f"Not sent: {e}"}
+    return {"sent": True, "detail": detail}

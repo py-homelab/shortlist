@@ -5,12 +5,12 @@ import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { apiUrl } from "@/lib/api";
 import {
-  countLabel,
+  describeCounts,
   isServerStage,
   LOG_FILTERS,
   matchesLogFilter,
-  progressLabel,
   STAGE_LABELS,
   type LogFilter,
 } from "@/lib/run-stages";
@@ -20,14 +20,7 @@ import { cn } from "@/lib/utils";
 function LogLine({ entry }: { entry: RunLogEntry }) {
   const time = entry.ts ? new Date(entry.ts).toLocaleTimeString() : "";
   const label = STAGE_LABELS[entry.stage] ?? entry.stage;
-  const counts = entry.counts ?? {};
-  // "3/5" reads as progress; "3 done · of 5" reads as two unrelated numbers.
-  const progress = progressLabel(counts);
-  const detail =
-    progress ??
-    Object.entries(counts)
-      .map(([k, v]) => countLabel(k, v))
-      .join(" · ");
+  const detail = describeCounts(entry.counts ?? {});
   const server = isServerStage(entry.user);
 
   return (
@@ -162,7 +155,7 @@ export function RunLogPanel({
             Follow
           </label>
           <Button asChild variant="ghost" size="sm">
-            <a href={`/api/runs/${runId}/log?format=text`} download>
+            <a href={apiUrl(`/api/runs/${runId}/log?format=text`)} download>
               <Download className="h-3.5 w-3.5" aria-hidden />
               Download
             </a>

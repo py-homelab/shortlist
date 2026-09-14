@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
+  ChevronRight,
   Cog,
   Database,
   Eraser,
@@ -11,7 +12,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { useState } from "react";
-import { useSearchParams } from "react-router";
+import { Link, useSearchParams } from "react-router";
 
 import { CronPicker } from "@/components/cron-picker";
 import { ActivityFeed } from "@/components/jobs/activity-feed";
@@ -22,6 +23,14 @@ import { PageHeader } from "@/components/page-header";
 import { RowSchedules } from "@/components/jobs/row-schedules";
 import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api } from "@/lib/api";
@@ -60,7 +69,7 @@ const PENDING_LABELS: Record<string, string> = {
  */
 const EFFECT_TAGS: Record<
   string,
-  { text: string; title: string; destructive?: boolean }
+  { text: string; title: string; destructive?: boolean; note?: string }
 > = {
   "sync.users": {
     text: "Changes Plex",
@@ -72,6 +81,10 @@ const EFFECT_TAGS: Record<
     title:
       "Writes corrections to Plex, and after you have read the preview and pressed Fix it can delete a collection for good. Nothing is deleted before you press Fix.",
     destructive: true,
+    // The reassurance was in the `title` above and nowhere else, so the only visible thing on the
+    // row was a red "Can delete" — hover-only on a desktop, unreachable on a phone, next to a
+    // button people then did not dare press. The scary half must never outlive the calming half.
+    note: "Nothing is deleted until you read the preview and press Fix.",
   },
   "privacy.sync": {
     text: "Changes Plex",
@@ -295,6 +308,8 @@ export function JobsPage() {
   const [watchedResult, setWatchedResult] = useState<SyncFinishedEvent | null>(
     null,
   );
+  // Gate on the one irreversible half of "Fix N rows" — see the button's own comment.
+  const [confirmDelete, setConfirmDelete] = useState(false);
 
   useSSE({
     onSyncProgress: (event) => {
@@ -384,6 +399,16 @@ export function JobsPage() {
   // Automatic jobs are queued by the mutation that knows their target (disabling someone, renaming
   // a row). No button may start them — but a cleanup that ran out of retries must still be visible.
   const automatic = entries.filter((e) => !e.manual);
+  // Split by whether the job has ever HAPPENED. On a fresh install none of them has, so this
+  // section was nine rows of internal machinery ("Credit a finished playback", "Undo a watch-history
+  // copy") each stamped "never run" — the job registry rendered as a to-do list the owner cannot
+  // act on, and "never run" fifteen times down one page. The ones that have run, or are running,
+  // are the ones worth a row; the rest go behind a disclosure so they are still findable when
+  // something does go wrong with one.
+  const hasHappened = (entry: JobCatalogEntry) =>
+    entry.last !== null || entry.running + entry.queued + entry.failed > 0;
+  const automaticSeen = automatic.filter(hasHappened);
+  const automaticIdle = automatic.filter((entry) => !hasHappened(entry));
   const totals = entries.reduce(
     (acc, e) => ({
       running: acc.running + e.running,
@@ -423,6 +448,46 @@ export function JobsPage() {
 
   return (
     <div className="space-y-5">
+      <Dialog open={confirmDelete} onOpenChange={setConfirmDelete}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              Delete {orphans.length} collection
+              {orphans.length === 1 ? "" : "s"}?
+            </DialogTitle>
+            <DialogDescription>
+              {orphans.join(", ")} will be removed from Plex for good. Shortlist
+              no longer knows who they belong to, so it cannot hide them
+              instead. The titles themselves stay in your library. This can’t be
+              undone.
+            </DialogDescription>
+          </DialogHeader>
+          {/* Inside the dialog, not beside the button that opened it: a failure leaves this dialog
+              open, and everything behind an open dialog is aria-hidden — an alert out there would be
+              invisible to a screen reader and buried under the overlay for everyone else. */}
+          {driftFix.isError && (
+            <p role="alert" className="text-sm text-destructive-text">
+              Couldn’t fix those rows. Try again.
+            </p>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmDelete(false)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              loading={driftFix.isPending}
+              onClick={() =>
+                driftFix.mutate(undefined, {
+                  onSuccess: () => setConfirmDelete(false),
+                })
+              }
+            >
+              Delete and fix
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <PageHeader
         icon={Wrench}
         title="Jobs"
@@ -749,7 +814,19 @@ export function JobsPage() {
                           <Button
                             size="sm"
                             loading={driftFix.isPending}
-                            onClick={() => driftFix.mutate()}
+                            // Confirm at the CLICK when this will delete, which every other
+                            // irreversible Plex write in the app already does (row delete, row
+                            // cleanup, disable-everyone, backup restore). The callout above already
+                            // names each collection, so the audit's "no confirm at all" was half
+                            // wrong — but one verb still fired reversible demotions and an
+                            // unrecoverable delete together, with nothing between the press and the
+                            // destruction. Only when something will actually be deleted: a confirm
+                            // on every fix teaches people to click through the one that matters.
+                            onClick={() =>
+                              orphans.length > 0
+                                ? setConfirmDelete(true)
+                                : driftFix.mutate()
+                            }
                           >
                             Fix {drifted.length + orphans.length} row
                             {drifted.length + orphans.length === 1 ? "" : "s"}
@@ -800,11 +877,31 @@ export function JobsPage() {
                 live={
                   backupNow.isError || backupNow.isSuccess ? (
                     <>
+                      {/* "Backup failed." was the whole message — no cause, no next step, on the
+                          one operation whose entire purpose is to be there when something else
+                          goes wrong. The server's own detail is terse too ("backup failed"), so
+                          the standing line under it carries what the owner can actually check. */}
                       {backupNow.isError && (
-                        <MutationAlert
-                          error={backupNow.error}
-                          fallback="Backup failed."
-                        />
+                        <div className="space-y-1">
+                          <MutationAlert
+                            error={backupNow.error}
+                            fallback="Couldn’t take a backup."
+                            onRetry={() => backupNow.mutate()}
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            Backups are written next to your database, in{" "}
+                            <span className="font-mono">/config/backups</span>.
+                            Check the disk has room and that Shortlist can write
+                            there — the{" "}
+                            <Link
+                              to="/logs"
+                              className="font-medium underline underline-offset-2"
+                            >
+                              Logs page
+                            </Link>{" "}
+                            has the reason it gave.
+                          </p>
+                        </div>
                       )}
                       {backupNow.isSuccess && !backupNow.isPending && (
                         <Succeeded>
@@ -886,18 +983,52 @@ export function JobsPage() {
               <GroupHeading
                 title="Automatic"
                 hint="queued for you when something changes"
+                note={
+                  automaticSeen.length === 0
+                    ? "Nothing has needed one of these yet. They queue themselves when you change something — there is nothing to do here."
+                    : undefined
+                }
               />
-              <div className="overflow-hidden rounded-md border">
-                {automatic.map((entry, index) => (
-                  <JobRow
-                    key={entry.kind}
-                    first={index === 0}
-                    entry={entry}
-                    queuedTitle={queuedTitleFor(entry.kind)}
-                    icon={Cog}
-                  />
-                ))}
-              </div>
+              {automaticSeen.length > 0 && (
+                <div className="overflow-hidden rounded-md border">
+                  {automaticSeen.map((entry, index) => (
+                    <JobRow
+                      key={entry.kind}
+                      first={index === 0}
+                      entry={entry}
+                      queuedTitle={queuedTitleFor(entry.kind)}
+                      icon={Cog}
+                    />
+                  ))}
+                </div>
+              )}
+              {/* Behind a disclosure, not deleted: when one of these DOES misbehave, its
+                  description and history are the only explanation of what it was for. Shut by
+                  default because a list of jobs that have never happened is not news. */}
+              {automaticIdle.length > 0 && (
+                <details className="group rounded-md border">
+                  <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden">
+                    <ChevronRight
+                      className="size-3.5 shrink-0 transition-transform group-open:rotate-90"
+                      aria-hidden="true"
+                    />
+                    {automaticIdle.length === 1
+                      ? "1 job that hasn’t needed to run"
+                      : `${automaticIdle.length} jobs that haven’t needed to run`}
+                  </summary>
+                  <div className="border-t">
+                    {automaticIdle.map((entry, index) => (
+                      <JobRow
+                        key={entry.kind}
+                        first={index === 0}
+                        entry={entry}
+                        queuedTitle={queuedTitleFor(entry.kind)}
+                        icon={Cog}
+                      />
+                    ))}
+                  </div>
+                </details>
+              )}
             </section>
           )}
         </div>

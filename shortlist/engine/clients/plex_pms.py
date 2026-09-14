@@ -14,11 +14,13 @@ import os
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from itertools import pairwise
 
+import httpx
 import requests
 from loguru import logger
 from plexapi.collection import Collection
@@ -63,12 +65,17 @@ class WatchedRead:
     was not honoured — the same absence means only "we did not read that far". Deleting on the second
     is data loss, so the flag travels with the items rather than being assumed by the caller.
 
-    Always False for a complete (`since=None`) read: there is no window, and that path replaces the
-    section outright instead of reasoning about absence.
+    For a complete (`since=None`) read the window is the WHOLE library, and the flag is earned the
+    same way: the server gave a `totalSize` and the walk reached it. The cache's periodic reconcile
+    replaces a section outright from such a read, so an unproven one is the most destructive shape
+    available — a single short page would drop every title behind it and report success.
     """
 
     items: list[WatchedItem]
     covers_window: bool
+    #: Rows the server returned that carry no `tmdb://` guid, so nothing here could ever match them.
+    #: Zero on a healthy library; a whole library's worth when it is matched with a legacy agent.
+    dropped_no_guid: int = 0
 
 
 class SectionNotShared(RuntimeError):
@@ -91,7 +98,89 @@ def has_shortlist_marker(title: str) -> bool:
     return len(suffix) == 64 and all(c in _MARKER_CHARS for c in suffix)
 
 
-def _is_promoted(hub) -> bool:
+def _tag_name(title: str) -> str:
+    """A collection title as Plex's `tags.tag` column compares it: `COLLATE NOCASE` folds ASCII only."""
+    return "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in title)
+
+
+#: What `_watched_item` dates a row that carries no `lastViewedAt`. A show marked watched rather than
+#: played has none, so this is a real and common value, not a corrupt one — see `_dates_from_episodes`.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+#: The identifier family Plex gives a COLLECTION's hub. Prefix only, and deliberately NOT a format.
+#: The two shapes recorded off a real PMS disagree about everything after it:
+#: `custom.collection.1.527794.527794` (section id, and the ratingKey DOUBLED —
+#: `pms_hubs_shared_account.json`, PMS 1.43.3) and `custom.collection.571285` (no section id at all —
+#: `pms_hubs_home.json`). plexapi's own `custom.collection.<sectionID>.<ratingKey>` (`collection.py`,
+#: `visibility()`) is what it SYNTHESIZES when a hub is missing, and matches neither capture — so
+#: anything stricter than the family name rejects a real collection and silently disables the guard.
+#: Built-ins are a different family (`home.television.recentlyadded`, `movie.recentlyadded`).
+#:
+#: Both captures are `hubIdentifier` on `/hubs`, not `identifier` on `/hubs/sections/<key>/manage`,
+#: which is what this actually reads — hence the fail-open note below. (The `custom.collection~68`
+#: and bare `custom.collection` strings in those fixtures are `context` values, a different field.)
+_COLLECTION_HUB_PREFIX = "custom.collection"
+
+
+def is_collection_hub(hub) -> bool:
+    """Whether a managed hub IS one of the library's collections, as opposed to a built-in Plex hub.
+
+    By IDENTIFIER, never by title. Titles COLLIDE — "Top Rated" is both a stock Plex hub and a stock
+    Kometa collection — so a built-in would be mistaken for a collection and refused as an anchor. And
+    a title check has to be answered from ``section.collections()``, a listing that can come back
+    SHORT; a truncated one would reclassify a real collection as a built-in and wave through the very
+    burial issue #106 is about. The identifier travels on the hub itself, so neither applies.
+
+    FAILS OPEN, and that is the intended direction. No fixture records
+    ``/hubs/sections/<key>/manage`` itself (plex-safety rule 11) — the identifier captures we have are
+    from ``/hubs`` — so if that endpoint ever names a collection differently this returns False, the
+    hub reads as a built-in, and the row is placed exactly as it was before issue #106 was fixed. That
+    is the old bug back, never a placement that works being refused.
+    """
+    return str(getattr(hub, "identifier", "") or "").startswith(_COLLECTION_HUB_PREFIX)
+
+
+#: The sequence entries that name a POSITION rather than a block of our rows. Every `("rows", …)`
+#: block is preceded by exactly one of these, and it applies to that block alone:
+#:
+#:   ("anchor", title)         the block goes immediately BELOW that hub
+#:   ("anchor_before", title)  the block goes immediately ABOVE it
+#:   ("top", "")               the block goes to the very top of the shelf
+#:
+#: All three are spelled out because none can be inferred from position in the list. A block sitting
+#: before an anchor entry is indistinguishable from one that simply wants the top; and a block with
+#: no marker at all used to inherit the PREVIOUS block's anchor, so a row set to "Top" after an
+#: anchored row silently landed under that row's collection.
+ANCHOR_KINDS = ("anchor", "anchor_before")
+TOP = "top"
+POSITION_KINDS = (*ANCHOR_KINDS, TOP)
+
+
+def can_anchor(hub) -> bool:
+    """Whether a hub is something a row can be placed relative to — i.e. it HAS a position to sit
+    next to. That means being on a shelf at all, which is `is_promoted`, for a built-in exactly as
+    much as for somebody's collection.
+
+    ONE definition, called by the engine's ordering pass AND by the editor's anchor picker
+    (`api/system.library_collections`). They have to agree: `on_shelf` in the picker exists purely to
+    predict what the ordering pass will do, so a disagreement greys out an anchor that places fine, or
+    offers one that will be refused. This rule has been rewritten three times over issue #106 with the
+    two copies kept in step by hand, which is a function's job, not a reviewer's.
+
+    It used to read `not is_collection_hub(hub) or is_promoted(hub)` — every built-in usable whatever
+    its flags, on the reasoning that refusing "Recently Released" as an anchor would be the worse
+    bug. It was the worse bug: a built-in the owner switched off in Manage Recommendations reads
+    unpromoted (recorded, `pms_managed_hubs.xml.txt`), `place_rows` builds its backbone from promoted
+    hubs only, so the block spliced onto that anchor left the arrangement entirely — and the pass then
+    compared the backbone with itself, agreed, and answered "already in place" every night with no
+    warning. Refusing it says so out loud instead — `place_rows` names it in `refused`, and the
+    pipeline audits one record per refused anchor into the events feed.
+    """
+    return is_promoted(hub)
+
+
+def is_promoted(hub) -> bool:
     """Whether a managed hub is on ANY surface — shared Home, the owner's Home, or Recommended.
 
     ``managedHubs()`` lists every managed hub, promoted or not. A hub with all three flags off is
@@ -199,6 +288,9 @@ def _retrying_session() -> requests.Session:
         read=3,
         status=3,
         backoff_factor=1.5,  # waits ~0s, 1.5s, 3s between tries
+        # urllib3 defaults this to 0.0 — no jitter at all. Every parallel user shares one PMS, so a
+        # 429 or a slow read hits them together and they would otherwise retry in step.
+        backoff_jitter=0.5,
         status_forcelist=(429, 500, 502, 503, 504),
         allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
         respect_retry_after_header=True,
@@ -217,31 +309,90 @@ _PMS_TIMEOUTS = (
     requests.exceptions.ConnectionError,
 )
 
-# How many times `order_owned_hubs` will re-read the managed shelf and re-place whatever did not end
+#: Plex answering with a server error rather than dropping the connection. Same transient overload
+#: as a read timeout — SFLIX 2026-09-06: `PUT /library/collections/687180/items` returned 500 after
+#: exactly 10.0s while that very collection served eight GETs and a children read as 200 either
+#: side of it — but it arrives as a `BadRequest`, not a timeout, so the retry ladder never saw it
+#: and one wobble failed a whole user for the run.
+_PMS_SERVER_ERROR_PREFIXES = ("(500)", "(502)", "(503)", "(504)")
+
+
+def _is_transient_pms_error(error: BaseException) -> bool:
+    """Whether a plexapi exception is a server-side wobble worth repeating.
+
+    Anchored on the LEADING token, never ``"500" in``: plexapi formats the message as
+    ``f'({status}) {codename}; {url} {errtext}'`` and that url carries the collection's own
+    ratingKey, so a substring test matches keys like 1500 or 45002 — the mistake that once swallowed
+    500s and 401s in ``delivery.rename_or_keep``.
+    """
+    return str(error).startswith(_PMS_SERVER_ERROR_PREFIXES)
+
+
+# How many times `place_rows` will re-read the managed shelf and re-place whatever did not end
 # up where it asked. A co-managing tool (agregarr, Kometa) reorders the same shelf on its own
 # schedule, so a pass can genuinely lose a race; each retry re-reads first, so the next pass moves
 # only what is still wrong. Three is enough for a shelf that converges and cheap for one that doesn't.
 _HUB_ORDER_ATTEMPTS = 3
 
 
-def _retry_idempotent(operation: Callable[[], None], *, label: str, attempts: int = 4) -> None:
-    """Retry an IDEMPOTENT PMS mutation (promotion, or a delivery collection upsert) on a read/connect
-    timeout, backing off between tries.
+class CollectionRejectedItems(RuntimeError):
+    """Plex answered 400 when items were ADDED to a collection — not to any other write on it.
 
-    The requests-level ``Retry`` only covers GETs (a create/label must never be blindly repeated), but
-    both callers here are safe to repeat: promotion (hide + set hub visibility) is a no-op re-applied,
-    and delivery re-reads current membership and re-applies only the delta. At scale a busy PMS pushes
-    these into read timeouts, and one un-retried timeout used to fail the whole user (SFLIX 48-user
-    rollout, 2026-07-18). The backoff also gives the server air.
+    Observed on a real server: an empty collection of ours refused a batch of 30 valid shows AND a
+    single one, while a sibling in the same library accepted the same item seconds later. The object
+    itself was broken and stayed broken run after run. `delivery._deliver_one` treats this, and only
+    this, as grounds to rebuild the row.
+    """
+
+
+def _retry_idempotent(
+    operation: Callable[[], None],
+    *,
+    label: str,
+    attempts: int = 4,
+    already_done: type[BaseException] | tuple[type[BaseException], ...] | None = None,
+) -> None:
+    """Retry an IDEMPOTENT PMS mutation (promotion, or a delivery collection upsert) on a read/connect
+    timeout OR a 5xx, backing off between tries.
+
+    A busy PMS expresses the same overload two ways — it drops the connection, or it answers 500 —
+    and only the first used to be retried. Both mean "try again", and neither says the request was
+    wrong; a 4xx still raises on the first attempt so a genuine rejection is never repeated.
+
+    The requests-level ``Retry`` only covers GETs, so every caller here has to carry its own reason
+    to be safe to repeat, and they are not all the same reason:
+
+    * promotion — hide + hub visibility is the same state re-applied, so a repeat is a no-op;
+    * ``addItems`` — one PUT with SET semantics, so re-adding a member changes nothing;
+    * a per-item removal — see ``set_items``; the repeat is bounded to the one item that failed,
+      and ``already_done`` covers the item the failed attempt had in fact removed;
+    * a label write — an ABSOLUTE tag set rebuilt from the same in-memory list, so re-sending it
+      writes the identical set;
+    * poster upload/reset — last write wins.
+
+    At scale a busy PMS pushes these into read timeouts, and one un-retried timeout used to fail the
+    whole user (SFLIX 48-user rollout, 2026-07-18). The backoff also gives the server air.
+
+    ``already_done`` is the exception type meaning "the thing you asked for is already true" on a
+    RETRY — never on the first attempt, where it is a genuine surprise worth raising.
     """
     for attempt in range(attempts):
         try:
             operation()
             return
-        except _PMS_TIMEOUTS as error:
+        except Exception as error:
+            if already_done is not None and attempt > 0 and isinstance(error, already_done):
+                # The first attempt applied it and then failed to say so — a 500 after Plex had
+                # already done the work. Asking again for a state that now holds is success.
+                logger.debug("{}: already applied on retry ({})", label, type(error).__name__)
+                return
+            if not isinstance(error, _PMS_TIMEOUTS) and not _is_transient_pms_error(error):
+                raise
             if attempt == attempts - 1:
                 raise
-            delay = 2.0 * (2**attempt)  # 2s, 4s, 8s
+            # Jittered: eight users deliver in parallel, so a PMS wobble times out all of them within
+            # the same second and an unjittered ladder marches them back in lockstep.
+            delay = http_retry.jittered(2.0 * (2**attempt))  # ~2s, ~4s, ~8s
             logger.warning(
                 "{}: PMS {} — retry {}/{} in {:.0f}s",
                 label,
@@ -427,15 +578,30 @@ class PlexClient:
             by_type.setdefault(kind, section)
         return by_type
 
-    def build_library_index(self, section: LibrarySection) -> dict[int, int]:
+    def build_library_index(
+        self, section: LibrarySection, *, genre_counts: Counter[str] | None = None
+    ) -> dict[int, int]:
         """Scan a section once, returning ``tmdb_id -> ratingKey`` for every TMDB-identified item.
 
         The finished-show fraction no longer needs a total episode count here — the share-token watch
         read carries each user's own ``viewedLeafCount``/``leafCount`` (marks included), so the total is
         read per user rather than reconstructed from a server-wide index.
+
+        Pass ``genre_counts`` to also tally every item's genres during the SAME scan — an optional
+        out-parameter, like ``candidates.filter_candidates``' ``dropped``, so no existing caller has
+        to change. It is free: a real PMS serves ``<Genre>`` children inline in the section listing,
+        so plexapi answers ``.genres`` from the response already parsed. That is NOT true of
+        ``.labels``, which triggers a silent per-item re-read — the asymmetry is pinned by
+        ``test_genres_ride_free_on_the_section_listing_but_labels_do_not`` because the whole
+        library-genre baseline depends on it staying free.
         """
         index: dict[int, int] = {}
         for item in section.all():
+            if genre_counts is not None:
+                # Tolerant like every other row-level read in this scan: one item with an odd genre
+                # shape must not abort a whole section.
+                with contextlib.suppress(Exception):
+                    genre_counts.update(g.tag for g in (item.genres or []) if getattr(g, "tag", None))
             tmdb_id = _tmdb_guid(item)
             if tmdb_id is not None:
                 index[tmdb_id] = item.ratingKey
@@ -497,6 +663,7 @@ class PlexClient:
                         slug = label.tag[len(prefix) :].lower()
                         row = owned.setdefault(slug, OwnedRow(label=label.tag))
                         row.rating_keys.append(collection.ratingKey)
+                        row.section_types.add(section.type)
         return owned
 
     def marked_account_ids(self) -> set[int]:
@@ -650,6 +817,21 @@ class PlexClient:
             return subtype == section.type
         return all(item.type == section.type for item in collection.items())
 
+    def collections_titled(self, title: str) -> list[Collection]:
+        """Every collection on the server, in ANY library, whose title Plex treats as ``title``.
+
+        A collection's title is a row in Plex's server-wide `tags` table, compared `COLLATE NOCASE`
+        (ASCII letters only), so a rename is refused while any other collection anywhere carries the
+        name — not just one in the same library (tests/fixtures/pms_collection_title_tags.json).
+
+        Read from the server, never the run's cache: this is asked right after Plex refused a rename, and
+        the cache holds collections renamed earlier in the run under their old titles.
+        """
+        wanted = _tag_name(title)
+        if self._sections_cache is None:
+            self._sections_cache = self._server.library.sections()
+        return [c for s in self._sections_cache for c in s.collections() if _tag_name(c.title) == wanted]
+
     def find_owned_collections(self, section: LibrarySection, wanted_label: str) -> list[Collection]:
         """Every collection in this section carrying `wanted_label` (case-insensitive).
 
@@ -671,18 +853,84 @@ class PlexClient:
             cached.append(collection)
         return collection
 
-    def stored_label(self, collection: Collection, label: str) -> str:
-        """Ensure `label` is on the collection and return it AS STORED (Plex title-cases it)."""
-        existing = next((tag.tag for tag in collection.labels if tag.tag.lower() == label.lower()), None)
-        if existing:
-            return existing
-        collection.addLabel(label)
+    def stored_label(self, collection: Collection, label: str, *, extra: str | None = None) -> str:
+        """Ensure `label` is on the collection and return it AS STORED (Plex title-cases it).
+
+        ``extra`` puts a SECOND label on in the same write. Measured on SFLIX 2026-09-06: a label PUT
+        costs ~9.3s whatever it carries, and every new row takes two of them (its ``shortlist_<user>``
+        and the constant ``shortlist``) — 64 PUTs, 593s, 21% of that run. plexapi's ``editTags``
+        concatenates ``existing + items`` and issues ONE ``PUT /library/sections/<key>/all``, so
+        passing both spends one write instead of two. Verified against the live PMS, not just the
+        source: two labels in one call came back as one PUT with both present.
+
+        ONLY safe on a row we have just created, and the reason is the whole leak this file guards.
+        A Plex label write REPLACES the label set; it reads as an append only because plexapi
+        re-sends ``collection.labels`` from memory. On an EXISTING row an empty/stale read would
+        therefore delete ``shortlist_<user>`` and leave the row visible to every shared account
+        (see ``delivery._apply_shortlist_label``, which keeps its own guard for exactly that). A
+        freshly created collection has no labels at all, so there is nothing a replace can drop —
+        and folding the second write in removes one read-modify-write from the create path rather
+        than adding one.
+
+        ``label`` is the one that matters and still raises if it does not persist: it is what other
+        accounts' share filters exclude, and the caller deletes the row when this raises. ``extra``
+        is cosmetic (Kometa coexistence), so a miss warns and returns normally — the same outcome as
+        the separate call it replaces.
+        """
+        present = {tag.tag.lower(): tag.tag for tag in collection.labels}
+        existing = present.get(label.lower())
+        wanted = [label] if existing is None else []
+        if extra is not None and extra.lower() not in present:
+            wanted.append(extra)
+        if not wanted:
+            return existing  # type: ignore[return-value]
+
+        try:
+            # Retried like any other idempotent PMS write: re-sending the same label set is a no-op,
+            # and a transient 5xx here makes the CALLER DELETE THE ROW (see
+            # `delivery._create_labelled_collection`). Plex answers 500-at-10.0s under load often
+            # enough that the self-test for this change needed four attempts to create one
+            # collection, so an un-retried label write would bin rows for no reason.
+            _retry_idempotent(lambda: collection.addLabel(wanted), label=log_title(collection.title))
+        except Exception:
+            # Gate on WHICH label failed, never on how many were sent. `wanted` omits whatever is
+            # already on the row, so a row that already carries its `shortlist_<user>` and needs
+            # only the cosmetic one sends `wanted == [extra]` — and counting would then re-raise,
+            # letting `_create_labelled_collection` DELETE a row over a label that is decorative.
+            # That is the precise outcome this fallback exists to prevent.
+            if label not in wanted:
+                logger.warning(
+                    "{}: could not add the '{}' label — the row is fine, but a co-managing tool may keep reordering it",
+                    log_title(collection.title),
+                    extra,
+                )
+            else:
+                if extra is None or len(wanted) == 1:
+                    raise
+                # Fall back to the critical label alone, so a batched failure is no worse than the
+                # two separate writes this replaced: there, `label` succeeding and `extra` failing
+                # left the row alive and private.
+                logger.warning(
+                    "{}: could not write labels {} together — retrying with {!r} alone",
+                    log_title(collection.title),
+                    wanted,
+                    label,
+                )
+                _retry_idempotent(lambda: collection.addLabel([label]), label=log_title(collection.title))
         collection.reload()
         stored = next((tag.tag for tag in collection.labels if tag.tag.lower() == label.lower()), None)
         if stored is None:
             raise RuntimeError(f"label {label!r} did not persist on collection {collection.title!r}")
         if stored != label:
             logger.debug("Plex stored label {!r} as {!r}", label, stored)
+        if extra is not None and not any(t.tag.lower() == extra.lower() for t in collection.labels):
+            # Never fatal, and never silent: the row is found, hidden and managed entirely through
+            # `label`. All this costs is a co-managing tool reordering this one row.
+            logger.warning(
+                "{}: the '{}' label did not persist — the row is fine, but a co-managing tool may keep reordering it",
+                log_title(collection.title),
+                extra,
+            )
         return stored
 
     def promote(
@@ -695,14 +943,20 @@ class PlexClient:
         # it. A privacy tool must never put a row on that surface by omission; callers say so.
         home: bool = False,
         recommended: bool = True,
-        pin_top: bool = False,
     ) -> None:
         """Hide from library browsing but promote onto the chosen surfaces (Home / Library Recommended).
 
         ``modeUpdate(hide)`` is unconditional — it hides the collection from normal library BROWSE and
         is the leak-safe half of promotion, independent of where the row is shown. ``home``/``shared``/
-        ``recommended`` pick the surfaces (a per-row placement). ``pin_top`` moves the managed hub to
-        the top of the library's Recommended shelf (server-wide order, not per viewing-user).
+        ``recommended`` pick the surfaces (a per-row placement).
+
+        Position is NOT set here. This used to honour a `pin_top` flag with ``move(after=None)``, once
+        per collection per run — the very primitive `place_rows` documents as unusable on its own: it
+        writes ``min - 1000``, and a built-in stuck at the minimum (a library's own
+        `movie.recentlyadded` refuses to move) makes everything sent above it land ON that value. One
+        such rebuild collapsed 72 of 94 hubs onto `1000`. `place_rows` owns position now, and a row
+        with no per-library placement already defaults to the top — so the flag was redundant as well
+        as unsafe, and it fired even when the owner had switched shelf ordering off.
         """
         start = time.monotonic()
 
@@ -710,21 +964,26 @@ class PlexClient:
             collection.modeUpdate(mode="hide")
             hub = collection.visibility()
             hub.updateVisibility(recommended=recommended, home=home, shared=shared)
-            if pin_top:
-                # after=None -> first position in this library's Managed Recommendations.
-                hub.reload().move(after=None)
 
         # Retry the whole promote on a PMS timeout — it's idempotent, and a busy server can time out a
         # single mutation that a retry (with the server given room to breathe) then completes.
         _retry_idempotent(_apply, label=log_title(collection.title))
         logger.info(
-            "{}: promoted (home={} library={} pin={}) in {:.1f}s",
+            "{}: promoted (home={} library={}) in {:.1f}s",
             log_title(collection.title),
             home,
             recommended,
-            pin_top,
             time.monotonic() - start,
         )
+
+    def hide_from_browse(self, collection: Collection) -> None:
+        """Hide a collection from its library's normal browse view, without promoting it anywhere.
+
+        The browse-hiding half of ``promote``, for a row that must not wait for promotion: a person's
+        first row has no ``label!=`` exclude in anyone's share filter until the run's merge phase. Not
+        retried — callers treat it as best-effort, and ``promote`` applies the same mode again.
+        """
+        collection.modeUpdate(mode="hide")
 
     def reads_as_on_owner_home(self, collection: Collection) -> bool:
         """Is this collection currently on the owner's Home shelf? A read, never a write.
@@ -796,270 +1055,263 @@ class PlexClient:
         logger.info("{}: demoted off the owner's Home (converge)", log_title(collection.title))
         return True
 
-    def order_owned_hubs(
+    def place_rows(
         self,
         section: LibrarySection,
         *,
         label_prefix: str,
-        anchor_title: str = "",
-        anchor_keys: set[int] | None = None,
-        anchor_label: str = "",
-        before: bool = False,
+        sequence: list[tuple[str, object]],
         dry_run: bool = False,
-        only_keys: set[int] | None = None,
-        to_top: bool = False,
         attempts: int = _HUB_ORDER_ATTEMPTS,
     ) -> dict:
-        """Place this section's Shortlist rows in Plex's Managed Recommendations shelf: at the very TOP
-        (``to_top``) or right after/before the ``anchor_title`` collection, so a co-managing tool
-        (Kometa) can't bury them.
+        """Arrange this library's Recommended shelf so our rows sit where the owner asked.
 
-        Only OUR hubs are moved — those labelled ``label_prefix``_* OR carrying the Shortlist title
-        marker; a FOREIGN anchor is read-only. ``only_keys`` restricts the move to the rows with those
-        collection ratingKeys (used when different rows anchor to different collections) — ``None``
-        moves them all.
+        ``sequence`` is the wanted arrangement of OUR rows and the landmarks they are placed against,
+        top first. Every ``("rows", …)`` block is preceded by exactly one POSITION marker that applies
+        to it alone — ``("anchor", title)`` to sit below that hub, ``("anchor_before", title)`` to sit
+        above it, or ``("top", "")`` for the top of the shelf (see ``POSITION_KINDS``). A marker may
+        repeat; blocks against one anchor accumulate in sequence order. An entry is therefore either a
+        marker — naming a hub we did not create, chosen by the owner as the thing to sit next to — or
+        ``("rows", {ratingKeys})``, one
+        row's collections, whose order among themselves is meaningless and is left as it is.
 
-        ``anchor_keys`` anchors to one of OUR OWN rows instead of a foreign collection: the ratingKeys
-        of that row's collections in this section, from the delivery ledger. The anchor hub is then the
-        last of them in current shelf order (or the first, for ``before``) rather than a title match —
-        a per-person row has one collection per person, so no single title names it. Passing it lifts
-        the "never one of ours" rule for exactly those keys, which is safe only because the caller
-        places that row's block FIRST; anchoring to a row not yet in position would chase a moving
-        target. ``only_keys`` and ``anchor_keys`` must not overlap — a row cannot follow itself.
-        ``anchor_label`` is what the audit and logs CALL the anchor, since a row anchor has no title.
+        HOW, AND WHY IT IS THE ONLY WAY THAT LASTS. Plex stores each hub's position as a float
+        (``hub_templates."order"``) and inserts by halving a gap, so a gap dies after ~50 inserts and
+        every later move is accepted and silently dropped — for every client, Plex's own web app
+        included — until the values are re-spaced. Two operations never halve: "to the top" takes
+        ``min - 1000`` and "after the last hub" takes ``max + 1000``.
 
-        Returns an audit dict ``{anchor, moved: [titles], skipped: bool, reason?}``,
-        plus ``verified: bool`` once anything has actually been written (a dry run returns
-        ``dry_run: True`` and no ``verified``: it asked for nothing, so there is nothing to confirm).
+        To-the-top is not usable. A library's built-in hub (``movie.recentlyadded``) can hold the
+        minimum and refuses to move, so everything sent above it lands ON its value instead: measured
+        on a real server, one 94-hub rebuild collapsed 72 hubs onto a single float (2026-09-12).
 
-        Moves ONLY hubs actually out of place, and VERIFIES by re-reading the shelf (SFLIX, 2026-08-12).
-        The old loop chained ``move(after=previous)`` over every one of our hubs whenever any single one
-        was out of place — 47 unpaced PUTs in 344ms, ~27 of them re-asserting rows already in position —
-        and then logged ``moved 47`` having never looked at the result. It counted requests ISSUED.
+        So the shelf is built from the BOTTOM. Walk the wanted order and send each hub to the end in
+        turn; every move takes ``max + 1000``, so the shelf finishes in exactly that order with values
+        1000 apart. It re-spaces as a side effect, which means it REPAIRS a collapsed library instead
+        of eroding it — verified on both of that server's libraries: 130 and 137 moves, exact
+        arrangement, every hub left with its own value.
 
-        That is what made this shelf unreadable: another tool on the same host (agregarr) reorders every
-        managed hub every 30 minutes, so the shelf genuinely was not ours, and a function that cannot
-        tell "we asked" from "it happened" reported success throughout. Re-reading is what stops us
-        claiming a shelf we lost. ``order_collection`` orders items the same way.
+        The cost is that it repositions hubs we did not create. Their order relative to each other is
+        preserved exactly — only our rows move within them — and it is the only way to honour "put my
+        row after that collection" without the halving insert. Owner decision, 2026-09-12.
+
+        Writes NOTHING when the shelf already matches: the comparison happens before any move, so a
+        settled shelf costs one read.
         """
         prefix = f"{label_prefix}_".lower()
-        # title -> ratingKey for every row of ours here. Titles carry the invisible per-account marker,
-        # so within one section they are unique per user; the key is what `only_keys` partitions on.
-        #
-        # Ours by label OR by title marker. `collection.labels` makes plexapi silently re-read each
-        # collection, and a read that comes back carrying no <Label> is indistinguishable from a
-        # genuinely unlabelled row (plex-safety rule 4) — which here would empty this map and skip the
-        # whole library in silence, the same shape of quiet nothing that hid the ordering bug. Ordering
-        # only ever changes a POSITION, so the marker alone is safe proof of ownership: rule 4's two
-        # guards exist because a wrong answer there DELETES, and nothing here can.
         key_by_title = {
             c.title: c.ratingKey
             for c in self._section_collections(section)
             if has_shortlist_marker(c.title) or any(label.tag.lower().startswith(prefix) for label in c.labels)
         }
-        owned_all = set(key_by_title)
-        # What the audit and the logs CALL this anchor. A row anchor has no title of its own — one
-        # collection per person — so without a label every ordering record for one would read
-        # 'anchor: ""', which is not an answer to "what moved where" (rule 10).
-        audit_anchor = anchor_label or anchor_title or ("another Shortlist row" if anchor_keys else "")
-        # The subset to MOVE (restricted by only_keys).
-        owned_titles = owned_all if only_keys is None else {t for t, key in key_by_title.items() if key in only_keys}
-        if not owned_titles:
-            return {"anchor": audit_anchor, "moved": [], "skipped": True, "reason": "no rows in this library"}
-        # The titles a ROW anchor resolves to here — its collections, one per person. Everything else
-        # of ours stays barred from being an anchor: without `anchor_keys` this set is empty and the
-        # rule is exactly what it was. A row that named ITSELF would be asked to move relative to its
-        # own hubs, which is meaningless and would thrash the shelf; the caller rejects that, and the
-        # subtraction here means a slip cannot reach Plex.
-        anchor_titles = {t for t, key in key_by_title.items() if anchor_keys and key in anchor_keys} - owned_titles
-        if anchor_keys and not anchor_titles:
-            # Named row has nothing on this shelf (never delivered here, or its collections are gone).
-            # Leaving the shelf alone beats falling back to a different slot: a silent reinterpretation
-            # of where someone asked their row to go is worse than not moving it, and the next run
-            # places it once the row exists.
-            return {"anchor": audit_anchor, "moved": [], "skipped": True, "reason": "anchor row not on this shelf"}
-
-        where = "to the top" if to_top else f"{'before' if before else 'after'} {audit_anchor!r}"
-        # Hub identifier -> title, so a row re-moved on a later attempt is audited once, not once per
-        # attempt. Titles are unique per section (the marker), the identifier more so.
+        #: The anchors this pass actually placed against. Built inside the attempt loop from the
+        #: anchors that RESOLVED, because naming a refused one here put it in the "we arranged the
+        #: shelf" record as well as in its own "could not place" record.
+        audit_anchor = TOP
+        ours_keys = {k for kind, v in sequence if kind == "rows" for k in v}
         moved: dict[str, str] = {}
+        #: EVERY hub this call repositioned, ours or not. `moved` holds only our row titles, because
+        #: that is what the events feed is read for — but the skipped/verified decision has to know a
+        #: write happened at all, and a bottom-build moves the backbone too. Counting only our rows
+        #: made a pass that moved one foreign hub report "already in place" on its next attempt.
+        writes = 0
 
-        def outcome(reason: str) -> dict:
-            """Give up, without discarding the record of writes already made.
-
-            An early exit on attempt 2+ has already moved hubs, and returning ``moved: []`` there put a
-            real Plex write outside the audit entirely — `_apply_order` drops skipped results, so
-            `report.hub_orderings` never saw it (plex-safety rule 10).
-            """
-            if not moved:
-                return {"anchor": audit_anchor, "moved": [], "skipped": True, "reason": reason}
-            return {
-                "anchor": "top" if to_top else audit_anchor,
-                "moved": list(moved.values()),
-                "skipped": False,
-                "verified": False,
-                "reason": reason,
+        for attempt in range(1, attempts + 2):
+            order = list(section.managedHubs())
+            idents = [h.identifier for h in order]
+            by_ident = {h.identifier: h for h in order}
+            title_of = {h.identifier: (getattr(h, "title", "") or "") for h in order}
+            ours_here = {
+                h.identifier
+                for h in order
+                if is_collection_hub(h) and key_by_title.get(title_of[h.identifier]) in ours_keys and is_promoted(h)
             }
 
-        # `attempts` write passes, then ONE more read that only verifies. Without that extra pass the
-        # final attempt wrote and fell straight through to `verified: False` — so a shelf this fixed on
-        # its last try was reported as a failure, which is the very defect this function exists to
-        # remove, pointed the other way.
-        for attempt in range(1, attempts + 2):
-            order = list(section.managedHubs())  # the live shelf order, re-read each attempt
-            # Rows promoted NOWHERE are skipped. `managedHubs()` lists every managed hub, promoted or
-            # not, so a paused/disabled user's dormant row was being moved into place on every pass —
-            # a position nobody can see, since all three promotion flags are off. On SFLIX that was 4
-            # wasted moves per library per pass, and it kept a reconciled shelf looking contested: a
-            # co-managing tool (agregarr) rightly ignores those rows, so we alone kept shuffling them.
-            ours = [h for h in order if (getattr(h, "title", "") or "") in owned_titles and _is_promoted(h)]
-            if not ours:
-                return outcome("rows not promoted yet")
+            #: Our rows, grouped as the sequence asks and each group in its CURRENT shelf order — the
+            #: order inside a row is one collection per person and nobody sees anyone else's, so
+            #: re-sorting it would be writes nobody asked for.
+            blocks: dict[int, list[str]] = {}
+            for n, (kind, value) in enumerate(sequence):
+                if kind == "rows":
+                    blocks[n] = [
+                        h.identifier
+                        for h in order
+                        if is_collection_hub(h) and key_by_title.get(title_of[h.identifier]) in value and is_promoted(h)
+                    ]
 
-            if to_top:
-                target = None  # move(after=None) -> the very top of the shelf
-            elif anchor_titles:
-                # A ROW anchor is a BLOCK of hubs — one collection per person — not a single
-                # collection, so it has two edges: sit after its LAST hub, or before its FIRST.
-                # Re-resolved every attempt because that block was itself placed moments ago.
-                #
-                # PROMOTED hubs only, exactly like `ours` above. A paused or disabled person's copy of
-                # the anchor row is still on the shelf and still in the ledger, but we never move it —
-                # so it sits wherever Plex appended it, at the bottom. Anchoring to it dragged the
-                # follower down there with it, underneath the co-managing tool's hubs: precisely the
-                # burial this whole function exists to undo, reported as a verified success.
-                block = [h for h in order if (getattr(h, "title", "") or "") in anchor_titles and _is_promoted(h)]
-                if not block:
-                    # Every copy of the anchor row here is dormant. Same answer as "not on this shelf":
-                    # there is no position to be relative to, and inventing one puts the follower
-                    # somewhere nobody asked for.
-                    logger.warning(
-                        "hub order: anchor row has no promoted hub in {} — {}",
-                        section.title,
-                        f"stopping after {len(moved)} move(s)" if moved else "leaving the shelf order unchanged",
-                    )
-                    return outcome("anchor row not on this shelf")
-                if before:
-                    # Skip only the hubs we are ABOUT TO MOVE: their current position is about to
-                    # change, so landing on one aims at a slot that is disappearing. Other rows of ours
-                    # are already in place and are legitimate landmarks — which only matters here,
-                    # because a row anchor is the one case where our own hubs are the neighbourhood.
-                    anchor_idx = order.index(block[0])
-                    target = next(
-                        (
-                            h
-                            for h in reversed(order[:anchor_idx])
-                            if (getattr(h, "title", "") or "") not in owned_titles
-                        ),
-                        None,
-                    )
-                else:
-                    target = block[-1]
-            else:
-                anchor = next(
+            # Every named anchor has to actually be on the shelf. A collection promoted nowhere names
+            # no position a viewer can see, so following it buries the row (issue #106); refused here
+            # rather than silently reinterpreted. Plex's own built-ins are always usable.
+            anchor_ident: dict[str, str] = {}
+            # Anchors we cannot use, BY NAME. One unusable anchor used to return for the whole
+            # library, so a single row pointed at a hub the owner had switched off in Manage
+            # Recommendations stopped every other row here from being placed — and said so only in a
+            # log line, with the audit naming every anchor at once. Now it costs that row its
+            # placement and nothing else, and each name is audited on its own.
+            refused: list[str] = []
+            for kind, value in sequence:
+                if kind not in ANCHOR_KINDS or value in anchor_ident or value in refused:
+                    continue
+                hit = next(
                     (
                         h
                         for h in order
-                        if (getattr(h, "title", "") or "") == anchor_title
-                        and (getattr(h, "title", "") or "") not in owned_all
+                        if title_of[h.identifier] == value and h.identifier not in ours_here and can_anchor(h)
                     ),
                     None,
                 )
-                if anchor is None:
-                    logger.warning(
-                        "hub order: anchor {!r} not found in {} — {}",
-                        anchor_title,
+                if hit is None:
+                    logger.info(
+                        "hub order: anchor {!r} is not on {}'s shelf — leaving those rows where they are",
+                        value,
                         section.title,
-                        f"stopping after {len(moved)} move(s)" if moved else "leaving the shelf order unchanged",
                     )
-                    return outcome("anchor not found")
-                # 'after anchor' -> the anchor; 'before anchor' -> the hub just before it that isn't one
-                # of ours (None -> the very top of the shelf).
-                if before:
-                    anchor_idx = order.index(anchor)
-                    target = next(
-                        (h for h in reversed(order[:anchor_idx]) if (getattr(h, "title", "") or "") not in owned_all),
-                        None,
-                    )
-                else:
-                    target = anchor
+                    refused.append(value)
+                    continue
+                # Keyed by IDENTIFIER from here on. Splicing by title would attach the block to
+                # whichever hub shares that title first in shelf order — not necessarily the one just
+                # validated as being on a shelf.
+                anchor_ident[value] = hit.identifier
+            audit_anchor = ", ".join(anchor_ident) or TOP
 
-            idents = [h.identifier for h in order]
-            by_ident = {h.identifier: h for h in order}
-            our_idents = [h.identifier for h in ours]
-            start = idents.index(target.identifier) + 1 if target is not None else 0
-            if idents[start : start + len(our_idents)] == our_idents:
-                if not moved:
-                    return {"anchor": audit_anchor, "moved": [], "skipped": True, "reason": "already in place"}
+            # The backbone is every hub that is not ours, in the order the shelf already has them, so
+            # a co-managing tool's rows keep their own arrangement. Our blocks are spliced in at the
+            # point the owner named; a block with no anchor before it goes to the very top.
+            after_anchor: dict[str, list[str]] = {}
+            before_anchor: dict[str, list[str]] = {}
+            seen_anchor = ""
+            seen_before = False
+            leading: list[str] = []
+            unusable = False
+            for n, (kind, value) in enumerate(sequence):
+                if kind == TOP:
+                    seen_anchor, seen_before, unusable = "", False, False
+                elif kind in ANCHOR_KINDS:
+                    unusable = value in refused
+                    if unusable:
+                        continue
+                    seen_anchor = anchor_ident[value]
+                    seen_before = kind == "anchor_before"
+                    (before_anchor if seen_before else after_anchor).setdefault(seen_anchor, [])
+                elif unusable:
+                    continue  # its landmark is on no shelf, so leave these rows exactly where they are
+                elif not seen_anchor:
+                    leading += blocks[n]
+                elif seen_before:
+                    before_anchor[seen_anchor] += blocks[n]
+                else:
+                    after_anchor[seen_anchor] += blocks[n]
+            if not leading and not any(after_anchor.values()) and not any(before_anchor.values()):
+                return {
+                    "anchor": audit_anchor,
+                    "moved": list(moved.values()),
+                    # `writes`, not 0 — a retry can reach here having already moved hubs, and
+                    # reporting none lost them from the audit (plex-safety rule 10).
+                    "repositioned": writes,
+                    "skipped": not writes,
+                    # Every block we had was refused, so say THAT rather than "nothing delivered here".
+                    "reason": "anchor not found" if refused else "no rows in this library",
+                    "refused": refused,
+                }
+            # Rows we are actually placing. A row of ours whose anchor was REFUSED is not one of
+            # them, and it falls through to the backbone below — so it keeps its position relative to
+            # the hubs we do not move, exactly like a co-managing tool's row, instead of dropping out
+            # of the arrangement altogether and stranding itself between an anchor and its row.
+            spliced = {ident for block in (leading, *before_anchor.values(), *after_anchor.values()) for ident in block}
+            arrangement = list(leading)
+            for ident in idents:
+                if ident in spliced:
+                    continue
+                if not is_promoted(by_ident[ident]):
+                    # Promoted nowhere, so on no shelf at all. Arranging it spends a write on a hub we
+                    # do not own for a position nobody can see.
+                    continue
+                arrangement += before_anchor.pop(ident, [])
+                arrangement.append(ident)
+                arrangement += after_anchor.pop(ident, [])
+            # First occurrence wins. An identifier listed TWICE — two row slugs sharing one collection
+            # in the delivery ledger — can never match the comparison below, which sees each hub once,
+            # so the pass rebuilt the whole shelf on every attempt and still answered `verified: False`.
+            wanted = list(dict.fromkeys(arrangement))
+
+            # Compare only the hubs this call is arranging. A hub left OUT — a paused person's row,
+            # or anyone's hub promoted nowhere — sits on no shelf, so where it falls is not a reason
+            # to rewrite anything. Comparing the whole list made every pass find a difference it could
+            # never fix and rewrite the shelf for ever.
+            in_play = set(wanted)
+            if [i for i in idents if i in in_play] == wanted:
+                if not writes:
+                    return {
+                        "anchor": audit_anchor,
+                        "moved": [],
+                        "repositioned": 0,
+                        "skipped": True,
+                        "reason": "already in place",
+                        "refused": refused,
+                    }
                 logger.info(
-                    "hub order: placed {} row(s) {} in {} — {} move(s) over {} attempt(s), verified",
-                    len(ours),
-                    where,
+                    "hub order: arranged {} hub(s) in {} — {} move(s) over {} attempt(s), verified",
+                    len(wanted),
                     section.title,
-                    len(moved),
+                    writes,
                     attempt - 1,
                 )
                 return {
-                    "anchor": "top" if to_top else audit_anchor,
+                    "anchor": audit_anchor,
                     "moved": list(moved.values()),
+                    "repositioned": writes,
                     "skipped": False,
                     "verified": True,
+                    "refused": refused,
                 }
-
             if attempt > attempts:
-                break  # the extra pass is verify-only: the shelf has just been read and is not right
-
-            # PLAN first, then write — `idents` is our model of the live order, advanced as if each
-            # move had landed, so a hub already in its wanted slot is never touched. Planning it
-            # separately is what lets the dry run report the REAL cost: it used to say "would move 46
-            # rows" for a shelf needing nineteen, which is the same overstatement the live pass made.
-            planned: list[tuple[str, object]] = []
-            previous = target
-            for ident in our_idents:
-                want = 0 if previous is None else idents.index(previous.identifier) + 1
-                if idents.index(ident) != want:
-                    planned.append((ident, previous))
-                    idents.remove(ident)
-                    idents.insert(0 if previous is None else idents.index(previous.identifier) + 1, ident)
-                previous = by_ident[ident]
-
+                break
             if dry_run:
-                logger.info(
-                    "[dry-run] hub order: would move {} of {} row(s) {} in {}",
-                    len(planned),
-                    len(ours),
-                    where,
-                    section.title,
-                )
+                logger.info("[dry-run] hub order: would arrange {} hub(s) in {}", len(wanted), section.title)
                 return {
-                    "anchor": "top" if to_top else audit_anchor,
-                    "moved": [by_ident[ident].title for ident, _ in planned],
+                    "anchor": audit_anchor,
+                    # `spliced`, not `ours_here` — the same accounting the real pass uses. Keyed on
+                    # ownership, the preview credited a row whose anchor was REFUSED as one it would
+                    # move, next to a record saying it could not be placed.
+                    "moved": [title_of[i] for i in wanted if i in spliced],
+                    # The preview must state what a real pass would WRITE, backbone included — an
+                    # owner told to trust it should not be shown a smaller number than the truth.
+                    "repositioned": sum(1 for n, i in enumerate(wanted) if not (n == 0 and i == idents[-1])),
                     "skipped": False,
                     "dry_run": True,
+                    "refused": refused,
                 }
 
-            for ident, after in planned:
-                by_ident[ident].reload().move(after=after)  # after=None -> top of the shelf
-                moved[ident] = by_ident[ident].title
+            # Bottom-build: each hub in turn to the END of the shelf, which is the one insert with
+            # room to spare. `tail` tracks the hub currently last so the model never re-reads.
+            tail = idents[-1]
+            for ident in wanted:
+                if ident == tail:
+                    continue
+                by_ident[ident].reload().move(after=by_ident[tail])
+                writes += 1
+                if ident in spliced:
+                    # `spliced`, not `ours_here`: a row of ours whose anchor was REFUSED rides along
+                    # in the backbone, and counting it here made the feed say "we moved Row A" beside
+                    # "we could not place Row A". `moved` means rows we put where the owner asked.
+                    moved[ident] = title_of[ident]
+                tail = ident
 
-        # Every attempt moved rows and the shelf still is not what we asked for — and the read that
-        # ended the loop confirms that, rather than assuming it. The likeliest reason by far is another
-        # tool reordering the same shelf between our passes, so the message says so: an operator who
-        # sees this needs to go looking OUTSIDE Shortlist. Cosmetic, so the run carries on, but it is
-        # reported as UNVERIFIED rather than as success, which is how this hid for weeks.
         logger.warning(
-            "hub order: the Shortlist rows in {} are still not {} after {} attempts and {} move(s) — "
-            "something else is very likely reordering this shelf (Kometa, agregarr); leaving it as it is",
+            "hub order: {}'s shelf is still not in the wanted order after {} attempts and {} move(s) — "
+            "Plex accepted the moves and did not apply them, which is what a library whose hub "
+            "positions have collapsed onto one float value looks like from here",
             section.title,
-            where,
             attempts,
-            len(moved),
+            writes,
         )
         return {
-            "anchor": "top" if to_top else audit_anchor,
+            "anchor": audit_anchor,
             "moved": list(moved.values()),
+            "repositioned": writes,
             "skipped": False,
             "verified": False,
+            "refused": refused,
         }
 
     def set_items(self, collection: Collection, existing_items: list, add_items: list, wanted_keys: list[int]) -> None:
@@ -1079,10 +1331,40 @@ class PlexClient:
         wanted_set = set(wanted_keys)
         to_remove = [i for i in existing_items if i.ratingKey not in wanted_set]
         if add_items:
-            collection.addItems(add_items)
+            try:
+                # Safe to repeat: a Plex collection is a SET, so re-adding an item the first attempt
+                # already landed is a no-op, and a partially-applied add converges on the retry.
+                _retry_idempotent(lambda: collection.addItems(add_items), label=log_title(collection.title))
+            except Exception as exc:
+                # Anchored on the leading token, never `"400" in`: plexapi formats the message as
+                # `f'({status}) {codename}; {url} {errtext}'` and that url carries the collection's
+                # own ratingKey, so a substring test matches keys like 1400 or 40053 — the mistake
+                # that once swallowed 500s and 401s in `delivery.rename_or_keep`.
+                if not str(exc).startswith("(400)"):
+                    raise
+                # Raised from HERE, not inferred by the caller, so "the collection refuses items" can
+                # never be confused with a 400 from the removeItems or sortUpdate below. Those are
+                # different endpoints and a rebuild does not fix them.
+                raise CollectionRejectedItems(str(exc)) from exc
         if to_remove:
-            collection.removeItems(to_remove)
-        collection.sortUpdate(sort="custom")
+            # ONE ITEM AT A TIME, each with its own retry, because plexapi's `removeItems` loops and
+            # issues a separate DELETE per item. Retrying the whole BATCH would re-send the deletes
+            # that already succeeded; this re-sends only the one item that failed. Same PMS
+            # round-trip count as before.
+            #
+            # It is not fully idempotent even so, and saying otherwise would be a lie a future
+            # reader relies on: the failure being retried is a 500-after-10.0s, which is Plex
+            # timing out on work it may well have applied — so the retry can re-DELETE an item that
+            # is already gone, and Plex's answer to that is recorded nowhere (rule 11). A NotFound
+            # on a later attempt is therefore treated as the success it describes: the item is not
+            # in the collection, which is exactly what this call was asking for.
+            for item in to_remove:
+                _retry_idempotent(
+                    lambda it=item: collection.removeItems([it]),
+                    label=log_title(collection.title),
+                    already_done=NotFound,
+                )
+        _retry_idempotent(lambda: collection.sortUpdate(sort="custom"), label=log_title(collection.title))
         # INFO only when the membership actually MOVED. A steady row is the common case on a nightly
         # converge, and "items +0 -0" once per collection buried the lines that mattered — a
         # 96-collection server logged ~96 of them a night saying nothing happened.
@@ -1182,6 +1464,34 @@ class PlexClient:
 
         _retry_idempotent(_op, label=f"resetPoster {collection.title!r}")
 
+    def edit_collection_fields(self, collection: Collection, fields: dict[str, str | None]) -> None:
+        """Set or hand back text fields on one of our collections, all in ONE PUT (issue #120).
+
+        ``fields`` maps a Plex field name (``summary``, ``titleSort``) to the value to lock in, or to None
+        to blank and unlock it so Plex manages it again. Locked, because an unlocked custom sort title
+        is overwritten by the next title edit; and a blank unlocked one is rebuilt by Plex from the title
+        (tests/fixtures/pms_collection_field_edits.json).
+
+        ``Collection.edit`` rather than plexapi's batch mode on purpose: an object left in batch mode by
+        a failure QUEUES every later edit instead of sending it — including a label write, which would
+        then silently never reach Plex.
+        """
+        params: dict[str, str | int] = {}
+        for name, value in fields.items():
+            params[f"{name}.value"] = value or ""
+            params[f"{name}.locked"] = 0 if value is None else 1
+        _retry_idempotent(lambda: collection.edit(**params), label=f"edit fields {log_title(collection.title)!r}")
+
+    def reread_collection(self, collection: Collection) -> Collection:
+        """A FRESH copy of one of our collections, read from the PMS now — for a decision the run's
+        cached listing is too old to make (issue #120: whether a field still holds what Shortlist wrote).
+
+        A separate object on purpose, never ``collection.reload()``: reloading the cached object would
+        overwrite its labels with whatever this read returns, and a read that comes back without
+        ``<Label>`` children would drop the row out of every later lookup this run (plex-safety rule 4).
+        """
+        return self._server.fetchItem(collection.key)  # a GET: the session's own Retry covers it
+
     def delete_owned_collection(self, collection: Collection, label_prefix: str) -> None:
         """Delete a collection only if it is provably ours (Kometa coexistence, plex-safety rule 4).
 
@@ -1238,6 +1548,41 @@ class PlexClient:
             )
         return items, missing
 
+    #: Keys per batch read. A ratingKey list rides in the URL path, so it is kept well short of URL limits.
+    _VISIBLE_BATCH = 50
+
+    def visible_to(self, token: str, rating_keys: list[int]) -> set[int]:
+        """Which of these library items the account holding `token` can see (#115).
+
+        Read AS that account: ``GET /library/metadata/{k1,k2,...}`` with its own server token. Recorded on
+        a real PMS (`tests/fixtures/pms_share_filter_allow_lists.json`, ``read_as_account``): items its
+        share filter hides are simply absent from a 200, and a batch holding none it can see is a 404.
+
+        Args:
+            token: The account's server token (plex-safety rule 9: never logged).
+            rating_keys: Library items to check.
+
+        Returns:
+            The subset of `rating_keys` the account can see.
+
+        Raises:
+            Whatever the read raises for anything but a 404 — an expired token must never read as
+            "nothing visible", which would empty that person's rows.
+        """
+        visible: set[int] = set()
+        for start in range(0, len(rating_keys), self._VISIBLE_BATCH):
+            batch = rating_keys[start : start + self._VISIBLE_BATCH]
+            r = http_retry.get(
+                self._server.url(f"/library/metadata/{','.join(str(k) for k in batch)}", includeToken=False),
+                headers={"X-Plex-Token": token, "Accept": "application/json"},
+                timeout=self._timeout,
+            )
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            visible.update(int(m["ratingKey"]) for m in r.json().get("MediaContainer", {}).get("Metadata", []) or [])
+        return visible & set(rating_keys)
+
     def user_hubs(self, canary_token: str, path: str = "/hubs") -> list[dict]:
         """Fetch hubs AS another user (for visibility checks). Uses that user's server token, not the owner's."""
         r = http_retry.get(
@@ -1247,6 +1592,61 @@ class PlexClient:
         )
         r.raise_for_status()
         return r.json().get("MediaContainer", {}).get("Hub", []) or []
+
+    def item_thumb_path(self, rating_key: int) -> str | None:
+        """The server-relative artwork path for one library item, or None when it has none.
+
+        Read through :meth:`fetch_items` so **plexapi owns the response shape**, not this repo. There
+        is no recorded fixture for a single ``GET /library/metadata/{key}`` carrying a ``thumb``
+        (rule 11): the recorded ``pms_metadata_batch_partial.json`` settles the envelope and the
+        partial-batch behaviour but was trimmed to ``ratingKey``/``type``, and every recorded ``thumb``
+        this repo holds (``pms_collections_listing.json``, ``pms_play_history.xml.txt``) came off a
+        different endpoint. Rather than parse a shape nobody has recorded, this leans on the same
+        plexapi path the delivery pipeline already depends on in production.
+
+        Defensive on purpose. An item with no artwork, or one whose ``thumb`` is anything other than a
+        path on THIS server, is reported as None so the caller can answer "no picture" — never by
+        following an absolute URL somewhere else, and never by inventing one.
+
+        Args:
+            rating_key: The item's Plex ratingKey.
+
+        Returns:
+            A path beginning with ``/`` (e.g. ``/library/metadata/123/thumb/1699999999``), or None.
+        """
+        items, _missing = self.fetch_items([rating_key])
+        if not items:
+            return None
+        thumb = str(getattr(items[0], "thumb", "") or "")
+        # A server-relative path only. plexapi hands back whatever the PMS wrote, and an absolute URL
+        # would turn this into a fetcher for a host the owner never pointed us at.
+        return thumb if thumb.startswith("/") and not thumb.startswith("//") else None
+
+    def read_artwork(self, thumb_path: str) -> tuple[bytes, str]:
+        """``(bytes, content-type)`` for a server-relative artwork path on this PMS.
+
+        The owner's token goes in the HEADER, never the query string (rule 9): these bytes are handed
+        to a browser by a proxy, and a token in the URL is a token in the browser's history.
+
+        Args:
+            thumb_path: A path from :meth:`item_thumb_path`. Must start with ``/``.
+
+        Returns:
+            The image bytes and the content type the PMS reported.
+
+        Raises:
+            ValueError: The path is not server-relative.
+            httpx.HTTPStatusError: The PMS refused the read.
+        """
+        if not thumb_path.startswith("/") or thumb_path.startswith("//"):
+            raise ValueError("artwork path must be relative to this server")
+        r = http_retry.get(
+            self._server.url(thumb_path, includeToken=False),
+            headers={"X-Plex-Token": self._token},
+            timeout=self._timeout,
+        )
+        r.raise_for_status()
+        return r.content, r.headers.get("content-type", "image/jpeg")
 
     def scrobble_as(self, rating_key: int, token: str, *, dry_run: bool = False) -> bool:
         """Mark one item played AS another account, using that account's server token.
@@ -1463,6 +1863,12 @@ class PlexClient:
     # single response to hold them all (a silent cap here would hide older watches from the
     # already-watched filter — the very 200-row bug the share-token read exists to end).
     _WATCHED_PAGE = 500
+
+    # Safety stop for the episode roll-up, which pages until the server returns an EMPTY page rather
+    # than trusting a short one (see `_newest_episode_stamps`). At 500 a page this is 100,000 watched
+    # episodes — an order of magnitude past the largest library measured (9,563) — so reaching it
+    # means the server is not terminating, not that someone watches a lot.
+    _EPISODE_PAGE_LIMIT = 200
     #: History pages. Both container headers are required — see `play_history`.
     _HISTORY_PAGE = 1000
 
@@ -1618,11 +2024,20 @@ class PlexClient:
     ) -> list[WatchedItem]:
         """Every title in one library this user has watched, read from the PMS AS that user.
 
-        ``unwatched=0`` filters to ``viewCount>0`` — Plex's own binary "watched" flag, which INCLUDES a
-        mark-as-watched (the playback-history API never returns marks; issue #12). ``includeGuids=1``
-        inlines each item's ``tmdb://`` GUID, so a title resolves to its tmdb_id here with no dependency
-        on the run's library index — the same on a sync as on a run (live-verified 2026-07-24: 100% of a
-        friend's watched movies carried an inline TMDB GUID).
+        The filter DIFFERS by media type, and the difference is issue #108:
+
+        * **Movies** — ``unwatched=0``, i.e. ``viewCount>0``. Plex's own binary watched flag, which
+          INCLUDES a mark-as-watched (the playback-history API never returns marks; issue #12).
+        * **Shows** — ``viewedLeafCount!=0``, NEVER ``unwatched=0``. The latter filters on the show's
+          own watch-state row, which marking a series or a season does not establish, so a finished
+          series is absent from it while its episode counts are correct. Measured on two servers:
+          533 shows against 491, the 491 matching the episode-level truth exactly. The filter is
+          applied again client-side, because an ignored query param on this endpoint is answered with
+          the whole library rather than an error.
+
+        ``includeGuids=1`` inlines each item's ``tmdb://`` GUID, so a title resolves to its tmdb_id here
+        with no dependency on the run's library index — the same on a sync as on a run (live-verified
+        2026-07-24: 100% of a friend's watched movies carried an inline TMDB GUID).
 
         A show is returned once, at the show level, carrying the user's own ``viewedLeafCount`` /
         ``leafCount`` — so the finished-show fraction is Plex's, not a reconstruction from play counts,
@@ -1656,7 +2071,21 @@ class PlexClient:
             on absence must check it.
         """
         plex_type = 1 if media_type is MediaType.MOVIE else 2
+        # Captured BEFORE the walk: the sort fallback below sets `since = None` mid-read, so by the
+        # end `since is None` no longer distinguishes "asked for everything" from "asked for a window
+        # and gave up on the sort". Only the first earns the complete-read coverage rule.
+        full_read = since is None
         items: list[WatchedItem] = []
+        # Rows Plex DID return that we then threw away for want of a `tmdb://` guid. Counted because
+        # the drop is otherwise invisible: a title the person really has watched simply never reaches
+        # the cache, the log says "5 titles" rather than "5 of 8", and nothing anywhere says why. A
+        # library matched with the legacy TheTVDB agent yields `tvdb://` only, so this is a whole
+        # library's worth of silence, not a stray row.
+        dropped = 0
+        # Rows the SERVER should have filtered out and did not. A handful is normal; a library's
+        # worth means `viewedLeafCount!=0` was ignored and we are paging everything, which the
+        # client-side filter hides completely — the answer stays right, the cost silently multiplies.
+        filtered_out = 0
         start = 0
         reached_cutoff = False
         read_whole_library = False
@@ -1689,8 +2118,21 @@ class PlexClient:
             elif since is not None and len(_stamps(entries)) >= 2:
                 order_observed = True
             for el in entries:
+                # Apply the filter OURSELVES rather than trusting the server to have applied it.
+                # Query-param filtering on this endpoint is silently ignored by some responses — a
+                # 200 carrying the FULL library, which is the worst failure available here: every
+                # show in the library would read as watched and nothing would ever be recommended
+                # again. Filtering client-side makes the answer correct either way; an honoured
+                # filter just means fewer rows crossed the wire.
+                if media_type is MediaType.SHOW and int(el.get("viewedLeafCount") or 0) <= 0:
+                    filtered_out += 1
+                    continue
                 item = self._watched_item(el, media_type)
                 if item is None:
+                    # Only on a complete read. An incremental walk stops at a cutoff, so a row it
+                    # skipped may simply be outside the window — counting it would report a match
+                    # problem that isn't one. Every sync reads complete now, so nothing is lost.
+                    dropped += full_read
                     continue
                 if since is not None and item.watched_at < since:
                     # An item with NO `lastViewedAt` is stamped 1970 by `_watched_item`, so it looks
@@ -1699,6 +2141,12 @@ class PlexClient:
                     # would look like a quiet night rather than a truncation. Skip it and keep going;
                     # only a real timestamp may end the walk.
                     if el.get("lastViewedAt") is None:
+                        # Returned, not just stepped over. The `continue` only has to stop the walk
+                        # ENDING here; dropping the row as well made an incremental read report a
+                        # show the full read had dated from its episodes as absent, which is
+                        # indistinguishable from an un-watch and let `_drop_vanished_since` delete it.
+                        # `viewedLeafCount!=0` already proved it watched, so returning it is right.
+                        items.append(item)
                         continue
                     # Sorted newest-first, so everything from here on is older. Stop reading — this
                     # is where the saving actually comes from, since the server ignores the filter.
@@ -1752,18 +2200,286 @@ class PlexClient:
         # `totalSize` AND caps the container below our page size ends the walk on a short page having
         # read only part of the window. `sort_honoured` gates both, because the fallback drops the
         # sort mid-walk and leaves the earlier pages in an order nothing verified.
+        #
+        # A COMPLETE read (`since is None`) has no cutoff to stop at, so `read_whole_library` is the
+        # only proof available — and it is the one the cache's reconcile pass checks before replacing
+        # a section wholesale.
         covers_window = (
-            since is not None and sort_honoured and ((reached_cutoff and order_observed) or read_whole_library)
+            read_whole_library
+            if full_read
+            else (sort_honoured and ((reached_cutoff and order_observed) or read_whole_library))
         )
+        # `warned` is per instance, created lazily: `tests/conftest.py`'s `mock_plex` builds this
+        # class via `__new__` and never runs `__init__`, and a mutable CLASS attribute would leak one
+        # test's suppressions into the next. A client lives for one sync or one run, which is the
+        # right lifetime for "already said once".
+        warned = self.__dict__.setdefault("_warned_unmatched", set())
+        if filtered_out > len(items) and filtered_out > 10 and str(section_key) not in warned:
+            # More thrown away than kept: the server is not applying `viewedLeafCount!=0`, so every
+            # sync pages the whole library instead of the watched part of it. Correctness is
+            # unaffected — the filter is applied here too — but on a real server this is 4,880 rows
+            # against 491, per person, per sync, with nothing else to show for it.
+            warned.add(str(section_key))
+            logger.warning(
+                "watched read: section {} — the server returned {} shows with nothing watched "
+                "alongside {} watched ones, so it is ignoring `viewedLeafCount!=0` and this read is "
+                "paging the whole library every time. Correct, but far more expensive than it needs "
+                "to be.",
+                section_key,
+                filtered_out,
+                len(items),
+            )
+        if dropped and str(section_key) not in warned:
+            # ONCE per library per client, not once per person. What it reports is a property of the
+            # LIBRARY — its metadata agent — and it is invariant across users and across nights,
+            # while this method runs per (person, library). Unguarded it produced one identical line
+            # per user per sync: ~100 a day on a 47-user server, which is how a warning becomes
+            # wallpaper. The per-read count stays on the DEBUG line above for anyone counting.
+            #
+            # WARNING, not debug: every one of these is a title the person has watched that Shortlist
+            # will keep recommending back to them, and the only cure is fixing the match in Plex.
+            warned.add(str(section_key))
+            agent = "TheTVDB" if media_type is MediaType.SHOW else "the legacy Movie"
+            logger.warning(
+                "watched read: section {} — Plex returned {} watched title(s) with no tmdb:// guid, "
+                "so they cannot be matched and are ignored. A library matched with {} does this to "
+                "EVERY title; re-matching it against Plex's own agent fixes it.",
+                section_key,
+                dropped,
+                agent,
+            )
         logger.debug(
-            "watched read: section {} ({}) -> {} titles{}{}",
+            "watched read: section {} ({}) -> {} titles{}{}{}",
             section_key,
             media_type.value,
             len(items),
+            f" ({dropped} dropped — no tmdb:// guid)" if dropped else "",
             f" since {since.isoformat()}" if since else "",
-            "" if since is None or covers_window else " (INCOMPLETE — window coverage unproven)",
+            "" if covers_window else " (INCOMPLETE — coverage unproven)",
         )
-        return WatchedRead(items=items, covers_window=covers_window)
+        if media_type is MediaType.SHOW and full_read:
+            items = self._dates_from_episodes(section_key, token, items)
+        return WatchedRead(items=items, covers_window=covers_window, dropped_no_guid=dropped)
+
+    def _dates_from_episodes(self, section_key: str | int, token: str, shows: list[WatchedItem]) -> list[WatchedItem]:
+        """Give a show with no watch date of its own the date of its newest watched EPISODE.
+
+        Marking a series or a season watched sets the episodes and leaves the show row with no
+        `lastViewedAt` — the same omission behind issue #108. `_watched_item` has to date such a row
+        1970, which is not a small inaccuracy: `watched_at` drives seed recency (a 1970 date weighs
+        zero, so the show never seeds) and the effectiveness report, which showed a series finished
+        minutes ago as "finished 20697d ago".
+
+        Only runs when at least one show came back undated, and reads once for the whole library
+        rather than per show. On a real server 19 of 491 shows were undated, of which the episodes
+        could date 2 — the rest have no watched episodes either, so nothing anywhere knows when, and
+        they keep the epoch. That is the honest answer rather than a guess.
+        """
+        undated = [item for item in shows if item.rating_key is not None and item.watched_at <= _EPOCH]
+        if not undated:
+            return shows
+        try:
+            newest = self._newest_episode_stamps(section_key, token)
+        except Exception as e:
+            # Dates only — never worth losing a good read over. Degrades to the epoch, which is what
+            # these rows carried before this existed.
+            logger.warning(
+                "watched read: section {} — could not read episodes to date {} undated show(s) ({})",
+                section_key,
+                len(undated),
+                type(e).__name__,
+            )
+            return shows
+        if newest is None:
+            # Coverage unproven — see `_newest_episode_stamps`. Dating from an arbitrary prefix of an
+            # unordered list would put a wrong date on a real row, which is worse than none: the
+            # epoch at least says "unknown" and weighs zero, while a plausible-looking wrong date
+            # silently mis-weights the seed and the effectiveness report.
+            return shows
+
+        dated = 0
+        out = []
+        for item in shows:
+            stamp = newest.get(item.rating_key or -1, 0) if item.watched_at <= _EPOCH else 0
+            if stamp:
+                dated += 1
+                out.append(replace(item, watched_at=datetime.fromtimestamp(stamp, tz=UTC)))
+            else:
+                out.append(item)
+        logger.debug(
+            "watched read: section {} — dated {} of {} undated show(s) from their episodes",
+            section_key,
+            dated,
+            len(undated),
+        )
+        return out
+
+    #: Above this many shows needing a date, ONE library-wide episode read is cheaper than a call
+    #: each. The library walk is ~2.8s over 9,563 episodes; a single show is one page of at most a few
+    #: dozen rows, so ~0.1-0.2s — the crossover is a dozen or so, not the ~3 the 1.1s SECTION read
+    #: would suggest (that read returns every show in the library, which is a different question).
+    #: Marking a handful of shows is the normal case, so the per-show path is the one that runs.
+    _PER_SHOW_DATE_LIMIT = 12
+
+    def newest_episode_dates(self, section_key: str | int, token: str, show_keys: set[int]) -> dict[int, datetime]:
+        """When each of these shows was last WATCHED, taken from its episodes.
+
+        For a show whose own `lastViewedAt` is stale — marking a partly-watched series bumps
+        `viewedLeafCount` and leaves the show's date alone (issue #108) — the episodes are the only
+        place the real date exists. The caller decides which shows need it; this just answers.
+
+        Args:
+            section_key: The library, used only to pick the bulk read when there are many.
+            token: The user's own server token — these are per-user watch states.
+            show_keys: The shows to date. Empty returns empty without a request.
+
+        Returns:
+            `{show ratingKey: newest watched-episode datetime}`, omitting any show nothing could date.
+        """
+        if not show_keys:
+            return {}
+        if len(show_keys) > self._PER_SHOW_DATE_LIMIT:
+            stamps = self._newest_episode_stamps(section_key, token)
+            if stamps is None:
+                return {}
+            return {k: datetime.fromtimestamp(v, tz=UTC) for k, v in stamps.items() if k in show_keys and v > 0}
+        out: dict[int, datetime] = {}
+        for key in sorted(show_keys):
+            try:
+                stamp = self._newest_leaf_stamp(key, token)
+            except Exception as e:
+                # Dates only — one show that will not read must not cost the other libraries their
+                # sync. It keeps the date it had, which is the pre-repair behaviour.
+                logger.warning("watched read: could not date show {} from its episodes ({})", key, type(e).__name__)
+                continue
+            if stamp:
+                out[key] = datetime.fromtimestamp(stamp, tz=UTC)
+        return out
+
+    def _newest_leaf_stamp(self, show_rating_key: int, token: str) -> int:
+        """Newest `lastViewedAt` across one show's WATCHED episodes, or 0 if none are.
+
+        Two things this endpoint does that the section read does not, both live-probed 2026-09-05 and
+        recorded in `pms_all_leaves.xml.txt`:
+
+        * ``?unwatched=0`` is **silently ignored** here — the filtered and unfiltered answers were
+          byte-for-byte the same 8 rows. So the filter is applied client-side, on ``viewCount``.
+        * ``totalSize`` is omitted entirely unless an explicit container size is asked for (One Piece
+          answered `size=1175` with no total, and `size=50 totalSize=1175` when paged). So the page
+          headers are always sent — without them a 1,175-episode show is one 3.6MB response.
+
+        A partially-watched episode carries a `lastViewedAt` and NO `viewCount` (recorded: episode 2
+        of the fixture, `viewOffset` only). It is excluded, because it is equally excluded from the
+        `viewedLeafCount` this repair exists to explain — counting it would date a show from an
+        episode nobody finished.
+        """
+        newest = 0
+        start = 0
+        for _ in range(self._EPISODE_PAGE_LIMIT):
+            url = self._server.url(f"/library/metadata/{show_rating_key}/allLeaves", includeToken=False)
+            r = http_retry.get(
+                url,
+                headers={
+                    "X-Plex-Token": token,
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(self._WATCHED_PAGE),
+                },
+                timeout=self._timeout,
+            )
+            if r.status_code == 403:
+                raise SectionNotShared(f"show {show_rating_key} is not visible to this user")
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            page = list(root)
+            for el in page:
+                try:
+                    views = int(el.get("viewCount") or 0)
+                    stamp = int(el.get("lastViewedAt") or 0)
+                except ValueError:
+                    continue
+                if views > 0:
+                    newest = max(newest, stamp)  # unwatched and part-watched rows are both excluded
+            if not page:
+                return newest
+            start += len(page)
+            reported = root.get("totalSize")
+            if reported is not None and start >= int(reported):
+                return newest
+        logger.warning("watched read: show {} did not finish paging its episodes", show_rating_key)
+        return newest
+
+    def _newest_episode_stamps(self, section_key: str | int, token: str) -> dict[int, int] | None:
+        """`{show ratingKey: newest watched episode lastViewedAt}` for one show library, read as `token`.
+
+        Folded per page rather than accumulating elements. The library this exists for holds 9,563
+        watched episodes (recorded: `pms_watched_episodes_rollup.xml.txt`) — retaining them was 14MB
+        held per user per library per sync to extract a handful of integers, while the dict is a few
+        hundred ints.
+
+        Returns:
+            The stamps, or **None** when the walk could not be proven complete — see below. Never a
+            partial answer: the episode list is not ordered by `lastViewedAt`, so a truncated read is
+            an arbitrary subset and every date taken from it is arbitrarily too old.
+        """
+        newest: dict[int, int] = {}
+        start = 0
+        # A server that reports no `totalSize` AND caps the container below what we asked for
+        # answers every page short, so "short page" cannot mean "the end" — that read stops after one
+        # page and dates every show from the first 2% of an unordered list. Page until the server
+        # returns an EMPTY page instead, which costs one extra request and cannot be misread. The
+        # bound is a safety stop against a server that never empties, not an expected exit.
+        for _ in range(self._EPISODE_PAGE_LIMIT):
+            url = self._server.url(f"/library/sections/{section_key}/all", includeToken=False)
+            # `?` or `&`: plexapi appends `?X-Plex-Token=...` to `url()` even with `includeToken=False`
+            # whenever `log.show_secrets` is on, and a hardcoded `?` then made `type=4` part of the
+            # token value rather than a parameter — answered with the whole library, not its episodes.
+            r = http_retry.get(
+                f"{url}{'&' if '?' in url else '?'}type=4&unwatched=0",
+                headers={
+                    "X-Plex-Token": token,
+                    "X-Plex-Container-Start": str(start),
+                    "X-Plex-Container-Size": str(self._WATCHED_PAGE),
+                },
+                timeout=self._timeout,
+            )
+            if r.status_code == 403:
+                raise SectionNotShared(f"section {section_key} is not shared with this user")
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            page = list(root)
+            for el in page:
+                raw = el.get("grandparentRatingKey")
+                if raw is None:
+                    continue  # a season or show row — only leaves carry the key we fold on
+                try:
+                    key, stamp = int(raw), int(el.get("lastViewedAt") or 0)
+                    views = int(el.get("viewCount") or 0)
+                except ValueError:
+                    continue
+                # `viewCount`, client-side, exactly as `_newest_leaf_stamp` does — so the two paths
+                # that date a show cannot disagree about the same show. A part-watched episode
+                # carries a `lastViewedAt` and no `viewCount`, and on the first real show this was
+                # tried against its stamp was NEWER than the only episode actually finished. This
+                # server's `unwatched=0` does exclude those (probed 2026-09-05: episode 460770,
+                # viewOffset-only, absent from all 9,581 rows) — but the same endpoint family
+                # silently ignores `viewedLeafCount!=0` and `lastViewedAt>=`, so depending on the
+                # server to filter is the assumption that keeps being wrong here.
+                if views <= 0:
+                    continue
+                if stamp > newest.get(key, 0):
+                    newest[key] = stamp
+            if not page:
+                return newest
+            start += len(page)
+            reported = root.get("totalSize")
+            if reported is not None and start >= int(reported):
+                return newest
+        logger.warning(
+            "watched read: section {} — episode read did not terminate in {} pages, dates left unknown",
+            section_key,
+            self._EPISODE_PAGE_LIMIT,
+        )
+        return None
 
     def _read_watched_page(
         self,
@@ -1779,15 +2495,44 @@ class PlexClient:
         # includeGuids inlines the TMDB id so no library index is consulted. includeToken=False keeps
         # the OWNER's token out of the URL — we set the per-user token in the header instead (rule 9).
         url = self._server.url(f"/library/sections/{section_key}/all", includeToken=False)
-        params: dict[str, object] = {"type": plex_type, "unwatched": 0, "includeGuids": 1}
+        params: dict[str, object] = {"type": plex_type, "includeGuids": 1}
+        show_filter = ""
+        if plex_type == 2:  # a show library
+            # `viewedLeafCount!=0`, NOT `unwatched=0`. The latter filters on the show's own
+            # watch-state row, which marking a series or a season never establishes — so a series
+            # someone has finished is absent from it while its episode counts are perfectly correct.
+            # Measured on two independent servers: `unwatched=0` returned 533 shows where
+            # `viewedLeafCount!=0` returned 491, matching the episode-level truth
+            # (`?type=4&unwatched=0` rolled up by show) EXACTLY, in both directions, and 20 shows with
+            # watched episodes were missing from `unwatched=0` altogether. Issue #108; the reporter
+            # found this filter independently.
+            #
+            # No new trust: `viewedLeafCount`/`leafCount` already drive the finished-show fraction
+            # everywhere else, so believing them about PRESENCE adds no assumption.
+            #
+            # APPENDED to the URL, not passed through `params`, because Plex's filter OPERATOR lives
+            # in the key and httpx percent-encodes a key: `params={"viewedLeafCount!": 0}` goes on the
+            # wire as `viewedLeafCount%21=0`. This server decodes that and answers 491 either way
+            # (measured), but plexapi's own `joinArgs` encodes only the VALUE for exactly this reason,
+            # and a server that did not decode it would fall back to the whole library — 4,880 rows
+            # instead of 491, per person, per library, per sync. Verified: the literal form
+            # round-trips intact and returns the same 491.
+            show_filter = "viewedLeafCount!=0"
+        else:
+            params["unwatched"] = 0
         if since is not None:
             # SORT, not filter. `lastViewedAt>=` (and `>>=`) are silently ignored by PMS 1.43.3 —
             # live-probed 2026-07-30, see `watched_titles`. Sorting newest-first IS honoured, and the
             # caller stops at the first title older than the cutoff.
             params["sort"] = "lastViewedAt:desc"
+        # The query is assembled here rather than handed to httpx as `params`, because httpx REPLACES
+        # a URL's existing query with `params` — so the show filter has to travel with the rest, and
+        # it has to keep its literal `!` (see above).
+        query = str(httpx.QueryParams(params))
+        if show_filter:
+            query = f"{query}&{show_filter}"
         r = http_retry.get(
-            url,
-            params=params,
+            f"{url}{'&' if '?' in url else '?'}{query}",
             headers={
                 "X-Plex-Token": token,
                 "X-Plex-Container-Start": str(start),
@@ -1821,9 +2566,7 @@ class PlexClient:
         if tmdb_id is None:
             return None
         last_viewed = el.get("lastViewedAt")
-        watched_at = (
-            datetime.fromtimestamp(int(last_viewed), tz=UTC) if last_viewed else datetime(1970, 1, 1, tzinfo=UTC)
-        )
+        watched_at = datetime.fromtimestamp(int(last_viewed), tz=UTC) if last_viewed else _EPOCH
         year = el.get("year")
         # `userRating` belongs to the TOKEN this page was read with, not to the server — live-probed
         # 2026-08-06 across 50 accounts on a real server: a title reading 6.2 as the owner came back

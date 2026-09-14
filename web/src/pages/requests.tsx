@@ -1,10 +1,13 @@
 import {
+  ArrowUpDown,
   Clapperboard,
   ExternalLink,
   Inbox,
   Loader2,
   RotateCcw,
+  Search,
   Send,
+  SlidersHorizontal,
   Star,
   Trash2,
   TriangleAlert,
@@ -23,6 +26,8 @@ import {
 import { PageHeader } from "@/components/page-header";
 import { EmptyState, QueryBoundary } from "@/components/query-boundary";
 import { Segmented } from "@/components/segmented";
+import { TitlePoster } from "@/components/title-poster";
+import { Why } from "@/components/why";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -65,43 +70,6 @@ function RequestsSkeleton() {
         <Skeleton key={i} className="h-16 w-full" />
       ))}
     </div>
-  );
-}
-
-/**
- * The title's artwork — the whole point of the inbox being visual rather than a wall of names.
- *
- * TMDB's image CDN, built from the stored path: `w154` is the smallest bucket that still looks sharp
- * at this size on a 2x display, so a 40-title inbox costs a few hundred KB rather than megabytes.
- * `loading="lazy"` keeps the off-screen ones off the wire entirely. A title with no artwork (TMDB
- * has none, or the row predates 0044) gets a placeholder tile of the same size, so rows never jump.
- */
-function Poster({ item }: { item: RequestCandidate }) {
-  // TMDB's CDN is a third-party host this app never checks: a server behind a restrictive network,
-  // an ad-blocker, or a title whose artwork was pulled all fail at load time, long after the path
-  // looked fine. Falling back on error keeps that as a tidy placeholder instead of a broken-image
-  // icon in every row.
-  const [failed, setFailed] = useState(false);
-
-  if (!item.poster_path || failed) {
-    return (
-      <div
-        className="flex h-[87px] w-[58px] shrink-0 items-center justify-center rounded border bg-muted"
-        aria-hidden="true"
-      >
-        <Clapperboard className="h-5 w-5 text-muted-foreground/60" />
-      </div>
-    );
-  }
-  return (
-    <img
-      src={`https://image.tmdb.org/t/p/w154${item.poster_path}`}
-      // Decorative: the title is right beside it as real text, so announcing it twice is noise.
-      alt=""
-      loading="lazy"
-      onError={() => setFailed(true)}
-      className="h-[87px] w-[58px] shrink-0 rounded border object-cover"
-    />
   );
 }
 
@@ -345,9 +313,9 @@ function RequestsOffBanner() {
       <p className="text-sm font-medium">Requests are off</p>
       <p className="text-sm text-muted-foreground">
         These titles were found before you turned requests off. Nothing new is
-        added while it stays off, Shortlist isn&rsquo;t asking Radarr or Sonarr
-        for anything, and nothing here can be sent or rejected until you turn it
-        back on.
+        added while it stays off, Shortlist isn&rsquo;t asking your download
+        apps for anything, and nothing here can be sent or rejected until you
+        turn it back on.
       </p>
       <Button asChild variant="outline" size="sm">
         <Link to={SETTINGS_LINK}>Go to Settings &rarr; Requests</Link>
@@ -369,6 +337,13 @@ const ARR_STATUS_LABELS: Record<
   downloaded: { label: "Downloaded", variant: "success" },
   downloading: { label: "Downloading", variant: "default" },
   queued: { label: "Searching", variant: "secondary" },
+  // Overseerr-route only — no Arr ever reports it. Amber like `unmonitored` and for the same reason:
+  // nothing is coming until a person acts, and that person is the one reading this.
+  awaiting_approval: {
+    label: "Waiting for approval",
+    variant: "warning",
+    hint: "Shortlist filed this request and Overseerr is holding it for someone to approve. Approve it there and it will go to Radarr or Sonarr — or change who requests go out as, in Settings › Requests, if you would rather they were approved automatically.",
+  },
   // Amber, because nothing is coming and only a person can change that. It used to have exactly one
   // cause — somebody unmonitored it by hand — so the colour was the whole message. "How much of a
   // show to grab" set to None now produces the same state on purpose, so the badge has to say which
@@ -409,29 +384,44 @@ function ArrStatusBadge({ view }: { view: ArrView }) {
     );
   }
   if (view.kind === "unreachable") {
+    // `max-w-full` + `min-w-0` + `flex-wrap` on the wrapper, because the disclosure's paragraph is
+    // a flex item here. MEASURED against the built stylesheet at 320/390/1024/1280: without them
+    // it is squeezed into a 111px column and stacks 312px tall at 320px; with them it takes the
+    // row's width and is 126px. Neither version scrolls the page sideways.
     return (
-      <Badge
-        variant="warning"
-        className="gap-1.5"
-        title={`Shortlist couldn't reach ${view.app}, so it can't say what state this title is in there. Check ${view.app} is running and that its URL and API key are right in Settings → Requests.`}
-      >
-        <TriangleAlert aria-hidden="true" className="h-3 w-3" />
-        Can&rsquo;t reach {view.app}
-      </Badge>
+      <span className="inline-flex min-w-0 max-w-full flex-wrap items-baseline">
+        <Badge variant="warning" className="gap-1.5">
+          <TriangleAlert aria-hidden="true" className="h-3 w-3" />
+          Can&rsquo;t reach {view.app}
+        </Badge>
+        <Why
+          text={`Shortlist couldn't reach ${view.app}, so it can't say what state this title is in there. Check ${view.app} is running and that its URL and API key are right in Settings → Requests.`}
+        />
+      </span>
     );
   }
   if (view.kind === "none") return null;
   const shown = ARR_STATUS_LABELS[view.status];
   if (!shown) return null;
+  // Downloaded / Downloading / Searching say everything in their label, so they stay a bare badge
+  // and the layout around them is untouched.
+  if (!shown.hint) return <Badge variant={shown.variant}>{shown.label}</Badge>;
+  // The two that DON'T — "Waiting for approval" and "Not monitored", the two statuses an owner most
+  // needs explained — carried 246- and 244-character remedies in a `title` and nowhere else:
+  // hover-only on a desktop, unreachable on a phone. `Why` is the app's existing answer to a long
+  // explanation that must stay reachable without taking a line, and it is a real button, so touch
+  // and keyboard both work.
   return (
-    <Badge variant={shown.variant} title={shown.hint}>
-      {shown.label}
-    </Badge>
+    <span className="inline-flex min-w-0 max-w-full flex-wrap items-baseline">
+      <Badge variant={shown.variant}>{shown.label}</Badge>
+      <Why text={shown.hint} />
+    </span>
   );
 }
 
 function PendingRow({
   item,
+  viaSeerr,
   checked,
   onToggle,
   globalTag,
@@ -447,6 +437,8 @@ function PendingRow({
   sending,
 }: {
   item: RequestCandidate;
+  /** True when requests route through Overseerr, which answers for films and shows alike. */
+  viaSeerr: boolean;
   checked: boolean;
   onToggle: (id: number) => void;
   globalTag: string;
@@ -466,7 +458,14 @@ function PendingRow({
    *  on the toolbar's, which may be scrolled off the top of a long queue. */
   sending: boolean;
 }) {
-  const app = item.media_type === "movie" ? "Radarr" : "Sonarr";
+  // Named from the ROUTE, not from the media type: the "already in {app}" line below is an
+  // explanation of a live status reading, and on the Overseerr route it was explaining a title's
+  // presence in an app nothing had asked.
+  const app = viaSeerr
+    ? "Overseerr"
+    : item.media_type === "movie"
+      ? "Radarr"
+      : "Sonarr";
   return (
     // A div, not the <label> this used to be: a <button> is a labelable element, so a label may not
     // contain one — the row now has three.
@@ -500,7 +499,7 @@ function PendingRow({
         onChange={() => onToggle(item.id)}
         className="mt-1.5 h-4 w-4 shrink-0 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
       />
-      <Poster item={item} />
+      <TitlePoster posterPath={item.poster_path} />
       <div className="min-w-0 flex-1 space-y-2">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <p className="text-base font-semibold leading-tight">{item.title}</p>
@@ -531,9 +530,13 @@ function PendingRow({
             add, only that `request_missing` never auto-sends an excluded title. */}
         {item.excluded ? (
           <p className="text-xs text-warning">
-            {app} was told never to add this again &mdash; usually left behind
-            by deleting it there ({app} calls it an import exclusion). Shortlist
-            never sends it for you; clear it in {app} if you want it back.
+            {app} was told never to fetch this again &mdash; usually left behind
+            by deleting it there ({app} calls it {viaSeerr ? "a" : "an"}{" "}
+            {/* The CONCEPT is route-aware too, not just the app's name. Naming Overseerr and then
+                calling its blocklist an "import exclusion" sends the owner looking for a screen it
+                does not have — the same failure the app-name fix was made for, one word deeper. */}
+            {viaSeerr ? "blocklist" : "import exclusion"}). Shortlist never
+            sends it for you; clear it in {app} if you want it back.
           </p>
         ) : null}
         {item.detail ? (
@@ -598,6 +601,7 @@ function SentRow({
   item,
   radarrUrl,
   sonarrUrl,
+  overseerrUrl,
   onClear,
   clearing,
   arrView,
@@ -606,23 +610,34 @@ function SentRow({
   item: RequestCandidate;
   radarrUrl: string;
   sonarrUrl: string;
+  /** Set only when requests route through Overseerr — which then answers for films AND shows. */
+  overseerrUrl: string;
   onClear: (id: number) => void;
   clearing: boolean;
   arrView: ArrView;
   nameOf: DisplayNameLookup;
 }) {
   const isMovie = item.media_type === "movie";
-  const app = isMovie ? "Radarr" : "Sonarr";
-  const ArrGlyph = isMovie ? RadarrGlyph : SonarrGlyph;
-  const base = (isMovie ? radarrUrl : sonarrUrl).replace(/\/+$/, "");
-  // Deep-link straight to the title's arr page. Radarr accepts its TMDB id; Sonarr has NO id URL —
-  // only /series/<titleSlug> — so it needs the slug captured at send time. Without a slug (a title
-  // sent before we recorded it) fall back to the app's home page rather than a dead link.
-  const arrPath = isMovie
-    ? `movie/${item.arr_slug ?? item.tmdb_id}`
-    : item.arr_slug
-      ? `series/${item.arr_slug}`
-      : "";
+  // Naming the app is not cosmetic: the badge is a record of where this title actually went, and
+  // on the Overseerr route it read "Sent to Radarr" for every film — an app that was never asked.
+  const viaSeerr = Boolean(overseerrUrl);
+  const app = viaSeerr ? "Overseerr" : isMovie ? "Radarr" : "Sonarr";
+  const ArrGlyph = viaSeerr ? Inbox : isMovie ? RadarrGlyph : SonarrGlyph;
+  const base = (
+    viaSeerr ? overseerrUrl : isMovie ? radarrUrl : sonarrUrl
+  ).replace(/\/+$/, "");
+  // Deep-link straight to the title's page. Overseerr needs no slug at all — its own UI addresses
+  // both types by TMDB id — which is why a *seerr send records none. Radarr accepts its TMDB id;
+  // Sonarr has NO id URL, only /series/<titleSlug>, so it needs the slug captured at send time.
+  // Without a slug (a title sent before we recorded it) fall back to the app's home page rather
+  // than a dead link.
+  const arrPath = viaSeerr
+    ? `${isMovie ? "movie" : "tv"}/${item.tmdb_id}`
+    : isMovie
+      ? `movie/${item.arr_slug ?? item.tmdb_id}`
+      : item.arr_slug
+        ? `series/${item.arr_slug}`
+        : "";
   const arrLink = base ? `${base}/${arrPath}` : "";
   const lead = arrLink
     ? [
@@ -636,11 +651,14 @@ function SentRow({
     : [];
   return (
     <div className="flex items-start gap-3 rounded-lg border p-3">
-      <Poster item={item} />
+      <TitlePoster posterPath={item.poster_path} />
       <div className="min-w-0 flex-1 space-y-1.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <p className="font-medium">{item.title}</p>
-          <div className="flex items-center gap-2">
+          {/* Wraps and shrinks, because the status badge beside these can open an explanation
+              underneath itself, and a non-wrapping row leaves it nowhere to go but a narrow
+              column (measured: 111px wide, 312px tall at 320px). */}
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <Badge variant="success" className="gap-1">
               <ArrGlyph className="h-3.5 w-3.5 rounded-[2px]" />
               Sent to {app}
@@ -746,6 +764,25 @@ const VOTES_OPTIONS: { value: string; label: string }[] = [
   { value: "1000", label: "1k+" },
 ];
 
+/** The Language filter's "no filter" value. Never a language code: TMDB's are two letters. */
+const ANY_LANGUAGE = "any";
+
+/**
+ * The Language filter's choices for one tab: every original language a title on it carries, by name,
+ * then "Unknown" when some title has none recorded. Unknown is a choice of its own rather than a
+ * title that silently matches nothing, so every title on the tab stays reachable through the menu.
+ */
+function languageOptions(
+  list: { language: string }[],
+): { value: string; label: string }[] {
+  const codes = new Set(list.map((r) => r.language));
+  const named = [...codes]
+    .filter((code) => code !== "")
+    .map((code) => ({ value: code, label: languageName(code) }))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  return codes.has("") ? [...named, { value: "", label: "Unknown" }] : named;
+}
+
 /**
  * One refinement control in the filter bar. These are deliberately NOT `Segmented`: sort + rating +
  * votes as chip groups put eleven buttons next to the Waiting/Sent tabs, four of them highlighted
@@ -779,6 +816,107 @@ function FilterSelect<T extends string>({
         ))}
       </select>
     </label>
+  );
+}
+
+/** Waiting / Sent / Rejected. Tabs, not a row of buttons: they are separate lists, and the refinements
+ *  under them are what narrow a list. The count is a pill beside the name; the accessible name keeps
+ *  it in brackets ("Sent (23)") so it is read as one phrase. */
+function RequestTabs({
+  value,
+  tabs,
+  onChange,
+  idBase,
+}: {
+  value: RequestView;
+  tabs: { value: RequestView; label: string; count: number }[];
+  onChange: (next: RequestView) => void;
+  /** Prefix for each tab's id (`<idBase>-<value>`) and the panel's (`<idBase>-panel`). */
+  idBase: string;
+}) {
+  // The ARIA tabs pattern: one tab in the Tab order (the selected one), arrows move between them.
+  const move = (from: number, step: number | "first" | "last") => {
+    const next =
+      step === "first" ? 0 : step === "last" ? tabs.length - 1 : (from + step + tabs.length) % tabs.length;
+    const tab = tabs[next];
+    if (!tab) return;
+    onChange(tab.value);
+    document.getElementById(`${idBase}-${tab.value}`)?.focus();
+  };
+  const KEY_STEP: Record<string, number | "first" | "last"> = {
+    ArrowRight: 1,
+    ArrowLeft: -1,
+    Home: "first",
+    End: "last",
+  };
+  return (
+    <div role="tablist" aria-label="Which requests to show" className="flex gap-6 border-b">
+      {tabs.map((tab, index) => {
+        const selected = tab.value === value;
+        return (
+          <button
+            key={tab.value}
+            id={`${idBase}-${tab.value}`}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            aria-controls={`${idBase}-panel`}
+            tabIndex={selected ? 0 : -1}
+            aria-label={tab.count ? `${tab.label} (${tab.count})` : tab.label}
+            onClick={() => onChange(tab.value)}
+            onKeyDown={(e) => {
+              const step = KEY_STEP[e.key];
+              if (step === undefined) return;
+              e.preventDefault();
+              move(index, step);
+            }}
+            className={cn(
+              "-mb-px inline-flex items-center gap-2 border-b-2 pb-2.5 pt-1 text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+              selected
+                ? "border-primary font-medium text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {tab.label}
+            {tab.count > 0 && (
+              <span
+                className={cn(
+                  "rounded-full px-2 text-xs tabular-nums",
+                  selected ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground",
+                )}
+              >
+                {tab.count}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** One active refinement, removable in place. */
+function FilterChip({
+  label,
+  removeLabel,
+  onRemove,
+}: {
+  label: string;
+  removeLabel: string;
+  onRemove: () => void;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1 rounded-full border border-primary/30 bg-primary/10 py-0.5 pl-2.5 pr-1 text-xs font-medium text-primary">
+      {label}
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={removeLabel}
+        className="grid h-4 w-4 place-items-center rounded-full hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <X className="h-3 w-3" aria-hidden="true" />
+      </button>
+    </span>
   );
 }
 
@@ -838,12 +976,20 @@ function PeopleFilter({
   people,
   selected,
   onToggle,
+  query,
+  onQuery,
+  offerPeople,
 }: {
   people: PersonOption[];
   selected: Set<string>;
   onToggle: (name: string) => void;
+  /** The typed text, owned by the page: it also narrows the list to titles, or wanters, matching it. */
+  query: string;
+  onQuery: (text: string) => void;
+  /** False when one person wanted everything — picking them would hide nothing, so no list is offered. */
+  offerPeople: boolean;
 }) {
-  const [query, setQuery] = useState("");
+  const setQuery = onQuery;
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(0);
   const labelId = useId();
@@ -869,44 +1015,31 @@ function PeopleFilter({
   };
 
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-      <span id={labelId} className="text-xs text-muted-foreground">
-        Wanted by
+    // One search for the two things people look for: a title by its name, or the titles someone
+    // wanted. Typing narrows the list at once (see `applyQuery`); picking a name from the list makes it
+    // a chip, which asks the SERVER for every title of theirs rather than only this loaded page.
+    <div className="relative min-w-[12rem] flex-1">
+      <span id={labelId} className="sr-only">
+        Search titles, or pick who wanted them
       </span>
-
-      {chosen.map((person) => (
-        <span
-          key={person.name}
-          className="inline-flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs font-medium text-primary-foreground"
-        >
-          {person.count ? `${person.label} (${person.count})` : person.label}
-          <button
-            type="button"
-            onClick={() => onToggle(person.name)}
-            aria-label={`Stop filtering by ${person.label}`}
-            className="rounded-sm opacity-70 hover:opacity-100 focus-visible:opacity-100"
-          >
-            <X className="h-3 w-3" aria-hidden="true" />
-          </button>
-        </span>
-      ))}
-
-      <div className="relative">
+      <Search
+        className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+        aria-hidden="true"
+      />
+      <div>
         <Input
           type="search"
           role="combobox"
-          aria-expanded={open}
+          aria-expanded={open && offerPeople}
           aria-controls={listId}
           aria-labelledby={labelId}
           aria-autocomplete="list"
           aria-activedescendant={
-            open && visible[active] ? `${listId}-${active}` : undefined
+            open && offerPeople && visible[active] ? `${listId}-${active}` : undefined
           }
           autoComplete="off"
-          className="h-8 w-48 text-sm"
-          placeholder={
-            chosen.length ? "Add another person…" : "Search for a person…"
-          }
+          className="h-9 w-full pl-8 text-sm"
+          placeholder="Search titles or people"
           value={query}
           onChange={(e) => {
             setQuery(e.target.value);
@@ -929,7 +1062,7 @@ function PeopleFilter({
                 const next = i + step;
                 return next < 0 ? visible.length - 1 : next % visible.length;
               });
-            } else if (e.key === "Enter" && open && visible[active]) {
+            } else if (e.key === "Enter" && open && offerPeople && visible[active]) {
               e.preventDefault();
               pick(visible[active].name);
             } else if (e.key === "Escape") {
@@ -943,7 +1076,7 @@ function PeopleFilter({
           }}
         />
 
-        {open && (
+        {open && offerPeople && (
           <ul
             id={listId}
             role="listbox"
@@ -1006,8 +1139,8 @@ function PeopleFilter({
 }
 
 /** Filtered down to nothing. A narrowed list must never read as an empty one, so this says how many
- *  are really on the tab and which control brings them back. Only reachable when a rating, vote or
- *  people filter is set — the Movies/Shows split only ever renders when both types are present, so
+ *  are really on the tab and which control brings them back. Only reachable when a rating, vote,
+ *  language or people filter is set — the Movies/Shows split only ever renders when both types are present, so
  *  it can never empty a list on its own — which is what makes "Clear filters" a safe thing to name. */
 function NoMatches({ label, total }: { label: string; total: number }) {
   return (
@@ -1056,9 +1189,21 @@ function arrViewFor(
   const isMovie = item.media_type === "movie";
   if (isPending) return { kind: "checking" };
   if (!status) return { kind: "none" }; // the fetch failed outright; the page says so elsewhere
-  const reach = isMovie ? status.radarr : status.sonarr;
+  // Overseerr answers for films and shows alike, so when it is the route there is no per-media-type
+  // app to name — and the two Arr fields are always "off", which must not read as "reachable".
+  // Tested against the two live values, never `!== "off"`: the field is absent from a response
+  // predating it, and `undefined !== "off"` would route every Arr install down the Overseerr branch
+  // and blank its badges.
+  const viaSeerr =
+    status.overseerr === "ok" || status.overseerr === "unreachable";
+  const reach = viaSeerr
+    ? status.overseerr
+    : isMovie
+      ? status.radarr
+      : status.sonarr;
   if (reach === "unreachable") {
-    return { kind: "unreachable", app: isMovie ? "Radarr" : "Sonarr" };
+    const app = viaSeerr ? "Overseerr" : isMovie ? "Radarr" : "Sonarr";
+    return { kind: "unreachable", app };
   }
   const found = status.statuses[String(item.id)];
   return found ? { kind: "status", status: found } : { kind: "none" };
@@ -1097,8 +1242,17 @@ export function RequestsPage() {
   const [sort, setSort] = useState<RequestSort>("recent");
   const [minRating, setMinRating] = useState("0");
   const [minVotes, setMinVotes] = useState("0");
+  // An original-language code, "" for titles with none recorded, or ANY_LANGUAGE.
+  const [language, setLanguage] = useState(ANY_LANGUAGE);
   // Whose requests to show. Empty = everyone's, so the page opens unfiltered.
   const [people, setPeople] = useState<Set<string>>(new Set());
+  // Free text from the search: narrows the list to titles, or wanters, containing it.
+  const [query, setQuery] = useState("");
+  // The rating, vote and language filters live behind one Filters button rather than as always-on
+  // dropdowns.
+  const [filtersOpen, setFiltersOpen] = useState(false);
+  const filtersId = useId();
+  const tabsId = useId();
 
   const togglePerson = (name: string) =>
     setPeople((prev) => {
@@ -1111,7 +1265,9 @@ export function RequestsPage() {
   const clearFilters = () => {
     setMinRating("0");
     setMinVotes("0");
+    setLanguage(ANY_LANGUAGE);
     setPeople(new Set());
+    setQuery("");
   };
 
   const toggle = (id: number) =>
@@ -1201,14 +1357,47 @@ export function RequestsPage() {
     list: T[],
   ): T[] =>
     list.filter((r) => r.rating >= ratingFloor && r.vote_count >= votesFloor);
+  // Narrows the same way, to one original language. A title with none recorded is in no named
+  // language, so it only shows under Any or Unknown.
+  const applyLanguage = (list: RequestCandidate[]): RequestCandidate[] =>
+    activeLanguage === ANY_LANGUAGE
+      ? list
+      : list.filter((r) => r.language === activeLanguage);
+  // The search's free text. Matches the title, and the people who wanted it by username or by the name
+  // the Users page shows — so "sarah" finds her titles before she is picked as a chip.
+  const needle = query.trim().toLowerCase();
+  const applyQuery = (list: RequestCandidate[]): RequestCandidate[] =>
+    !needle
+      ? list
+      : list.filter(
+          (r) =>
+            r.title.toLowerCase().includes(needle) ||
+            (r.wanters ?? []).some(
+              (w) => w.toLowerCase().includes(needle) || nameOf(w).toLowerCase().includes(needle),
+            ),
+        );
   const narrow = (list: RequestCandidate[]) =>
-    sortRequests(applyThresholds(applyPeople(applyMedia(list))), sort);
+    sortRequests(applyQuery(applyLanguage(applyThresholds(applyPeople(applyMedia(list))))), sort);
   // Built from the server's answer, not from `pending`/`sent`/`rejected` — those stay the loaded
   // page, because the tab counts and the "Wanted by" roster have to keep describing the whole inbox
   // rather than the slice a picked name narrowed it to.
   const pendingRows = listRows.filter((r) => r.status === "pending");
   const sentRows = listRows.filter((r) => r.status === "sent");
   const rejectedRows = listRows.filter((r) => r.status === "rejected");
+  const activeShown =
+    active === "waiting"
+      ? pendingRows
+      : active === "sent"
+        ? sentRows
+        : rejectedRows;
+  // The languages offered describe the tab you're on: the loaded page, plus the server's answer once a
+  // name is picked, which can reach titles the page never loaded. A language nothing on the tab is in
+  // any more (its last title was just sent) is dropped rather than left filtering — the same
+  // self-healing the people filter does.
+  const languageChoices = languageOptions([...activeFull, ...activeShown]);
+  const activeLanguage = languageChoices.some((o) => o.value === language)
+    ? language
+    : ANY_LANGUAGE;
   const pendingShown = narrow(pendingRows);
   const sentShown = narrow(sentRows);
   const rejectedShown = narrow(rejectedRows);
@@ -1216,12 +1405,6 @@ export function RequestsPage() {
   // The count beside a PICKED name is re-read from the server's answer, which isn't capped to this
   // page — otherwise the chip could say "(12)" beside a list of forty of that person's titles.
   // Unpicked names keep the loaded page's count; nothing better exists until they're picked.
-  const activeShown =
-    active === "waiting"
-      ? pendingRows
-      : active === "sent"
-        ? sentRows
-        : rejectedRows;
   const exactCounts = new Map(
     peopleOn(activeShown, nameOf, usernames).map((p) => [p.name, p.count]),
   );
@@ -1234,7 +1417,17 @@ export function RequestsPage() {
   // "nothing clears these filters" note. The media split is excluded on purpose: it only renders
   // when both types are present, so it can never be the reason a list is empty.
   const filtered =
-    minRating !== "0" || minVotes !== "0" || activePeople.size > 0;
+    minRating !== "0" ||
+    minVotes !== "0" ||
+    activeLanguage !== ANY_LANGUAGE ||
+    activePeople.size > 0 ||
+    needle !== "";
+  // How many of the Filters menu's own choices are set, for the count on its button.
+  const menuFiltersSet =
+    (minRating !== "0" ? 1 : 0) +
+    (minVotes !== "0" ? 1 : 0) +
+    (activeLanguage !== ANY_LANGUAGE ? 1 : 0);
+  const languageLabel = activeLanguage ? languageName(activeLanguage) : "Unknown language";
 
   // Only visible pending rows are selectable, so an id lingering in the set after a send/reject or a
   // filter change is harmless, but scoping to what's shown keeps the count honest.
@@ -1279,7 +1472,10 @@ export function RequestsPage() {
       <PageHeader
         icon={Inbox}
         title="Requests"
-        subtitle="Titles your people wanted that aren’t in your library yet. Send the ones you want to Radarr or Sonarr."
+        // Names no app: this renders OUTSIDE the settings boundary, so the route is not known yet and
+        // naming one would flash the wrong answer on every load. The Send button below, which is
+        // inside the boundary, says where they are actually going.
+        subtitle="Titles your people wanted that aren’t in your library yet. Send the ones you want, reject the rest."
       />
 
       {/* Whether requests are ON is a fact about the SETTING, never about whether the inbox happens
@@ -1306,8 +1502,20 @@ export function RequestsPage() {
           // things back. On the default "any" server nothing is.
           const languageModeOn =
             settingString(settings, "requests.language_mode", "any") !== "any";
-          const radarrUrl = settingString(settings, "requests.radarr.url");
-          const sonarrUrl = settingString(settings, "requests.sonarr.url");
+          // Read from the TARGET, not from whichever URLs happen to be filled in: an owner who tried
+          // Radarr first and then switched still has its address saved, and passing it here would
+          // deep-link Overseerr's sends into Radarr.
+          const viaSeerr =
+            settingString(settings, "requests.target", "arr") === "overseerr";
+          const overseerrUrl = viaSeerr
+            ? settingString(settings, "requests.overseerr.url")
+            : "";
+          const radarrUrl = viaSeerr
+            ? ""
+            : settingString(settings, "requests.radarr.url");
+          const sonarrUrl = viaSeerr
+            ? ""
+            : settingString(settings, "requests.sonarr.url");
           return (
             <QueryBoundary
               query={requestsQuery}
@@ -1352,21 +1560,12 @@ export function RequestsPage() {
                 // Tabs, not a long stack: with a big queue the send log used to sit far below the
                 // fold and read as missing. Waiting + Sent are always offered; Rejected appears
                 // only once something's been rejected.
-                const tabs: { value: RequestView; label: string }[] = [
-                  {
-                    value: "waiting",
-                    label: `Waiting${pending.length ? ` (${pending.length})` : ""}`,
-                  },
-                  {
-                    value: "sent",
-                    label: `Sent${sent.length ? ` (${sent.length})` : ""}`,
-                  },
+                const tabs: { value: RequestView; label: string; count: number }[] = [
+                  { value: "waiting", label: "Waiting", count: pending.length },
+                  { value: "sent", label: "Sent", count: sent.length },
                 ];
                 if (rejected.length > 0) {
-                  tabs.push({
-                    value: "rejected",
-                    label: `Rejected (${rejected.length})`,
-                  });
+                  tabs.push({ value: "rejected", label: "Rejected", count: rejected.length });
                 }
 
                 // The Movies/Shows split, scoped to the active tab's list — only offered when that list
@@ -1400,13 +1599,15 @@ export function RequestsPage() {
                   <div className="space-y-6">
                     {!requestsEnabled && <RequestsOffBanner />}
 
-                    {/* Two levels, not one row of fifteen chips: the tab strip decides WHAT you are
-                        looking at and keeps the primary highlight; the refinements below it narrow
-                        that list and stay quiet. */}
+                    {/* Three layers, top to bottom: WHICH list (tabs), how to narrow it (one toolbar), and
+                        what is narrowing it right now (removable chips). It used to be six stacked rows
+                        before the first title — two sets of buttons, three dropdowns, a person search,
+                        and two paragraphs, one of them repeating the page subtitle. */}
                     <div className="space-y-3">
-                      <Segmented
+                      <RequestTabs
+                        idBase={tabsId}
                         value={active}
-                        options={tabs}
+                        tabs={tabs}
                         // Switching tabs clears every refinement so a stale "Movies" (or a name
                         // nobody on this tab carries) can't hide the list with no visible control
                         // to reset it.
@@ -1415,76 +1616,155 @@ export function RequestsPage() {
                           setMedia("all");
                           clearFilters();
                         }}
-                        ariaLabel="Which requests to show"
                       />
+                      <div
+                        role="tabpanel"
+                        id={`${tabsId}-panel`}
+                        aria-labelledby={`${tabsId}-${active}`}
+                        className="space-y-3"
+                      >
                       {(showMediaFilter || activeFull.length > 1) && (
-                        <div className="space-y-2 border-b pb-3">
-                          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-                            {showMediaFilter && (
-                              <Segmented
-                                value={media}
-                                onChange={setMedia}
-                                ariaLabel="Filter by library"
-                                options={[
-                                  {
-                                    value: "all",
-                                    label: `All (${activeFull.length})`,
-                                  },
-                                  {
-                                    value: "movie",
-                                    label: `Movies (${movieCount})`,
-                                  },
-                                  {
-                                    value: "show",
-                                    label: `Shows (${showCount})`,
-                                  },
-                                ]}
-                              />
-                            )}
-                            {activeFull.length > 1 && (
-                              <>
-                                <FilterSelect
-                                  label="Sort"
-                                  value={sort}
-                                  onChange={setSort}
-                                  options={SORT_OPTIONS}
-                                />
-                                <FilterSelect
-                                  label="Rating"
-                                  value={minRating}
-                                  onChange={setMinRating}
-                                  options={RATING_OPTIONS}
-                                />
-                                <FilterSelect
-                                  label="Votes"
-                                  value={minVotes}
-                                  onChange={setMinVotes}
-                                  options={VOTES_OPTIONS}
-                                />
-                                {filtered && (
-                                  <button
-                                    type="button"
-                                    onClick={clearFilters}
-                                    className="text-xs text-primary underline-offset-4 hover:underline focus-visible:underline"
-                                  >
-                                    Clear filters
-                                  </button>
-                                )}
-                              </>
-                            )}
-                          </div>
-                          {/* One person wanting everything is no filter at all, so the names only
-                              appear once there are at least two to choose between — and only
-                              alongside the other refinements, so "Clear filters" is always there
-                              to undo them together. */}
-                          {activeFull.length > 1 &&
-                            peopleOptions.length > 1 && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          {showMediaFilter && (
+                            <Segmented
+                              value={media}
+                              onChange={setMedia}
+                              ariaLabel="Filter by library"
+                              options={[
+                                { value: "all", label: `All (${activeFull.length})` },
+                                { value: "movie", label: `Movies (${movieCount})` },
+                                { value: "show", label: `Shows (${showCount})` },
+                              ]}
+                            />
+                          )}
+                          {activeFull.length > 1 && (
+                            <>
                               <PeopleFilter
                                 people={peopleChips}
                                 selected={activePeople}
                                 onToggle={togglePerson}
+                                query={query}
+                                onQuery={setQuery}
+                                // One person wanting everything is no filter at all, so their name is
+                                // not offered — the search still finds titles.
+                                offerPeople={peopleOptions.length > 1}
                               />
-                            )}
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9"
+                                aria-expanded={filtersOpen}
+                                aria-controls={filtersId}
+                                onClick={() => setFiltersOpen((open) => !open)}
+                              >
+                                <SlidersHorizontal aria-hidden="true" />
+                                Filters
+                                {menuFiltersSet > 0 && (
+                                  <span className="rounded-full bg-primary px-1.5 text-[11px] font-bold tabular-nums text-primary-foreground">
+                                    {menuFiltersSet}
+                                  </span>
+                                )}
+                              </Button>
+                              <span className="relative inline-flex items-center">
+                                <ArrowUpDown
+                                  className="pointer-events-none absolute left-2.5 h-3.5 w-3.5 text-muted-foreground"
+                                  aria-hidden="true"
+                                />
+                                <select
+                                  aria-label="Sort"
+                                  value={sort}
+                                  onChange={(e) => setSort(e.target.value as RequestSort)}
+                                  className="h-9 rounded-md border bg-background pl-8 pr-2 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                >
+                                  {SORT_OPTIONS.map((option) => (
+                                    <option key={option.value} value={option.value}>
+                                      {option.label}
+                                    </option>
+                                  ))}
+                                </select>
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {filtersOpen && activeFull.length > 1 && (
+                        <div
+                          id={filtersId}
+                          className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-md border bg-card px-3 py-2"
+                        >
+                          <FilterSelect
+                            label="Rating"
+                            value={minRating}
+                            onChange={setMinRating}
+                            options={RATING_OPTIONS}
+                          />
+                          <FilterSelect
+                            label="Votes"
+                            value={minVotes}
+                            onChange={setMinVotes}
+                            options={VOTES_OPTIONS}
+                          />
+                          {/* One language is no choice at all: picking it would hide nothing. */}
+                          {languageChoices.length > 1 && (
+                            <FilterSelect
+                              label="Language"
+                              value={activeLanguage}
+                              onChange={setLanguage}
+                              options={[{ value: ANY_LANGUAGE, label: "Any" }, ...languageChoices]}
+                            />
+                          )}
+                        </div>
+                      )}
+                      {/* Whenever ANYTHING is narrowing the list — even with one title left, when the
+                          toolbar is no longer drawn. A search that emptied the list with no control
+                          left to undo it pointed at a "Clear filters" that did not exist. */}
+                      {filtered && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          {needle && (
+                            <FilterChip
+                              label={`“${query.trim()}”`}
+                              removeLabel="Clear the search"
+                              onRemove={() => setQuery("")}
+                            />
+                          )}
+                          {peopleChips
+                            .filter((person) => activePeople.has(person.name))
+                            .map((person) => (
+                              <FilterChip
+                                key={person.name}
+                                label={person.count ? `${person.label} (${person.count})` : person.label}
+                                removeLabel={`Stop filtering by ${person.label}`}
+                                onRemove={() => togglePerson(person.name)}
+                              />
+                            ))}
+                          {minRating !== "0" && (
+                            <FilterChip
+                              label={`Rating ${RATING_OPTIONS.find((o) => o.value === minRating)?.label ?? minRating}`}
+                              removeLabel={`Remove the Rating ${RATING_OPTIONS.find((o) => o.value === minRating)?.label ?? minRating} filter`}
+                              onRemove={() => setMinRating("0")}
+                            />
+                          )}
+                          {minVotes !== "0" && (
+                            <FilterChip
+                              label={`Votes ${VOTES_OPTIONS.find((o) => o.value === minVotes)?.label ?? minVotes}`}
+                              removeLabel={`Remove the Votes ${VOTES_OPTIONS.find((o) => o.value === minVotes)?.label ?? minVotes} filter`}
+                              onRemove={() => setMinVotes("0")}
+                            />
+                          )}
+                          {activeLanguage !== ANY_LANGUAGE && (
+                            <FilterChip
+                              label={languageLabel}
+                              removeLabel={`Remove the ${activeLanguage ? languageName(activeLanguage) : "unknown"} language filter`}
+                              onRemove={() => setLanguage(ANY_LANGUAGE)}
+                            />
+                          )}
+                          <button
+                            type="button"
+                            onClick={clearFilters}
+                            className="text-xs text-primary underline-offset-4 hover:underline focus-visible:underline"
+                          >
+                            Clear filters
+                          </button>
                         </div>
                       )}
                       {/* Only when the cap is actually in play — otherwise it is a note about a
@@ -1494,27 +1774,31 @@ export function RequestsPage() {
                           {capNote}
                         </p>
                       )}
-                    </div>
 
                     {active === "waiting" &&
                       (pending.length > 0 ? (
                         <section className="space-y-3">
-                          {/* What the tab strip never said: the tabs are three STATES, and only this
-                              one is asking for a decision. Traceable — `persist_request_queue` drops
-                              a pending row the library now holds, and a title only leaves Waiting
-                              when it is sent, rejected or deleted. */}
-                          <p className="text-sm text-muted-foreground">
-                            Titles Shortlist wanted for your people that your
-                            library doesn&rsquo;t have. Nothing here has been
-                            sent &mdash; send the ones you want, or reject the
-                            rest.
-                          </p>
-
-                          <div className="flex flex-wrap items-center justify-between gap-3">
+                          {/* The action bar. Quiet until something is ticked, then it lights up and says
+                              what it will act on. The Delete-vs-Reject difference rides along as one
+                              short line — the two both clear the list but do opposite things next run,
+                              so it must never be a guess or hover-only. */}
+                          <div
+                            className={cn(
+                              "flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border px-3 py-2",
+                              selectedPending.length > 0
+                                ? "border-primary/45 bg-primary/10"
+                                : "bg-card",
+                            )}
+                          >
                             <label className="flex cursor-pointer items-center gap-2 text-sm font-medium">
                               <input
                                 type="checkbox"
                                 checked={allChecked}
+                                // Some ticked but not all: a half-tick, so "3 selected" beside an empty
+                                // box does not read as nothing selected.
+                                ref={(box) => {
+                                  if (box) box.indeterminate = selectedPending.length > 0 && !allChecked;
+                                }}
                                 disabled={!requestsEnabled}
                                 onChange={toggleAll}
                                 className="h-4 w-4 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
@@ -1532,7 +1816,7 @@ export function RequestsPage() {
                             <div
                               role="group"
                               aria-label="Actions for the selected titles"
-                              className="flex items-center gap-2"
+                              className="flex flex-wrap items-center gap-2"
                             >
                               <Button
                                 size="sm"
@@ -1547,14 +1831,14 @@ export function RequestsPage() {
                                     send.mutate({ ids: selectedPending }),
                                   )
                                 }
-                                title="Add the selected titles to Radarr or Sonarr and start searching for them now."
+                                title={`Ask ${viaSeerr ? "Overseerr" : "Radarr or Sonarr"} for the selected titles now.`}
                               >
                                 {!send.isPending && <Send aria-hidden="true" />}
                                 Send{" "}
                                 {selectedPending.length > 0
                                   ? selectedPending.length
                                   : ""}{" "}
-                                to Radarr/Sonarr
+                                to {viaSeerr ? "Overseerr" : "Radarr/Sonarr"}
                               </Button>
                               <span
                                 aria-hidden="true"
@@ -1593,21 +1877,22 @@ export function RequestsPage() {
                                 Reject
                               </Button>
                             </div>
+                            <p className="ml-auto text-xs text-muted-foreground">
+                              <strong className="font-medium text-foreground">Delete</strong>{" "}
+                              can come back on a later run &middot;{" "}
+                              <strong className="font-medium text-foreground">Reject</strong>{" "}
+                              blocks it for good
+                            </p>
+                            {selectedPending.length > 0 && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setSelected(new Set())}
+                              >
+                                Clear selection
+                              </Button>
+                            )}
                           </div>
-
-                          {/* Always visible (not just on hover) so the Delete-vs-Reject difference is
-                              never a guess — the two both clear the list but do opposite things next run. */}
-                          <p className="text-xs text-muted-foreground">
-                            <strong className="font-medium text-foreground">
-                              Delete
-                            </strong>{" "}
-                            removes a title for now &mdash; it can return on a
-                            later run if it&rsquo;s still wanted.{" "}
-                            <strong className="font-medium text-foreground">
-                              Reject
-                            </strong>{" "}
-                            blocks it for good &mdash; it won&rsquo;t come back.
-                          </p>
 
                           {(send.isError || reject.isError || del.isError) && (
                             <p
@@ -1627,6 +1912,7 @@ export function RequestsPage() {
                                 <PendingRow
                                   key={item.id}
                                   item={item}
+                                  viaSeerr={viaSeerr}
                                   checked={selected.has(item.id)}
                                   onToggle={toggle}
                                   globalTag={globalTag}
@@ -1672,7 +1958,7 @@ export function RequestsPage() {
                       <section className="space-y-3">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <h2 className="text-sm font-medium text-muted-foreground">
-                            Sent to Radarr &amp; Sonarr
+                            Sent to {viaSeerr ? "Overseerr" : "Radarr & Sonarr"}
                           </h2>
                           {sentShown.length > 0 && (
                             <Button
@@ -1711,6 +1997,7 @@ export function RequestsPage() {
                                 item={item}
                                 radarrUrl={radarrUrl}
                                 sonarrUrl={sonarrUrl}
+                                overseerrUrl={overseerrUrl}
                                 onClear={(id) => clear.mutate([id])}
                                 clearing={clear.isPending}
                                 arrView={arrView(item)}
@@ -1792,6 +2079,8 @@ export function RequestsPage() {
                         )}
                       </section>
                     )}
+                      </div>
+                    </div>
                   </div>
                 );
               }}

@@ -10,9 +10,11 @@ It does, indirectly. Plex lets you hide things from someone by **label**, so Sho
 person's row a label of its own and tells every _other_ account to hide that label. The result is a
 row only its owner can see.
 
-The order matters: a row is created **hidden**, and only made visible once the "hide this from
-everyone else" rules are already in place, so there's no window where the wrong person could see
-it. Your existing sharing settings are saved beforehand, and **Uninstall** puts them back exactly.
+The order those steps happen in is what makes it safe, and it is the same every run:
+
+{% include privacy-order.html %}
+
+Your existing sharing settings are saved beforehand, and **Uninstall** puts them back exactly.
 
 This needs Plex Media Server **1.43.2.10687 or newer**, and **Plex Pass** on the admin account,
 because the hiding rule is a Pass feature. Older versions ignore it.
@@ -35,9 +37,18 @@ Shortlist only touched the accounts you gave rows to, **everyone else would see 
 rows**.
 
 So it adds hide-this-label rules to every account your server is shared with — unless you've asked
-it to leave one alone, which you can do per person if their own Plex restrictions clash with ours.
-Nothing else in their settings is touched. Shortlist reads what's there, adds only its own entries, and leaves the rest
-exactly as they were. The original is saved first, and Uninstall restores all of them.
+it to leave one alone, which you can do per person if their own Plex restrictions clash with
+Shortlist's. Nothing else in their settings is touched. Shortlist reads what's there, adds only its
+own entries, and leaves the rest exactly as they were. The original is saved first, and Uninstall
+restores all of them.
+
+## Someone has an "allow only" label or rating list. Do they still get a row?
+
+Yes. Plex's allow list shows only what it names, and a Shortlist row is labelled with that person's
+own Shortlist label, so on its own the allow list would hide their row. Shortlist adds that one label
+to their allow list, and nobody else's. It also builds their row only from titles their restrictions
+let them see, so the row isn't half-empty. Everything else their restrictions hide stays hidden,
+inside the row too.
 
 ## Do I get a row myself?
 
@@ -47,9 +58,9 @@ whole point on a one-person server.
 
 ## What can the server owner see?
 
-Everyone's rows — but **not** on your Home screen. Plex tracks "on the owner's Home"
-(`promotedToOwnHome`) separately from "on a friend's Home" (`promotedToSharedHome`), and Shortlist
-puts each person's row on their own side only, so nobody else's row ever lands on your Home.
+Everyone's rows — but **not** on your Home screen. Plex keeps "on the owner's Home" and "on a
+friend's Home" as two separate switches, and Shortlist only ever sets a person's row on their own
+side, so nobody else's row lands on your Home.
 
 Where you do see them all is the library's **Collections tab**, and its **Recommended shelf** if you
 leave _Everyone else → Recommended shelf_ on for a row. Rows are hidden from other people through
@@ -60,7 +71,7 @@ Shortlist walks you through the three options under **Users → You see everyone
 rows off the library shelf, leave it alone, or move your own watching to a separate Plex Home
 account. That last one copies your watch history across exactly — the same episodes of each show,
 your rewatch counts, and anything you are part-way through, back where you left it. See
-[the reference](reference.md#why-you-see-everyones-rows-and-the-watching-account).
+[the reference](reference/concepts.md#why-you-see-everyones-rows-and-the-watching-account).
 
 ## Does the AI invent recommendations I don't have?
 
@@ -89,23 +100,10 @@ The optional web-search source can search in three ways, and you pick one in
 | **[Exa](https://exa.ai) key**       | **every provider, local included** | one extra free-tier signup; billed per search             |
 | **[SearXNG](https://docs.searxng.org)** | **every provider, local included** | free and fully self-hosted; you run and maintain it    |
 
-**Why we suggest adding one of the external backends**, even if your provider can already search:
-
-- **It's the only way a local model can search at all.** (Either backend does this.) An Ollama or LM Studio server on your own
-  hardware has no way to search the internet. With Exa or SearXNG, _Shortlist_ does the searching and
-  hands the findings over, so a completely offline model can still recommend current titles.
-- **Your results stop depending on which AI you picked.** Switch from Claude to a local model to
-  save money and the search half stays identical. Only the choosing changes.
-- **The cost is predictable.** Exa bills per search, not per word, and Shortlist reports those
-  searches separately from AI usage. SearXNG costs nothing. Results are reused for 14 days and shared
-  across everyone on your server, so a popular film is looked up once. Not once per person.
-
-**Exa or SearXNG?** Exa returns extracted page text, needs no infrastructure, and its free tier
-covers roughly 1,000 searches a month. SearXNG runs on your own hardware, needs no account, costs
-nothing, and keeps everything but the forwarded queries on your server — but you maintain it, and its
-JSON API must be switched on (`json` added to `search.formats` in its `settings.yml`, or it refuses
-Shortlist with a 403). You pick exactly one backend — Shortlist never runs two, so it can never
-search (or bill) twice for the same title. See [AI and cost](guides/ai.md#exa-or-searxng).
+The two external backends are the only options a local model can use, because an Ollama or LM Studio
+server on your own hardware cannot reach the internet by itself. They also keep your results the same
+when you switch AI providers. [AI and cost](guides/ai.md#exa-or-searxng) compares the two and
+covers the one SearXNG setting you have to turn on.
 
 It's genuinely optional. Leave it empty and everything still works. You would just be limited to your
 provider's own search, or to no web search at all.
@@ -127,7 +125,7 @@ what to watch next. No usernames, no account IDs, no genres, no viewing times.
 
 One flow, with a preview first. Every account's sharing settings are restored from the copy taken
 before Shortlist's first change, every Shortlist collection is deleted, and you get a report of
-exactly what changed. Your server ends up as we found it.
+exactly what changed. Your server ends up exactly as it was before you installed Shortlist.
 
 The one exception is an account that has since left your server. Shortlist can no longer reach a
 departed account's settings on plex.tv, so there is nothing there to put back — the report names
@@ -149,3 +147,31 @@ the feature, so a broken update wouldn't be caught automatically.
 
 That's why the minimum is Plex Media Server **1.43.2.10687**: older builds ignore the rule
 entirely. Stay on that build or newer, and watch the README for advisories.
+
+{% comment %}
+FAQPage structured data, generated from the same _data/faq.yml the home page's teaser renders, so
+this page's structured data and that teaser can never disagree. This page carries more questions
+than faq.yml on purpose (faq.yml is a deliberate short subset, see its own header): the reused set
+is accurate, just partial.
+
+It produces no Google rich result. Google retired the FAQ rich result and removed the feature: its
+own documentation page for FAQPage now 301s to /search/updates#removing-faq-rich-result (checked
+2026-09-05), and FAQPage is absent from the current structured-data gallery. It stays here for the
+same reason as the SoftwareApplication block in head.html: AI crawlers and other indexes read
+schema.org types to work out what this software is. Do not describe it as ranking work.
+{% endcomment %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {%- for q in site.data.faq -%}
+    {
+      "@type": "Question",
+      "name": {{ q.q | jsonify }},
+      "acceptedAnswer": { "@type": "Answer", "text": {{ q.a | markdownify | strip_html | normalize_whitespace | strip | jsonify }} }
+    }{%- unless forloop.last -%},{%- endunless -%}
+    {%- endfor -%}
+  ]
+}
+</script>

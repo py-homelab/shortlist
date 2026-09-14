@@ -29,19 +29,33 @@ from shortlist.engine.clients.plextv import PlexTvClient
 from shortlist.engine.clients.tmdb import TmdbClient
 from shortlist.engine.context import EngineContext
 from shortlist.engine.curator import NullCurator
-from shortlist.engine.delivery import row_marker
+from shortlist.engine.delivery import row_marker, strip_marker
 from shortlist.engine.history import ShareTokenWatchSource
-from shortlist.engine.models import EngineConfig, MediaType, RowOverride, RowSpec, UserProfile, UserType
+from shortlist.engine.models import (
+    EngineConfig,
+    HubAnchor,
+    MediaType,
+    RowOverride,
+    RowSpec,
+    RunReport,
+    UserProfile,
+    UserType,
+    WrittenDetails,
+)
 from shortlist.engine.pipeline import run as engine_run
-from shortlist.engine.privacy import shortlist_labels_in
+from shortlist.engine.privacy import allowed_shortlist_labels, shortlist_labels_in, unhidden_rows_on_home
 from tests.fakes.fake_plex import (
     FakeCollection,
     FakeHistoryEntry,
     FakePlexState,
     FakeSection,
+    collection_tag,
     make_fake_plex,
     make_fake_plextv,
+    movie_title,
     seed_state,
+    show_title,
+    tag_name,
 )
 from tests.fakes.file_stores import FileSnapshotStore
 
@@ -190,7 +204,7 @@ def test_engine_run_end_to_end(fakes, tmp_path):
         for u in sorted(plextv.list_users(), key=lambda u: u.id)
         if not u.restriction_profile  # the server never passes the engine a profiled account
     ]
-    assert [u.username for u in users] == ["sarah", "mike", "canary"]
+    assert [u.username for u in users] == ["sarah", "mike", "jess"]
 
     report = engine_run(ctx, users)
 
@@ -213,7 +227,7 @@ def test_engine_run_end_to_end(fakes, tmp_path):
     by_slug = {u.slug: u for u in report.users}
     assert by_slug["sarah"].status == "ok"
     assert by_slug["mike"].status == "ok"
-    assert by_slug["canary"].status == "cold_start"  # no watch history seeded for the canary
+    assert by_slug["jess"].status == "cold_start"  # no watch history seeded for the jess
 
     # Every user's rows, found by title-cased label. A user gets one collection per library they
     # have picks in — never one collection holding both types, which no share filter can hide.
@@ -221,7 +235,7 @@ def test_engine_run_end_to_end(fakes, tmp_path):
     assert {slug: row.label for slug, row in owned.items()} == {
         "sarah": "Shortlist_sarah",
         "mike": "Shortlist_mike",
-        "canary": "Shortlist_canary",
+        "jess": "Shortlist_jess",
     }
     rows_by_library = {
         slug: sorted(state.collections[key].section_id for key in row.rating_keys) for slug, row in owned.items()
@@ -231,7 +245,7 @@ def test_engine_run_end_to_end(fakes, tmp_path):
         "mike": [state.show_section_id],  # watched only TV -> only a TV row
         # Cold start draws from EVERY library, so a thin-history TV watcher gets shows rather
         # than a row of films they never asked for.
-        "canary": [state.section_id, state.show_section_id],
+        "jess": [state.section_id, state.show_section_id],
     }
     user_by_slug = {u.username.lower(): u for u in users}
     for slug, row in owned.items():
@@ -257,14 +271,20 @@ def test_engine_run_end_to_end(fakes, tmp_path):
 
     # Filters merged on the fake plex.tv: every user excludes the OTHER two users' stored labels.
     remote = {u.id: u for u in plextv.list_users()}
+    # ONE `label!=` clause holding exactly the other two labels. Their order inside the clause is
+    # whichever order they were merged in — each first row is merged as its person finishes — and Plex
+    # does not care about it.
     expected = {
-        201: "label!=Shortlist_canary,Shortlist_mike",
-        202: "label!=Shortlist_canary,Shortlist_sarah",
-        203: "label!=Shortlist_mike,Shortlist_sarah",
+        201: {"Shortlist_jess", "Shortlist_mike"},
+        202: {"Shortlist_jess", "Shortlist_sarah"},
+        203: {"Shortlist_mike", "Shortlist_sarah"},
     }
-    for account_id, merged in expected.items():
-        assert remote[account_id].filters["filterMovies"] == merged
-        assert remote[account_id].filters["filterTelevision"] == merged
+    for account_id, labels in expected.items():
+        for field_name in ("filterMovies", "filterTelevision"):
+            clause = remote[account_id].filters[field_name]
+            assert clause.startswith("label!=") and "&" not in clause and "|" not in clause, clause
+            assert set(clause.removeprefix("label!=").split(",")) == labels, clause
+    first_run_filters = {account_id: dict(remote[account_id].filters) for account_id in expected}
 
     # Snapshots captured the PRE-merge filters (all empty at seed time).
     for account_id in (201, 202, 203):
@@ -290,14 +310,14 @@ def test_engine_run_end_to_end(fakes, tmp_path):
     assert not (other_ids & owner_hub_ids), "nobody else's row may appear on the owner's Home"
     assert owner_ids <= owner_hub_ids, "the owner's own rows should appear on their Home"
 
-    # Canary /hubs (switch -> resources -> server token) shows its own row and NONE of the others'
+    # Jess /hubs (switch -> resources -> server token) shows its own row and NONE of the others'
     # — including sarah's TV row, which lives in a different library than her movie row.
-    canary_token = plextv.canary_server_token(203)
-    assert canary_token == "server-203"
-    canary_hub_ids = {collection_id_from_hub(h) for h in plex.user_hubs(canary_token)}
-    assert set(owned["canary"].rating_keys) <= canary_hub_ids
+    jess_token = plextv.canary_server_token(203)
+    assert jess_token == "server-203"
+    jess_hub_ids = {collection_id_from_hub(h) for h in plex.user_hubs(jess_token)}
+    assert set(owned["jess"].rating_keys) <= jess_hub_ids
     foreign = set(owned["sarah"].rating_keys) | set(owned["mike"].rating_keys)
-    assert not (foreign & canary_hub_ids), "another user's row is visible to the canary"
+    assert not (foreign & jess_hub_ids), "another user's row is visible to the jess"
 
     # Second run is a steady-state no-op: same rows, zero filter writes, update path exercised
     # (sortUpdate + moveItem run against the existing collections instead of createCollection).
@@ -305,8 +325,69 @@ def test_engine_run_end_to_end(fakes, tmp_path):
     assert report2.ok
     assert all(not u.privacy_synced for u in report2.users)
     assert len(state.collections) == len(owner_ids) + len(other_ids)  # no duplicate rows created on a re-run
-    for account_id, merged in expected.items():
-        assert state.users[account_id].filters["filterMovies"] == merged
+    for account_id, filters in first_run_filters.items():
+        assert dict(state.users[account_id].filters) == filters, "a re-run rewrote a filter that was already right"
+
+
+def test_engine_run_deletes_a_genuine_unlabelled_orphan_end_to_end(fakes, tmp_path):
+    """Plants a real interrupted-run orphan on the fake PMS and sweeps it through the REAL pipeline.
+
+    The decision logic in `sweep_broken_rows` is well covered against MagicMocks, and
+    `confirm_unlabelled` is covered against the fake server — but nothing joined the two: no test
+    planted a genuine orphan and ran the pipeline over it. That gap matters here more than anywhere
+    else in the engine, because this is its one irreversible write, and because the shape it depends
+    on is a real-PMS quirk a mock cannot reproduce: the collections LISTING carries no `<Label>`
+    children (recorded in `pms_collections_listing.json`), so `collection.labels` is populated only
+    by plexapi silently re-reading each collection. This is the only place that re-read, the
+    `confirm_unlabelled` second read, the wall-clock gap between the two, and the aggregate guard all
+    run together against the shape Plex actually serves.
+    """
+    state, pms_url, _tmdb_app = fakes
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+
+    # What a run that died between `create()` and the label write leaves behind: our invisible title
+    # marker, and no label at all. With no label, NO `label!=` share filter can hide it, so every
+    # account on the server sees it — which is why this is the one thing the sweep deletes.
+    orphan_key = 9200
+    movies_section = state.default_section("movie")
+    orphan_title = "✨ Movies Picked for You" + row_marker(202)
+    state.collections[orphan_key] = FakeCollection(
+        rating_key=orphan_key,
+        title=orphan_title,
+        section_id=movies_section.key,
+        labels=[],
+    )
+
+    ctx = EngineContext(
+        config=EngineConfig(
+            row_size=12,
+            min_history=5,
+            candidates_pre_rank=40,
+            max_seeds=12,
+            rows=[RowSpec(slug="picked", name_template="✨ {library_name} Picked for You", size=12)],
+            rows_defined=True,
+        ),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+    )
+    users = [
+        UserProfile(username=u.username, plex_account_id=u.id, user_type=UserType.SHARED)
+        for u in sorted(plextv.list_users(), key=lambda u: u.id)
+        if not u.restriction_profile
+    ]
+
+    report = engine_run(ctx, users)
+
+    assert report.ok, [(u.username, u.error) for u in report.users]
+    assert orphan_key not in state.collections, "the leaking orphan survived a full run"
+    assert any(orphan_title in titles for titles in report.swept_rows.values()), (
+        "the orphan was removed but the run did not report it"
+    )
 
 
 def _add_4k_movie_library(state: FakePlexState) -> FakeSection:
@@ -332,11 +413,11 @@ def test_a_row_builds_in_every_movie_library_with_that_librarys_own_rating_keys(
 
     * Each collection holds its OWN library's ratingKeys for the same picks — the other library's
       keys name items this library does not have.
-    * BOTH collections are promoted. `promote()` is the only call that hides a collection from the
-      library's normal browse view (`modeUpdate(mode="hide")`), so a row promoted in only the
-      lowest-keyed library sits browse-visible to every user in whatever other library it landed in
-      — a leak that the `label!=` excludes, which govern browse, do nothing about while the mode is
-      still "library default".
+    * BOTH collections are promoted. `promote()` is the only call that guarantees a collection is
+      hidden from the library's normal browse view (`modeUpdate(mode="hide")`; the hide at creation is
+      best-effort, and only for new rows), so a row promoted in only the lowest-keyed library sits
+      browse-visible to every user in whatever other library it landed in — a leak that the `label!=`
+      excludes, which govern browse, do nothing about while the mode is still "library default".
     """
     state, pms_url, _tmdb_app = fakes
     movies_4k = _add_4k_movie_library(state)
@@ -391,7 +472,7 @@ def test_a_row_builds_in_every_movie_library_with_that_librarys_own_rating_keys(
         )
         assert state.filterable(row)
 
-    # And the excludes hide every one of them from everyone else — through the canary's own eyes.
+    # And the excludes hide every one of them from everyone else — through the jess's own eyes.
     for account_id in (202, 203):
         assert "Shortlist_sarah" in state.users[account_id].filters["filterMovies"]
         visible = {collection_id_from_hub(h) for h in plex.user_hubs(f"server-{account_id}")}
@@ -626,6 +707,59 @@ def test_shared_row_is_public_built_from_aggregate_and_never_excluded(fakes, tmp
     assert all(pick.seed_title is None for pick in shared_report.picks)
 
 
+def test_a_shared_rows_description_is_set_and_then_handed_back(fakes, tmp_path):
+    """Issue #120 on the shared-row path, which has its own delivery call and its own persist.
+
+    The ledger is keyed by the report's own slug — exactly what `_persist_shared_row_report` stores — so
+    if the engine ever looked a shared row's record up under a different owner, run 2 would find nothing
+    to hand back and the description would stay on Plex for good.
+    """
+    state, pms_url, _tmdb_app = fakes
+    _watch(state, 202, 301)  # mike shares show 301 with sarah -> it clears the 2-watcher floor
+    shared = RowSpec(
+        slug="popular", name_template="Popular on this server", size=6, shared=True, description="Loved by {user}"
+    )
+
+    def run(row: RowSpec, delivered_details: dict) -> RunReport:
+        plex = PlexClient(pms_url, state.owner_token)
+        plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+        ctx = EngineContext(
+            config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12, rows=[row]),
+            plex=plex,
+            plextv=plextv,
+            tmdb=TmdbClient("test-key"),
+            history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+            curator=NullCurator(),
+            snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+            delivered_details=delivered_details,
+        )
+        users = [
+            UserProfile(username=u.username, plex_account_id=u.id, user_type=UserType.SHARED)
+            for u in plextv.list_users()
+            if not u.restriction_profile
+        ]
+        report = engine_run(ctx, users)
+        assert report.ok, [(u.username, u.error) for u in report.users]
+        return report
+
+    first = run(shared, {})
+
+    shared_report = next(r for r in first.users if r.slug == "shared_popular")
+    rows = [state.collections[entry["rating_key"]] for entry in shared_report.breakdown]
+    assert rows, "the shared row was not delivered"
+    assert all((row.summary, row.summary_locked) == ("Loved by Everyone", True) for row in rows)
+    ledger = {
+        (shared_report.slug, entry["row_slug"], entry["library_key"]): WrittenDetails(
+            entry["summary_written"], entry["title_sort_written"]
+        )
+        for entry in shared_report.breakdown
+    }
+
+    run(replace(shared, description=""), ledger)
+
+    assert all((row.summary, row.summary_locked) == ("", False) for row in rows)
+
+
 def test_a_solo_watched_title_never_reaches_a_shared_row(fakes, tmp_path):
     """The aggregate-privacy floor: with no title watched by >= 2 distinct people, a shared row is
     written at all — so one person's viewing can never shape (or appear in) a public row. The
@@ -748,7 +882,7 @@ def test_shared_row_restricted_to_a_subset_is_hidden_from_the_rest(fakes, tmp_pa
     # In the audience (sarah 201, mike 202) -> not excluded.
     assert "shared" not in remote[201].filters.get("filterTelevision", "").lower()
     assert "shared" not in remote[202].filters.get("filterTelevision", "").lower()
-    # Outside it (canary 203) -> the shared label IS excluded, hiding the row from them.
+    # Outside it (jess 203) -> the shared label IS excluded, hiding the row from them.
     assert "Shortlist__shared_staff" in remote[203].filters["filterTelevision"]
 
 
@@ -838,7 +972,7 @@ def test_a_run_heals_the_leaking_rows_a_previous_version_left_behind(fakes, tmp_
         user.filters["filterMovies"] = f"label!={excludes}"
         user.filters["filterTelevision"] = f"label!={excludes}"
 
-    # Sanity: these really are leaks today — the canary sees both rows despite excluding both labels.
+    # Sanity: these really are leaks today — the jess sees both rows despite excluding both labels.
     for collection in broken.values():
         assert not state.filterable(collection)
     before = {collection_id_from_hub(h) for h in plex.user_hubs("server-203")}
@@ -856,7 +990,7 @@ def test_a_run_heals_the_leaking_rows_a_previous_version_left_behind(fakes, tmp_
 
     # And now nobody sees anyone else's row.
     owned = plex.owned_collections()
-    for account_id, slug in ((201, "sarah"), (202, "mike"), (203, "canary")):
+    for account_id, slug in ((201, "sarah"), (202, "mike"), (203, "jess")):
         visible = {collection_id_from_hub(h) for h in plex.user_hubs(f"server-{account_id}")}
         foreign = {key for other, row in owned.items() if other != slug for key in row.rating_keys}
         assert not (foreign & visible), f"{slug} can still see another user's row"
@@ -1363,7 +1497,7 @@ def test_every_account_that_shares_the_server_gets_the_excludes_not_just_the_man
         snapshots=FileSnapshotStore(tmp_path / "snapshots"),
     )
 
-    # Only sarah is processed. mike and the canary share the server but are not in this run.
+    # Only sarah is processed. mike and the jess share the server but are not in this run.
     sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
     report = engine_run(ctx, [sarah])
 
@@ -1482,7 +1616,7 @@ def test_each_users_row_contains_only_their_own_picks(fakes, tmp_path):
         history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
         curator=NullCurator(),
         snapshots=FileSnapshotStore(tmp_path / "snapshots"),
-        known_slugs={201: "sarah", 202: "mike", 203: "canary"},
+        known_slugs={201: "sarah", 202: "mike", 203: "jess"},
     )
     users = [
         UserProfile(username=u.username, plex_account_id=u.id, user_type=UserType.SHARED)
@@ -1526,7 +1660,7 @@ def test_migration_night_rebuilds_every_shared_row_in_one_run(fakes, tmp_path):
         history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
         curator=NullCurator(),
         snapshots=FileSnapshotStore(tmp_path / "snapshots"),
-        known_slugs={201: "sarah", 202: "mike", 203: "canary"},
+        known_slugs={201: "sarah", 202: "mike", 203: "jess"},
     )
     users = [
         UserProfile(username=u.username, plex_account_id=u.id, user_type=UserType.SHARED)
@@ -1537,7 +1671,7 @@ def test_migration_night_rebuilds_every_shared_row_in_one_run(fakes, tmp_path):
     # The legacy state: every user's row titled the same, in the same library, sharing one tag.
     legacy = {}
     for rating_key, (slug, items) in enumerate(
-        {"sarah": [101, 102], "mike": [103, 104], "canary": [105]}.items(), start=98000
+        {"sarah": [101, 102], "mike": [103, 104], "jess": [105]}.items(), start=98000
     ):
         collection = FakeCollection(
             rating_key=rating_key,
@@ -1563,7 +1697,7 @@ def test_migration_night_rebuilds_every_shared_row_in_one_run(fakes, tmp_path):
     for slug, collection in legacy.items():
         assert collection.rating_key not in state.collections, f"{slug}'s shared row survived"
     by_slug = {u.slug: u for u in report.users}
-    for slug in ("sarah", "mike", "canary"):
+    for slug in ("sarah", "mike", "jess"):
         assert "✨ Picked for You" in (by_slug[slug].diff.deleted or []), f"{slug}'s destroyed row was not recorded"
 
     # And every rebuilt row holds only its owner's picks.
@@ -1631,6 +1765,272 @@ def test_delivery_records_the_rating_key_of_the_collection_it_built(fakes, tmp_p
             assert collection.title == entry["row_title"] + marker
             checked += 1
     assert checked, "nothing was delivered, so there is no ledger input to check"
+
+
+def test_a_row_that_loses_most_of_its_titles_stays_the_same_plex_collection(fakes, tmp_path):
+    """Issue #119, against the real request shapes: a big turnover used to delete the row and create a
+    new one, and every tool that keys on a collection's ratingKey (agregarr's custom summary and sort
+    title) lost its settings. The row must come out of the run as the SAME collection, holding the
+    new titles."""
+    state, pms_url, _tmdb_app = fakes
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+    )
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    assert engine_run(ctx, [sarah]).ok
+    movie_row = next(
+        state.collections[key]
+        for key in plex.owned_collections()["sarah"].rating_keys
+        if state.collections[key].section_id == state.section_id
+    )
+    delivered = list(movie_row.item_keys)
+    # Swap the row's membership for titles it does not want, as if a refresh had rotated most of it.
+    stale = [key for key in state.movies if key not in delivered][:6]
+    assert len(stale) == 6, "the fake library needs spare movies to rotate in"
+    movie_row.item_keys = stale
+    before = set(state.collections)
+
+    assert engine_run(ctx, [sarah]).ok
+
+    assert state.collections.get(movie_row.rating_key) is movie_row, "the row was deleted and recreated"
+    assert set(state.collections) == before, "a new collection was created for a row that already existed"
+    assert set(movie_row.item_keys) == set(delivered), "the row does not hold the titles it was given"
+
+
+def _renaming_ctx(state, pms_url, tmp_path, rows, ledger=None) -> EngineContext:
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    return EngineContext(
+        config=EngineConfig(
+            row_size=8, min_history=5, candidates_pre_rank=40, max_seeds=12, rows=rows, rows_defined=True
+        ),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        delivered_keys=ledger or {},
+    )
+
+
+def _rows_of(state, account_id: int, section_id: int) -> dict[int, FakeCollection]:
+    marker = row_marker(account_id)
+    return {k: c for k, c in state.collections.items() if c.section_id == section_id and c.title.endswith(marker)}
+
+
+def _assert_breakdown_names_what_plex_holds(report: RunReport, state, account_id: int) -> None:
+    marker = row_marker(account_id)
+    for user_report in report.users:
+        for entry in user_report.breakdown:
+            collection = state.collections.get(entry.get("rating_key"))
+            assert collection is not None, f"{entry['row_title']} names ratingKey {entry.get('rating_key')}, not a row"
+            assert collection.title == entry["row_title"] + marker, "the run reports a name Plex does not have"
+
+
+def test_a_row_renamed_onto_a_deleted_collections_name_keeps_its_collection_and_gets_the_name(fakes, tmp_path):
+    """A real PMS keeps a deleted collection's name as a tag and refuses every rename onto it
+    (pms_collection_title_tags.json). On SFLIX that froze four `{top_seed}` rows on their old seed's
+    name night after night, while the run reported the new one. The row must come out renamed, as the
+    same collection, with nothing left behind."""
+    state, pms_url, _tmdb_app = fakes
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    marker = row_marker(sarah.plex_account_id)
+    before = [RowSpec(slug="gems", name_template="Hidden Gems", size=8, media="movie")]
+    ctx = _renaming_ctx(state, pms_url, tmp_path, before)
+    assert engine_run(ctx, [sarah]).ok
+    (row_key,) = _rows_of(state, sarah.plex_account_id, state.section_id)
+    # A collection that once carried the new name, deleted the way the old rebuild deleted rows.
+    section = ctx.plex.sections()[0]
+    gone = ctx.plex.create_collection(section, "Buried Treasure" + marker, [ctx.plex._server.fetchItem(101)])
+    gone.delete()
+    collections_before = set(state.collections)
+
+    after = [RowSpec(slug="gems", name_template="Buried Treasure", size=8, media="movie")]
+    ledger = {(sarah.slug, "gems", str(state.section_id)): row_key}
+    report = engine_run(_renaming_ctx(state, pms_url, tmp_path, after, ledger), [sarah])
+
+    assert report.ok
+    assert state.collections[row_key].title == "Buried Treasure" + marker
+    assert set(state.collections) == collections_before, "the row was recreated, or a helper was left behind"
+    assert state.collections[row_key].item_keys, "the renamed row lost its titles"
+    _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
+
+
+def test_a_row_renamed_onto_its_twin_rows_name_in_another_library_is_rebuilt_under_that_name(fakes, tmp_path):
+    """The one name Plex will not let a row take over by renaming: a LIVE collection of the same person
+    in another library already has it (issue #121 lets two rows share a name across libraries). Only
+    a create can use it, so the row is rebuilt once under the right name, and the twin is untouched."""
+    state, pms_url, _tmdb_app = fakes
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    marker = row_marker(sarah.plex_account_id)
+    before = [
+        RowSpec(slug="gems", name_template="Hidden Gems", size=8, media="movie"),
+        RowSpec(slug="gems_tv", name_template="Buried Treasure", size=8, media="show"),
+    ]
+    ctx = _renaming_ctx(state, pms_url, tmp_path, before)
+    assert engine_run(ctx, [sarah]).ok
+    (movie_key,) = _rows_of(state, sarah.plex_account_id, state.section_id)
+    (show_key,) = _rows_of(state, sarah.plex_account_id, state.show_section_id)
+    show_items = list(state.collections[show_key].item_keys)
+
+    after = [RowSpec(slug="gems", name_template="Buried Treasure", size=8, media="movie"), before[1]]
+    ledger = {
+        (sarah.slug, "gems", str(state.section_id)): movie_key,
+        (sarah.slug, "gems_tv", str(state.show_section_id)): show_key,
+    }
+    report = engine_run(_renaming_ctx(state, pms_url, tmp_path, after, ledger), [sarah])
+
+    assert report.ok
+    movie_rows = _rows_of(state, sarah.plex_account_id, state.section_id)
+    assert list(movie_rows) != [movie_key] and len(movie_rows) == 1, "expected exactly one rebuilt Movies row"
+    (rebuilt,) = movie_rows.values()
+    assert rebuilt.title == "Buried Treasure" + marker
+    assert rebuilt.item_keys, "the rebuilt row holds no titles"
+    assert f"shortlist_{sarah.slug}" in [label.lower() for label in rebuilt.labels], "the rebuilt row is unlabelled"
+    assert state.collections[show_key].title == "Buried Treasure" + marker, "the twin was renamed"
+    assert state.collections[show_key].item_keys == show_items, "the twin's titles changed"
+    _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
+
+
+def test_two_libraries_renamed_onto_one_name_in_one_run_never_use_the_helper(fakes, tmp_path):
+    """Architecture review 2026-09-14 (HIGH). plexapi's `editTitle` leaves the object's title as it was, and
+    the run's collection cache keeps that object. So after the Movies row took the new name, the TV row's
+    refused rename looked the name up in the cache, saw the Movies row under its OLD title, found no holder
+    and freed the name with a helper — which took over the live Movies row's tag and renamed it away. The
+    holder must be read fresh, so the TV row is rebuilt as the Movies row's twin and nothing else moves."""
+    state, pms_url, _tmdb_app = fakes
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    marker = row_marker(sarah.plex_account_id)
+    before = [
+        RowSpec(slug="gems", name_template="Hidden Gems", size=8, media="movie"),
+        RowSpec(slug="gems_tv", name_template="Buried Treasure", size=8, media="show"),
+    ]
+    assert engine_run(_renaming_ctx(state, pms_url, tmp_path, before), [sarah]).ok
+    (movie_key,) = _rows_of(state, sarah.plex_account_id, state.section_id)
+    (show_key,) = _rows_of(state, sarah.plex_account_id, state.show_section_id)
+
+    after = [
+        RowSpec(slug="gems", name_template="Same Name", size=8, media="movie"),
+        RowSpec(slug="gems_tv", name_template="Same Name", size=8, media="show"),
+    ]
+    ledger = {
+        (sarah.slug, "gems", str(state.section_id)): movie_key,
+        (sarah.slug, "gems_tv", str(state.show_section_id)): show_key,
+    }
+    report = engine_run(_renaming_ctx(state, pms_url, tmp_path, after, ledger), [sarah])
+
+    assert report.ok
+    movie_row = state.collections[movie_key]
+    assert movie_row.title == "Same Name" + marker
+    assert collection_tag(movie_row) == tag_name("Same Name" + marker), "a helper renamed the live Movies row's tag"
+    (tv_row,) = _rows_of(state, sarah.plex_account_id, state.show_section_id).values()
+    assert tv_row.title == "Same Name" + marker
+    assert not [c for c in state.collections.values() if "freed name" in c.title.lower()]
+    _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
+
+
+def test_a_rows_description_and_sort_title_reach_plex_and_clearing_them_hands_back_only_ours(fakes, tmp_path):
+    """Issue #120 through plexapi's real request shapes, with the fake following what a real PMS was
+    measured doing (tests/fixtures/pms_collection_field_edits.json).
+
+    Run 1 sets both fields; the ledger records what was written. Between runs a person edits one
+    collection's summary in Plex. Run 2 clears both fields: every value Shortlist wrote is handed back,
+    and the hand-edited summary is not.
+    """
+    state, pms_url, _tmdb_app = fakes
+    spec = RowSpec(
+        slug="picked",
+        name_template="✨ {library_name} Picked for You",
+        size=12,
+        description="Picked for {user}",
+        sort_title_prefix="!010_",
+    )
+
+    def run(row: RowSpec, delivered_details: dict) -> RunReport:
+        plex = PlexClient(pms_url, state.owner_token)  # a client per run, as the server builds one
+        plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+        ctx = EngineContext(
+            config=EngineConfig(
+                row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12, rows=[row], rows_defined=True
+            ),
+            plex=plex,
+            plextv=plextv,
+            tmdb=TmdbClient("test-key"),
+            history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+            curator=NullCurator(),
+            snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+            delivered_details=delivered_details,
+        )
+        report = engine_run(ctx, [UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)])
+        assert report.ok
+        return report
+
+    first = run(spec, {})
+
+    rows = [state.collections[entry["rating_key"]] for entry in first.users[0].breakdown]
+    assert len(rows) >= 2, "sarah needs a row in both libraries for the hand-edit to have a control"
+    for row in rows:
+        assert (row.summary, row.summary_locked) == ("Picked for sarah", True)
+        assert (row.title_sort, row.title_sort_locked) == ("!010_" + strip_marker(row.title), True)
+        assert row.labels, "a field edit must never cost the row its label"
+    ledger = {
+        ("sarah", entry["row_slug"], entry["library_key"]): WrittenDetails(
+            entry["summary_written"], entry["title_sort_written"]
+        )
+        for entry in first.users[0].breakdown
+    }
+    hand_edited, *untouched = rows
+    hand_edited.summary = "Written by hand in Plex"
+
+    second = run(replace(spec, description="", sort_title_prefix=""), ledger)
+
+    assert (hand_edited.summary, hand_edited.summary_locked) == ("Written by hand in Plex", True)
+    for row in untouched:
+        assert (row.summary, row.summary_locked) == ("", False)
+    for row in rows:
+        # Blank + unlock, with no title sent: Plex rebuilds it from the full title, emoji kept.
+        assert (row.title_sort, row.title_sort_locked) == (row.title, False)
+    assert all(entry["summary_written"] is None for entry in second.users[0].breakdown)
+    assert all(entry["title_sort_written"] is None for entry in second.users[0].breakdown)
+
+
+def test_a_new_row_is_already_hidden_from_library_browse_before_it_is_promoted(fakes, tmp_path, monkeypatch):
+    """Over the real request shapes: the early hide must actually land, not just be attempted. Every
+    other test promotes, and promote() hides again, so a hide that silently failed would pass them all."""
+    state, pms_url, _tmdb_app = fakes
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+    )
+    modes_at_promotion: dict[int, int] = {}
+    promote = PlexClient.promote
+
+    def spy(self, collection, **kwargs):
+        modes_at_promotion[int(collection.ratingKey)] = state.collections[int(collection.ratingKey)].mode
+        return promote(self, collection, **kwargs)
+
+    monkeypatch.setattr(PlexClient, "promote", spy)
+
+    assert engine_run(ctx, [UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)]).ok
+
+    assert modes_at_promotion, "nothing was promoted, so the test proved nothing"
+    assert set(modes_at_promotion.values()) == {0}, f"rows reached promotion still browsable: {modes_at_promotion}"
 
 
 def test_a_scoped_run_never_rebuilds_another_row_as_itself(fakes, tmp_path):
@@ -1966,7 +2366,7 @@ def test_a_profiled_account_that_can_see_other_peoples_rows_is_measured_and_repo
         snapshots=FileSnapshotStore(tmp_path / "snapshots"),
     )
     # What the server always supplies: the PMS as ONE user sees it. Mirrors
-    # `ContextBuilder._pms_for_user`, including its canary fallback for a managed account that was
+    # `ContextBuilder._pms_for_user`, including its jess fallback for a managed account that was
     # never separately shared — which is precisely the archetype here.
     ctx.pms_for_user = lambda profile: PlexClient(pms_url, token) if (token := history._token_for(profile)) else None
 
@@ -2066,7 +2466,7 @@ class TestPlexRatingsEndToEnd:
 
     #: One of sarah's watched movies (`seed_state` gives her 101..108).
     DISLIKED = 103
-    DISLIKED_TITLE = "Movie 03"
+    DISLIKED_TITLE = movie_title(3)
 
     def test_a_title_sarah_rated_low_stops_seeding_her_row(self, fakes, tmp_path):
         state, pms_url, _ = fakes
@@ -2079,7 +2479,7 @@ class TestPlexRatingsEndToEnd:
         seeds = _seed_titles(report, "sarah")
         assert seeds, "sarah produced no seeds at all, so the absence below proves nothing"
         assert self.DISLIKED_TITLE not in seeds
-        assert "Movie 04" in seeds, "her other watches must still seed — this is not a blanket drop"
+        assert movie_title(4) in seeds, "her other watches must still seed — this is not a blanket drop"
 
     def test_the_same_title_still_seeds_when_the_feature_is_off(self, fakes, tmp_path):
         """The control. Without it, a title missing from the seeds could be the fixture, the cap, or
@@ -2112,9 +2512,9 @@ class TestPlexRatingsEndToEnd:
 
         report = engine_run(ctx, _users(plextv))
 
-        assert "Show 05" not in _seed_titles(report, "mike"), "mike's own rating must act on mike"
+        assert show_title(5) not in _seed_titles(report, "mike"), "mike's own rating must act on mike"
         # sarah never rated it, so nothing about it changed for her.
-        sarah_watched = {"Show 01", "Show 02", "Show 03", "Show 04"}
+        sarah_watched = {show_title(n) for n in (1, 2, 3, 4)}
         assert sarah_watched & _seed_titles(report, "sarah") == sarah_watched
 
     def test_a_tool_written_rating_is_ignored_over_the_real_wire(self, fakes, tmp_path):
@@ -2142,7 +2542,7 @@ class TestPlexRatingsEndToEnd:
         dropped = next(w for w in recent if w["title"] == self.DISLIKED_TITLE)
         assert dropped["rating"] == 2.0
         assert dropped["rating_blocked"] is True
-        kept = next(w for w in recent if w["title"] == "Movie 04")
+        kept = next(w for w in recent if w["title"] == movie_title(4))
         assert kept["rating"] is None and kept["rating_blocked"] is False
 
     def test_the_trace_records_the_policy_the_run_actually_used(self, fakes, tmp_path):
@@ -2229,7 +2629,7 @@ class TestPlexRatingsCannotReachSharedRows:
 
         assert report.ok, [(u.username, u.error) for u in report.users]
         shared = next(u for u in report.users if u.slug == "shared_popular")
-        # Show 01 is the ONLY title two people share in this fixture (see
+        # Show 1 is the ONLY title two people share in this fixture (see
         # `test_a_solo_watched_title_never_reaches_a_shared_row`: sarah/mike overlap is otherwise
         # zero), so it is the single seed the shared row can be built from. If sarah's 1-star reached
         # the aggregate, the row derives nothing and comes back empty — which makes "does it still
@@ -2275,7 +2675,7 @@ class TestPlexRatingsCannotReachSharedRows:
 
         report = engine_run(ctx, users)
 
-        assert "Show 01" not in _seed_titles(report, "sarah"), "her own row must respect her rating"
+        assert show_title(1) not in _seed_titles(report, "sarah"), "her own row must respect her rating"
         # …while the shared row, whose only possible seed is that same title, still builds. A shared
         # row records no seed trace of its own, so its contents are the observable (see the sibling
         # test for why "has picks" is exact here rather than a proxy).
@@ -2329,7 +2729,7 @@ class TestTrustIsJudgedPerPersonNotPerRow:
 
         report = engine_run(ctx, users)
 
-        assert "Show 01" in _seed_titles(report, "sarah"), (
+        assert show_title(1) in _seed_titles(report, "sarah"), (
             "the TV row judged its own slice, abstained, and acted on a rating the account-level "
             "verdict rejects — the row and the person disagree about whose ratings are real"
         )
@@ -2350,7 +2750,7 @@ class TestTrustIsJudgedPerPersonNotPerRow:
         for watch in sarah.trace["history"]["recent"]:
             if watch["rating_blocked"]:
                 assert watch["title"] not in seeds, f"trace calls {watch['title']} blocked, but it seeded"
-            elif watch["title"] in ("Show 01",):
+            elif watch["title"] in (show_title(1),):
                 assert watch["title"] in seeds, "trace stayed silent about a title the run kept — consistent"
 
 
@@ -2660,7 +3060,7 @@ def test_a_filter_plex_stores_but_ignores_is_caught_and_reported(fakes, tmp_path
     profile — so the accounts we successfully write filters FOR had no verification at all, and the
     first person to notice was a user, not the owner.
 
-    Modelled by making the fake PMS store the filter and not act on it (`excluded_labels` -> empty),
+    Modelled by making the fake PMS store the filter and not act on it (`sees` -> always True),
     which is precisely the difference between "stored" and "enforced".
     """
     state, pms_url, _tmdb_app = fakes
@@ -2686,13 +3086,13 @@ def test_a_filter_plex_stores_but_ignores_is_caught_and_reported(fakes, tmp_path
 
     # Now Plex starts storing the exclusions without applying them. Nothing else changes: the filter
     # strings stay exactly where they were, so every existing check still reports a healthy server.
-    monkeypatch.setattr(type(state), "excluded_labels", staticmethod(lambda _user: set()))
+    monkeypatch.setattr(type(state), "sees", lambda _self, _user, _collection: True)
     report = engine_run(ctx, [sarah, mike])
 
     # Both account KINDS must be represented: the check samples one per type, and the managed
     # (Plex Home) arm is the exact shape #88 reported. Asserting only "something was reported" would
-    # stay green if the canary/managed path broke entirely.
-    assert sorted(report.filters_not_enforced) == ["canary", "sarah"]
+    # stay green if the jess/managed path broke entirely.
+    assert sorted(report.filters_not_enforced) == ["jess", "sarah"]
     assert report.filters_enforcement_measured is True, "a filter that is stored but ignored has to be reported"
     exposed = next(iter(report.filters_not_enforced.values()))
     assert exposed, "the finding names the rows the account can actually see"
@@ -2700,6 +3100,67 @@ def test_a_filter_plex_stores_but_ignores_is_caught_and_reported(fakes, tmp_path
     # and still promotes.
     assert report.ok
     assert not report.promotion_blockers
+
+
+def _privacy_ctx(state, pms_url, tmp_path):
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        token_for_user=lambda profile: f"server-{profile.plex_account_id}",
+    )
+    return ctx, plex
+
+
+def test_an_account_with_its_own_plex_restriction_still_sees_no_one_elses_row(fakes, tmp_path):
+    """#116, end to end. The owner set ONE restriction on Sarah in Plex (a rating exclude). The old
+    merge appended our excludes with `|`, which a real PMS reads as OR — she saw every row, the owner's
+    rating exclude stopped applying, and every check said healthy because plex.tv stored it perfectly.
+    """
+    state, pms_url, _tmdb_app = fakes
+    for fieldname in ("filterMovies", "filterTelevision"):
+        state.users[201].filters[fieldname] = "contentRating!=R"
+    ctx, plex = _privacy_ctx(state, pms_url, tmp_path)
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    mike = UserProfile(username="mike", plex_account_id=202, user_type=UserType.SHARED)
+
+    report = engine_run(ctx, [sarah, mike])
+
+    owned = plex.owned_collections()
+    assert owned["mike"].rating_keys, "mike needs a row for this to prove anything"
+    assert unhidden_rows_on_home(plex.user_hubs("server-201"), owned, "sarah") == []
+    assert state.users[201].filters["filterMovies"].startswith("contentRating!=R&label!=")
+    assert report.filters_not_enforced == {}
+    assert report.restrictions_restored == {}, "a first merge restores nothing — nothing was voided yet"
+
+
+def test_an_account_the_old_merge_broke_is_repaired_and_reported_once(fakes, tmp_path):
+    """Every affected server holds this today, and the old merge never touched it again: nothing was
+    MISSING from the filter, only unenforced. The repair moves our excludes to where Plex applies them,
+    which also brings the owner's own restriction back — so the run says so, once."""
+    state, pms_url, _tmdb_app = fakes
+    ctx, plex = _privacy_ctx(state, pms_url, tmp_path)
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    mike = UserProfile(username="mike", plex_account_id=202, user_type=UserType.SHARED)
+    engine_run(ctx, [sarah, mike])
+    ours = state.users[201].filters["filterMovies"]
+    for fieldname in ("filterMovies", "filterTelevision"):
+        state.users[201].filters[fieldname] = f"contentRating!=R|{ours}"
+    owned = plex.owned_collections()
+    assert unhidden_rows_on_home(plex.user_hubs("server-201"), owned, "sarah"), "the damage must leak first"
+
+    repaired = engine_run(ctx, [sarah, mike])
+
+    assert state.users[201].filters["filterMovies"] == f"contentRating!=R&{ours}"
+    assert unhidden_rows_on_home(plex.user_hubs("server-201"), plex.owned_collections(), "sarah") == []
+    assert repaired.restrictions_restored == {201: "sarah"}
+    assert engine_run(ctx, [sarah, mike]).restrictions_restored == {}
 
 
 def test_a_server_that_enforces_its_filters_reports_nothing(fakes, tmp_path):
@@ -2725,3 +3186,344 @@ def test_a_server_that_enforces_its_filters_reports_nothing(fakes, tmp_path):
     report = engine_run(ctx, [sarah, mike])
 
     assert report.filters_not_enforced == {}
+
+
+def test_a_run_leaves_a_scheduled_off_row_hidden_and_intact(fakes, tmp_path):
+    """A row on a day off must survive a full run: hidden, but not rebuilt and not deleted.
+
+    This is the probe that shaped "When it appears" (issue #102). A row demoted BEHIND the engine's
+    back is put straight back by the next run — promotion is computed from the row's placement, not
+    from what is currently on the server. So the schedule cannot be a sweep bolted on the side; it
+    has to resolve into the placement itself, which is what `context_builder._build_rows` does.
+
+    The three things asserted here are the three ways this could go wrong on a real server: the row
+    comes back anyway, the row gets deleted, or the row gets rebuilt (paying up to 26s per
+    membership write on a large TV library, nightly, for a row nobody can see).
+    """
+    state, pms_url, _tmdb_app = fakes
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    rows = [RowSpec(slug="picked", name_template="Picked for You", size=8)]
+    ctx, users, report = _run(plex, plextv, tmp_path, rows, state.owner_token)
+    assert report.ok
+
+    target = next(u for u in users if any(r.slug == u.slug and r.status == "ok" and r.picks for r in report.users))
+    label = f"Shortlist_{target.slug}"
+    keys = {c.rating_key for c in state.collections.values() if any(t.lower() == label.lower() for t in c.labels)}
+    assert keys, "nothing was delivered, so this proves nothing"
+    token = f"server-{target.plex_account_id}"
+    titles_before = {k: list(state.collections[k].item_keys) for k in keys}
+
+    def on_home() -> set[int]:
+        return {collection_id_from_hub(h) for h in plex.user_hubs(token)}
+
+    assert keys <= on_home(), "the row should be up before its day off"
+
+    # The day turns over: the server resolves this row's schedule to `off` and runs as normal.
+    ctx.config.rows = [replace(rows[0], placement="off", placement_friends="off")]
+    off_report = engine_run(ctx, users)
+
+    assert off_report.ok
+    assert not (keys & on_home()), "a scheduled-off row must not be on anyone's Home"
+    for key in keys:
+        assert key in state.collections, "hidden is not deleted — the row must survive its day off"
+        assert state.collections[key].item_keys == titles_before[key], "a hidden row must not be rebuilt"
+
+    # ...and the following day it comes back, still without a rebuild.
+    ctx.config.rows = rows
+    back_report = engine_run(ctx, users)
+
+    assert back_report.ok
+    assert keys <= on_home(), "the row must return on its next day"
+    for key in keys:
+        assert state.collections[key].item_keys == titles_before[key], "coming back must not rebuild it either"
+
+
+def test_a_scoped_run_does_not_resurrect_a_scheduled_off_seeded_row(fakes, tmp_path):
+    """The `{top_seed}` cell of "a run must not undo the midnight schedule" (issue #102).
+
+    A `{top_seed}` title is different every run, so it cannot be re-rendered without picks — and a run
+    that does not REBUILD a row stamps no title for it. The collection then matches no spec, and
+    promotion's no-spec fallback SHOWS it. So the midnight job hides the row at 00:00 and the 03:30
+    run puts it straight back on Friends' Home for the rest of its off day.
+
+    The static-titled sibling of this test passes either way, because a static title can always be
+    re-rendered — which is exactly why that test did not catch this.
+    """
+    state, pms_url, _tmdb_app = fakes
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    rows = [
+        RowSpec(slug="picked", name_template="Picked for You", size=6),
+        RowSpec(slug="seeded", name_template="Because you watched {top_seed}", size=6),
+    ]
+    ctx, users, report = _run(plex, plextv, tmp_path, rows, state.owner_token)
+    assert report.ok
+
+    target = next(u for u in users if any(r.slug == u.slug and r.status == "ok" and r.picks for r in report.users))
+    label = f"Shortlist_{target.slug}"
+    seeded = {
+        c.rating_key
+        for c in state.collections.values()
+        if any(t.lower() == label.lower() for t in c.labels) and c.title.startswith("Because you watched")
+    }
+    assert seeded, "the {top_seed} row was never delivered, so this proves nothing"
+    token = f"server-{target.plex_account_id}"
+
+    def on_home() -> set[int]:
+        return {collection_id_from_hub(h) for h in plex.user_hubs(token)}
+
+    assert seeded <= on_home()
+
+    # The server persists what a run delivered and hands the next context that ledger back
+    # (`context_builder._delivered_keys`). The fake context is built fresh, so model it here — without
+    # it this test proves nothing about production, where the ledger is exactly what identifies a row
+    # whose title cannot be re-rendered.
+    from shortlist.engine.pipeline import live_delivered_keys
+
+    ctx.delivered_keys = live_delivered_keys(ctx, report)
+    assert any(row_slug == "seeded" for (_u, row_slug, _l) in ctx.delivered_keys), "ledger did not record it"
+
+    # Midnight: the schedule resolves this row to `off` and takes it down.
+    ctx.config.rows = [rows[0], replace(rows[1], placement="off", placement_friends="off")]
+    for section in plex.sections():
+        for collection in plex.find_owned_collections(section, label):
+            if collection.title.startswith("Because you watched"):
+                plex.demote_all(collection, reason="scheduled off")
+    assert not (seeded & on_home())
+
+    # 03:30: a run scoped to the OTHER row — so nothing re-stamps the seeded row's title.
+    ctx.config.build_only = ["picked"]
+    later = engine_run(ctx, users)
+
+    assert later.ok
+    assert not (seeded & on_home()), "the 03:30 run put a scheduled-off {top_seed} row back on Home"
+
+
+def test_two_labels_go_on_in_one_write_and_do_not_disturb_a_foreign_label(fakes):
+    """The claim the label batching rests on, proved against real plexapi + the fake PMS.
+
+    The unit tests can only assert what OUR code hands plexapi. The load-bearing behaviour is
+    plexapi's: `editTags` concatenates `existing + new` and PUTs an ABSOLUTE tag set. So a plexapi
+    upgrade that changed it would leave every mock-based test green while a batched write silently
+    dropped a co-managing tool's label — or, far worse, another user's `shortlist_<user>` label,
+    which is the only thing hiding that row from the rest of the server.
+
+    Two things are asserted, and the second is the safety one:
+      1. both labels arrive in a SINGLE PUT (the ~10%-of-a-run saving), and
+      2. a label already on the collection SURVIVES that write.
+    """
+    state, pms_url, _tmdb_app = fakes
+    plex = PlexClient(pms_url, state.owner_token)
+    section = next(s for s in plex.sections() if s.type == "movie")
+    item = section.all(maxresults=1)[0]
+
+    puts: list[str] = []
+    session = plex._server._session
+    original = session.request
+
+    def counting(method, url, **kwargs):
+        if method.upper() == "PUT" and "/all" in url:
+            puts.append(url.split("?")[0])
+        return original(method, url, **kwargs)
+
+    session.request = counting
+    collection = None
+    try:
+        collection = plex.create_collection(section, "zz batched label probe", [item])
+        # A co-managing tool's label, already on the row before we touch it.
+        collection.addLabel("Kometa_managed")
+        collection.reload()
+        puts.clear()
+
+        stored = plex.stored_label(collection, "shortlist_bob", extra="shortlist")
+
+        assert len(puts) == 1, f"both labels must ride in ONE write, got {len(puts)}: {puts}"
+        assert stored.lower() == "shortlist_bob", "the CRITICAL label's casing is what filters exclude"
+        collection.reload()
+        tags = {t.tag.lower() for t in collection.labels}
+        assert "shortlist_bob" in tags
+        assert "shortlist" in tags
+        assert "kometa_managed" in tags, (
+            "a label write is an ABSOLUTE set — a foreign label must survive it, or this write "
+            "would be capable of dropping another user's shortlist_<user> label too"
+        )
+    finally:
+        if collection is not None:
+            collection.delete()
+
+
+def _placement_ctx(state, pms_url, tmp_path, rows):
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(
+            row_size=12,
+            min_history=5,
+            candidates_pre_rank=40,
+            max_seeds=12,
+            rows=rows(plex),
+            rows_defined=True,
+            manage_shelf_order=True,
+        ),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+    )
+    users = [
+        UserProfile(username=u.username, plex_account_id=u.id, user_type=UserType.SHARED)
+        for u in sorted(plextv.list_users(), key=lambda u: u.id)
+        if not u.restriction_profile
+    ]
+    return plex, ctx, users
+
+
+def test_the_default_placement_puts_our_rows_above_plex_own_hubs(fakes, tmp_path):
+    """The SHIPPED default (no placement set = top of the shelf), through the whole stack, on a shelf
+    whose first hub is one of Plex's own.
+
+    This is the arrangement every new install gets, and nothing full-stack could express it: the fake
+    served no built-in hubs, and modelled shelf order as the insertion order of its collections, so a
+    built-in could neither be moved nor moved past. Reaching the top therefore meant moving
+    `movie.recentlyadded`, which the fake answered with a 500 that `_apply_placement` swallows.
+    """
+    state, pms_url, _tmdb_app = fakes
+    plex, ctx, users = _placement_ctx(
+        state,
+        pms_url,
+        tmp_path,
+        lambda _plex: [RowSpec(slug="picked", name_template="✨ {library_name} Picked for You", size=12)],
+    )
+
+    report = engine_run(ctx, users)
+
+    assert not report.error, report.error
+    failures = [e for e in report.hub_orderings if e.get("placed") is False]
+    assert not failures, f"the default placement must not fail against a built-in: {failures}"
+    for section in plex.sections():
+        titles = [getattr(h, "title", "") for h in section.managedHubs()]
+        assert "Recently Added" in titles, titles
+        ours = [n for n, t in enumerate(titles) if "Picked for You" in t]
+        assert ours, titles
+        assert max(ours) < titles.index("Recently Added"), f"our rows must sit ABOVE Plex's own hub, got {titles}"
+
+
+def test_an_anchor_the_owner_switched_off_in_plex_is_reported_not_silently_skipped(fakes, tmp_path):
+    """The other half: a row anchored to one of Plex's own hubs that the owner has switched OFF.
+
+    It occupies no position a viewer can see, so there is nothing to sit beside — and it must be said
+    out loud rather than leaving the row at the bottom for ever with the pass reporting success.
+    """
+    state, pms_url, _tmdb_app = fakes
+    plex, ctx, users = _placement_ctx(
+        state,
+        pms_url,
+        tmp_path,
+        lambda p: [
+            RowSpec(
+                slug="picked",
+                name_template="✨ {library_name} Picked for You",
+                size=12,
+                hub_anchors={str(s.key): HubAnchor(anchor_title="By Genre") for s in p.sections()},
+            )
+        ],
+    )
+
+    report = engine_run(ctx, users)
+
+    assert not report.error, report.error
+    refused = [e for e in report.hub_orderings if e.get("placed") is False]
+    assert refused, f"anchoring to a switched-off built-in must be reported: {report.hub_orderings}"
+    assert all(e["reason"] == "anchor not found" for e in refused), refused
+    # And the shelf really carries Plex's own hubs, so this was not asserted against a shelf of ours.
+    titles = [getattr(h, "title", "") for h in plex.sections()[0].managedHubs()]
+    assert "Recently Added" in titles and "By Genre" in titles, titles
+
+
+def test_an_allow_list_account_gets_a_full_row_it_can_see_and_nobody_elses(fakes, tmp_path):
+    """#115 end to end. sarah's owner restricted her to G-rated movies and TV-Y shows. Before, Shortlist
+    picked from the whole library, so Plex hid most of her row — and her row itself, which carries no
+    rating. Now her picks come only from what she can see, and her own row label joins her allow list,
+    while mike's row stays hidden from her."""
+    state, pms_url, _tmdb_app = fakes
+    for key, movie in state.movies.items():
+        movie.content_rating = "G" if key % 2 == 0 else "PG-13"
+    for key, show in state.shows.items():
+        show.content_rating = "TV-Y" if key % 2 == 0 else "TV-MA"
+    state.users[201].filters["filterMovies"] = "contentRating=G"
+    state.users[201].filters["filterTelevision"] = "contentRating=TV-Y"
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=12, min_history=5, candidates_pre_rank=40, max_seeds=12),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        token_for_user=lambda profile: f"server-{profile.plex_account_id}",
+    )
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    mike = UserProfile(username="mike", plex_account_id=202, user_type=UserType.SHARED)
+
+    report = engine_run(ctx, [sarah, mike])
+
+    assert report.ok
+    owned = plex.owned_collections()
+    sarah_rows = set(owned["sarah"].rating_keys)
+    assert sarah_rows, "sarah should still get rows"
+    for key in sarah_rows:
+        members = [state.item(k) for k in state.members(state.collections[key])]
+        assert members, f"row {key} is empty"
+        hidden = [m.title for m in members if not state.admits_item(state.users[201], m)]
+        assert not hidden, f"sarah's row {key} holds titles her restrictions hide: {hidden}"
+    for fieldname in ("filterMovies", "filterTelevision"):
+        assert allowed_shortlist_labels(state.users[201].filters[fieldname]) == {owned["sarah"].label}
+    on_her_home = {collection_id_from_hub(h) for h in plex.user_hubs("server-201")}
+    assert sarah_rows <= on_her_home, "her own rows must show despite her allow list"
+    assert not (set(owned["mike"].rating_keys) & on_her_home), "mike's row must stay hidden from her"
+    # mike has no restrictions: nothing about his filter or his picks changes.
+    assert allowed_shortlist_labels(state.users[202].filters["filterTelevision"]) == set()
+
+    settled = {k: dict(state.users[201].filters) for k in (201,)}
+    engine_run(ctx, [sarah, mike])
+    assert dict(state.users[201].filters) == settled[201], "a second night rewrote her filter"
+
+
+def test_a_cold_start_allow_list_account_gets_only_titles_it_can_see(fakes, tmp_path):
+    """The cold path builds from the library's top-rated titles and returns before the warm path's checks.
+    jess has no history, and her owner restricted her to G-rated movies and TV-Y shows."""
+    state, pms_url, _tmdb_app = fakes
+    for key, movie in state.movies.items():
+        movie.content_rating = "G" if key % 2 == 0 else "PG-13"
+    for key, show in state.shows.items():
+        show.content_rating = "TV-Y" if key % 2 == 0 else "TV-MA"
+    state.users[203].filters["filterMovies"] = "contentRating=G"
+    state.users[203].filters["filterTelevision"] = "contentRating=TV-Y"
+    plex = PlexClient(pms_url, state.owner_token)
+    plextv = PlexTvClient(state.owner_token, plex.machine_id, min_write_interval=0.0)
+    ctx = EngineContext(
+        config=EngineConfig(row_size=6, min_history=5, candidates_pre_rank=40, max_seeds=12, cold_start="popular"),
+        plex=plex,
+        plextv=plextv,
+        tmdb=TmdbClient("test-key"),
+        history_source=ShareTokenWatchSource(plex, plextv, owner_token=state.owner_token),
+        curator=NullCurator(),
+        snapshots=FileSnapshotStore(tmp_path / "snapshots"),
+        token_for_user=lambda profile: f"server-{profile.plex_account_id}",
+    )
+    jess = UserProfile(username="jess", plex_account_id=203, user_type=UserType.MANAGED)
+
+    report = engine_run(ctx, [jess])
+
+    assert report.ok
+    rows = set(plex.owned_collections()["jess"].rating_keys)
+    assert rows
+    for key in rows:
+        members = [state.item(k) for k in state.members(state.collections[key])]
+        assert members, f"row {key} is empty"
+        assert all(state.admits_item(state.users[203], m) for m in members), [m.title for m in members]

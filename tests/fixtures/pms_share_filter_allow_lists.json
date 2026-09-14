@@ -1,0 +1,185 @@
+{
+  "_why": [
+    "Issue #115: what a real PMS does with an account's ALLOW list ('label=' / 'contentRating=' conditions),",
+    "the grouping question pms_share_filter_boolean_semantics.json could not settle, and whether reading",
+    "items AS a restricted account leaves out what its allow list hides.",
+    "",
+    "Measured by writing one managed Home account's filterMovies/filterTelevision (PUT /api/users/{id}),",
+    "waiting for the PMS to apply it, then reading AS that account with its own server token. Only that",
+    "account's filters were written; each original value was restored byte-identical afterwards.",
+    "",
+    "Conclusions the code relies on:",
+    "1. GROUPING. A filter is '&'-separated groups of '|'-separated alternatives: (A|B)&C. Case",
+    "   'XYZNOPE&recommended|G' returned 0 movies; strict left-to-right would have returned 401. So '|'",
+    "   binds TIGHTER than '&' — the question the #116 recording left open.",
+    "2. '&' is a strict AND even between two allow conditions: 'contentRating=G&label=<row>' shows nothing.",
+    "3. OWN ROW UNDER AN ALLOW LIST. Adding the row's label as an alternative in EVERY allow group shows the",
+    "   row on Home and in the library, and inside it exactly the items the allow list admits. Added to",
+    "   only one of two allow groups, the row stays hidden.",
+    "4. READING AS THE ACCOUNT. GET /library/metadata/{k1,k2,...} with the account's token returns only",
+    "   the keys its share filter admits (200, the rest silently absent), and 404 when it admits none —",
+    "   the same shape as a batch of deleted keys (pms_metadata_batch_partial.json). plexapi's fetchItems",
+    "   raises NotFound for that 404. An allow list on filterMovies does not touch TV items.",
+    "",
+    "Row labels here: ROW = the probed person's shortlist_ label; OURS = the account's real exclude clause",
+    "(every other person's shortlist_ label). Library: 9,988 movies, 401 rated G, 11 labelled",
+    "'recommended', 6,660 not rated R.",
+    "5. A library the account is not shared behaves the same: its items are absent from a 200, and 404 when the batch holds only those. So one title's copy in an unshared library reads as hidden even when the account can see its copy in another library."
+  ],
+  "recorded": "2026-09-13",
+  "pms_version": "1.43.4.10903-e5521bd8c",
+  "endpoint_written": "PUT https://plex.tv/api/users/{id}?filterMovies=...&filterTelevision=...",
+  "endpoints_read": [
+    "GET /library/sections/{id}/all?type=1",
+    "GET /library/sections/{id}/collections",
+    "GET /library/metadata/{collection}/children",
+    "GET /hubs",
+    "GET /library/metadata/{k1,k2,...}"
+  ],
+  "note_on_children": "GET /library/collections/{key}/children does NOT apply the share filter (it returned every member of a row the account could not see); /library/metadata/{key}/children does.",
+  "grouping": [
+    {
+      "filter": "contentRating=G|label=recommended&contentRating=XYZNOPE",
+      "movies_visible": 0,
+      "left_to_right_would_give": 0,
+      "pipe_tighter_gives": 0
+    },
+    {
+      "filter": "contentRating=XYZNOPE&label=recommended|contentRating=G",
+      "movies_visible": 0,
+      "left_to_right_would_give": 401,
+      "pipe_tighter_gives": 0
+    },
+    {
+      "filter": "contentRating!=R|genre=NoSuchGenre&label!=ROW",
+      "movies_visible": 6660,
+      "row_listed": false
+    },
+    {
+      "filter": "contentRating=G|label=recommended&OURS",
+      "movies_visible": 412
+    },
+    {
+      "filter": "contentRating=G&label=ROW",
+      "movies_visible": 0,
+      "row_listed": false
+    }
+  ],
+  "own_row": {
+    "probed_person_rows": {
+      "movies": 2,
+      "tv": 2,
+      "movie_row_sizes": [
+        30,
+        20
+      ],
+      "tv_row_sizes": [
+        30,
+        20
+      ]
+    },
+    "cases": [
+      {
+        "filter_movies": "contentRating=R&OURS",
+        "filter_television": "contentRating=TV-MA&OURS",
+        "rows_on_home": 0,
+        "rows_listed": 0,
+        "verdict": "an allow list with no row label hides the person's own rows"
+      },
+      {
+        "filter_movies": "contentRating=R|label=ROW&OURS-minus-ROW",
+        "filter_television": "contentRating=TV-MA|label=ROW&OURS-minus-ROW",
+        "rows_on_home": 4,
+        "rows_listed": 4,
+        "other_peoples_rows_visible": 0,
+        "items_visible_per_row": [
+          9,
+          14,
+          16,
+          11
+        ],
+        "items_admitted_per_row": [
+          9,
+          14,
+          16,
+          11
+        ],
+        "exact_item_match": true,
+        "home_row_items_all_admitted": true,
+        "verdict": "row label as an alternative in the allow group: rows show, holding exactly the admitted items"
+      },
+      {
+        "filter_movies": "label=recommended,ROW",
+        "movies_visible": 11,
+        "row_listed": true,
+        "row_children_visible": 0,
+        "row_children_admitted": 0,
+        "verdict": "row label added to a label= allow clause: row listed, contents still filtered"
+      },
+      {
+        "filter_movies": "contentRating=R,PG-13|label=ROW&label=Overlay,ROW&OURS-minus-ROW",
+        "filter_television": "contentRating=TV-MA,TV-14|label=ROW&label=Overlay,ROW&OURS-minus-ROW",
+        "rows_listed": 4,
+        "rows_on_home": 4,
+        "other_peoples_rows_visible": 0,
+        "verdict": "two allow groups, row label in both: row shows"
+      },
+      {
+        "filter_movies": "contentRating=R,PG-13&label=Overlay,ROW&OURS-minus-ROW",
+        "filter_television": "contentRating=TV-MA,TV-14&label=Overlay,ROW&OURS-minus-ROW",
+        "rows_listed": 0,
+        "rows_on_home": 0,
+        "verdict": "two allow groups, row label in only one: row hidden"
+      }
+    ]
+  },
+  "read_as_account": {
+    "batch": "10 movies rated R + 10 rated PG-13",
+    "exclude_only_filter": {
+      "status": 200,
+      "size": 20,
+      "returned_R": 10,
+      "returned_PG13": 10
+    },
+    "allow_R_filter": {
+      "status": 200,
+      "size": 10,
+      "returned_R": 10,
+      "returned_PG13": 0
+    },
+    "allow_R_filter_plexapi_fetchItems": {
+      "returned_R": 10,
+      "returned_PG13": 0,
+      "error": null
+    },
+    "allow_R_filter_batch_of_only_hidden": {
+      "status": 404,
+      "returned": 0
+    },
+    "allow_R_filter_batch_of_only_hidden_plexapi": {
+      "returned": 0,
+      "error": "NotFound"
+    },
+    "allow_R_on_filterMovies_tv_batch": {
+      "status": 200,
+      "requested": 5,
+      "returned": 5
+    },
+    "library_not_shared_with_the_account": {
+      "_why": "Read-only, as a real account shared libraries 1 and 2 but not 12 ('Sports'), whose TV filter holds only label!= excludes. Items of a library the account is not shared are left out exactly like filtered ones; a batch of only those is a 404, never a 401/403.",
+      "mixed_5_shared_tv_5_unshared": {
+        "status": 200,
+        "returned_shared": 5,
+        "returned_unshared": 0
+      },
+      "only_unshared": {
+        "status": 404,
+        "returned": 0
+      },
+      "only_shared": {
+        "status": 200,
+        "returned": 5
+      }
+    }
+  }
+}

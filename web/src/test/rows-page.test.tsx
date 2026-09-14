@@ -41,14 +41,18 @@ const SUBSET_ROW: Collection = {
   sort_order: 0,
   name_template: "",
   fallback_name: "",
+  description: "",
+  sort_title_prefix: "",
   min_watchers: 2,
   request_tag: "",
   candidate_sources: [],
   library_keys: [],
   watched_pct: null,
   rewatch: false,
+  rewatch_cooldown_days: 30,
   unstarted_only: false,
   refresh_days: null,
+  idle_hold_days: null,
   recency: null,
   recent_count: null,
   max_seeds: null,
@@ -74,6 +78,8 @@ const SUBSET_ROW: Collection = {
   pick_order: "best",
   placement: "both",
   placement_friends: "both",
+  show_days: [],
+  shown_today: true,
   pin_top: false,
   hub_anchor: {},
   poster: { mode: "", title: "", subtitle: "", style: "", has_image: false },
@@ -132,5 +138,89 @@ describe("RowsPage", () => {
     renderPage();
 
     expect(await screen.findByText(/sarah · 15 titles/i)).toBeTruthy();
+  });
+
+  // A row name is a TEMPLATE, and the card marks each `{placeholder}` as a grey chip rather than
+  // printing braces — but nothing said what a chip was, so "✨ [library name] Picked for You" read
+  // as a stray tag stuck on the row (audit finding, Sep 2026). The row editor already answers this
+  // with a worked example; this is that example, once, under the list.
+  it("explains the placeholder chip when a row on screen has one", async () => {
+    getUsers.mockResolvedValue([]);
+    listCollections.mockResolvedValue([
+      { ...SUBSET_ROW, name: "✨ {library_name} Picked for You" },
+    ]);
+    renderPage();
+
+    expect(
+      await screen.findByText(/✨ Movies Picked for You/),
+    ).toBeInTheDocument();
+  });
+
+  it("explains the chip in plain sentences, not a run-on with a dangling fragment", async () => {
+    // It read "…reads ✨ Movies Picked for You on Plex. An example: the real library, person or recent
+    // watch fills in." — the owner could not tell whether that was one sentence or two.
+    getUsers.mockResolvedValue([]);
+    listCollections.mockResolvedValue([
+      { ...SUBSET_ROW, name: "✨ {library_name} Picked for You" },
+    ]);
+    renderPage();
+
+    const legend = (await screen.findByText(/Movies Picked for You/)).closest("p");
+    expect(legend?.textContent).toBe(
+      "Grey chips like library name are placeholders, filled in when Shortlist builds the row. " +
+        "For example, ✨ library name Picked for You shows on Plex as ✨ Movies Picked for You. " +
+        "A person’s name or a recent watch fills in the same way.",
+    );
+  });
+
+  it("says nothing about chips when no row has one", async () => {
+    // An explainer for something not on screen is noise on the page it explains.
+    getUsers.mockResolvedValue([]);
+    listCollections.mockResolvedValue([SUBSET_ROW]);
+    renderPage();
+
+    expect(await screen.findByText("Hidden Gems")).toBeInTheDocument();
+    expect(screen.queryByText(/✨ Movies Picked for You/)).toBeNull();
+  });
+});
+
+describe("RowsPage — the day-schedule badge", () => {
+  beforeEach(() => {
+    getUsers.mockReset();
+    listCollections.mockReset();
+    getUsers.mockResolvedValue([]);
+  });
+
+  it("says nothing for a row that appears every day", async () => {
+    // The ordinary row must be untouched: a badge on every row would make the schedule look like
+    // something every row has.
+    listCollections.mockResolvedValue([
+      { ...SUBSET_ROW, show_days: [], shown_today: true },
+    ]);
+    renderPage();
+
+    expect(await screen.findByText("Hidden Gems")).toBeInTheDocument();
+    expect(screen.queryByText(/today/i)).toBeNull();
+  });
+
+  it("says Showing today for a scheduled row that is on", async () => {
+    listCollections.mockResolvedValue([
+      { ...SUBSET_ROW, show_days: [1, 3, 5], shown_today: true },
+    ]);
+    renderPage();
+
+    expect(await screen.findByText("Showing today")).toBeInTheDocument();
+  });
+
+  it("says Hidden today for a scheduled row that is off", async () => {
+    // The whole reason this badge exists: a scheduled row that is simply absent from Plex is
+    // indistinguishable from a broken one, and "my row disappeared" is the question the feature
+    // creates. `shown_today` comes from the server, so this never disagrees with Plex.
+    listCollections.mockResolvedValue([
+      { ...SUBSET_ROW, show_days: [1, 3, 5], shown_today: false },
+    ]);
+    renderPage();
+
+    expect(await screen.findByText("Hidden today")).toBeInTheDocument();
   });
 });

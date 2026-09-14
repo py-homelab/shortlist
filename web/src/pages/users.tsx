@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Eye, RefreshCw, Users as UsersIcon } from "lucide-react";
+import { Eye, RefreshCw, ShieldCheck, Users as UsersIcon } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router";
 
@@ -29,8 +29,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { GatedSwitch } from "@/components/ui/gated-switch";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -45,6 +45,7 @@ import type { User } from "@/lib/types";
 import { formatHitRate, timeAgo } from "@/lib/format";
 import {
   queryKeys,
+  useHitRatesMatured,
   useRemoveUser,
   useSetAllUsersEnabled,
   usePatchUser,
@@ -65,6 +66,7 @@ export function UsersPage() {
   const usersQuery = useUsers();
   const navigate = useNavigate();
   const patchUser = usePatchUser();
+  const ratesMatured = useHitRatesMatured();
 
   /**
    * Toggle one person, and say so immediately.
@@ -158,6 +160,15 @@ export function UsersPage() {
             </Button>
             {/* Neither trigger carries `loading` — both merely OPEN a dialog; the mutation (and its
                 loading state) belongs to the confirm button inside it. */}
+            {/* Beside the people it is about, not in a Settings section: "is everyone's row
+                actually hidden from everyone else" is a question the owner asks while looking at
+                this list. */}
+            <Button variant="outline" asChild>
+              <Link to="/sharing">
+                <ShieldCheck aria-hidden="true" />
+                Sharing and privacy
+              </Link>
+            </Button>
             <Button
               variant="outline"
               onClick={() => setConfirmEnableOpen(true)}
@@ -174,7 +185,9 @@ export function UsersPage() {
                 and dismissing "you see everyone's rows" is how people say "yes, I know" rather than
                 "I never want the tool again". Before this, hiding the note hid the only way back to
                 it short of remembering the URL. */}
-            {(usersQuery.data ?? []).some((user) => user.user_type === "owner") && (
+            {(usersQuery.data ?? []).some(
+              (user) => user.user_type === "owner",
+            ) && (
               <Button variant="outline" asChild>
                 <Link to="/watching-account?setup=1">
                   <Eye aria-hidden="true" />
@@ -373,9 +386,28 @@ export function UsersPage() {
                         so the number is what yields. */}
                     <TableHead
                       className="hidden sm:table-cell"
-                      title="Share of Shortlist's picks this person has watched"
+                      // NOT "a pick gets a month before it counts" — that is the DASHBOARD's
+                      // landing rate, which uses a matured cohort. This figure is lifetime
+                      // watched-over-delivered with no maturity filter at all (`api/users.py`), so
+                      // borrowing that sentence would describe a different number. All the blank
+                      // means is "too early for a zero to tell you anything".
+                      title={
+                        ratesMatured
+                          ? "Share of Shortlist's picks this person has watched, over all time"
+                          : "Share of Shortlist's picks this person has watched, over all time. Blank while every pick on the server is still too new to judge."
+                      }
                     >
                       Picks watched
+                      {/* Visible, not only in the `title`. Before maturity this column is a dash
+                          for every person, and a whole column of dashes with its explanation
+                          hover-only tells a phone or keyboard user nothing at all. The tooltip
+                          stays for the detail; this says the one word that makes the dashes read
+                          as "not yet" instead of "broken". */}
+                      {!ratesMatured && (
+                        <span className="ml-1.5 font-normal text-muted-foreground">
+                          (too early)
+                        </span>
+                      )}
                     </TableHead>
                     <TableHead className="text-right">Enabled</TableHead>
                   </TableRow>
@@ -417,19 +449,21 @@ export function UsersPage() {
                       <TableCell className="hidden text-muted-foreground lg:table-cell">
                         {timeAgo(user.last_run_at)}
                       </TableCell>
+                      {/* An em dash, not "0%", until a pick has actually had its chance. On day one
+                          this whole column read 0% for everybody — a number the dashboard itself
+                          refuses to compute yet. */}
                       <TableCell className="hidden text-muted-foreground tabular-nums sm:table-cell">
-                        {formatHitRate(user.hit_rate)}
+                        {formatHitRate(user.hit_rate, ratesMatured)}
                       </TableCell>
                       <TableCell className="text-right">
                         {/* Gated on the PRESET, not on `restricted` — plex.tv sets that for every Plex
                             Home user, so keying on it greyed out ordinary managed accounts that can
                             perfectly well have a row (#20). */}
-                        <Switch
+                        <GatedSwitch
                           checked={user.enabled && !user.restriction_profile}
-                          disabled={Boolean(user.restriction_profile)}
-                          title={
+                          reason={
                             user.restriction_profile
-                              ? `Plex's ${profileName(user)} restriction profile is set on this account — Plex refuses the privacy filters Shortlist writes for it, so set the profile to None in Plex to enable`
+                              ? `Plex's ${profileName(user)} restriction profile is set on this account — Plex won't let Shortlist hide anything from it, so a row here couldn't be kept private. Clear the Restriction Profile in Plex (Settings → Users & Sharing) to enable.`
                               : undefined
                           }
                           onCheckedChange={(enabled) =>

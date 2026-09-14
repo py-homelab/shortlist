@@ -38,6 +38,9 @@ class PickOut(PassthroughModel):
     rank: int
     title: str
     reason: str
+    # The Plex ratingKey the poster proxy is keyed on. 0 means the pipeline never matched the title
+    # to a library item, or the run predates this field being recorded.
+    rating_key: int = 0
     seed_title: str | None  # the watched title that produced it, when the pipeline knows it
     sources: list[str]  # candidate-source ids; [] on picks written before provenance existed
     affinity: float | None  # 0..1, how near the top of the suggesting source's list it sat
@@ -110,7 +113,7 @@ class RunSummaryOut(PassthroughModel):
     #: wizard's first run also goes through) are ever written; `wizard` is carried because the column
     #: has always documented it, and a Literal that is a strict SUPERSET of what the code emits can
     #: only over-describe the schema, while one that is too narrow 500s the whole Runs page.
-    trigger: Literal["schedule", "manual", "wizard"]
+    trigger: Literal["schedule", "manual", "wizard", "resume"]
     #: Not optional: `runs.started_at` is NOT NULL (migration 0001) and carries an ORM-side `utcnow`
     #: default, so every run row has one. It read `str | None` only because `iso_utc` is typed that
     #: way — the serializer's signature, not this column's.
@@ -224,6 +227,16 @@ class LandingOut(PassthroughModel):
     matured_days: int
 
 
+class ViewingShareOut(PassthroughModel):
+    """Of the titles people watched in the window, how many their Shortlist row had shown them."""
+
+    #: Distinct (person, title) pairs watched in the window, by people Shortlist builds rows for.
+    watched: int
+    #: Of those, the ones a row of theirs was showing when they watched it. Always <= `watched`.
+    from_rows: int
+    rate: float | None
+
+
 class OverallOut(PassthroughModel):
     """Headline counts for the window, with the change vs the previous equal period."""
 
@@ -248,6 +261,7 @@ class OverallOut(PassthroughModel):
     avg_days_to_watch: float | None
     avg_days_to_watch_delta: int | float | None
     landing: LandingOut
+    viewing_share: ViewingShareOut
 
 
 class WatchSyncOut(PassthroughModel):
@@ -324,11 +338,21 @@ class PerRowOut(PassthroughModel):
     finished: int
 
 
+class WatcherOut(PassthroughModel):
+    id: int
+    name: str
+
+
 class TopTitleOut(PassthroughModel):
     tmdb_id: int
     media_type: str
     title: str
     watchers: int
+    #: Plex's key for the poster; 0 when no delivery or watch history ever matched it to the library.
+    rating_key: int
+    year: int | None
+    #: The newest three people who watched it in the window, for faces beside `watchers`.
+    watcher_sample: list[WatcherOut]
 
 
 class RecentWatchOut(PassthroughModel):
@@ -338,6 +362,11 @@ class RecentWatchOut(PassthroughModel):
     display_name: str
     title: str
     media_type: str
+    #: For the look-up links (TMDB, IMDb, Trakt).
+    tmdb_id: int
+    #: Plex's key for the poster; 0 when nothing on record matched it to the library.
+    rating_key: int
+    year: int | None
     row: str
     library: str
     seed_title: str

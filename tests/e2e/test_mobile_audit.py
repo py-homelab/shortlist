@@ -157,6 +157,7 @@ def _routes(app: ShortlistApp) -> list[tuple[str, str, str | None]]:
         ("row edit", f"/rows/{row_id}", "Schedule|Audience|Name"),
         ("row rename", f"/rows/{row_id}/rename", "name|Rename"),
         ("users", "/users", "sarah"),
+        ("sharing", "/sharing", "Sharing and privacy"),
         ("user detail", f"/users/{sarah}", "Because you watched|sarah"),
         ("runs", "/runs", "succeeded|ok"),
         # "AI tokens|Summary|user" matched nothing this page renders — it shows DURATION,
@@ -255,7 +256,11 @@ def test_the_mobile_drawer_opens_and_covers_the_nav(browser: Browser, app: Short
     try:
         page.goto("/")
         page.get_by_role("button", name="Open menu").click()
-        drawer_links = page.get_by_role("link")
+        # Scoped to the drawer, not the page. Unscoped, ANY link reading "Rows" satisfied this —
+        # and the dashboard behind the drawer now has one (the health strip's Rows chip), so the
+        # assertion would have passed with the drawer stuck shut.
+        drawer = page.get_by_role("dialog", name="Main menu")
+        drawer_links = drawer.get_by_role("link")
         drawer_links.first.wait_for(timeout=4000)
         labels = [t.strip() for t in drawer_links.all_inner_texts() if t.strip()]
         assert any("Rows" in t for t in labels), f"drawer opened without the main nav: {labels}"

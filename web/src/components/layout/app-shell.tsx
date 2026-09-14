@@ -2,10 +2,10 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   CircleAlert,
   CircleCheck,
+  Coffee,
   Loader2,
   BookOpen,
   Gauge,
-  Heart,
   Inbox,
   LifeBuoy,
   ListChecks,
@@ -14,6 +14,7 @@ import {
   Menu,
   Rows3,
   Settings as SettingsIcon,
+  Star,
   Users as UsersIcon,
   Wrench,
   X,
@@ -25,12 +26,13 @@ import { HomeWordmark } from "@/components/brand";
 import { ActivityPill } from "@/components/layout/activity-pill";
 import { ActivityIndicator } from "@/components/layout/activity-indicator";
 import { NotificationBell } from "@/components/layout/notification-bell";
+import { WhatsNewDialog } from "@/components/layout/whats-new-dialog";
 import { SettingsSubNav } from "@/components/settings/settings-nav";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { buildLabel } from "@/lib/format";
 import { useSession, useVersion } from "@/lib/queries";
-import { GITHUB_REPO, SPONSOR_URL } from "@/lib/support";
+import { COFFEE_URL, DOCS_URL, STAR_URL } from "@/lib/support";
 import { Toaster } from "sonner";
 
 import { cn } from "@/lib/utils";
@@ -59,7 +61,7 @@ export function HelpLinks() {
   return (
     <div className="space-y-1 px-3">
       <a
-        href={`${GITHUB_REPO}#readme`}
+        href={DOCS_URL}
         target="_blank"
         rel="noopener noreferrer"
         className={linkClass}
@@ -114,9 +116,9 @@ function SessionFooter() {
         {!logout.isPending && <LogOut aria-hidden="true" />}
         Sign out
       </Button>
-      {/* The build and the support link read as one quiet block: same size, same colour, a hairline
+      {/* The build and the support links read as one quiet block: same size, same colour, a hairline
           above them separating both from the account controls. Sitting flush under "Sign out" made
-          the support line look like a third button that had lost its padding.
+          the support lines look like a third button that had lost its padding.
 
           In the chrome deliberately — NOT among the nav items, and not floating over the page.
           People self-host to get away from being sold to, and a donate prompt that follows them
@@ -130,17 +132,29 @@ function SessionFooter() {
         >
           {buildLabel(version.data)}
         </p>
-        <a
-          href={SPONSOR_URL}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-2 rounded-md px-1 py-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <Heart className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-          Support this project
-        </a>
+        <SupportLinks />
       </div>
     </div>
+  );
+}
+
+const supportLinkClass =
+  "flex items-center gap-2 rounded-md px-1 py-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground";
+
+/** A star and a coffee, in the sidebar's quiet footer. Only the icons take colour: enough to be
+ *  seen, while the words stay as quiet as the build line above them. Exported for its test. */
+export function SupportLinks() {
+  return (
+    <>
+      <a href={STAR_URL} target="_blank" rel="noopener noreferrer" className={supportLinkClass}>
+        <Star className="h-3.5 w-3.5 shrink-0 fill-primary text-primary" aria-hidden="true" />
+        Star on GitHub
+      </a>
+      <a href={COFFEE_URL} target="_blank" rel="noopener noreferrer" className={supportLinkClass}>
+        <Coffee className="h-3.5 w-3.5 shrink-0 text-support" aria-hidden="true" />
+        Buy me a coffee
+      </a>
+    </>
   );
 }
 
@@ -255,6 +269,7 @@ export function AppShell() {
           ),
         }}
       />
+      <WhatsNewDialog />
       {/* Mobile top bar: wordmark + hamburger. Hidden once the sidebar appears at md. */}
       <header className="sticky top-0 z-30 flex items-center justify-between border-b bg-card/80 px-4 py-3 backdrop-blur md:hidden">
         <HomeWordmark />

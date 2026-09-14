@@ -6,8 +6,38 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestsSettings } from "@/components/requests-settings";
 import type { Settings } from "@/lib/types";
 
-const { putSettings } = vi.hoisted(() => ({
+const { putSettings, getSeerrOptions } = vi.hoisted(() => ({
   putSettings: vi.fn((values: Settings) => Promise.resolve(values)),
+  getSeerrOptions: vi.fn(() =>
+    Promise.resolve({
+      // An admin that approves instantly and a service account that does not — the two ends of the
+      // choice this screen exists to make legible.
+      users: [
+        {
+          id: 1,
+          name: "serverowner",
+          auto_approve_movies: true,
+          auto_approve_tv: true,
+          is_plex_user: true,
+        },
+        {
+          id: 4,
+          name: "Shortlist",
+          auto_approve_movies: false,
+          auto_approve_tv: false,
+          is_plex_user: false,
+        },
+        {
+          id: 7,
+          name: "MooHouse",
+          auto_approve_movies: true,
+          auto_approve_tv: false,
+          is_plex_user: true,
+        },
+      ],
+      default_user_id: 1,
+    }),
+  ),
 }));
 
 vi.mock("@/lib/api", () => {
@@ -27,6 +57,7 @@ vi.mock("@/lib/api", () => {
       testConnection: () => Promise.resolve({ ok: true, message: "Connected" }),
       getArrOptions: () =>
         Promise.resolve({ quality_profiles: [], root_folders: [] }),
+      getSeerrOptions: () => getSeerrOptions(),
     },
   };
 });
@@ -50,7 +81,38 @@ function renderPanel(settings: Settings = {}) {
 }
 
 describe("RequestsSettings", () => {
-  beforeEach(() => putSettings.mockClear());
+  beforeEach(() => {
+    putSettings.mockClear();
+    // Reset per test: one describe below points this at a rejection, and a leaked failure would
+    // make every later account-list assertion pass for the wrong reason.
+    getSeerrOptions.mockReset();
+    getSeerrOptions.mockResolvedValue({
+      users: [
+        {
+          id: 1,
+          name: "serverowner",
+          auto_approve_movies: true,
+          auto_approve_tv: true,
+          is_plex_user: true,
+        },
+        {
+          id: 4,
+          name: "Shortlist",
+          auto_approve_movies: false,
+          auto_approve_tv: false,
+          is_plex_user: false,
+        },
+        {
+          id: 7,
+          name: "MooHouse",
+          auto_approve_movies: true,
+          auto_approve_tv: false,
+          is_plex_user: true,
+        },
+      ],
+      default_user_id: 1,
+    });
+  });
 
   it("keeps the config hidden until requests are turned on", async () => {
     renderPanel();
@@ -404,6 +466,282 @@ describe("RequestsSettings", () => {
       expect(
         await screen.findByText(/it never applies/i),
       ).toBeTruthy();
+    });
+  });
+
+  describe("choosing where requests go", () => {
+    /** Requests on, routed through a CONNECTED Overseerr (a saved key reads back redacted). */
+    const VIA_SEERR: Settings = {
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+      "requests.overseerr.apikey": "•••••",
+    };
+
+    it("shows Radarr and Sonarr by default", async () => {
+      renderPanel({ "requests.enabled": true });
+      expect(await screen.findByText("Radarr")).toBeTruthy();
+      expect(screen.getByText("Sonarr")).toBeTruthy();
+      expect(screen.queryByLabelText("Request as")).toBeNull();
+    });
+
+    it("swaps the two Arr cards for one Overseerr card", async () => {
+      renderPanel(VIA_SEERR);
+      expect(await screen.findByLabelText("Request as")).toBeTruthy();
+      expect(screen.queryByText("Radarr")).toBeNull();
+      expect(screen.queryByText("Sonarr")).toBeNull();
+    });
+
+    it("hides both tag controls, which Overseerr's API cannot carry", async () => {
+      // POST /request has no tags field at all, so leaving these on screen would offer a setting
+      // that silently does nothing.
+      renderPanel(VIA_SEERR);
+      expect(await screen.findByLabelText("Request as")).toBeTruthy();
+      expect(screen.queryByLabelText("Tag added items")).toBeNull();
+      expect(screen.queryByLabelText("Also tag by person")).toBeNull();
+    });
+
+    it("keeps the guardrails on both routes — they are Shortlist's, not the app's", async () => {
+      renderPanel(VIA_SEERR);
+      expect(await screen.findByText("Guardrails")).toBeTruthy();
+    });
+
+    it("offers the way to a review queue, without restating what the dropdown said", async () => {
+      renderPanel(VIA_SEERR);
+      const picker = (await screen.findByLabelText(
+        "Request as",
+      )) as HTMLSelectElement;
+      // Wait for the fetched list FIRST. The label exists on first paint, so asserting off
+      // `findByLabelText` alone reads the screen before it knows which account it is describing —
+      // the same early-read trap in its presence form.
+      await screen.findByRole("option", { name: /Shortlist — requests wait/ });
+
+      expect(
+        screen.getByText(/Want to check them in Overseerr/),
+      ).toBeTruthy();
+      // NOT "they'll go straight to Radarr/Sonarr" — whether an approved request reaches a
+      // download app is Overseerr's own setup, not something this screen can promise.
+      expect(screen.queryByText(/straight to Radarr\/Sonarr/i)).toBeNull();
+      await userEvent.selectOptions(picker, "4");
+      await waitFor(() => {
+        const saved = putSettings.mock.calls.at(-1)![0];
+        expect(saved["requests.overseerr.request_as_user_id"]).toBe(4);
+      });
+    });
+
+    it("saves the target when it is switched", async () => {
+      renderPanel({ "requests.enabled": true });
+      await userEvent.click(
+        await screen.findByRole("button", { name: "Overseerr / Jellyseerr" }),
+      );
+      await waitFor(() => {
+        const saved = putSettings.mock.calls.at(-1)![0];
+        expect(saved["requests.target"]).toBe("overseerr");
+      });
+    });
+
+    it("nudges to Connections when Overseerr is chosen but not connected", async () => {
+      renderPanel({ "requests.enabled": true, "requests.target": "overseerr" });
+      expect(
+        await screen.findByText("Connect Overseerr to start requesting"),
+      ).toBeTruthy();
+    });
+  });
+
+  describe("when the saved account cannot be listed", () => {
+    const VIA_BROKEN_SEERR: Settings = {
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+      "requests.overseerr.apikey": "•••••",
+      "requests.overseerr.request_as_user_id": 4,
+    };
+
+    beforeEach(() => {
+      getSeerrOptions.mockRejectedValue(new Error("unreachable"));
+    });
+
+    it("keeps the picker usable rather than hiding it behind the error", async () => {
+      // Hiding it left an owner whose instance was briefly down unable to change the setting at
+      // all — including putting it back to the server default.
+      renderPanel(VIA_BROKEN_SEERR);
+      expect(await screen.findByText(/Couldn.t reach Overseerr/i)).toBeTruthy();
+      expect(screen.getByLabelText("Request as")).toBeTruthy();
+    });
+
+    it("names a saved account that Overseerr no longer lists", async () => {
+      // Same trap as the unreachable case, reached a different way: the account was deleted in
+      // Overseerr, so the list loads FINE and simply lacks it. Keying the fallback on the error
+      // flag would have covered only half of this.
+      getSeerrOptions.mockResolvedValue({
+        users: [
+          {
+            id: 1,
+            name: "serverowner",
+            auto_approve_movies: true,
+            auto_approve_tv: true,
+            is_plex_user: true,
+          },
+        ],
+        default_user_id: 1,
+      });
+      renderPanel(VIA_BROKEN_SEERR);
+      expect(
+        await screen.findByRole("option", { name: /Account #4/ }),
+      ).toBeTruthy();
+      expect(
+        (screen.getByLabelText("Request as") as HTMLSelectElement).value,
+      ).toBe("4");
+    });
+
+    it("still shows the saved account rather than silently reading as the default", async () => {
+      // The select would otherwise fall back to its first option, misreport the saved value, and
+      // then have autosave WRITE that back.
+      renderPanel(VIA_BROKEN_SEERR);
+      // Wait for the FAILURE to land, not merely for the label: while the fetch is still pending
+      // the fallback option does not exist yet and the select genuinely does read "0". Asserting
+      // before then measures the loading state and calls it the bug.
+      expect(
+        await screen.findByRole("option", { name: /Account #4/ }),
+      ).toBeTruthy();
+      const picker = screen.getByLabelText("Request as") as HTMLSelectElement;
+      expect(picker.value).toBe("4");
+    });
+  });
+
+  describe("saying what will actually happen", () => {
+    const VIA_SEERR: Settings = {
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+      "requests.overseerr.apikey": "\u2022\u2022\u2022\u2022\u2022",
+    };
+
+    it("says each account's effect in the dropdown, not just its name", async () => {
+      // The difference between "filed for you to look at" and "already downloading" is a property
+      // of the account, so it belongs where the account is chosen.
+      renderPanel(VIA_SEERR);
+      expect(
+        await screen.findByRole("option", {
+          name: /Shortlist — requests wait for approval/,
+        }),
+      ).toBeTruthy();
+      // The default account is already the first option; listing it AGAIN just asks "which of
+      // these two identical lines did I want?".
+      expect(
+        screen.getAllByRole("option", { name: /serverowner/ }),
+      ).toHaveLength(1);
+    });
+
+    it("resolves Server default to the account the API key actually is", async () => {
+      // The commonest setting. Without `default_user_id` it would be an unknown, and the summary
+      // would go vague on the very path most people are on.
+      renderPanel(VIA_SEERR);
+      expect(
+        await screen.findByText(
+          /approved there automatically, so they start downloading/,
+        ),
+      ).toBeTruthy();
+    });
+
+    it("changes what it says when a non-approving account is picked", async () => {
+      renderPanel(VIA_SEERR);
+      const picker = (await screen.findByLabelText(
+        "Request as",
+      )) as HTMLSelectElement;
+      await screen.findByRole("option", { name: /Shortlist — requests wait/ });
+      await userEvent.selectOptions(picker, "4");
+      expect(
+        await screen.findByText(/filed in Overseerr for you to approve there/),
+      ).toBeTruthy();
+    });
+
+    it("names the double-approval trap and says how to escape it", async () => {
+      // Auto-send off AND an account that cannot approve = every title approved twice. Legitimate,
+      // almost never deliberate, and previously silent.
+      renderPanel({
+        ...VIA_SEERR,
+        "requests.auto_send": false,
+        "requests.overseerr.request_as_user_id": 4,
+      });
+      expect(await screen.findByText(/approve each title twice/)).toBeTruthy();
+      expect(screen.getByText(/decide in only one place/)).toBeTruthy();
+    });
+
+    it("stays quiet about the trap when there is only one gate", async () => {
+      renderPanel({ ...VIA_SEERR, "requests.auto_send": false });
+      // Anchored on something positive first: an absence assertion that renders before the account
+      // list resolves would pass against a broken screen.
+      expect(
+        await screen.findByText(
+          /Nothing reaches Overseerr until you approve it/,
+        ),
+      ).toBeTruthy();
+      expect(screen.queryByText(/approve each title twice/)).toBeNull();
+    });
+
+    it("spells out the setup that used to be undiscoverable", async () => {
+      // Bars at the guardrails: Shortlist stops deciding and Overseerr becomes the only gate. You
+      // could always do this; nothing ever said so.
+      renderPanel({
+        ...VIA_SEERR,
+        "requests.min_demand": 2,
+        "requests.min_rating": 7,
+        "requests.auto_min_demand": 2,
+        "requests.auto_min_rating": 7,
+      });
+      // Not "Nothing waits here" — max_per_run still queues the overflow, whatever the bars say.
+      expect(await screen.findByText(/up to 5 a night/)).toBeTruthy();
+    });
+
+    it("still describes the Arr route in its own terms", async () => {
+      renderPanel({ "requests.enabled": true });
+      const summary = await screen.findByText(
+        /go to Radarr or Sonarr as soon as a run finds them/,
+      );
+      // Scoped to the sentence, not the page: "Overseerr" legitimately appears elsewhere on the
+      // Arr route — it is the other half of the chooser.
+      expect(summary.textContent).not.toMatch(/Overseerr/);
+    });
+  });
+
+  describe("choosing whose name requests go out under", () => {
+    const VIA_SEERR: Settings = {
+      "requests.enabled": true,
+      "requests.target": "overseerr",
+      "requests.overseerr.url": "http://overseerr.test",
+      "requests.overseerr.apikey": "\u2022\u2022\u2022\u2022\u2022",
+    };
+
+    it("offers real people, grouped after the accounts made for this", async () => {
+      // They were hidden for a while, and that was wrong: on most instances every account that
+      // does NOT auto-approve belongs to a person, so hiding them left owners with nothing to pick
+      // and every title downloading immediately (reported on discussion #110).
+      renderPanel(VIA_SEERR);
+      expect(
+        await screen.findByRole("option", { name: /MooHouse/ }),
+      ).toBeTruthy();
+      const groups = [...document.querySelectorAll("optgroup")].map(
+        (g) => g.label,
+      );
+      expect(groups).toEqual([
+        "Accounts made for this",
+        "People on your server",
+      ]);
+    });
+
+    it("says what picking a person costs THEM, at the moment it is picked", async () => {
+      renderPanel({ ...VIA_SEERR, "requests.overseerr.request_as_user_id": 7 });
+      const note = await screen.findByText(/count against their quota/);
+      expect(note.textContent).toMatch(/MooHouse/);
+    });
+
+    it("says nothing of the sort for an account made for this", async () => {
+      renderPanel({ ...VIA_SEERR, "requests.overseerr.request_as_user_id": 4 });
+      expect(
+        await screen.findByRole("option", { name: /Shortlist — requests wait/ }),
+      ).toBeTruthy();
+      expect(screen.queryByText(/count against their quota/)).toBeNull();
     });
   });
 });

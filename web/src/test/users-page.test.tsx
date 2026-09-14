@@ -20,18 +20,37 @@ vi.mock("sonner", () => ({
   },
 }));
 
-const { getUsers, patchUser, removeUser, setAllUsersEnabled, syncUsers } =
-  vi.hoisted(() => ({
-    getUsers: vi.fn(),
-    patchUser: vi.fn(),
-    removeUser: vi.fn(),
-    syncUsers: vi.fn(() =>
-      Promise.resolve({ added: 1, updated: 48, total: 49, queued: false }),
-    ),
-    setAllUsersEnabled: vi.fn((_enabled: boolean) =>
-      Promise.resolve({ updated: 1, cleaned: 0, enabled: true }),
-    ),
-  }));
+const {
+  getUsers,
+  getReport,
+  patchUser,
+  removeUser,
+  setAllUsersEnabled,
+  syncUsers,
+} = vi.hoisted(() => ({
+  getUsers: vi.fn(),
+  getReport: vi.fn(),
+  patchUser: vi.fn(),
+  removeUser: vi.fn(),
+  syncUsers: vi.fn(() =>
+    Promise.resolve({ added: 1, updated: 48, total: 49, queued: false }),
+  ),
+  setAllUsersEnabled: vi.fn((_enabled: boolean) =>
+    Promise.resolve({ updated: 1, cleaned: 0, enabled: true }),
+  ),
+}));
+
+/** The report, reduced to the two fields `useHitRatesMatured` reads. `firstPickDaysAgo` decides
+ *  whether any pick on the server has had its 30 days yet. */
+function report(firstPickDaysAgo: number | null) {
+  return {
+    first_pick:
+      firstPickDaysAgo === null
+        ? null
+        : new Date(Date.now() - firstPickDaysAgo * 86_400_000).toISOString(),
+    overall: { landing: { matured_days: 30 } },
+  };
+}
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof ApiModule>();
@@ -39,6 +58,7 @@ vi.mock("@/lib/api", async (importOriginal) => {
     ...actual,
     api: {
       getUsers: () => getUsers(),
+      getReport: (window: string) => getReport(window),
       patchUser: (id: number, patch: UserPatch) => patchUser(id, patch),
       removeUser: (id: number) => removeUser(id),
       setAllUsersEnabled: (enabled: boolean) => setAllUsersEnabled(enabled),
@@ -92,6 +112,45 @@ describe("UsersPage", () => {
     getUsers.mockReset();
     patchUser.mockReset();
     setAllUsersEnabled.mockClear();
+    getReport.mockReset();
+    // Most tests here are not about the hit-rate column; a long-running install is the state that
+    // leaves every other assertion unchanged.
+    getReport.mockResolvedValue(report(400));
+  });
+
+  // `hit_rate` is watched-over-delivered across all time, so on a fresh install it is 0 for
+  // everyone and the column read "0%" down the page — which says "nobody watches any of this" when
+  // the truth is that no pick has had time to be watched. The dashboard already withholds its own
+  // landing rate on exactly this rule.
+  it("shows an em dash rather than 0% until picks have had their 30 days", async () => {
+    getUsers.mockResolvedValue([{ ...SARAH, hit_rate: 0 }]);
+    getReport.mockResolvedValue(report(3));
+
+    renderPage();
+
+    expect(await screen.findByText("sarah")).toBeInTheDocument();
+    await waitFor(() => expect(getReport).toHaveBeenCalled());
+    await waitFor(() => expect(screen.queryByText("0%")).toBeNull());
+    expect(screen.getAllByText("—").length).toBeGreaterThan(0);
+  });
+
+  it("shows a real 0% once the earliest picks are old enough for it to mean something", async () => {
+    getUsers.mockResolvedValue([{ ...SARAH, hit_rate: 0 }]);
+    getReport.mockResolvedValue(report(45));
+
+    renderPage();
+
+    expect(await screen.findByText("sarah")).toBeInTheDocument();
+    expect(await screen.findByText("0%")).toBeInTheDocument();
+  });
+
+  it("never hides a rate somebody has actually earned, however new the install", async () => {
+    getUsers.mockResolvedValue([{ ...SARAH, hit_rate: 0.5 }]);
+    getReport.mockResolvedValue(report(1));
+
+    renderPage();
+
+    expect(await screen.findByText("50%")).toBeInTheDocument();
   });
 
   it("tells the owner where they DO see everyone's rows — but only once they're in the list", async () => {
@@ -395,12 +454,41 @@ describe("UsersPage — Plex Home accounts", () => {
     expect(await screen.findByText("Younger Kid")).toBeInTheDocument();
   });
 
-  it("disables the toggle only for an account Plex really hides everything from", async () => {
+  it("gates the toggle only for an account Plex really hides everything from", async () => {
     getUsers.mockResolvedValue([managed("little_kid")]);
     renderPage();
 
     await screen.findByText("Younger Kid");
-    expect(screen.getByRole("switch")).toBeDisabled();
+    const toggle = screen.getByRole("switch");
+    // NOT the native `disabled` attribute. It drops the control out of the tab order and takes its
+    // explanation with it, which is how this shipped saying nothing at all to a keyboard or a
+    // screen reader — the reason was in a `title`, reachable only by hovering a mouse over it.
+    expect(toggle).not.toBeDisabled();
+    expect(toggle).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("says WHY that toggle is gated, in text assistive tech can reach", async () => {
+    getUsers.mockResolvedValue([managed("little_kid")]);
+    renderPage();
+
+    await screen.findByText("Younger Kid");
+    const reasonId =
+      screen.getByRole("switch").getAttribute("aria-describedby") ?? "";
+    expect(reasonId).not.toBe("");
+    expect(document.getElementById(reasonId)?.textContent).toMatch(
+      /Younger Kid restriction profile.*Settings → Users & Sharing/s,
+    );
+  });
+
+  it("ignores a click on the gated toggle instead of sending a patch Plex would defeat", async () => {
+    // `aria-disabled` is advisory: Radix still fires the change event, so the guard has to be real.
+    getUsers.mockResolvedValue([managed("little_kid")]);
+    renderPage();
+
+    await screen.findByText("Younger Kid");
+    await userEvent.click(screen.getByRole("switch"));
+
+    expect(patchUser).not.toHaveBeenCalled();
   });
 
   it("treats a managed account with NO profile as an ordinary user", async () => {
@@ -463,4 +551,4 @@ describe("UsersPage — reaching the watching account", () => {
       screen.queryByRole("link", { name: /watching account/i }),
     ).not.toBeInTheDocument();
   });
-})
+});

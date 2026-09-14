@@ -101,3 +101,136 @@ def test_a_clean_boot_queues_nothing(tmp_path: Path):
 
     with second.app.state.sessions() as session:
         assert session.query(Job).count() == 0
+
+
+class TestAScheduledRunCutShortIsFinishedOnce:
+    """A scheduled run a restart cut short rebuilds only the people it never reached, once (owner decision
+    2026-09-14). On SFLIX Watchtower replaced the container at 04:30 while the 03:30 run was half way,
+    and 23 of 46 people went a day without a rebuild, the same people every night an image was published.
+    Only once: the resumed run is not resumed again, so a crash loop cannot re-curate the server over and over."""
+
+    @pytest.fixture
+    def started(self, monkeypatch) -> list[dict]:
+        from shortlist.server.services.run_service import RunService
+
+        calls: list[dict] = []
+
+        async def start_run(self, **kwargs):
+            calls.append(kwargs)
+            return 0
+
+        monkeypatch.setattr(RunService, "start_run", start_run)
+        return calls
+
+    @staticmethod
+    def _seed(client: TestClient, *, trigger="schedule", dry_run=False, hours_ago=1.0, reached=("amy",)) -> dict:
+        from datetime import timedelta
+
+        from shortlist.server.db.models import Collection, RunUser, User
+
+        with client.app.state.sessions() as session:
+            people = {
+                slug: User(plex_account_id=1000 + i, username=slug, slug=slug, enabled=True)
+                for i, slug in enumerate(("amy", "bob", "cat", "dan"))
+            }
+            people["dan"].enabled = False  # turned off since the run started
+            rows = [
+                Collection(slug="night_a", name="Night A", enabled=True),
+                Collection(slug="night_b", name="Night B", enabled=True),
+                Collection(slug="other_cron", name="Other cron", enabled=True),
+            ]
+            session.add_all([*people.values(), *rows])
+            session.flush()
+            run = Run(
+                status="running",
+                trigger=trigger,
+                dry_run=dry_run,
+                started_at=datetime.now(UTC) - timedelta(hours=hours_ago),
+                stats={
+                    "expected_users": [
+                        {"slug": s, "username": s, "display_name": s} for s in ("amy", "bob", "cat", "dan")
+                    ],
+                    "expected_rows": [
+                        {"slug": "night_a", "title": "Night A", "build": "picked"},
+                        {"slug": "night_b", "title": "Night B", "build": "picked"},
+                    ],
+                },
+            )
+            session.add(run)
+            session.flush()
+            for slug in reached:
+                session.add(RunUser(run_id=run.id, user_id=people[slug].id, status="ok"))
+            session.commit()
+            return {"users": {s: u.id for s, u in people.items()}, "rows": {r.slug: r.id for r in rows}}
+
+    def test_it_rebuilds_only_the_people_the_run_never_reached(self, tmp_path: Path, started):
+        ids = self._seed(_boot(tmp_path))
+
+        _boot(tmp_path)
+
+        assert started == [
+            {
+                "trigger": "resume",
+                "dry_run": False,
+                "user_ids": sorted([ids["users"]["bob"], ids["users"]["cat"]]),
+                "collection_ids": sorted([ids["rows"]["night_a"], ids["rows"]["night_b"]]),
+            }
+        ]
+
+    def test_the_consistency_pass_is_still_queued(self, tmp_path: Path, started):
+        from shortlist.server.db.models import Job
+
+        self._seed(_boot(tmp_path))
+        second = _boot(tmp_path)
+
+        with second.app.state.sessions() as session:
+            assert [j.kind for j in session.query(Job).all()] == ["privacy.sync"]
+
+    @pytest.mark.parametrize(
+        "seed",
+        [
+            {"trigger": "resume"},  # the resumed run itself: once, never a loop
+            {"trigger": "manual"},  # a run someone started by hand is theirs to start again
+            {"dry_run": True},  # safe mode wrote nothing to rebuild
+            {"hours_ago": 21},  # the row's next scheduled run is the better answer by now
+            {"reached": ("amy", "bob", "cat")},  # everyone enabled was reached before the restart
+        ],
+        ids=["resumed-run", "manual", "dry-run", "too-old", "all-reached"],
+    )
+    def test_nothing_is_rerun_when(self, tmp_path: Path, started, seed):
+        self._seed(_boot(tmp_path), **seed)
+
+        _boot(tmp_path)
+
+        assert started == []
+
+    def test_rows_turned_off_since_are_not_rebuilt(self, tmp_path: Path, started):
+        from shortlist.server.db.models import Collection
+
+        first = _boot(tmp_path)
+        ids = self._seed(first)
+        with first.app.state.sessions() as session:
+            session.get(Collection, ids["rows"]["night_b"]).enabled = False
+            session.commit()
+
+        _boot(tmp_path)
+
+        assert [call["collection_ids"] for call in started] == [[ids["rows"]["night_a"]]]
+
+    def test_restoring_a_backup_that_caught_a_run_mid_flight_starts_no_run(self, tmp_path: Path, started):
+        """A backup taken at 04:00 holds that night's run as `running`. Restoring it is not a restart
+        cutting that run short, and a real run must not start on the restored configuration by itself."""
+        from shortlist.server.services.backup import request_restore, take_backup
+
+        first = _boot(tmp_path)
+        self._seed(first)
+        backup = take_backup(tmp_path, label="manual")
+        with first.app.state.sessions() as session:
+            for run in session.query(Run).all():
+                run.status = "ok"
+            session.commit()
+        assert request_restore(tmp_path, backup.name)
+
+        _boot(tmp_path)
+
+        assert started == []

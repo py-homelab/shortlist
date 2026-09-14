@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import ClassVar
+from unittest.mock import MagicMock, call
 
 import pytest
+from plexapi.exceptions import BadRequest
 
-from shortlist.engine.clients.plex_pms import PlexClient
+from shortlist.engine import delivery
+from shortlist.engine.clients.plex_pms import CollectionRejectedItems, PlexClient
 from shortlist.engine.delivery import DEFAULT_ROW_NAME, deliver_rows, render_row_name, row_marker, sweep_broken_rows
 from shortlist.engine.models import LABEL_PREFIX, EngineConfig, MediaType, Pick
 from tests.conftest import make_profile
@@ -291,11 +294,22 @@ def _labelling_plex_mock(plex: MagicMock) -> MagicMock:
     # would quietly yield nothing — the mock must carry the real shape.
     plex.fetch_items.return_value = ([], [])
 
-    def stored_label(collection, label):
-        stored = label.replace("shortlist", "Shortlist", 1)
+    def stored_label(collection, label, *, extra=None):
+        # `extra` lands in the SAME write, exactly as the real client does on a create — so the
+        # constant label is already present when `_apply_shortlist_label` runs and that call
+        # short-circuits without a write. A fake that ignored `extra` would leave the label absent
+        # and hide the fact that the second write is now redundant.
         current = list(getattr(collection, "_labels", []))
-        if not any(t.tag.lower() == label.lower() for t in current):
-            current.append(SimpleNamespace(tag=stored))
+
+        def _put(name: str) -> str:
+            stored_name = name.replace("shortlist", "Shortlist", 1)
+            if not any(t.tag.lower() == name.lower() for t in current):
+                current.append(SimpleNamespace(tag=stored_name))
+            return stored_name
+
+        stored = _put(label)  # the CRITICAL label's casing is what the caller reports
+        if extra is not None:
+            _put(extra)
         collection._labels = current
         collection.labels = current
         return stored
@@ -378,12 +392,39 @@ class TestDeliverRows:
         # Two labels per collection: the OWNER label everything keys off, and the constant one a
         # co-managing tool can be pointed at (ours are per person, so a 46-account server otherwise
         # needs 46 entries in agregarr's exclusion list, going stale on every roster change).
-        assert [c.args[1] for c in plex.stored_label.call_args_list] == [
-            "shortlist_sarah",
-            "shortlist",
+        # ONE labelling call carrying BOTH labels, not two. A label PUT costs ~9.3s on a large
+        # library whatever it carries, so the second write was 10% of a 46-user run; the row is new,
+        # so there are no existing labels a combined write could drop.
+        assert [(c.args[1], c.kwargs.get("extra")) for c in plex.stored_label.call_args_list] == [
+            ("shortlist_sarah", "shortlist"),
         ]
         # Promotion is the pipeline's job, AFTER filters are merged — never delivery's.
         plex.promote.assert_not_called()
+
+    def test_a_new_row_is_hidden_from_library_browse_as_soon_as_it_is_labelled(self, engine_config, movies, shows):
+        """A person's FIRST row has no `label!=` exclude in anyone's share filter until the merge phase,
+        which waits for every later person's delivery. The browse-hiding
+        mode promote() sets is applied as soon as the label lands instead; promote() sets it again."""
+        plex = self._plex(movies, shows)
+
+        deliver_rows(plex, make_profile(), picks(), engine_config)
+
+        created = plex.create_collection.return_value
+        plex.hide_from_browse.assert_called_once_with(created)
+        names = [c[0] for c in plex.mock_calls]
+        assert names.index("stored_label") < names.index("hide_from_browse")
+
+    def test_a_row_is_created_even_when_hiding_it_from_browse_fails(self, engine_config, movies, shows):
+        """Best-effort: promote() hides it again after the filters merge, so a failed early hide is no
+        worse than before — and must not cost the person their row."""
+        plex = self._plex(movies, shows)
+        plex.hide_from_browse.side_effect = RuntimeError("(500) internal_server_error")
+
+        diff, stored = deliver_rows(plex, make_profile(), picks(), engine_config)
+
+        assert diff.created is True
+        assert stored == "Shortlist_sarah"
+        plex.create_collection.return_value.delete.assert_not_called()
 
     def test_show_picks_go_to_the_tv_library_not_the_movie_one(self, engine_config: EngineConfig, movies, shows):
         """A show delivered into a movie collection is matched by neither filterMovies nor
@@ -558,77 +599,296 @@ class TestDeliverRows:
         existing.items.return_value = [MagicMock(title=f"Stale {k}", ratingKey=2000 + k) for k in range(n_stale)]
         return existing
 
-    def test_large_turnover_rebuilds_instead_of_firing_per_item_removes(self, engine_config, movies, shows):
-        """A big turnover (>= _REBUILD_MIN_REMOVES stale items) rebuilds the collection — one batched
-        create — instead of N slow per-item removeItems DELETEs. set_items is never called."""
+    def test_a_full_turnover_updates_the_row_in_place_and_keeps_its_plex_identity(self, engine_config, movies, shows):
+        """Issue #119: a row losing many titles used to be deleted and recreated to save per-item
+        removes. The new collection had a new ratingKey, so every tool that keys on it (agregarr's
+        custom summary and sort title) lost its settings each time. The row must stay the SAME
+        Plex object however much of it changes."""
         plex = self._plex(movies, shows)
         profile = make_profile()
-        existing = self._existing_with_stale(profile, 6)  # 6 removes >= threshold -> rebuild
+        existing = self._existing_with_stale(profile, 20)  # every current item is unwanted
+        existing.ratingKey = 4242
+        stale = existing.items.return_value
         plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        fetched = [MagicMock(ratingKey=1001), MagicMock(ratingKey=1002)]
+        plex.fetch_items.return_value = (fetched, [])
+        breakdown: list[dict] = []
+
+        diff, stored = deliver_rows(plex, profile, picks(), engine_config, breakdown=breakdown)
+
+        plex.delete_owned_collection.assert_not_called()
+        plex.create_collection.assert_not_called()
+        plex.fetch_items.assert_called_once_with([1001, 1002])  # only the delta is fetched
+        plex.set_items.assert_called_once_with(existing, stale, fetched, [1001, 1002])
+        assert breakdown[0]["rating_key"] == 4242  # the ledger keeps pointing at the same collection
+        assert diff.removed == [f"Stale {k}" for k in range(20)]
+        assert diff.created is False
+        assert stored == "Shortlist_sarah"
+
+    def test_a_collection_that_refuses_every_item_is_rebuilt(self, engine_config, movies, shows):
+        """Observed on a real server: an EMPTY collection of ours 400'd on a batch of 30 valid shows
+        and on a single one, while a sibling accepted the same item a second later. Same library,
+        same subtype, every ratingKey resolving — the Plex object itself was broken, and it stayed
+        broken run after run, so that person's row was empty and would never have refilled."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 0)  # empty: nothing to lose by rebuilding
+        existing.items.return_value = []
+        existing.childCount = 0  # and Plex AGREES it is empty — an empty read alone is not enough
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.set_items.side_effect = CollectionRejectedItems("(400) bad_request; .../collections/9/items")
 
         diff, stored = deliver_rows(plex, profile, picks(), engine_config)
 
         plex.delete_owned_collection.assert_called_once()
         assert plex.delete_owned_collection.call_args.args[0] is existing
-        # The ownership-guard prefix (rule 4) — LABEL_PREFIX is the one hardcoded source of truth now
-        # that EngineConfig no longer carries a (never-set) label_prefix knob of its own.
         assert plex.delete_owned_collection.call_args.args[1] == LABEL_PREFIX
-        plex.create_collection.assert_called_once()  # rebuilt via one batched create
-        plex.set_items.assert_not_called()  # NOT the per-item update path
-        existing.editTitle.assert_not_called()  # nothing to rename — it's being deleted
-        plex.fetch_items.assert_called_once_with([1001, 1002])  # the fresh row holds the wanted picks
+        # The ARGUMENTS, not just the call. Mutating the repair to `title=display` — dropping the
+        # per-account invisible marker, which is exactly the shared-tag leak `sweep_broken_rows`
+        # exists to clean up — left an assert-called-once test green.
+        create = plex.create_collection.call_args
+        assert create.args[0] is movies
+        assert create.args[1] == "✨ Movies Picked for You" + row_marker(profile.plex_account_id)
+        assert plex.fetch_items.call_args.args[0] == [1001, 1002]
         assert stored == "Shortlist_sarah"
-        assert diff.removed == [f"Stale {k}" for k in range(6)]
+        # The ledger's handle must follow the NEW collection, or the next run addresses the deleted one.
+        assert diff.rating_key is not None
 
-    def test_exactly_the_threshold_rebuilds_boundary(self, engine_config, movies, shows):
-        """Boundary: removing exactly _REBUILD_MIN_REMOVES items rebuilds (the branch is `>=`)."""
-        from shortlist.engine.delivery import _REBUILD_MIN_REMOVES
+    def test_a_row_plex_says_has_items_is_never_deleted_on_an_empty_read(self, engine_config, movies, shows):
+        """plex-safety rule 4: an empty read never authorises a delete.
 
+        plexapi returns [] for a 200 carrying no children, which is indistinguishable from a failed
+        read — the exact successful-but-empty answer rule 4 records for `<Label>`. A PMS mid
+        library-index rebuild could hand back an empty membership for a row that really has 30 items,
+        and without this guard one bad-read night would delete and recreate every row on the server.
+        """
         plex = self._plex(movies, shows)
         profile = make_profile()
-        existing = self._existing_with_stale(profile, _REBUILD_MIN_REMOVES)
+        existing = self._existing_with_stale(profile, 0)
+        existing.items.return_value = []  # the read says empty...
+        existing.childCount = 30  # ...but Plex says it has 30 items
         plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.set_items.side_effect = CollectionRejectedItems("(400) bad_request; .../collections/9/items")
 
-        deliver_rows(plex, profile, picks(), engine_config)
-
-        plex.delete_owned_collection.assert_called_once()
-        plex.set_items.assert_not_called()
-
-    def test_rebuild_deletes_the_old_row_before_creating_the_new_one(self, engine_config, movies, shows):
-        """Leak-safe order: delete-first, then create+label. Nothing exists between the two steps
-        (nothing to leak), and it avoids a duplicate-title 409 from two live collections."""
-        plex = self._plex(movies, shows)
-        profile = make_profile()
-        existing = self._existing_with_stale(profile, 6)
-        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
-
-        deliver_rows(plex, profile, picks(), engine_config)
-
-        names = [c[0] for c in plex.mock_calls]
-        assert names.index("delete_owned_collection") < names.index("create_collection")
-
-    def test_a_small_delta_still_updates_in_place_no_rebuild(self, engine_config, movies, shows):
-        """Just under the threshold stays on the cheap in-place update — no needless delete+recreate."""
-        plex = self._plex(movies, shows)
-        profile = make_profile()
-        existing = self._existing_with_stale(profile, 4)  # 4 removes < threshold -> update
-        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
-
-        deliver_rows(plex, profile, picks(), engine_config)
-
+        with pytest.raises(CollectionRejectedItems):
+            deliver_rows(plex, profile, picks(), engine_config)
         plex.delete_owned_collection.assert_not_called()
-        plex.set_items.assert_called_once()
 
-    def test_dry_run_never_rebuilds(self, engine_config, movies, shows):
+    def test_a_400_on_a_POPULATED_collection_still_fails(self, engine_config, movies, shows):
+        """The repair is deliberately narrow. A row that HAS items has something to lose from being
+        deleted, and a 400 there is a different fault — so it must surface, not silently rebuild."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 2)
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.set_items.side_effect = CollectionRejectedItems("(400) bad_request; .../collections/9/items")
+
+        with pytest.raises(CollectionRejectedItems):
+            deliver_rows(plex, profile, picks(), engine_config)
+        plex.delete_owned_collection.assert_not_called()
+
+    def test_a_non_400_failure_is_never_swallowed(self, engine_config, movies, shows):
+        """Anchored on the leading token, not `"400" in`: plexapi puts the collection's own ratingKey
+        in the message, so a substring test matches keys like 1400 or 40053. That exact mistake
+        swallowed 500s and 401s in `rename_or_keep`."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 0)
+        existing.items.return_value = []
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.set_items.side_effect = RuntimeError("(500) internal; http://pms/library/collections/1400/items")
+
+        with pytest.raises(RuntimeError, match="500"):
+            deliver_rows(plex, profile, picks(), engine_config)
+        plex.delete_owned_collection.assert_not_called()
+
+    def test_a_dry_run_update_writes_and_announces_nothing(self, engine_config, movies, shows):
         plex = self._plex(movies, shows)
         profile = make_profile()
         existing = self._existing_with_stale(profile, 6)
         plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        events: list = []
 
-        deliver_rows(plex, profile, picks(), engine_config, dry_run=True)
+        deliver_rows(plex, profile, picks(), engine_config, dry_run=True, on_write=events.append)
 
+        plex.set_items.assert_not_called()
         plex.delete_owned_collection.assert_not_called()
         plex.create_collection.assert_not_called()
+        assert events == []
+
+    def test_says_what_it_will_add_and_remove_before_updating_a_row(self, engine_config, movies, shows):
+        """Plex removes titles one DELETE at a time, so an in-place update on a big library runs for
+        minutes — the run page is told what is about to change BEFORE the writes start, not after."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 3)
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.fetch_items.return_value = ([MagicMock(ratingKey=1001), MagicMock(ratingKey=1002)], [])
+        events: list = []
+        plex.set_items.side_effect = lambda *args: events.append("set_items")
+
+        deliver_rows(plex, profile, picks(), engine_config, on_write=events.append)
+
+        assert events == [
+            {"row": "✨ Movies Picked for You", "library": "Movies", "adding": 2, "removing": 3},
+            "set_items",
+        ]
+
+    def test_the_announced_add_count_leaves_out_picks_that_have_vanished(self, engine_config, movies, shows):
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 1)
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.fetch_items.return_value = ([MagicMock(ratingKey=1001)], [1002])  # Movie 2 deleted from Plex
+        events: list = []
+
+        deliver_rows(plex, profile, picks(), engine_config, on_write=events.append)
+
+        assert events == [{"row": "✨ Movies Picked for You", "library": "Movies", "adding": 1, "removing": 1}]
+
+    def test_announces_nothing_when_every_title_to_add_has_vanished_and_nothing_is_removed(
+        self, engine_config, movies, shows
+    ):
+        """An announcement with nothing to add and nothing to remove would render as a line with no verb."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = MagicMock()
+        existing.title = "✨ Movies Picked for You" + row_marker(profile.plex_account_id)
+        existing.items.return_value = [MagicMock(title="Movie 1", ratingKey=1001)]
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.fetch_items.return_value = ([], [1002])  # the one title to add was deleted from Plex
+        events: list = []
+
+        deliver_rows(plex, profile, picks(), engine_config, on_write=events.append)
+
+        assert events == []
+
+    def test_the_announced_new_row_size_leaves_out_picks_that_have_vanished(self, engine_config, movies, shows):
+        plex = self._plex(movies, shows)
+        plex.fetch_items.return_value = ([MagicMock(ratingKey=1001)], [1002])
+        events: list = []
+
+        deliver_rows(plex, make_profile(), picks(), engine_config, on_write=events.append)
+
+        assert events == [{"row": "✨ Movies Picked for You", "library": "Movies", "creating": 1}]
+
+    def test_says_it_is_creating_the_row_when_a_broken_one_has_to_be_recreated(self, engine_config, movies, shows):
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 0)
+        existing.items.return_value = []
+        existing.childCount = 0
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.set_items.side_effect = CollectionRejectedItems("(400) bad_request; .../collections/9/items")
+        plex.fetch_items.return_value = ([MagicMock(ratingKey=1001), MagicMock(ratingKey=1002)], [])
+        events: list = []
+
+        deliver_rows(plex, profile, picks(), engine_config, on_write=events.append)
+
+        assert events[-1] == {"row": "✨ Movies Picked for You", "library": "Movies", "creating": 2}
+
+    def test_says_it_is_creating_a_row_before_creating_it(self, engine_config, movies, shows):
+        plex = self._plex(movies, shows)
+        plex.fetch_items.return_value = ([MagicMock(ratingKey=1001), MagicMock(ratingKey=1002)], [])
+        profile = make_profile()
+        events: list = []
+        create = plex.create_collection.side_effect
+
+        def create_and_record(*args):
+            events.append("create")
+            return create(*args)
+
+        plex.create_collection.side_effect = create_and_record
+
+        deliver_rows(plex, profile, picks(), engine_config, on_write=events.append)
+
+        assert events == [{"row": "✨ Movies Picked for You", "library": "Movies", "creating": 2}, "create"]
+
+    def test_reports_a_stored_label_before_the_next_library_is_written(self, engine_config, movies, shows):
+        """The caller hides a person's first row the moment its label exists. Waiting for the row's other
+        libraries left the first collection listed in everyone's Collections tab while a TV collection was
+        created — ~36s on a large library, measured live."""
+        plex = self._plex(movies, shows)
+        plex.fetch_items.side_effect = lambda keys: ([MagicMock(ratingKey=k) for k in keys], [])
+        events: list = []
+        create = plex.create_collection.side_effect
+        plex.create_collection.side_effect = lambda section, title, items: (
+            events.append(("create", section.title)) or create(section, title, items)
+        )
+        stored_labels: dict[str, str] = {}
+        mixed = picks(1) + picks(1, MediaType.SHOW, start=5)
+
+        deliver_rows(
+            plex,
+            make_profile(),
+            mixed,
+            engine_config,
+            stored_labels=stored_labels,
+            on_label_stored=lambda: events.append(("label stored", dict(stored_labels))),
+        )
+
+        assert events[0] == ("create", "Movies")
+        assert events[1] == ("label stored", {"sarah": "Shortlist_sarah"})
+        assert events[2] == ("create", "TV Shows")
+
+    def test_a_library_whose_label_never_landed_reports_nothing(self, engine_config, movies, shows):
+        """Reporting it anyway would spend the caller's run-once hide on a row that has no label to exclude."""
+        plex = self._plex(movies, shows)
+        plex.stored_label.side_effect = RuntimeError("label write failed")
+        called: list = []
+
+        with pytest.raises(RuntimeError):
+            deliver_rows(
+                plex,
+                make_profile(),
+                picks(),
+                engine_config,
+                stored_labels={},
+                on_label_stored=lambda: called.append(True),
+            )
+
+        assert called == []
+
+    def test_a_dry_run_reports_no_stored_label(self, engine_config, movies, shows):
+        plex = self._plex(movies, shows)
+        called: list = []
+
+        deliver_rows(
+            plex,
+            make_profile(),
+            picks(),
+            engine_config,
+            stored_labels={},
+            dry_run=True,
+            on_label_stored=lambda: called.append(True),
+        )
+
+        assert called == []
+
+    def test_says_nothing_when_the_row_is_unchanged(self, engine_config, movies, shows):
+        """An unchanged row writes nothing, so announcing a write would be a lie."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        unchanged = MagicMock()
+        unchanged.title = "✨ Movies Picked for You" + row_marker(profile.plex_account_id)
+        unchanged.items.return_value = [
+            MagicMock(title="Movie 1", ratingKey=1001),
+            MagicMock(title="Movie 2", ratingKey=1002),
+        ]
+        plex.find_owned_collections.side_effect = lambda section, label: [unchanged] if section is movies else []
+        events: list = []
+
+        deliver_rows(plex, profile, picks(), engine_config, on_write=events.append)
+
+        assert events == []
+
+    def test_a_dry_run_create_announces_nothing(self, engine_config, movies, shows):
+        plex = self._plex(movies, shows)
+        events: list = []
+
+        deliver_rows(plex, make_profile(), picks(), engine_config, dry_run=True, on_write=events.append)
+
+        assert events == []
 
     def test_records_order_work_on_create_for_the_deferred_ordering_pass(
         self, engine_config: EngineConfig, movies, shows
@@ -879,6 +1139,51 @@ class TestSweepBrokenRows:
         assert deleted == {"mike": ["✨ Picked for You"]}
         plex.delete_owned_collection.assert_called_once_with(stranded, "shortlist")
 
+    def test_deletes_a_name_freeing_helper_a_killed_run_left_behind(self, engine_config: EngineConfig, movies, shows):
+        from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
+
+        """`_reclaim_orphaned_name` deletes its helper in a `finally`, which a killed process never reaches.
+        Nothing else matches the helper to a row, so it would sit on that person's Home for good."""
+        marker = row_marker(4242)
+        helper = self._collection(movies, "Shortlist_mike", title=f"Shortlist freed name 0123456789ab{marker}")
+        plex = self._plex(movies, shows, helper)
+        plex.matches_section.return_value = True
+
+        deleted = sweep_broken_rows(plex, engine_config, markers={"mike": marker})
+
+        # Not filed under "mike": that is their deleted ROWS, which the run page lists as theirs.
+        assert deleted == {f"{FREED_NAME_HELPER_KEY}mike": [helper.title]}
+        plex.delete_owned_collection.assert_called_once_with(helper, "shortlist")
+
+    def test_an_unlabelled_helper_is_filed_as_a_helper_not_as_the_persons_row(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        """Killed between the helper's rename and its label write, it is swept as an unlabelled orphan."""
+        from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
+
+        marker = row_marker(4242)
+        helper = self._collection(movies, title=f"Shortlist freed name 0123456789ab{marker}")
+        healthy = self._collection(movies, "Shortlist_mike", title=f"✨ Picked for You{marker}")
+        plex = self._plex(movies, shows, helper, healthy)
+        plex.matches_section.return_value = True
+        plex.confirm_unlabelled.side_effect = lambda c, _prefix: c is helper
+
+        deleted = sweep_broken_rows(
+            plex,
+            engine_config.__class__(**{**engine_config.__dict__, "orphan_confirm_delay_s": 0}),
+            markers={"mike": marker},
+        )
+
+        assert deleted == {f"{FREED_NAME_HELPER_KEY}mike": [helper.title]}
+
+    def test_a_row_someone_named_like_a_helper_is_left_alone(self, engine_config: EngineConfig, movies, shows):
+        marker = row_marker(4242)
+        row = self._collection(movies, "Shortlist_mike", title=f"Shortlist freed name of the week{marker}")
+        plex = self._plex(movies, shows, row)
+        plex.matches_section.return_value = True
+
+        assert sweep_broken_rows(plex, engine_config, markers={"mike": marker}) == {}
+
     def test_leaves_a_well_typed_row_alone(self, engine_config: EngineConfig, movies, shows):
         healthy = self._collection(movies, "Shortlist_mike")
         plex = self._plex(movies, shows, healthy)
@@ -964,7 +1269,15 @@ class TestSweepBrokenRows:
 
         sweep_broken_rows(plex, engine_config, markers={"mike": row_marker(202)})
 
-        plex.confirm_unlabelled.assert_called_once_with(orphan, "shortlist")
+        # TWO confirms, not one. This asserted `assert_called_once_with` until the lone-candidate
+        # bypass was removed: one confirm was enough to authorise a delete, and on a single-row
+        # server one hiccup answering both the listing read and that confirm destroyed a real row.
+        # Both reads must agree, separated by `orphan_confirm_delay_s` (0 here, so no wall clock is
+        # spent in tests).
+        assert plex.confirm_unlabelled.call_args_list == [
+            call(orphan, "shortlist"),
+            call(orphan, "shortlist"),
+        ]
 
     def test_a_label_read_that_comes_back_empty_does_not_wipe_the_server(
         self, engine_config: EngineConfig, movies, shows
@@ -1044,6 +1357,67 @@ class TestSweepBrokenRows:
         deleted = sweep_broken_rows(plex, engine_config, markers={"mike": row_marker(202)})
 
         assert deleted == {"mike": [orphan.title]}
+
+    def test_confirm_unlabelled_is_required_twice_with_a_real_gap_before_deleting(
+        self, engine_config: EngineConfig, movies, shows, monkeypatch
+    ):
+        """The lone-candidate bypass was the dangerous one, not the systemic case.
+
+        `orphan_candidates <= 1` can only be true when there is at most ONE Shortlist collection on
+        the entire server — so it fired exactly when there was nothing to corroborate the read
+        against, which is backwards from every other guard here. On a single-row deployment (which
+        the documented 5 -> 15 -> 40 rollout guarantees exists for days on every install) one PMS
+        hiccup during the sweep answered both reads "no label", and a genuine, months-old, correctly
+        labelled row was deleted permanently while the run reported success.
+
+        A single confirm cannot tell the two apart, so nothing here trusts a single confirm any more:
+        two independent reads, separated by real wall-clock time. A transient hiccup clears; a
+        genuine orphan's label never arrives however long you wait.
+        """
+        orphan = self._collection(movies, title="✨ Movies Picked for You" + row_marker(202))
+        plex = self._plex(movies, shows, orphan)
+        plex.matches_section.return_value = True
+        plex.confirm_unlabelled.return_value = True
+        engine_config.orphan_confirm_delay_s = 30.0
+        slept: list[float] = []
+        monkeypatch.setattr(delivery.time, "sleep", slept.append)
+
+        deleted = sweep_broken_rows(plex, engine_config, markers={"mike": row_marker(202)})
+
+        assert deleted == {"mike": [orphan.title]}
+        assert plex.confirm_unlabelled.call_count == 2, "a single confirm must never authorise a delete"
+        assert slept == [30.0], "the two confirms must be separated by a real gap, not back-to-back"
+
+    def test_a_row_that_reads_as_labelled_on_the_second_look_is_spared(
+        self, engine_config: EngineConfig, movies, shows, monkeypatch
+    ):
+        """The case the delay exists for: the first read missed the label, the second one sees it.
+        Before the fix this row was deleted on the strength of one read."""
+        established = self._collection(movies, title="✨ Movies Picked for You" + row_marker(202))
+        plex = self._plex(movies, shows, established)
+        plex.matches_section.return_value = True
+        plex.confirm_unlabelled.side_effect = [True, False]  # transient miss, then the truth
+        engine_config.orphan_confirm_delay_s = 5.0
+        monkeypatch.setattr(delivery.time, "sleep", lambda _s: None)
+
+        deleted = sweep_broken_rows(plex, engine_config, markers={"mike": row_marker(202)})
+
+        assert deleted == {}, "deleted a row the server said was labelled"
+        plex.delete_owned_collection.assert_not_called()
+
+    def test_the_second_confirm_is_not_even_attempted_when_the_first_says_labelled(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        """Fail closed on the cheap answer — no delay, no second round-trip, for the common case."""
+        established = self._collection(movies, title="✨ Movies Picked for You" + row_marker(202))
+        plex = self._plex(movies, shows, established)
+        plex.matches_section.return_value = True
+        plex.confirm_unlabelled.return_value = False
+
+        deleted = sweep_broken_rows(plex, engine_config, markers={"mike": row_marker(202)})
+
+        assert deleted == {}
+        assert plex.confirm_unlabelled.call_count == 1
 
     def test_a_failed_re_read_is_treated_as_do_not_delete(self, engine_config: EngineConfig, movies, shows):
         """`confirm_unlabelled` returns False when it cannot read at all. "I don't know" must never
@@ -1723,7 +2097,10 @@ class TestTheConstantLabel:
 
         _diff, stored = deliver_rows(plex, make_profile(), picks(), engine_config)
 
+        # Both labels still go on; the constant one now rides along as `extra` in the SAME write,
+        # so gather from both the positional label and that kwarg.
         applied = [c.args[1] for c in plex.stored_label.call_args_list]
+        applied += [c.kwargs["extra"] for c in plex.stored_label.call_args_list if c.kwargs.get("extra")]
         assert "shortlist_sarah" in applied, "the per-user label is what every share filter excludes"
         assert "shortlist" in applied
         assert stored == "Shortlist_sarah", "the reported label is the OWNER one, not the constant"
@@ -1743,9 +2120,14 @@ class TestTheConstantLabel:
         # was never reached, and deleting it would not have failed anything.
         labelling = plex.stored_label.side_effect
 
-        def boom(collection, label):
+        def boom(collection, label, *, extra=None):
             if label == LABEL_PREFIX:
                 raise RuntimeError("PMS said no")
+            # The create write lands the OWNER label but NOT the constant one — what the real client
+            # does when the batched write fails and it falls back to the critical label alone. That
+            # leaves `_apply_shortlist_label` with work to do, so its swallow is what this exercises;
+            # passing `extra` through here would apply the label and the delete path would never be
+            # approached at all.
             return labelling(collection, label)
 
         plex.stored_label.side_effect = boom
@@ -1839,7 +2221,7 @@ class TestTheOwnerPrefixIsLoadBearing:
             labels=[SimpleNamespace(tag="Shortlist"), SimpleNamespace(tag="Shortlist_sarah")],
         )
         client._section_collections = lambda _section: [ours]
-        client.sections = lambda: [SimpleNamespace(title="Movies")]
+        client.sections = lambda: [SimpleNamespace(title="Movies", type="movie")]
 
         owned = client.owned_collections("shortlist")
 
@@ -1961,8 +2343,7 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
     """A Plex collection is keyed by TITLE within a library, so renaming onto a title that already
     exists there answers 409 Conflict.
 
-    The rebuild path deletes first precisely to avoid this. The in-place rename did not, and an
-    unguarded `editTitle` propagated — recorded on a real 46-user server (run 4, 2026-08-15):
+    An unguarded `editTitle` propagated — recorded on a real 46-user server (run 4, 2026-08-15):
     `users_ok: 45, users_error: 1`, the one error being
 
         BadRequest: (409) conflict; …title.value=🎯 Because you watched Ted Lasso…&type=18
@@ -1998,6 +2379,337 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         existing.editTitle.side_effect = raiser
         return existing
 
+    @staticmethod
+    def _warnings(fn) -> str:
+        """loguru sink — this codebase does not log through the stdlib, so `caplog` stays empty."""
+        from loguru import logger
+
+        seen: list[str] = []
+        sink = logger.add(seen.append, level="WARNING")
+        try:
+            fn()
+        finally:
+            logger.remove(sink)
+        return "".join(seen)
+
+    @staticmethod
+    def _held(rating_key: int, title: str, section_key) -> MagicMock:
+        holder = MagicMock(ratingKey=rating_key, title=title)
+        holder.librarySectionID = section_key
+        return holder
+
+    def _refused_row(self, profile, *, then=None) -> MagicMock:
+        """A row whose first rename is refused; `then` is what every later rename does (default: succeed)."""
+        collection = MagicMock(ratingKey=771)
+        collection.title = "Old Name" + row_marker(profile.plex_account_id)
+        collection.editTitle.side_effect = [BadRequest(self.CONFLICT), then]
+        return collection
+
+    def _rename(self, plex, collection, target, profile, section, spare="spare"):
+        from shortlist.engine.delivery import rename_or_keep
+
+        outcome: list[str] = []
+        text = self._warnings(
+            lambda: outcome.append(
+                rename_or_keep(
+                    plex,
+                    collection,
+                    target,
+                    profile,
+                    section,
+                    label="Shortlist_sarah",
+                    marker=row_marker(profile.plex_account_id),
+                    spare_item=spare,
+                )
+            )
+        )
+        return outcome[0], text
+
+    def test_a_rename_plex_accepts_needs_nothing_else(self, movies):
+        from shortlist.engine.delivery import RENAMED
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        collection = MagicMock()
+
+        outcome, _ = self._rename(plex, collection, "New", profile, movies)
+
+        assert outcome == RENAMED
+        plex.collections_titled.assert_not_called()
+        plex.create_collection.assert_not_called()
+
+    def test_a_name_something_in_this_library_holds_is_its_own_outcome(self, movies):
+        """So a caller can say "something there has that name" only when something does."""
+        from shortlist.engine.delivery import HELD
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = [self._held(99887, "New", movies.key)]
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), "New", profile, movies)
+
+        assert outcome == HELD
+
+    def test_freeing_a_name_waits_when_a_caller_says_plex_is_busy(self, movies):
+        """A rename from the row editor runs beside the nightly run: its helper holding a name the run is
+        about to deliver would move that row's tag away from its title."""
+        from shortlist.engine.delivery import DEFERRED, rename_or_keep
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+
+        outcome = rename_or_keep(
+            plex,
+            self._refused_row(profile),
+            "New",
+            profile,
+            movies,
+            label="Shortlist_sarah",
+            marker=row_marker(profile.plex_account_id),
+            spare_item="item",
+            may_free_name=lambda: False,
+        )
+
+        assert outcome == DEFERRED
+        plex.create_collection.assert_not_called()
+
+    def test_the_conflict_warning_names_what_is_holding_the_title(self, movies):
+        """A name another collection in THIS library really has is the one refusal nothing here can fix,
+        and "a collection already has that title" is untriageable on its own. The ratingKey is what makes
+        the squatter findable, because the title carries invisible marker characters.
+        """
+        from shortlist.engine.delivery import HELD
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        target = "New Name" + row_marker(profile.plex_account_id)
+        plex.collections_titled.return_value = [self._held(99887, target, movies.key)]
+        collection = self._refused_row(profile)
+
+        outcome, text = self._rename(plex, collection, target, profile, movies)
+
+        assert outcome == HELD
+        assert "99887" in text, "the ratingKey is the only way to find it in Plex"
+        assert "also a Shortlist row" in text
+        plex.create_collection.assert_not_called()
+
+    def test_identifying_the_squatter_never_costs_the_row(self, movies):
+        """The lookup is diagnostics. A PMS that fails it must not turn a survivable rename into the
+        raised exception that once cost a person every row they had."""
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.side_effect = RuntimeError("PMS down")
+
+        outcome, text = self._rename(plex, self._refused_row(profile), "New Name", profile, movies)
+
+        assert outcome == KEPT
+        assert "could not check what holds it" in text
+        plex.create_collection.assert_not_called()
+
+    def test_a_name_only_a_twin_in_another_library_has_asks_for_a_rebuild(self, movies):
+        """A helper there would share the twin's tag row, and renaming the helper would rename the twin."""
+        from shortlist.engine.delivery import REBUILD
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        target = "New Name" + row_marker(profile.plex_account_id)
+        plex.collections_titled.return_value = [self._held(4242, target, 2)]
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), target, profile, movies)
+
+        assert outcome == REBUILD
+        plex.create_collection.assert_not_called()
+
+    def test_an_orphaned_name_is_freed_and_the_same_row_takes_it(self, movies):
+        """The SFLIX shape: nothing on the server has the name, a deleted collection's tag row does."""
+        from shortlist.engine.delivery import RENAMED
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        marker = row_marker(profile.plex_account_id)
+        target = "New Name" + marker
+        plex.collections_titled.return_value = []
+        helper = MagicMock(ratingKey=5555)
+        plex.create_collection.return_value = helper
+        collection = self._refused_row(profile)
+        order = MagicMock()
+        order.attach_mock(plex.stored_label, "label")
+        order.attach_mock(helper.editTitle, "helper_rename")
+        order.attach_mock(collection.editTitle, "row_rename")
+        order.attach_mock(plex.delete_owned_collection, "delete")
+
+        outcome, _ = self._rename(plex, collection, target, profile, movies, spare="an item of the row")
+
+        assert outcome == RENAMED
+        plex.create_collection.assert_called_once_with(movies, target, ["an item of the row"])
+        steps = [c[0] for c in order.mock_calls]
+        # The helper gives the name up BEFORE anything slow: while it holds the row's exact title, a process
+        # killed there would leave a labelled collection the next run takes for the row itself.
+        assert steps == ["row_rename", "helper_rename", "label", "row_rename", "delete"], steps
+        # Labelled with this person's label, as a new row is: hidden from everyone the row is hidden from.
+        assert plex.stored_label.call_args == call(helper, "Shortlist_sarah", extra=LABEL_PREFIX)
+        assert collection.title == target, "the cached object must carry the name Plex now has"
+        freed = helper.editTitle.call_args.args[0]
+        assert freed != target and freed.endswith(marker), "the helper must move away under a name that is ours"
+        # plexapi leaves the object's title as it was, and `delete_owned_collection` proves ownership by the
+        # marker on THAT title: a shared row's unmarked name would leave a helper whose label failed undeletable.
+        assert helper.title == freed
+        assert collection.editTitle.call_args_list[-1] == call(target)
+        plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
+
+    def test_a_rename_plex_accepts_updates_the_cached_title(self, movies):
+        """plexapi's `editTitle` does not, and the run's collection cache keeps the object: a later lookup
+        in the same run would see the old name (architecture review 2026-09-14)."""
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        collection = MagicMock()
+        collection.title = "Old"
+
+        self._rename(plex, collection, "New", profile, movies)
+
+        assert collection.title == "New"
+
+    def test_a_helper_that_could_not_be_deleted_is_not_claimed_hidden_when_its_label_failed(self, movies):
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        helper = MagicMock(ratingKey=5555)
+        plex.create_collection.return_value = helper
+        plex.stored_label.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+        plex.delete_owned_collection.side_effect = BadRequest("(500) internal_server_error; http://pms/y")
+        from loguru import logger
+
+        seen: list[str] = []
+        sink = logger.add(seen.append, level="ERROR")
+        try:
+            self._rename(plex, self._refused_row(profile), "New", profile, movies)
+        finally:
+            logger.remove(sink)
+
+        assert "5555" in "".join(seen)
+        assert "no one else can see it" not in "".join(seen)
+
+    def test_every_helper_moves_to_a_name_no_earlier_helper_left_behind(self, movies):
+        """A freed name stays behind as an orphan, so reusing one would be refused the next time."""
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        names = []
+        for _ in range(2):
+            helper = MagicMock()
+            plex.create_collection.return_value = helper
+            self._rename(plex, self._refused_row(profile), "New", profile, movies)
+            names.append(helper.editTitle.call_args.args[0])
+
+        assert names[0] != names[1]
+
+    def test_the_helper_is_deleted_even_when_the_row_is_refused_again(self, movies):
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        helper = MagicMock()
+        plex.create_collection.return_value = helper
+        collection = self._refused_row(profile, then=BadRequest(self.CONFLICT))
+
+        outcome, text = self._rename(plex, collection, "New", profile, movies)
+
+        assert outcome == KEPT
+        plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
+        assert "freeing it failed" in text
+
+    def test_a_shared_rows_helper_whose_label_failed_is_still_deleted(self, movies):
+        """Review 2026-09-14 (HIGH). A shared row is renamed to an unmarked title, so the helper is created
+        unmarked; if its label write fails, only the marker on its freed name proves it is ours, and the real
+        `delete_owned_collection` reads that from the object's title."""
+        from shortlist.engine.delivery import KEPT
+
+        real = PlexClient.__new__(PlexClient)
+        real._collections_cache = {}
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        plex.collections_titled.return_value = []
+        plex.stored_label.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+        plex.delete_owned_collection.side_effect = lambda c, prefix: PlexClient.delete_owned_collection(real, c, prefix)
+        helper = MagicMock(ratingKey=5555, labels=[])
+        helper.title = "Popular on the server"  # what the create was given, unmarked
+        plex.create_collection.return_value = helper
+        profile = make_profile()
+        collection = self._refused_row(profile)
+
+        from shortlist.engine.delivery import rename_or_keep
+
+        outcome = rename_or_keep(
+            plex,
+            collection,
+            "Popular on the server",
+            profile,
+            movies,
+            label="Shortlist__shared_popular",
+            marker=row_marker(0),
+            spare_item="item",
+        )
+
+        assert outcome == KEPT
+        helper.delete.assert_called_once()
+
+    def test_a_helper_whose_own_rename_failed_is_still_deleted(self, movies):
+        """Created by this very call, so it is ours whatever its title says: a failed rename left it on the
+        row's unmarked shared name with no label, which `delete_owned_collection` cannot prove ours."""
+        from shortlist.engine.delivery import rename_or_keep
+
+        real = PlexClient.__new__(PlexClient)
+        real._collections_cache = {}
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        plex.collections_titled.return_value = []
+        plex.delete_owned_collection.side_effect = lambda c, prefix: PlexClient.delete_owned_collection(real, c, prefix)
+        helper = MagicMock(ratingKey=5555, labels=[])
+        helper.title = "Popular on the server"
+        helper.editTitle.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+        plex.create_collection.return_value = helper
+        profile = make_profile()
+
+        rename_or_keep(
+            plex,
+            self._refused_row(profile),
+            "Popular on the server",
+            profile,
+            movies,
+            label="Shortlist__shared_popular",
+            marker=row_marker(0),
+            spare_item="item",
+        )
+
+        helper.delete.assert_called_once()
+
+    def test_a_helper_that_was_never_created_is_not_deleted(self, movies):
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        plex.create_collection.side_effect = BadRequest("(400) bad_request; http://pms/library/collections")
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), "New", profile, movies)
+
+        assert outcome == KEPT
+        plex.delete_owned_collection.assert_not_called()
+
+    def test_an_empty_row_keeps_its_name_rather_than_creating_an_empty_helper(self, movies):
+        from shortlist.engine.delivery import KEPT
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), "New", profile, movies, spare=None)
+
+        assert outcome == KEPT
+        plex.create_collection.assert_not_called()
+
     def test_the_row_still_gets_its_titles_when_plex_refuses_the_rename(
         self, engine_config: EngineConfig, movies, shows
     ):
@@ -2005,6 +2717,8 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         profile = make_profile()
         existing = self._existing(profile, Exception(self.CONFLICT))
         plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        # Something in this library really has the name: the one refusal that stays refused.
+        plex.collections_titled.side_effect = lambda title: [self._held(99887, title, movies.key)]
 
         diff, _ = deliver_rows(plex, profile, picks(), engine_config)
 
@@ -2013,6 +2727,56 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         assert diff.added == ["Movie 2"]
         assert diff.kept == ["Movie 1"]
         plex.set_items.assert_called_once()
+
+    def test_a_kept_name_is_what_the_run_reports(self, engine_config: EngineConfig, movies, shows):
+        """The run page and the ledger reported the name Plex refused, so SFLIX's run pages showed four
+        rows under names they did not have, and the reconcile looks a `{top_seed}` row up by that title."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing(profile, Exception(self.CONFLICT))
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.collections_titled.side_effect = lambda title: [self._held(99887, title, movies.key)]
+
+        breakdown: list[dict] = []
+        deliver_rows(plex, profile, picks(), engine_config, breakdown=breakdown)
+
+        assert [entry["row_title"] for entry in breakdown] == ["Old Name"]
+
+    def test_a_rebuild_that_fails_to_create_updates_the_old_row_under_its_old_name(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing(profile, Exception(self.CONFLICT))
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.collections_titled.side_effect = lambda title: [self._held(4242, title, shows.key)]
+        plex.create_collection.side_effect = BadRequest("(400) bad_request; http://pms/library/collections")
+
+        diff, _ = deliver_rows(plex, profile, picks(), engine_config)
+
+        plex.delete_owned_collection.assert_not_called()
+        plex.set_items.assert_called_once()
+        assert diff.added == ["Movie 2"]
+
+    def test_a_rebuild_replaces_the_old_row_with_one_under_the_twins_name(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing(profile, Exception(self.CONFLICT))
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.collections_titled.side_effect = lambda title: [self._held(4242, title, shows.key)]
+        rebuilt = MagicMock(ratingKey=6001, labels=[])
+        plex.create_collection.return_value = rebuilt
+
+        breakdown: list[dict] = []
+        deliver_rows(plex, profile, picks(), engine_config, breakdown=breakdown)
+
+        wanted = plex.create_collection.call_args.args[1]
+        assert wanted.endswith(row_marker(profile.plex_account_id)) and not wanted.startswith("Old Name")
+        plex.delete_owned_collection.assert_called_once_with(existing, LABEL_PREFIX)
+        (entry,) = breakdown
+        assert entry["rating_key"] == 6001 and entry["created"] is True
 
     def test_the_old_title_is_kept_so_nothing_becomes_visible_to_anyone_new(
         self, engine_config: EngineConfig, movies, shows
@@ -2094,3 +2858,247 @@ class TestTheDiffReportsWhatLandedNotWhatWasAsked:
         added = diff.added if hasattr(diff, "added") else diff[0].added
         assert "Still Here" in added
         assert "Deleted Since" not in added, "the run must not claim it delivered a title Plex dropped"
+
+
+class TestATitleAnotherRowBuildsUnderIsNeverThisRows:
+    """Issue #121: two of one person's rows may share a title when they build in different libraries.
+
+    All of a person's rows carry one label and marker and are told apart by title, and the removal
+    paths scan EVERY library — so muting, disabling or cold-skipping a Movies-only row matched a
+    TV-only row's collection by that same title and deleted it. A title another row builds under in a
+    library now names THAT row's collection there; only this row's ledger entry can say otherwise.
+    """
+
+    MARK = row_marker(100)
+    A: ClassVar[dict] = {"slug": "a", "size": 5, "media": "movie"}
+    B: ClassVar[dict] = {"slug": "b", "size": 5, "media": "show"}
+
+    def _plex(self, owned_by_section: dict[str, list[tuple[str, int]]]):
+        movies, shows = _section("Movies", "movie", "1"), _section("TV Shows", "show", "2")
+        deleted: list[str] = []
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [movies, shows]
+        plex.find_owned_collections.side_effect = lambda section, label: [
+            SimpleNamespace(title=title, ratingKey=key) for title, key in owned_by_section[str(section.key)]
+        ]
+        plex.delete_owned_collection.side_effect = lambda collection, prefix: deleted.append(collection.ratingKey)
+        return plex, [movies, shows], deleted
+
+    def _remove(self, plex, sections, a: dict, others: list[dict], delivered_keys: dict[str, int] | None = None):
+        from shortlist.engine.delivery import remove_row
+        from shortlist.engine.models import CollectionDiff, RowSpec
+
+        spec = RowSpec(**a)
+        return remove_row(
+            plex,
+            make_profile("sarah", account_id=100),
+            EngineConfig(),
+            spec,
+            dry_run=False,
+            diff=CollectionDiff(),
+            sections=sections,
+            delivered_keys=delivered_keys,
+            other_rows=[spec, *(RowSpec(**o) for o in others)],
+        )
+
+    @pytest.mark.parametrize("template", ["{library_name} Picked For You", "Friday Picks"])
+    def test_removing_a_movies_row_leaves_a_tv_row_of_the_same_title_alone(self, template):
+        profile = make_profile("sarah", account_id=100)
+        a_movies = render_row_name(template, profile, [], library_name="Movies") + self.MARK
+        b_shows = render_row_name(template, profile, [], library_name="TV Shows") + self.MARK
+        plex, sections, deleted = self._plex({"1": [(a_movies, 11)], "2": [(b_shows, 22)]})
+
+        removed_in = self._remove(
+            plex, sections, {**self.A, "name_template": template}, [{**self.B, "name_template": template}], {"1": 11}
+        )
+
+        assert deleted == [11], "only row A's own collection may go — B's TV collection wears the same title"
+        assert removed_in == ["1"]
+
+    def test_explicit_libraries_claim_their_titles_the_same_way(self):
+        plex, sections, deleted = self._plex({"1": [("Friday" + self.MARK, 11)], "2": [("Friday" + self.MARK, 22)]})
+
+        self._remove(
+            plex,
+            sections,
+            {"slug": "a", "size": 5, "name_template": "Friday", "library_keys": ["1"]},
+            [{"slug": "b", "size": 5, "name_template": "Friday", "library_keys": ["2"]}],
+        )
+
+        assert deleted == [11]
+
+    def test_a_leftover_in_a_library_no_other_row_claims_still_goes_by_title(self):
+        """Unchanged, and the reason the scan covers every library: a row narrowed away from TV whose
+        narrowing cleanup never ran still has a copy there, and it would otherwise sit on this person's
+        Home for ever. Nothing else builds "Friday" in TV, so the title is still this row's."""
+        plex, sections, deleted = self._plex({"1": [("Friday" + self.MARK, 11)], "2": [("Friday" + self.MARK, 22)]})
+
+        removed_in = self._remove(
+            plex, sections, {**self.A, "name_template": "Friday"}, [{**self.B, "name_template": "Something Else"}]
+        )
+
+        assert sorted(removed_in) == ["1", "2"]
+        assert sorted(deleted) == [11, 22]
+
+    def test_the_ledger_can_still_name_a_claimed_title_as_this_rows(self):
+        plex, sections, deleted = self._plex({"1": [], "2": [("Friday" + self.MARK, 22)]})
+
+        self._remove(
+            plex, sections, {**self.A, "name_template": "Friday"}, [{**self.B, "name_template": "Friday"}], {"2": 22}
+        )
+
+        assert deleted == [22]
+
+    def test_a_row_that_builds_for_nobody_named_claims_its_fallback_name(self):
+        """A `{top_seed}` row with a fallback wears that fallback for anyone with nothing watched — the
+        one title of its that can be predicted, so the one it claims."""
+        plex, sections, deleted = self._plex({"1": [], "2": [("New Here" + self.MARK, 22)]})
+
+        self._remove(
+            plex,
+            sections,
+            {**self.A, "name_template": "New Here"},
+            [{**self.B, "name_template": "Because you watched {top_seed}", "fallback_name": "New Here"}],
+        )
+
+        assert deleted == []
+
+    def test_a_row_this_person_is_not_in_the_audience_of_claims_nothing_for_them(self):
+        """It builds no collection for them, so its title there cannot be theirs — and claiming it would
+        strand this row's leftover copy on their Home for ever."""
+        plex, sections, deleted = self._plex({"1": [], "2": [("Friday" + self.MARK, 22)]})
+
+        self._remove(
+            plex,
+            sections,
+            {**self.A, "name_template": "Friday"},
+            [{**self.B, "name_template": "Friday", "audience": {999}}],
+        )
+
+        assert deleted == [22]
+
+    def test_an_unrenderable_row_is_still_removed_by_ledger_identity(self):
+        """Unchanged: a `{top_seed}` row has no title to guard, and the ledger was already its only handle."""
+        plex, sections, _deleted = self._plex({"1": [], "2": [("Because you watched Fargo" + self.MARK, 22)]})
+
+        removed_in = self._remove(
+            plex, sections, {**self.A, "name_template": "Because you watched {top_seed}"}, [], {"2": 22}
+        )
+
+        assert removed_in == ["2"]
+
+
+class TestRowsCanShareALibrary:
+    """The static test the duplicate-title check uses: could two rows ever build in one library?"""
+
+    @pytest.mark.parametrize(
+        ("a", "b", "expected"),
+        [
+            (("movie", []), ("show", []), False),  # different media types never meet
+            (("movie", ["1"]), ("show", ["2"]), False),
+            (("movie", ["1"]), ("movie", ["3"]), False),  # two named sets with nothing in common
+            (("both", ["1", "2"]), ("both", ["3", "4"]), False),
+            (("movie", []), ("movie", ["3"]), True),  # "every movie library" includes library 3
+            (("both", []), ("show", ["2"]), True),
+            (("movie", ["1"]), ("both", ["1", "2"]), True),
+            (("both", []), ("both", []), True),
+        ],
+    )
+    def test_the_matrix(self, a, b, expected):
+        from shortlist.engine.delivery import rows_can_share_a_library
+
+        assert rows_can_share_a_library(*a, *b) is expected
+        assert rows_can_share_a_library(*b, *a) is expected, "the answer cannot depend on argument order"
+
+    def test_never_says_no_when_delivery_would_put_both_rows_in_one_library(self):
+        """Soundness against the function delivery actually uses. A false "no" is the dangerous one:
+        it lets two rows take one collection. A false "yes" only refuses a save."""
+        from hypothesis import given
+        from hypothesis import strategies as st
+
+        from shortlist.engine.delivery import rows_can_share_a_library, target_sections
+        from shortlist.engine.models import RowSpec
+
+        keys = st.lists(st.sampled_from(["1", "2", "3", "4"]), unique=True, max_size=4)
+        media = st.sampled_from(["movie", "show", "both"])
+        kinds = st.lists(st.sampled_from(["movie", "show"]), min_size=4, max_size=4)
+
+        @given(kinds, media, keys, media, keys)
+        def check(section_kinds, media_a, keys_a, media_b, keys_b):
+            sections = [SimpleNamespace(key=str(i + 1), type=k, title=f"L{i + 1}") for i, k in enumerate(section_kinds)]
+            in_a = {s.key for s in target_sections(sections, RowSpec("a", "", 1, media=media_a, library_keys=keys_a))}
+            in_b = {s.key for s in target_sections(sections, RowSpec("b", "", 1, media=media_b, library_keys=keys_b))}
+            if in_a & in_b:
+                assert rows_can_share_a_library(media_a, keys_a, media_b, keys_b)
+
+        check()
+
+
+class TestOnDemandReconcilesNeverMatchAnotherRowsTitle:
+    """Issue #121, the on-demand half: row delete/disable/audience-shrink (`remove_row_collections`)
+    and a poster reset (`reset_row_posters`) match by title too, across every library."""
+
+    MARK = row_marker(100)
+    CLAIMED: ClassVar[set[tuple[str, str]]] = {("2", "Friday")}  # another of sarah's rows builds "Friday" in TV Shows
+
+    def _plex(self):
+        movies, shows = _section("Movies", "movie", "1"), _section("TV Shows", "show", "2")
+        a = SimpleNamespace(title="Friday" + self.MARK, ratingKey=11)
+        b = SimpleNamespace(title="Friday" + self.MARK, ratingKey=22)
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [movies, shows]
+        plex.find_owned_collections.side_effect = lambda section, label: [a] if str(section.key) == "1" else [b]
+        return plex, a, b
+
+    def test_a_removal_never_matches_a_title_another_row_builds_under(self, engine_config: EngineConfig):
+        from shortlist.engine.delivery import remove_row_collections
+
+        plex, a, _b = self._plex()
+
+        removed = remove_row_collections(
+            plex,
+            engine_config,
+            label="shortlist_sarah",
+            displays={"Friday"},
+            dry_run=False,
+            claimed_titles=self.CLAIMED,
+        )
+
+        assert removed == ["Friday"]
+        plex.delete_owned_collection.assert_called_once_with(a, "shortlist")
+
+    def test_a_ledger_key_still_removes_a_collection_whose_title_is_claimed(self, engine_config: EngineConfig):
+        """Callers hand this only UNAMBIGUOUS keys — a ratingKey two rows both hold is dropped upstream
+        (`pipeline.identity_map`, `collection_reconcile._ledger_keys`) — so a key here is this row's."""
+        from shortlist.engine.delivery import remove_row_collections
+
+        plex, a, b = self._plex()
+
+        remove_row_collections(
+            plex,
+            engine_config,
+            label="shortlist_sarah",
+            displays={"Friday"},
+            rating_keys={22},
+            dry_run=False,
+            claimed_titles=self.CLAIMED,
+        )
+
+        assert [c.args[0] for c in plex.delete_owned_collection.call_args_list] == [a, b]
+
+    def test_a_poster_reset_never_matches_a_title_another_row_builds_under(self, engine_config: EngineConfig):
+        from shortlist.engine.delivery import reset_row_posters
+
+        plex, a, _b = self._plex()
+
+        reset = reset_row_posters(
+            plex,
+            engine_config,
+            label="shortlist_sarah",
+            displays={"Friday"},
+            dry_run=False,
+            claimed_titles=self.CLAIMED,
+        )
+
+        assert reset == ["Movies"]
+        plex.reset_poster.assert_called_once_with(a)

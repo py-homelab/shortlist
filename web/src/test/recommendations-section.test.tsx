@@ -39,15 +39,37 @@ describe("RecommendationsSection", () => {
     expect(screen.getByLabelText(/Trakt API key/i)).toBeInTheDocument();
   });
 
-  it("AI web search: with no curator, prompts to set one up (every backend needs a model)", () => {
+  // Whether an AI provider is needed depends on the BACKEND — it used to be asked as one blanket
+  // question, which told Exa owners to buy a key they did not need. Exa extracts titles itself.
+  it("web search: native with no curator says the search runs inside the AI", () => {
+    renderSection({
+      "curator.provider": "none",
+      "candidates.sources": ["llm_web"],
+      "llm_web.search_provider": "native",
+    });
+    expect(screen.getByText(/the search runs inside it/i)).toBeInTheDocument();
+  });
+
+  it("web search: SearXNG with no curator explains WHY it needs one", () => {
+    renderSection({
+      "curator.provider": "none",
+      "searxng.url": "http://searx.local:8080",
+      "candidates.sources": ["llm_web"],
+      "llm_web.search_provider": "searxng",
+    });
+    expect(screen.getByText(/returns raw web snippets/i)).toBeInTheDocument();
+  });
+
+  it("web search: Exa with no curator does NOT ask for one, because it needs none", () => {
+    // The bug this pins: Exa + no AI was reported as needing a key, while the engine ran anyway and
+    // billed for every search. Both halves are fixed; this is the UI half.
     renderSection({
       "curator.provider": "none",
       "exa.apikey": "•••••",
       "candidates.sources": ["llm_web"],
+      "llm_web.search_provider": "exa",
     });
-    expect(
-      screen.getByText(/needs an AI provider to choose titles/i),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/needs an AI provider/i)).not.toBeInTheDocument();
   });
 
   it("AI web search: 'AI provider's own' on a provider that can't self-search (Ollama) warns loudly", () => {
@@ -162,6 +184,61 @@ describe("RecommendationsSection", () => {
     ).toBeInTheDocument();
   });
 
+  it("saves the idle hold, and says what turning it off means", async () => {
+    renderSection({ "recommendations.idle_hold_days": 0 });
+    // Off is the shipped default, so the control has to explain the DEFAULT, not just the feature.
+    expect(
+      screen.getByText(/rebuild on schedule whatever/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /^a month$/i }));
+
+    await waitFor(() => expect(putSettings).toHaveBeenCalled());
+    expect(
+      putSettings.mock.calls.at(-1)?.[0]?.["recommendations.idle_hold_days"],
+    ).toBe(30);
+  });
+
+  it("says the hold has a ceiling, not that it freezes the row", async () => {
+    // The one thing an owner must not misread. A row that stopped for ever would be the opposite of
+    // what this is for, and the number is the only thing on screen that says otherwise.
+    renderSection({ "recommendations.idle_hold_days": 30 });
+    expect(
+      screen.getByText(/rebuilds anyway after 30 days/i),
+    ).toBeInTheDocument();
+  });
+
+  it("warns when the hold can never fire because the cadence already beats it", async () => {
+    // A row is rebuilt on its due night, so at its next due night its age is exactly the cadence —
+    // the hold only bites when it is strictly greater. Both controls offer 14 and 30 as presets, so
+    // this is a plausible thing to set and a complete no-op, with nothing on screen saying so.
+    renderSection({
+      "recommendations.refresh_days": 30,
+      "recommendations.idle_hold_days": 30,
+    });
+    expect(screen.getByText(/no effect/i)).toBeInTheDocument();
+  });
+
+  it("warns that a hold does nothing on rows that never rebuild", () => {
+    // Cadence 0 is "Never" — a one-click preset. `_is_refresh_night` returns False at 0, so the row
+    // never comes due and the hold can never fire. The field said only "rebuilds anyway after 30
+    // days, so a row never goes stale", which is false for a row that never rebuilds — and the docs
+    // promised all three surfaces warn while only the support endpoint did.
+    renderSection({
+      "recommendations.refresh_days": 0,
+      "recommendations.idle_hold_days": 30,
+    });
+    expect(screen.getByText(/never rebuild/i)).toBeInTheDocument();
+  });
+
+  it("does not warn when the hold is above the cadence", () => {
+    renderSection({
+      "recommendations.refresh_days": 8,
+      "recommendations.idle_hold_days": 30,
+    });
+    expect(screen.queryByText(/no effect/i)).not.toBeInTheDocument();
+  });
+
   it("saves the cold-start choice, and says what it will actually do", async () => {
     renderSection({ "recommendations.cold_start": "popular" });
     const select = screen.getByLabelText(/hasn’t watched enough/i);
@@ -191,5 +268,36 @@ describe("RecommendationsSection", () => {
     expect(
       putSettings.mock.calls.at(-1)?.[0]?.["recommendations.min_history"],
     ).toBe(4);
+  });
+
+  // The web-search count is a SLICE of the seed budget, not a peer of it — `candidates.py` searches
+  // `seeds[:recent_count]`. Rendered side by side, the only thing saying so was word order, and the
+  // narrower field had to spend a paragraph explaining the field above it. Asserted as containment
+  // rather than as copy: the relationship is what the fix is, and copy can be reworded without
+  // breaking it.
+  it("nests the web-search count inside the seed budget it slices", () => {
+    renderSection({
+      "recommendations.max_seeds": 40,
+      "recommendations.recent_count": 10,
+    });
+
+    const budget = screen.getByLabelText(/^Watches every source builds from$/i);
+    const slice = screen.getByLabelText(
+      /^Watches the AI web search looks up$/i,
+    );
+    const budgetBlock = budget.closest("div.border-t");
+
+    expect(budgetBlock).not.toBeNull();
+    expect(budgetBlock?.contains(slice)).toBe(true);
+  });
+
+  it("no longer restates the seed budget under the field that slices it", () => {
+    // The old helper opened "A narrower slice of the same list: …" and closed by repeating the
+    // AI web search card's own "cached for 7 days" line — 293 characters explaining the control
+    // above it, which nesting now says for free.
+    renderSection({ "recommendations.recent_count": 10 });
+
+    expect(screen.queryByText(/a narrower slice of the same list/i)).toBeNull();
+    expect(screen.queryByText(/cached for 7 days/i)).toBeNull();
   });
 });

@@ -286,7 +286,7 @@ class TestDegenerateCases:
         assert [m.title for m in report.sent] == ["t1"]
 
     def test_an_unconfigured_arr_on_one_row_does_not_stop_the_other(self, radarr):
-        """A row whose target is missing reports its own skip; the other row still sends."""
+        """A row whose target is missing holds its own title with the reason; the other row still sends."""
         base = _cfg()
         report = requests_mod.request_missing(
             base,
@@ -295,7 +295,7 @@ class TestDegenerateCases:
             dry_run=False,
         )
         assert [m.title for m in report.sent] == ["t2"]
-        assert any(o.status == "skipped_no_target" for o in report.outcomes)
+        assert [(m.title, m.detail.split(" —")[0]) for m in report.queued] == [("t1", "Radarr isn't fully set up")]
 
     def test_a_show_and_a_movie_with_the_same_id_are_two_titles(self, radarr, monkeypatch):
         sonarr_fake = FakeArr()
@@ -665,17 +665,20 @@ class TestTheClaimingRowSurvivesTheRequeuePath:
         assert "this row's own limit (0)" in report.queued[0].detail
 
     def test_claims_are_reported_separately_from_sends(self, radarr, monkeypatch):
-        """A claim can still be skipped at the send — no TheTVDB id, an Arr that refuses it. The caps
-        decide CLAIMS, so a breakdown that only reports sends cannot answer "did my row limit bind".
-        Measured live: sent read picked:3/because:0 while the caps had allocated picked:4/because:1."""
-        monkeypatch.setattr(requests_mod, "SonarrClient", lambda *a, **k: FakeArr())
+        """A claim can still fail at the send — an Arr that refuses it. The caps decide CLAIMS, so a
+        breakdown that only reports sends cannot answer "did my row limit bind". Measured live: sent
+        read picked:3/because:0 while the caps had allocated picked:4/because:1.
+
+        The vehicle was a show with no TheTVDB id until those stopped being claimed at all (they are
+        held back before allocation now); the contract is the same with an Arr that refuses the add."""
+        monkeypatch.setattr(requests_mod, "RadarrClient", lambda *a, **k: FakeArr(raise_on=70))
         base = _cfg(max_per_run=4)
-        show = MissingTitle(70, "no-tvdb", MediaType.SHOW, 2021, 8.0, 500, demand=1)
+        movie = _title(70)
 
         report = requests_mod.request_missing(
             base,
-            FakeTmdb(tvdb={70: None}),  # TMDB has no TheTVDB id, so Sonarr cannot take it
-            _rows(("tv", base, _demand(show))),
+            FakeTmdb(),
+            _rows(("tv", base, _demand(movie))),
             dry_run=False,
         )
 

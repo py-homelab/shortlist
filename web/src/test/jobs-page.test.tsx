@@ -383,6 +383,94 @@ describe("JobsPage — sync check", () => {
     ).toBeInTheDocument();
   });
 
+  it("confirms at the click before deleting a collection", async () => {
+    // The preview callout already names every collection and says it cannot be undone — so the
+    // audit's "no confirm" was half wrong. What was missing is a confirm AT THE CLICK, which every
+    // other irreversible Plex write in this app has (row delete, row cleanup, disable-everyone,
+    // backup restore). This one button bundled reversible demotions and an irreversible delete
+    // under a single verb and fired both immediately.
+    runJob.mockResolvedValue({
+      id: 1,
+      kind: "sync.check",
+      status: "done",
+      detail: "",
+      error: null,
+      fixed: [],
+      orphans: ["Shortlist_ghost"],
+    });
+    renderPage();
+
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: /^Check now: Check and fix rows on Plex$/,
+      }),
+    );
+    runJob.mockClear();
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Fix 1 row$/ }),
+    );
+
+    expect(runJob).not.toHaveBeenCalled();
+    expect(
+      await screen.findByRole("dialog", { name: /delete 1 collection/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("does the delete once confirmed", async () => {
+    runJob.mockResolvedValue({
+      id: 1,
+      kind: "sync.check",
+      status: "done",
+      detail: "",
+      error: null,
+      fixed: [],
+      orphans: ["Shortlist_ghost"],
+    });
+    renderPage();
+
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: /^Check now: Check and fix rows on Plex$/,
+      }),
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Fix 1 row$/ }),
+    );
+    runJob.mockClear();
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Delete and fix$/ }),
+    );
+
+    expect(runJob).toHaveBeenCalledWith("sync.check", { confirmed: true });
+  });
+
+  it("does not confirm when nothing will be deleted", async () => {
+    // Demotions are reversible and the run repeats them nightly anyway. A confirm on every fix
+    // teaches people to click through the one that matters.
+    runJob.mockResolvedValue({
+      id: 1,
+      kind: "sync.check",
+      status: "done",
+      detail: "",
+      error: null,
+      fixed: ["Shortlist_gemnath"],
+      orphans: [],
+    });
+    renderPage();
+
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: /^Check now: Check and fix rows on Plex$/,
+      }),
+    );
+    runJob.mockClear();
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^Fix 1 row$/ }),
+    );
+
+    expect(runJob).toHaveBeenCalledWith("sync.check", { confirmed: true });
+  });
+
   it("offers no fix button when nothing drifted", async () => {
     runJob.mockResolvedValue({
       id: 1,
@@ -556,6 +644,12 @@ describe("JobsPage — sync check", () => {
         label: "Remove a disabled person's rows",
         manual: false,
         trigger: "Queued when you disable someone.",
+        // Has actually RUN, so it gets a row of its own rather than the disclosure below.
+        last: {
+          status: "done",
+          created_at: "2026-08-01T03:31:00Z",
+          detail: "",
+        },
       }),
     ]);
     renderPage();
@@ -574,6 +668,65 @@ describe("JobsPage — sync check", () => {
       }),
     );
     expect(row).toHaveTextContent(/queued when you disable someone/i);
+  });
+
+  // On a fresh install NONE of the automatic kinds has ever run, so this section was nine rows of
+  // internal machinery each stamped "never run" — the job registry rendered as a user-facing list,
+  // with "never run" appearing fifteen times down the page. The ones that have actually happened
+  // are the ones worth a row.
+  it("keeps automatic jobs that have never run behind a disclosure", async () => {
+    getJobCatalog.mockResolvedValue([
+      entry("user.cleanup", {
+        label: "Remove a disabled person's rows",
+        manual: false,
+        last: {
+          status: "done",
+          created_at: "2026-08-01T03:31:00Z",
+          detail: "",
+        },
+      }),
+      entry("watch.credit", {
+        label: "Credit a finished playback",
+        manual: false,
+      }),
+      entry("notify.send", {
+        label: "Send an alert to your webhook",
+        manual: false,
+      }),
+    ]);
+    renderPage();
+
+    expect(await screen.findByText(/^Automatic$/)).toBeInTheDocument();
+    const disclosure = screen.getByText(/2 jobs that haven’t needed to run/i);
+    // The one that HAS run is not inside it; the two that haven't are.
+    const details = disclosure.closest("details");
+    expect(details).not.toBeNull();
+    expect(details?.contains(screen.getByTestId("job-watch.credit"))).toBe(
+      true,
+    );
+    expect(details?.contains(screen.getByTestId("job-notify.send"))).toBe(true);
+    expect(details?.contains(screen.getByTestId("job-user.cleanup"))).toBe(
+      false,
+    );
+    expect(details?.open).toBe(false);
+  });
+
+  it("says so plainly when no automatic job has ever run, rather than listing them all", async () => {
+    getJobCatalog.mockResolvedValue([
+      entry("watch.credit", {
+        label: "Credit a finished playback",
+        manual: false,
+      }),
+    ]);
+    renderPage();
+
+    expect(await screen.findByText(/^Automatic$/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/nothing has needed one of these yet/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("1 job that hasn’t needed to run"),
+    ).toBeInTheDocument();
   });
 
   it("gives the retention prune a row of its own, with a button that runs it", async () => {
@@ -652,6 +805,23 @@ describe("JobsPage — sync check", () => {
       const row = await screen.findByTestId(`job-${kind}`);
       expect(within(row).queryByText(/Changes Plex|Can delete/)).toBeNull();
     }
+  });
+
+  it("keeps the reassurance beside 'Can delete' visible, not in a hover title", async () => {
+    // A red "Can delete" whose only "nothing is deleted before you press Fix" lived in a `title`
+    // is a warning with its calming half hidden — on a phone there is no hover at all, so the tag
+    // is everything that is left (audit finding, Sep 2026).
+    renderPage();
+
+    const destructive = await screen.findByTestId("job-sync.check");
+    expect(
+      within(destructive).getByText(
+        /Nothing is deleted until you read the preview/i,
+      ),
+    ).toBeVisible();
+    // Only the destructive tag earns a permanent line; the two "Changes Plex" rows stay one line.
+    const writes = await screen.findByTestId("job-privacy.sync");
+    expect(within(writes).queryByText(/Nothing is deleted/i)).toBeNull();
   });
 
   it("shows a manual job's other trigger, so a run nobody pressed is explained", async () => {
@@ -745,8 +915,14 @@ describe("JobsPage — one place for everything on a timer", () => {
           cron: "30 3 * * *",
           next_run: "2026-08-01T03:30:00Z",
           rows: [
-            { id: 1, name: "✨ Picked for You" },
-            { id: 2, name: "🍿 Movie night" },
+            // A TEMPLATE name, because that is what most rows carry — the chip used to print it
+            // raw, braces and all.
+            {
+              id: 1,
+              slug: "picked",
+              name: "✨ {library_name} Picked for You",
+            },
+            { id: 2, slug: "movie-night", name: "🍿 Movie night" },
           ],
         },
       ],
@@ -793,6 +969,18 @@ describe("JobsPage — one place for everything on a timer", () => {
       "href",
       "/rows/2",
     );
+  });
+
+  it("strips a row name's placeholders instead of printing the braces", async () => {
+    // A row is configured as a template, so this chip used to read "✨ {library_name} Picked for
+    // You" — which looks like a substitution that failed, on a page that is otherwise all plain
+    // English. Same treatment the run pages give it (`rowDisplayName`).
+    renderPage();
+
+    const link = await screen.findByRole("link", { name: /Picked for You/ });
+    expect(link.textContent).toBe("✨ Picked for You");
+    expect(link.textContent).not.toContain("{");
+    expect(link).toHaveAttribute("title", "Edit ✨ Picked for You");
   });
 
   it("still lands somewhere sensible for an old ?tab=timeline link", async () => {

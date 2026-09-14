@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import re
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import httpx
 import pytest
 import respx
+from plexapi.exceptions import BadRequest
 
 import shortlist.engine.clients.plextv as plextv_mod
-from shortlist.engine.clients.plex_pms import MIN_PMS_VERSION, PlexClient, parse_pms_version
+from shortlist.engine.clients.plex_pms import (
+    MIN_PMS_VERSION,
+    CollectionRejectedItems,
+    PlexClient,
+    parse_pms_version,
+)
 from shortlist.engine.clients.plextv import PlexTvClient
 from shortlist.engine.clients.tautulli import TautulliClient
 from shortlist.engine.clients.tmdb import TmdbClient
@@ -284,6 +293,76 @@ class TestPlexTvClient:
         assert max(sleeps, default=0) >= 1.0
         assert 0.0 < client._pace < 1.0
 
+    @pytest.mark.parametrize("status", [500, 502, 503, 504])
+    @respx.mock
+    def test_a_transient_5xx_is_retried_because_the_filter_PUT_is_idempotent(self, status, monkeypatch):
+        """Losing a filter write is a PRIVACY problem, not a missing feature.
+
+        The `label!=shortlist_*` exclusion is what hides one person's row from everyone else (rule
+        1), so a dropped write leaves a row unhidden until the next run. This PUT carries the full
+        pre-merged value rather than a delta (rule 3's merge happened upstream), so re-sending it
+        either applies the same value or re-applies it as a no-op — which is what makes retrying a
+        5xx safe here, where it would not be on a Radarr add.
+        """
+        monkeypatch.setattr(plextv_mod.time, "sleep", lambda _s: None)
+        route = respx.put("https://plex.tv/api/users/100")
+        route.side_effect = [httpx.Response(status), httpx.Response(200)]
+        self._client().update_user_filters(100, {"filterMovies": "label!=Shortlist_a"})
+        assert len(route.calls) == 2
+        # The RETRY must carry the same value — a retry that sent something else would be a
+        # different write, and rule 3 forbids rebuilding a filter.
+        assert route.calls.last.request.url.params["filterMovies"] == "label!=Shortlist_a"
+
+    @respx.mock
+    def test_a_4xx_verdict_is_not_retried(self, monkeypatch):
+        """A 400 is plex.tv's answer about this account, not a blip — retrying only wastes the run."""
+        monkeypatch.setattr(plextv_mod.time, "sleep", lambda _s: None)
+        route = respx.put("https://plex.tv/api/users/100")
+        route.side_effect = [httpx.Response(400, text="nope"), httpx.Response(200)]
+        with pytest.raises(RuntimeError):
+            self._client().update_user_filters(100, {"filterMovies": "x=y"})
+        assert len(route.calls) == 1
+
+    @respx.mock
+    def test_relentless_5xx_gives_up_fast_because_every_account_pays_this(self, monkeypatch):
+        """Asserts the ladder's COST, not just its length.
+
+        The privacy phase writes a filter for every account in the audience, so a per-account wait is
+        paid ~46 times over on a bad night — and after the first hard failure the run cannot promote
+        anything anyway. Sharing the connect-error ladder cost 90s per account (~69 minutes across a
+        real roster) and no test could see it, because they all patch `sleep` away.
+        """
+        sleeps: list[float] = []
+        monkeypatch.setattr(plextv_mod.time, "sleep", sleeps.append)
+        route = respx.put("https://plex.tv/api/users/100").mock(return_value=httpx.Response(503))
+        with pytest.raises(RuntimeError, match="503"):
+            self._client().update_user_filters(100, {"filterMovies": "x=y"})
+        assert 1 < len(route.calls) <= 4
+        assert sum(sleeps) <= 20, f"{sum(sleeps)}s per account is too long to pay 46 times"
+
+    @respx.mock
+    def test_a_5xx_give_up_still_carries_plex_tvs_own_words(self, monkeypatch):
+        """Issue #1: "HTTP 500" alone leaves an operator guessing WHICH account and why. That string
+        reaches them through `report.promotion_blockers`, so dropping the body makes a permanently
+        failing account undiagnosable from the UI."""
+        monkeypatch.setattr(plextv_mod.time, "sleep", lambda _s: None)
+        respx.put("https://plex.tv/api/users/100").mock(
+            return_value=httpx.Response(503, text="account is not eligible for label filters")
+        )
+        with pytest.raises(RuntimeError, match="not eligible for label filters"):
+            self._client().update_user_filters(100, {"filterMovies": "x=y"})
+
+    @respx.mock
+    def test_a_5xx_does_not_slow_the_adaptive_pace(self, monkeypatch):
+        """A distinct matrix cell from the 429 test above: 429 means "you are going too fast" and
+        must widen the pace (rule 6); a 5xx means plex.tv is unwell and must not."""
+        monkeypatch.setattr(plextv_mod.time, "sleep", lambda _s: None)
+        route = respx.put("https://plex.tv/api/users/100")
+        route.side_effect = [httpx.Response(503), httpx.Response(200)]
+        client = self._client()
+        client.update_user_filters(100, {"filterMovies": "x=y"})
+        assert client._pace == 0.0
+
     @respx.mock
     def test_relentless_429_backs_off_then_gives_up_without_looping_forever(self, monkeypatch):
         monkeypatch.setattr(plextv_mod.time, "sleep", lambda _s: None)  # don't actually wait
@@ -437,25 +516,94 @@ class TestTmdbClient:
         assert TmdbClient("k").discover(MediaType.MOVIE, []) == []
 
     @respx.mock
-    def test_search_returns_top_match_with_the_query_and_year(self):
+    def test_search_sends_only_the_query_and_ranks_the_year_locally(self):
+        """The year ranks, it no longer filters — and that is the point of the change.
+
+        Sending `year=` (or `first_air_date_year=`) made TMDB exclude everything else, so a proposal
+        whose year was one out returned NOTHING and the title was lost entirely. Sources disagree
+        about years constantly: a series gets dated by its premiere, a film by its festival run.
+        Ranking keeps the near-miss and still puts the right release first.
+        """
         route = respx.get("https://api.themoviedb.org/3/search/movie").mock(
             return_value=httpx.Response(200, json={"results": [{"id": 42, "title": "Dune"}, {"id": 43}]})
         )
         found = TmdbClient("k").search("Dune", MediaType.MOVIE, year=2021)
-        assert found["id"] == 42  # the top result, used to resolve an LLM-proposed title
+        assert found["id"] == 42
         params = route.calls.last.request.url.params
         assert params.get("query") == "Dune"
-        assert params.get("year") == "2021"  # movies gate on `year`
+        assert params.get("year") is None
+        assert params.get("first_air_date_year") is None
 
     @respx.mock
-    def test_search_shows_gate_on_first_air_date_year(self):
-        route = respx.get("https://api.themoviedb.org/3/search/tv").mock(
-            return_value=httpx.Response(200, json={"results": [{"id": 95396, "name": "Severance"}]})
+    def test_search_prefers_an_exact_title_over_a_more_popular_one(self):
+        """TMDB's own order is popularity, which is quietly wrong for shared and remade titles —
+        exactly the case that puts an unrelated film in someone's row."""
+        respx.get("https://api.themoviedb.org/3/search/movie").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 1, "title": "Poor Things: The Making Of", "release_date": "2024-01-01"},
+                        {"id": 2, "title": "Poor Things", "release_date": "2023-12-07"},
+                    ]
+                },
+            )
         )
-        found = TmdbClient("k").search("Severance", MediaType.SHOW, year=2022)
-        assert found["id"] == 95396
-        params = route.calls.last.request.url.params
-        assert params.get("first_air_date_year") == "2022"  # shows use first_air_date_year, not year
+        assert TmdbClient("k").search("Poor Things", MediaType.MOVIE, year=2023)["id"] == 2
+
+    @respx.mock
+    def test_search_uses_the_year_to_separate_two_exact_titles(self):
+        """A remake and its original share a title exactly, so only the year can tell them apart."""
+        respx.get("https://api.themoviedb.org/3/search/movie").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 1, "title": "Dune", "release_date": "1984-12-14"},
+                        {"id": 2, "title": "Dune", "release_date": "2021-09-15"},
+                    ]
+                },
+            )
+        )
+        assert TmdbClient("k").search("Dune", MediaType.MOVIE, year=2021)["id"] == 2
+        assert TmdbClient("k").search("Dune", MediaType.MOVIE, year=1984)["id"] == 1
+
+    @respx.mock
+    def test_search_keeps_a_title_whose_year_is_one_out(self):
+        """Half of what web extraction produces has no year at all, and plenty of the rest is off by
+        one. Neither may cost us the title — under the old filter, both did."""
+        respx.get("https://api.themoviedb.org/3/search/tv").mock(
+            return_value=httpx.Response(
+                200, json={"results": [{"id": 95396, "name": "Severance", "first_air_date": "2022-02-17"}]}
+            )
+        )
+        assert TmdbClient("k").search("Severance", MediaType.SHOW, year=2023)["id"] == 95396
+        assert TmdbClient("k").search("Severance", MediaType.SHOW)["id"] == 95396
+
+    @respx.mock
+    def test_search_ignores_punctuation_differences_in_the_title(self):
+        """A title copied out of an article carries a curly apostrophe; TMDB stores a straight one."""
+        respx.get("https://api.themoviedb.org/3/search/tv").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"id": 1, "name": "Daredevil", "first_air_date": "2015-04-10"},
+                        {"id": 2, "name": "Marvel's Daredevil", "first_air_date": "2015-04-10"},
+                    ]
+                },
+            )
+        )
+        # The curly apostrophe is the point of the test, not a typo — hence the noqa.
+        assert TmdbClient("k").search("Marvel’s Daredevil", MediaType.SHOW)["id"] == 2  # noqa: RUF001
+
+    @respx.mock
+    def test_search_falls_back_to_tmdb_order_when_nothing_matches_well(self):
+        """No title or year signal to go on — keep the old behaviour rather than invent a preference."""
+        respx.get("https://api.themoviedb.org/3/search/movie").mock(
+            return_value=httpx.Response(200, json={"results": [{"id": 7}, {"id": 8}]})
+        )
+        assert TmdbClient("k").search("Something Else", MediaType.MOVIE)["id"] == 7
 
     @respx.mock
     def test_search_returns_none_when_nothing_matches(self):
@@ -611,6 +759,93 @@ class TestPlexClient:
         index = mock_plex.build_library_index(section)
         assert index == {99: 2}
 
+    def test_build_library_index_can_tally_genres_in_the_same_scan(self, mock_plex: PlexClient):
+        """The library-genre baseline rides along on the scan that already happens, so measuring a
+        person's genre avoidance costs no extra PMS request."""
+        from collections import Counter
+
+        section = MagicMock()
+        section.title = "Movies"
+        section.totalSize = 2
+        first = fake_media_item(1, "A", tmdb_id=42)
+        first.genres = [SimpleNamespace(tag="Horror"), SimpleNamespace(tag="Thriller")]
+        second = fake_media_item(2, "B", tmdb_id=43)
+        second.genres = [SimpleNamespace(tag="Horror")]
+        section.all.return_value = [first, second]
+        counts: Counter[str] = Counter()
+
+        index = mock_plex.build_library_index(section, genre_counts=counts)
+
+        assert index == {42: 1, 43: 2}
+        assert counts == Counter({"Horror": 2, "Thriller": 1})
+
+    def test_one_item_with_an_odd_genre_shape_does_not_abort_the_scan(self, mock_plex: PlexClient):
+        """Tolerant like every other row-level read here: a bad scrape costs its own genres, never the
+        whole section's index."""
+        from collections import Counter
+
+        section = MagicMock()
+        section.title = "Movies"
+        section.totalSize = 2
+
+        class RaisesOnGenres:
+            ratingKey = 1
+            title = "Bad"
+            guids: ClassVar = [SimpleNamespace(id="tmdb://42")]
+
+            @property
+            def genres(self):
+                raise RuntimeError("a corrupted agent match")
+
+        bad = RaisesOnGenres()
+        good = fake_media_item(2, "Good", tmdb_id=43)
+        good.genres = [SimpleNamespace(tag="Drama")]
+        section.all.return_value = [bad, good]
+        counts: Counter[str] = Counter()
+
+        index = mock_plex.build_library_index(section, genre_counts=counts)
+
+        assert index == {42: 1, 43: 2}, "a bad genre read cost the whole index"
+        assert counts == Counter({"Drama": 1})
+
+    def test_genre_tallying_is_off_unless_asked_for(self, mock_plex: PlexClient):
+        section = MagicMock()
+        section.title = "Movies"
+        section.totalSize = 1
+        item = fake_media_item(1, "A", tmdb_id=42)
+        item.genres = [SimpleNamespace(tag="Horror")]
+        section.all.return_value = [item]
+
+        assert mock_plex.build_library_index(section) == {42: 1}
+
+    def test_genres_ride_free_on_the_section_listing_but_labels_do_not(self):
+        """The asymmetry the genre profile is built on, pinned against a RECORDED real response.
+
+        plexapi lazily re-reads a collection when `.labels` is touched, because a real PMS serves no
+        `<Label>` children in a listing — that re-read is the whole reason `plex-safety.md` rule 4
+        needs two guards before deleting an orphan. `<Genre>` children ARE served inline, so
+        `.genres` is answered from the parsed listing with no second request.
+
+        Asserted here rather than assumed because the cheap library-genre profile depends on it
+        entirely: if genres ever stop riding along, the scan silently becomes one HTTP round trip per
+        title and the profile has to move to a cached TMDB lookup instead (rule 11).
+
+        `server=None` is the proof: any lazy re-read has nothing to query and raises, so a passing
+        `.genres` assertion cannot be an accidental network read.
+        """
+        from xml.etree import ElementTree
+
+        from plexapi.video import Movie
+
+        xml = (FIXTURES / "pms_in_progress_movies.xml.txt").read_text()
+        video = ElementTree.fromstring(xml).find("Video")
+
+        movie = Movie(server=None, data=video)
+
+        assert [g.tag for g in movie.genres] == ["Horror", "Science Fiction"]
+        with pytest.raises(AttributeError):
+            _ = movie.labels
+
     def test_stored_label_returns_existing_title_cased_form_without_write(self, mock_plex: PlexClient):
         collection = MagicMock()
         collection.labels = [SimpleNamespace(tag="Shortlist_sarah")]
@@ -630,10 +865,13 @@ class TestPlexClient:
         collection.labels = [SimpleNamespace(tag="Shortlist_sarah")]
         added: list[str] = []
 
-        def add(label):
-            added.append(label)
+        def add(labels):
+            # `stored_label` always hands plexapi a LIST now (it may carry a second label in the
+            # same write); plexapi normalises a bare string to one anyway. What is asserted below is
+            # unchanged: the owner label must still be on the row afterwards.
+            added.extend(labels)
             # What a real PUT does: the union, written back as the whole set.
-            collection.labels = [*collection.labels, SimpleNamespace(tag=label.replace("s", "S", 1))]
+            collection.labels = [*collection.labels, *(SimpleNamespace(tag=x.replace("s", "S", 1)) for x in labels)]
 
         collection.addLabel.side_effect = add
 
@@ -715,6 +953,14 @@ class TestPlexClient:
         assert vis.updateVisibility.call_args.kwargs == {"recommended": True, "home": False, "shared": True}
         vis.reload.return_value.move.assert_not_called()  # not pinned by default
 
+    def test_hide_from_browse_hides_the_collection_and_touches_nothing_else(self, mock_plex: PlexClient):
+        collection = MagicMock()
+
+        mock_plex.hide_from_browse(collection)
+
+        collection.modeUpdate.assert_called_once_with(mode="hide")
+        assert [c[0] for c in collection.method_calls] == ["modeUpdate"]  # where it is SHOWN is promotion's
+
     def test_promote_passes_placement_flags_through(self, mock_plex: PlexClient):
         """A library-only row must be hidden from Home and friends' Home — recommended only."""
         collection = MagicMock()
@@ -722,13 +968,24 @@ class TestPlexClient:
         vis = collection.visibility.return_value
         assert vis.updateVisibility.call_args.kwargs == {"recommended": True, "home": False, "shared": False}
 
-    def test_promote_pins_to_top_when_requested(self, mock_plex: PlexClient):
+    def test_promote_never_moves_the_hub(self, mock_plex):
+        """Promotion sets surfaces; it must not set POSITION.
+
+        It used to honour `pin_top` with `hub.reload().move(after=None)` — the one primitive
+        `place_rows` documents as unusable on its own (a built-in stuck at the minimum float makes
+        everything sent above it land on that value; one rebuild collapsed 72 of 94 hubs). The
+        argument is gone, so assert the write is gone with it rather than that the flag is unread.
+        """
+        import inspect
+
+        from shortlist.engine.clients.plex_pms import PlexClient
+
         collection = MagicMock()
-        vis = collection.visibility.return_value
-        vis.reload.return_value = vis
-        mock_plex.promote(collection, pin_top=True)
-        # modeUpdate + visibility happen first, THEN the move to the top (after=None).
-        vis.move.assert_called_once_with(after=None)
+        mock_plex.promote(collection)
+
+        collection.visibility.return_value.reload.assert_not_called()
+        collection.visibility.return_value.move.assert_not_called()
+        assert "pin_top" not in inspect.signature(PlexClient.promote).parameters
 
     def test_owned_collections_maps_slug_to_stored_label_and_id(self, mock_plex: PlexClient):
         ours = MagicMock(ratingKey=571285)
@@ -739,7 +996,7 @@ class TestPlexClient:
         section.type = "movie"
         section.collections.return_value = [ours, kometa]
         mock_plex._server.library.sections.return_value = [section]
-        assert mock_plex.owned_collections("shortlist") == {"sarah": OwnedRow("Shortlist_sarah", [571285])}
+        assert mock_plex.owned_collections("shortlist") == {"sarah": OwnedRow("Shortlist_sarah", [571285], {"movie"})}
 
     def test_owned_collections_collects_a_users_row_from_every_library(self, mock_plex: PlexClient):
         """One user, one collection per library. Collapsing them to a single id once hid a real
@@ -754,7 +1011,21 @@ class TestPlexClient:
         shows.collections.return_value = [show_row]
         mock_plex._server.library.sections.return_value = [movies, shows]
 
-        assert mock_plex.owned_collections("shortlist") == {"sarah": OwnedRow("Shortlist_sarah", [571285, 571290])}
+        assert mock_plex.owned_collections("shortlist") == {
+            "sarah": OwnedRow("Shortlist_sarah", [571285, 571290], {"movie", "show"})
+        }
+
+    def test_collections_titled_reads_the_server_not_the_runs_cache(self, mock_plex: PlexClient):
+        """It is asked only after Plex refused a rename, and the cache holds objects renamed earlier in the
+        same run under their OLD titles (plexapi's `editTitle` does not update them)."""
+        stale = MagicMock(ratingKey=7, title="Old Name")
+        fresh = MagicMock(ratingKey=7, title="New Name")
+        section = MagicMock(type="movie")
+        section.collections.side_effect = [[stale], [fresh]]
+        mock_plex._server.library.sections.return_value = [section]
+        mock_plex.find_owned_collections(section, "x")  # warms the cache with the stale object
+
+        assert [c.ratingKey for c in mock_plex.collections_titled("new name")] == [7]
 
     def test_section_collections_are_cached_within_a_run(self, mock_plex: PlexClient):
         # The section's collection list is otherwise re-pulled for every owned/find scan. Two reads
@@ -861,6 +1132,174 @@ class TestPlexClient:
         assert [i.ratingKey for i in collection.removeItems.call_args.args[0]] == [2]
         collection.sortUpdate.assert_called_once_with(sort="custom")
         collection.moveItem.assert_not_called()  # ordering happens later, in order_collection
+
+    def test_set_items_retries_a_transient_500_instead_of_failing_the_user(self, mock_plex: PlexClient, monkeypatch):
+        """A 5xx from addItems is Plex under load, not a rejected request.
+
+        SFLIX 2026-09-06: `PUT /library/collections/687180/items` answered 500 after exactly 10.0s
+        while that same collection served eight GETs and a children read as 200 either side of it.
+        It arrives as a plexapi BadRequest rather than a timeout, so the retry ladder never saw it
+        and user j.fm failed for the whole run after 9.5 minutes of work - having already had their
+        other row delivered.
+        """
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.time.sleep", lambda _s: None)
+        item = self._item
+        collection = MagicMock()
+        collection.addItems.side_effect = [BadRequest("(500) internal_server_error; http://pms/1500"), None]
+
+        mock_plex.set_items(collection, [item(1)], [item(4)], [1, 4])
+
+        assert collection.addItems.call_count == 2, "a 500 must be retried, not raised"
+        collection.sortUpdate.assert_called_once_with(sort="custom")
+
+    def test_set_items_does_not_retry_a_400_which_means_the_row_is_broken(self, mock_plex: PlexClient, monkeypatch):
+        """A 400 is a verdict about the request, so repeating it just wastes the ladder — and the
+        caller needs CollectionRejectedItems promptly to rebuild the row."""
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.time.sleep", lambda _s: None)
+        item = self._item
+        collection = MagicMock()
+        collection.addItems.side_effect = BadRequest("(400) bad_request; http://pms/500")
+
+        with pytest.raises(CollectionRejectedItems):
+            mock_plex.set_items(collection, [item(1)], [item(4)], [1, 4])
+
+        assert collection.addItems.call_count == 1, "a 400 must fail on the first attempt"
+
+    def test_a_ratingkey_containing_500_is_not_mistaken_for_a_server_error(self, mock_plex: PlexClient, monkeypatch):
+        """The url in a plexapi message carries the collection's own ratingKey, so a substring test
+        for "500" matches key 1500 and would retry a genuine 400 four times."""
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.time.sleep", lambda _s: None)
+        item = self._item
+        collection = MagicMock()
+        collection.addItems.side_effect = BadRequest("(400) bad_request; http://pms/library/collections/1500/items")
+
+        with pytest.raises(CollectionRejectedItems):
+            mock_plex.set_items(collection, [item(1)], [item(4)], [1, 4])
+
+        assert collection.addItems.call_count == 1
+
+    def test_set_items_retries_a_transient_500_on_REMOVAL_too(self, mock_plex: PlexClient, monkeypatch):
+        """The second failure of run 1 was a DELETE, not the add.
+
+        SFLIX 2026-09-06: user uid=20 died on
+        `DELETE /library/collections/687190/items/604259 -> 500`, on a collection that served 11
+        GETs and another DELETE as 200. Retrying only the add would have left this user failing.
+        """
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.time.sleep", lambda _s: None)
+        item = self._item
+        collection = MagicMock()
+        collection.removeItems.side_effect = [BadRequest("(500) internal_server_error; http://pms/1"), None]
+
+        mock_plex.set_items(collection, [item(1), item(2)], [], [1])
+
+        assert collection.removeItems.call_count == 2, "a 500 on removal must be retried"
+
+    def test_removals_go_one_at_a_time_so_a_retry_never_redeletes(self, mock_plex: PlexClient):
+        """plexapi's removeItems loops a DELETE per item, so batching the retry would re-send the
+        deletes that already succeeded. Each call must carry exactly one item."""
+        item = self._item
+        collection = MagicMock()
+
+        mock_plex.set_items(collection, [item(1), item(2), item(3)], [], [1])
+
+        sent = [c.args[0] for c in collection.removeItems.call_args_list]
+        assert [len(batch) for batch in sent] == [1, 1], "each removal must be its own call"
+        assert sorted(i.ratingKey for batch in sent for i in batch) == [2, 3]
+
+    def test_stored_label_writes_both_labels_in_one_call(self, mock_plex: PlexClient):
+        """Two labels, ONE PUT. Verified against the live PMS 2026-09-06 before this was written:
+        addLabel([a, b]) came back as a single PUT with both labels present."""
+        collection = MagicMock()
+        collection.labels = []
+
+        def _applied(tags):
+            collection.labels = [SimpleNamespace(tag=x.title()) for x in tags]
+
+        collection.addLabel.side_effect = _applied
+
+        stored = mock_plex.stored_label(collection, "shortlist_alice", extra="shortlist")
+
+        assert collection.addLabel.call_count == 1, "both labels must go in a single write"
+        assert collection.addLabel.call_args.args[0] == ["shortlist_alice", "shortlist"]
+        assert stored == "Shortlist_Alice", "the CRITICAL label's stored casing is what filters use"
+
+    def test_stored_label_returns_the_critical_labels_casing_not_the_extras(self, mock_plex: PlexClient):
+        """The returned string is written into every OTHER account's `label!=` exclude. Return the
+        wrong one and nobody's filter hides this row."""
+        collection = MagicMock()
+        collection.labels = [SimpleNamespace(tag="Shortlist_Alice"), SimpleNamespace(tag="Shortlist")]
+
+        stored = mock_plex.stored_label(collection, "shortlist_alice", extra="shortlist")
+
+        assert stored == "Shortlist_Alice"
+        assert collection.addLabel.call_count == 0, "both already present — no write at all"
+
+    def test_a_missing_critical_label_still_raises_so_the_caller_deletes_the_row(self, mock_plex: PlexClient):
+        """An unlabelled row is one no share filter can hide, so it must never survive."""
+        collection = MagicMock()
+        collection.labels = []
+        collection.addLabel.side_effect = lambda tags: None  # Plex accepts, nothing persists
+
+        with pytest.raises(RuntimeError, match="did not persist"):
+            mock_plex.stored_label(collection, "shortlist_alice", extra="shortlist")
+
+    def test_a_missing_EXTRA_label_is_not_fatal(self, mock_plex: PlexClient):
+        """The constant label is cosmetic (Kometa coexistence). Losing it must not fail a row that
+        already reached Plex with its privacy label intact."""
+        collection = MagicMock()
+        collection.labels = []
+        collection.addLabel.side_effect = lambda tags: setattr(
+            collection, "labels", [SimpleNamespace(tag="Shortlist_Alice")]
+        )
+
+        assert mock_plex.stored_label(collection, "shortlist_alice", extra="shortlist") == "Shortlist_Alice"
+
+    def test_a_batched_failure_falls_back_to_the_critical_label_alone(self, mock_plex: PlexClient, monkeypatch):
+        """Batching must not make a cosmetic failure fatal. Before this, `label` succeeding and
+        `extra` failing left the row alive and private; one combined write must not turn that into a
+        deleted row."""
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.time.sleep", lambda _s: None)
+        collection = MagicMock()
+        collection.labels = []
+
+        def _addLabel(tags):
+            if len(tags) > 1:
+                raise BadRequest("(400) bad_request; http://pms/1")
+            collection.labels = [SimpleNamespace(tag="Shortlist_Alice")]
+
+        collection.addLabel.side_effect = _addLabel
+
+        assert mock_plex.stored_label(collection, "shortlist_alice", extra="shortlist") == "Shortlist_Alice"
+        assert collection.addLabel.call_count == 2, "batched attempt, then the critical label alone"
+        assert collection.addLabel.call_args.args[0] == ["shortlist_alice"]
+
+    def test_stored_label_retries_a_transient_500_rather_than_losing_the_row(self, mock_plex: PlexClient, monkeypatch):
+        """A 5xx here makes the CALLER DELETE the row, so an un-retried wobble bins a good row.
+        SFLIX 2026-09-06: creating one collection needed four attempts under load."""
+        monkeypatch.setattr("shortlist.engine.clients.plex_pms.time.sleep", lambda _s: None)
+        collection = MagicMock()
+        collection.labels = []
+        calls = {"n": 0}
+
+        def _addLabel(tags):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise BadRequest("(500) internal_server_error; http://pms/1")
+            collection.labels = [SimpleNamespace(tag=x.title()) for x in tags]
+
+        collection.addLabel.side_effect = _addLabel
+
+        assert mock_plex.stored_label(collection, "shortlist_alice", extra="shortlist") == "Shortlist_Alice"
+        assert calls["n"] == 2, "the 500 must be retried, not surfaced as a lost row"
+
+    def test_stored_label_without_extra_is_unchanged(self, mock_plex: PlexClient):
+        """The backfill path still calls this with one label; it must behave exactly as before."""
+        collection = MagicMock()
+        collection.labels = []
+        collection.addLabel.side_effect = lambda tags: setattr(collection, "labels", [SimpleNamespace(tag="Shortlist")])
+
+        assert mock_plex.stored_label(collection, "shortlist") == "Shortlist"
+        assert collection.addLabel.call_args.args[0] == ["shortlist"]
 
     def test_order_collection_moves_only_displaced_items(self, mock_plex: PlexClient):
         """order_collection reorders with the FEWEST moveItem calls: only items out of place move,
@@ -1249,7 +1688,11 @@ class TestWatchedTitles:
         assert (item.title, item.tmdb_id, item.media_type) == ("Suits", 37680, MediaType.SHOW)
         assert (item.viewed_leaf_count, item.leaf_count) == (30, 134)
         assert item.watch_count == 30  # episodes watched drives a show's frequency weight
-        assert respx.calls.last.request.url.params["type"] == "2"  # show
+        params = respx.calls.last.request.url.params
+        assert params["type"] == "2"  # show
+        # `viewedLeafCount!=0`, never `unwatched=0` — see issue #108.
+        assert params["viewedLeafCount!"] == "0"
+        assert "unwatched" not in params
 
     @respx.mock
     def test_a_title_with_no_tmdb_guid_is_dropped(self, mock_plex: PlexClient):
@@ -1726,11 +2169,30 @@ class TestWatchedWindowCoverage:
         assert read.covers_window is False
 
     @respx.mock
-    def test_a_full_read_never_claims_window_coverage(self, mock_plex: PlexClient):
-        """There is no window to have covered, and the full path replaces the section outright."""
+    def test_a_complete_read_claims_coverage_when_it_reached_the_servers_own_total(self, mock_plex: PlexClient):
+        """A complete read's window is the whole library, and reaching `totalSize` proves it saw it.
+
+        This is what lets the cache replace the section. It used to be hardcoded False, so the
+        DESTRUCTIVE path — delete the section, reinsert what came back — ran on no proof at all.
+        """
         self._mock_url(mock_plex)
         respx.get(self._URL).mock(
             return_value=httpx.Response(200, text=self._page([(1, "Heat", self._NOW)], size=1, total=1))
+        )
+
+        read = mock_plex.watched_titles("1", MediaType.MOVIE, "TOK")
+
+        assert [i.title for i in read.items] == ["Heat"]
+        assert read.covers_window is True
+
+    @respx.mock
+    def test_a_complete_read_REFUSES_coverage_when_the_server_reported_no_total(self, mock_plex: PlexClient):
+        """The dangerous shape: a server that omits `totalSize` and caps the container answers a
+        SHORT page with a 200. Indistinguishable from a small library — so the walk cannot prove it
+        saw everything, and must not let the cache delete what it did not read."""
+        self._mock_url(mock_plex)
+        respx.get(self._URL).mock(
+            return_value=httpx.Response(200, text=self._page([(1, "Heat", self._NOW)], size=1, total=None))
         )
 
         read = mock_plex.watched_titles("1", MediaType.MOVIE, "TOK")
@@ -1802,6 +2264,611 @@ class TestWatchedWindowCoverage:
         with sessions() as session:
             titles = {r.title for r in session.query(WatchedTitle).all()}
         assert titles == {"Newest", "Older"}, "a title the walk never reached was deleted as an un-watch"
+
+    @respx.mock
+    def test_a_truncated_COMPLETE_read_does_not_wipe_the_section(self, mock_plex, tmp_path):
+        """The twin of the test above, on the more destructive path.
+
+        A complete read DELETES the section and reinserts what came back, so a short page answered
+        with a 200 — the shape a server that omits `totalSize` and caps the container produces — used
+        to erase every title behind it and stamp the sync a success. Now the delete waits for proof,
+        and an unproven read tops up instead.
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from shortlist.server.db.models import User, WatchedTitle, WatchSyncState
+        from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
+        from shortlist.server.services.watch_cache import WatchCache
+
+        run_migrations(tmp_path)
+        sessions = make_session_factory(make_engine(tmp_path))
+        with sessions() as session:
+            user = User(username="sarah", slug="sarah", plex_account_id=1, user_type="shared", enabled=True)
+            session.add(user)
+            session.commit()
+            user_id = user.id
+
+        cache = WatchCache(sessions)
+        person = SimpleNamespace(username="sarah", slug="sarah")
+        everything = [(1, "Newest", self._NOW), (2, "Older", self._NOW - 100)]
+        self._mock_url(mock_plex)
+
+        def complete_read(now=None):
+            with sessions() as session:
+                cache.sync_section(
+                    session,
+                    person,
+                    user_id,
+                    "1",
+                    MediaType.MOVIE,
+                    lambda since: mock_plex.watched_titles("1", MediaType.MOVIE, "TOK", since=since),
+                    force_full=True,
+                    now=now,
+                )
+                session.commit()
+
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._page(everything, size=2, total=2)))
+        complete_read()
+        with sessions() as session:
+            assert {r.title for r in session.query(WatchedTitle).all()} == {"Newest", "Older"}
+            stamped = session.query(WatchSyncState).one().last_full_at
+
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._page(everything[:1], size=1, total=None)))
+        complete_read(now=datetime.now(UTC) + timedelta(seconds=1))
+
+        with sessions() as session:
+            assert {r.title for r in session.query(WatchedTitle).all()} == {"Newest", "Older"}, (
+                "an unproven complete read wiped a title nobody un-watched"
+            )
+            assert session.query(WatchSyncState).one().last_full_at == stamped, (
+                "an unproven complete read reset the clock on the reconcile it never did"
+            )
+
+    @respx.mock
+    def test_an_incremental_read_LOSES_a_series_whose_show_date_lagged_its_episodes(self, mock_plex):
+        """Issue #108, at the seam that causes it — the reason the sync now always reads complete.
+
+        A show's own `lastViewedAt` can be OLDER than the episodes it counts (measured on a live
+        server: 2 of the 25 most recent). Marking a series watched changes every episode; if the show
+        row's date does not move with them, the row sorts behind the cursor, the walk stops at the
+        cutoff, and the finished series is never returned. It then stayed invisible until the weekly
+        complete read. Movies cannot drift this way — there is no second level — which is exactly
+        what the reporter saw.
+        """
+        self._mock_url(mock_plex)
+        # `Just Finished` is 20/20 watched but still carries last month's date, because its episodes
+        # moved and it did not. `Watched Normally` is newer, so the cursor sits past the stale row.
+        stale = (
+            f'<Directory ratingKey="5002" type="show" title="Just Finished" year="2021" '
+            f'leafCount="20" viewedLeafCount="20" lastViewedAt="{self._NOW - 2_600_000}">'
+            '<Guid id="tmdb://222"/></Directory>'
+        )
+        recent = (
+            f'<Directory ratingKey="5001" type="show" title="Watched Normally" year="2020" '
+            f'leafCount="10" viewedLeafCount="4" lastViewedAt="{self._NOW}">'
+            '<Guid id="tmdb://111"/></Directory>'
+        )
+        body = f'<MediaContainer size="2" totalSize="2">{recent}{stale}</MediaContainer>'
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=body))
+
+        complete = mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+        incremental = self._read(mock_plex, body, since_ago=1000)
+
+        assert {i.tmdb_id for i in complete.items} == {111, 222}, "a complete read sees the finished series"
+        assert 222 not in {i.tmdb_id for i in incremental.items}, "an incremental read stops short of it"
+
+    @respx.mock
+    def test_an_incremental_read_RETURNS_a_show_with_no_date_at_all(self, mock_plex):
+        """The same failure from the other direction, kept because the code guards it explicitly.
+
+        A row with no `lastViewedAt` is dated 1970 by `_watched_item`, so it can never clear a cutoff.
+        Two things follow, and they are separate. It must not END the walk — a data gap behind which
+        everything is silently dropped reads exactly like a quiet night. And it must still be
+        RETURNED: the full read dates such a show from its newest watched episode and caches that
+        recent date, so a later incremental read that omitted the row would put it inside
+        `_drop_vanished_since`'s window and absent from the answer, which is the definition of an
+        un-watch. The cache would delete a series the person had just marked watched — #108 again,
+        by a different route. `viewedLeafCount!=0` already proved it watched; there is nothing to
+        weigh up.
+        """
+        self._mock_url(mock_plex)
+        undated = (
+            '<Directory ratingKey="5002" type="show" title="No Date" year="2021" '
+            'leafCount="20" viewedLeafCount="20"><Guid id="tmdb://222"/></Directory>'
+        )
+        recent = (
+            f'<Directory ratingKey="5001" type="show" title="Watched Normally" year="2020" '
+            f'leafCount="10" viewedLeafCount="4" lastViewedAt="{self._NOW}">'
+            '<Guid id="tmdb://111"/></Directory>'
+        )
+        body = f'<MediaContainer size="2" totalSize="2">{recent}{undated}</MediaContainer>'
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=body))
+
+        complete = mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+        incremental = self._read(mock_plex, body, since_ago=1000)
+
+        assert {i.tmdb_id for i in complete.items} == {111, 222}
+        assert 222 in {i.tmdb_id for i in incremental.items}, (
+            "the undated show was dropped — a later reconcile reads that as an un-watch and deletes it"
+        )
+        assert incremental.covers_window is True, "the gap must not make the walk claim a truncated read"
+
+    @respx.mock
+    def test_a_watched_title_with_no_tmdb_guid_is_COUNTED_not_silently_dropped(self, mock_plex):
+        """A title Plex returns that carries no `tmdb://` guid can never be matched, so it is skipped
+        — and until now that happened in total silence.
+
+        It is the failure mode with no symptom: the person really has watched the thing, Shortlist
+        goes on recommending it back to them, and the log reads "1 titles" rather than "1 of 2". A
+        library matched with the legacy TheTVDB agent yields `tvdb://` for EVERY title, so this is a
+        whole library disappearing, not a stray row. Reported on issue #108 by someone whose TV shows
+        never appeared while their movies did.
+        """
+        self._mock_url(mock_plex)
+        matched = (
+            f'<Directory ratingKey="1" type="show" title="Matched" year="2020" leafCount="4" '
+            f'viewedLeafCount="4" lastViewedAt="{self._NOW}"><Guid id="tmdb://111"/></Directory>'
+        )
+        tvdb_only = (
+            f'<Directory ratingKey="2" type="show" title="TVDB Only" year="2019" leafCount="6" '
+            f'viewedLeafCount="6" lastViewedAt="{self._NOW - 500}"><Guid id="tvdb://999"/></Directory>'
+        )
+        respx.get(self._URL).mock(
+            return_value=httpx.Response(
+                200, text=f'<MediaContainer size="2" totalSize="2">{matched}{tvdb_only}</MediaContainer>'
+            )
+        )
+
+        read = mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+
+        assert [i.tmdb_id for i in read.items] == [111]
+        assert read.dropped_no_guid == 1, "the unmatched title was dropped without being counted"
+
+    @respx.mock
+    def test_a_healthy_library_reports_no_drops(self, mock_plex):
+        """So the count means something when it is non-zero."""
+        self._mock_url(mock_plex)
+        row = (
+            f'<Directory ratingKey="1" type="show" title="Matched" year="2020" leafCount="4" '
+            f'viewedLeafCount="4" lastViewedAt="{self._NOW}"><Guid id="tmdb://111"/></Directory>'
+        )
+        respx.get(self._URL).mock(
+            return_value=httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{row}</MediaContainer>')
+        )
+
+        assert mock_plex.watched_titles("2", MediaType.SHOW, "TOK").dropped_no_guid == 0
+
+    @respx.mock
+    def test_the_show_read_asks_for_viewedLeafCount_not_unwatched(self, mock_plex):
+        """Issue #108, at the seam that causes it.
+
+        `unwatched=0` filters on the SHOW's own watch-state row, which marking a series or a season
+        never establishes — so a series someone has finished is absent from that read while its
+        episode counts are perfectly correct. Measured on two independent servers: `unwatched=0`
+        returned 533 shows where `viewedLeafCount!=0` returned 491, matching the episode-level truth
+        exactly in both directions, with 20 shows missing from `unwatched=0` altogether.
+
+        A MOVIE library still uses `unwatched=0` — a film has no episodes beneath it, so there is no
+        second record to go missing, which is exactly why movies were never affected.
+        """
+        self._mock_url(mock_plex)
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._page([], size=0, total=0)))
+
+        mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+        show_params = respx.calls.last.request.url.params
+        mock_plex.watched_titles("1", MediaType.MOVIE, "TOK")
+        movie_params = respx.calls.last.request.url.params
+
+        assert show_params["viewedLeafCount!"] == "0" and "unwatched" not in show_params
+        assert movie_params["unwatched"] == "0" and "viewedLeafCount!" not in movie_params
+
+    @respx.mock
+    def test_the_show_filter_reaches_the_wire_UNENCODED(self, mock_plex):
+        """Plex's filter OPERATOR lives in the key, and httpx percent-encodes keys.
+
+        `params={"viewedLeafCount!": 0}` goes out as `viewedLeafCount%21=0`. The maintainer's server
+        decodes that and answers identically (measured, 491 either way), but plexapi's own `joinArgs`
+        encodes only the VALUE for exactly this reason, and a server that did not decode it would
+        ignore the filter and return the WHOLE library — 4,880 rows against 491, per person, per
+        library, per sync, silently.
+
+        Asserts the RAW query, not `url.params`: that view percent-DECODES, so it reports
+        `viewedLeafCount%21=0` as `{"viewedLeafCount!": "0"}` and cannot tell the two apart. Every
+        other test here, and the fake, are blind to this for the same reason.
+        """
+        self._mock_url(mock_plex)
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._page([], size=0, total=0)))
+
+        mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+
+        raw = respx.calls.last.request.url.query.decode()
+        assert "viewedLeafCount!=0" in raw, f"the filter was mangled on the wire: {raw}"
+        assert "%21" not in raw
+
+    @respx.mock
+    def test_a_server_that_IGNORES_the_filter_still_gives_the_right_answer(self, mock_plex):
+        """The hazard this endpoint is known for: a query param silently ignored, answered with a 200
+        carrying the FULL library. Here that is the worst failure available — every show in the
+        library would read as watched and nothing would ever be recommended again.
+
+        So the filter is applied client-side as well. An honoured filter just means fewer rows crossed
+        the wire; an ignored one costs bandwidth and nothing else.
+        """
+        watched = (
+            f'<Directory ratingKey="5001" type="show" title="Watched" year="2020" leafCount="10" '
+            f'viewedLeafCount="4" lastViewedAt="{self._NOW}"><Guid id="tmdb://111"/></Directory>'
+        )
+        never_touched = (
+            '<Directory ratingKey="5002" type="show" title="Never Touched" year="2019" '
+            'leafCount="8" viewedLeafCount="0"><Guid id="tmdb://222"/></Directory>'
+        )
+        no_attribute_at_all = (
+            '<Directory ratingKey="5003" type="show" title="No Counts" year="2018" leafCount="6">'
+            '<Guid id="tmdb://333"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+        body = watched + never_touched + no_attribute_at_all
+        respx.get(self._URL).mock(
+            return_value=httpx.Response(200, text=f'<MediaContainer size="3" totalSize="3">{body}</MediaContainer>')
+        )
+
+        items = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items
+
+        assert [i.tmdb_id for i in items] == [111], "a show with no watched episodes was counted as watched"
+
+    @respx.mock
+    def test_a_series_marked_watched_comes_back_even_with_no_show_level_stamp(self, mock_plex):
+        """The reporter's exact case, as the server actually reports it: episode counts complete,
+        no `lastViewedAt` on the show at all. Verified live — MooHouse/Rabbit Hole read
+        `viewedLeafCount=8 leafCount=8 lastViewedAt=None` and was absent from `unwatched=0`."""
+        marked = (
+            '<Directory ratingKey="5001" type="show" title="Rabbit Hole" year="2023" '
+            'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://156819"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+        respx.get(self._URL).mock(
+            return_value=httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{marked}</MediaContainer>')
+        )
+
+        item = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items[0]
+
+        assert (item.title, item.tmdb_id) == ("Rabbit Hole", 156819)
+        assert (item.viewed_leaf_count, item.leaf_count) == (8, 8)
+        assert item.watch_count == 8
+
+    @respx.mock
+    def test_a_show_with_no_watch_date_takes_its_newest_EPISODE_date(self, mock_plex):
+        """Marking a series watched sets the episodes and leaves the show with no `lastViewedAt`, so
+        `_watched_item` has to date it 1970 — and that is not a cosmetic wrong.
+
+        `watched_at` drives seed recency (a 1970 date weighs zero, so the show never seeds again) and
+        the effectiveness report, which showed a series finished minutes ago as "finished 20697d
+        ago". Reported on #108 after the episode roll-up was removed.
+        """
+        marked = (
+            '<Directory ratingKey="5001" type="show" title="Just Marked" year="2023" '
+            'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://111"/></Directory>'
+        )
+        eps = "".join(
+            f'<Video ratingKey="{900 + n}" type="episode" title="Ep{n}" viewCount="1" '
+            f'grandparentRatingKey="5001" lastViewedAt="{self._NOW - n * 60}"/>'
+            for n in range(3)
+        )
+        self._mock_url(mock_plex)
+
+        def answer(request):
+            body, size = (eps, 3) if request.url.params.get("type") == "4" else (marked, 1)
+            return httpx.Response(200, text=f'<MediaContainer size="{size}" totalSize="{size}">{body}</MediaContainer>')
+
+        respx.get(self._URL).mock(side_effect=answer)
+
+        item = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items[0]
+
+        assert int(item.watched_at.timestamp()) == self._NOW, "the show kept the epoch instead of its episode date"
+
+    @respx.mock
+    def test_a_show_that_ALREADY_has_a_date_costs_no_episode_read(self, mock_plex):
+        """The episode read is a repair, not a routine second call. A library whose shows all carry a
+        date must not pay for it — on a real server that is 472 of 491 shows."""
+        dated = (
+            f'<Directory ratingKey="5001" type="show" title="Watched Normally" year="2020" '
+            f'leafCount="8" viewedLeafCount="8" lastViewedAt="{self._NOW}"><Guid id="tmdb://111"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+        respx.get(self._URL).mock(
+            return_value=httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{dated}</MediaContainer>')
+        )
+
+        mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+
+        types = [c.request.url.params.get("type") for c in respx.calls]
+        assert "4" not in types, f"an episode read was made for a library that needed none: {types}"
+
+    @respx.mock
+    def test_a_show_no_episode_can_date_keeps_the_epoch_rather_than_a_guess(self, mock_plex):
+        """17 of 19 undated shows on a real server had no watched episodes either — nothing anywhere
+        knows when they were watched. Saying so beats inventing a date."""
+        marked = (
+            '<Directory ratingKey="5001" type="show" title="No Date Anywhere" year="2023" '
+            'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://111"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+
+        def answer(request):
+            body, size = ("", 0) if request.url.params.get("type") == "4" else (marked, 1)
+            return httpx.Response(200, text=f'<MediaContainer size="{size}" totalSize="{size}">{body}</MediaContainer>')
+
+        respx.get(self._URL).mock(side_effect=answer)
+
+        item = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items[0]
+        assert item.watched_at == datetime(1970, 1, 1, tzinfo=UTC)
+
+    @respx.mock
+    def test_the_recorded_episode_shape_dates_the_show_it_rolls_up_to(self, mock_plex):
+        """Replayed from the real recording rather than hand-built XML (testing.md).
+
+        `pms_watched_episodes_rollup.xml.txt` is the response this read actually gets — the fold has
+        to survive its real attribute set, not a three-attribute stand-in.
+        """
+        raw = (FIXTURES / "pms_watched_episodes_rollup.xml.txt").read_text()
+        eps_root = ET.fromstring(raw[raw.index("<MediaContainer") :])
+        # The recording keeps the real server's totalSize (9563) above a SAMPLE of its rows. Left as
+        # recorded, the walk would page for a total that never arrives; the rows are the point here,
+        # not the count, so make the container describe what it actually carries.
+        eps_root.set("size", str(len(list(eps_root))))
+        eps_root.set("totalSize", str(len(list(eps_root))))
+        episodes = ET.tostring(eps_root, encoding="unicode")
+        leaves = [el for el in eps_root if el.get("grandparentRatingKey") and el.get("lastViewedAt")]
+        assert leaves, "the fixture no longer carries dated episodes — this test proves nothing"
+        show_key = leaves[0].get("grandparentRatingKey")
+        newest = max(int(el.get("lastViewedAt")) for el in leaves if el.get("grandparentRatingKey") == show_key)
+        marked = (
+            f'<Directory ratingKey="{show_key}" type="show" title="From The Fixture" year="2023" '
+            f'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://111"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+
+        def answer(request):
+            if request.url.params.get("type") == "4":
+                return httpx.Response(200, text=episodes)
+            return httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{marked}</MediaContainer>')
+
+        respx.get(self._URL).mock(side_effect=answer)
+
+        item = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items[0]
+
+        assert int(item.watched_at.timestamp()) == newest
+
+    @respx.mock
+    def test_a_failed_episode_read_leaves_the_epoch_rather_than_losing_the_show(self, mock_plex):
+        """The repair is best-effort: losing it must cost the DATE, never the row or the coverage.
+
+        `covers_window` gates deletion, so a 404 on this secondary read must not make the primary
+        read look incomplete — and the item must still come back, or the show vanishes from the
+        watched set and is recommended straight back.
+        """
+        marked = (
+            '<Directory ratingKey="5001" type="show" title="Just Marked" year="2023" '
+            'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://111"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+
+        def answer(request):
+            if request.url.params.get("type") == "4":
+                return httpx.Response(404)
+            return httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{marked}</MediaContainer>')
+
+        respx.get(self._URL).mock(side_effect=answer)
+
+        read = mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+
+        assert [i.title for i in read.items] == ["Just Marked"], "a failed date repair lost the row itself"
+        assert read.covers_window is True, "a failed date repair made the primary read look incomplete"
+        assert read.items[0].watched_at == datetime(1970, 1, 1, tzinfo=UTC)
+
+    @respx.mock
+    def test_the_newest_episode_date_is_found_on_a_LATER_page(self, mock_plex):
+        """The episode list is not ordered by `lastViewedAt`, so the answer can be on any page.
+
+        Stopping early here does not fail loudly — it produces an older date that looks perfectly
+        plausible, which is why the walk pages on the reported total rather than on a full page.
+        """
+        marked = (
+            '<Directory ratingKey="5001" type="show" title="Just Marked" year="2023" '
+            'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://111"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+        page_size = mock_plex._WATCHED_PAGE
+
+        def answer(request):
+            if request.url.params.get("type") != "4":
+                return httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{marked}</MediaContainer>')
+            start = int(request.headers["X-Plex-Container-Start"])
+            # Page 1 is full and OLD; the newest stamp is the single row on page 2.
+            if start == 0:
+                rows = "".join(
+                    f'<Video ratingKey="{900 + n}" type="episode" title="Ep{n}" viewCount="1" '
+                    f'grandparentRatingKey="5001" lastViewedAt="{self._NOW - 99999}"/>'
+                    for n in range(page_size)
+                )
+                return httpx.Response(
+                    200, text=f'<MediaContainer size="{page_size}" totalSize="{page_size + 1}">{rows}</MediaContainer>'
+                )
+            row = (
+                f'<Video ratingKey="9999" type="episode" title="Newest" viewCount="1" '
+                f'grandparentRatingKey="5001" lastViewedAt="{self._NOW}"/>'
+            )
+            return httpx.Response(
+                200, text=f'<MediaContainer size="1" totalSize="{page_size + 1}">{row}</MediaContainer>'
+            )
+
+        respx.get(self._URL).mock(side_effect=answer)
+
+        item = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items[0]
+
+        assert int(item.watched_at.timestamp()) == self._NOW, "the walk stopped before the newest episode"
+
+    @respx.mock
+    def test_a_server_that_caps_the_page_and_reports_no_total_gets_no_date_at_all(self, mock_plex):
+        """The truncation case, and the reason a short page cannot mean "the end" here.
+
+        A server that omits `totalSize` and caps the container below what we asked for answers EVERY
+        page short. Reading a short page as the end stops after one, and since the episode list is
+        unordered that first slice dates every show arbitrarily far in the past — a wrong date that
+        looks entirely plausible. An absent date says "unknown" and weighs zero; that is the honest
+        answer, so the walk keeps going until the server actually returns nothing.
+        """
+        marked = (
+            '<Directory ratingKey="5001" type="show" title="Just Marked" year="2023" '
+            'leafCount="8" viewedLeafCount="8"><Guid id="tmdb://111"/></Directory>'
+        )
+        self._mock_url(mock_plex)
+        cap = 200
+
+        def answer(request):
+            if request.url.params.get("type") != "4":
+                return httpx.Response(200, text=f'<MediaContainer size="1" totalSize="1">{marked}</MediaContainer>')
+            start = int(request.headers["X-Plex-Container-Start"])
+            # Caps at 200 however much is asked for, and NEVER reports a total — so no page is ever
+            # empty and no page is ever full. Nothing in the response can prove the end.
+            rows = "".join(
+                f'<Video ratingKey="{start + n}" type="episode" title="Ep" viewCount="1" '
+                f'grandparentRatingKey="5001" lastViewedAt="{self._NOW - 99999}"/>'
+                for n in range(cap)
+            )
+            return httpx.Response(200, text=f'<MediaContainer size="{cap}">{rows}</MediaContainer>')
+
+        respx.get(self._URL).mock(side_effect=answer)
+
+        read = mock_plex.watched_titles("2", MediaType.SHOW, "TOK")
+
+        assert read.items[0].watched_at == datetime(1970, 1, 1, tzinfo=UTC), (
+            "dated the show from a truncated, unordered slice of its episodes"
+        )
+        episode_calls = [c for c in respx.calls if c.request.url.params.get("type") == "4"]
+        assert len(episode_calls) == mock_plex._EPISODE_PAGE_LIMIT, "the safety stop did not bound the walk"
+
+
+class TestDatingAShowFromItsEpisodes:
+    """`newest_episode_dates` — the repair for a show Plex re-counted without re-dating (#108).
+
+    Everything here is pinned to `pms_all_leaves.xml.txt`, recorded off a real server, because the
+    two behaviours that make this hard are both invisible from the code: the endpoint ignores
+    `unwatched=0`, and a part-watched episode carries a `lastViewedAt` with no `viewCount`.
+    """
+
+    _URL = "http://pms:32400/library/metadata/460767/allLeaves"
+
+    @staticmethod
+    def _fixture() -> str:
+        raw = (FIXTURES / "pms_all_leaves.xml.txt").read_text()
+        return raw[raw.index("<MediaContainer") :]
+
+    @respx.mock
+    def test_a_part_watched_episode_does_not_date_the_show(self, mock_plex):
+        """The trap the recording caught on the FIRST real show it was tried against.
+
+        Episode 2 was started and abandoned: `viewOffset`, `lastViewedAt`, no `viewCount`. Its stamp
+        is NEWER than the only episode actually watched, and it is not counted in the show's
+        `viewedLeafCount` either — so `max(lastViewedAt)` across all episodes dates the show from an
+        episode nobody finished.
+        """
+        mock_plex._server.url.return_value = self._URL
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._fixture()))
+
+        dates = mock_plex.newest_episode_dates("2", "TOK", {460767})
+
+        watched, abandoned = 1637199585, 1637560154
+        assert int(dates[460767].timestamp()) == watched, (
+            "dated the show from a part-watched episode — the newer stamp belongs to one nobody finished"
+        )
+        assert int(dates[460767].timestamp()) != abandoned
+
+    @respx.mock
+    def test_it_sends_page_headers_so_the_server_reports_a_total(self, mock_plex):
+        """`totalSize` is absent unless a container size is asked for, and without it a 1,175-episode
+        show is one 3.6MB response with nothing to prove the walk finished (both measured)."""
+        mock_plex._server.url.return_value = self._URL
+        respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._fixture()))
+
+        mock_plex.newest_episode_dates("2", "TOK", {460767})
+
+        headers = respx.calls.last.request.headers
+        assert headers["X-Plex-Container-Size"] == str(mock_plex._WATCHED_PAGE)
+        assert headers["X-Plex-Container-Start"] == "0"
+
+    @respx.mock
+    def test_no_shows_asked_for_means_no_request_at_all(self, mock_plex):
+        """The whole point of detecting WHICH shows are stale: a quiet night must cost nothing."""
+        mock_plex._server.url.return_value = self._URL
+        route = respx.get(self._URL).mock(return_value=httpx.Response(200, text=self._fixture()))
+
+        assert mock_plex.newest_episode_dates("2", "TOK", set()) == {}
+        assert not route.called
+
+    @respx.mock
+    def test_many_stale_shows_switch_to_one_library_wide_read(self, mock_plex):
+        """Past a dozen shows, one library read beats a call each — 2.8s against 1.1s for the show
+        read on a 9,563-episode library, so a call per show overtakes it quickly."""
+        section_url = "http://pms:32400/library/sections/2/all"
+        mock_plex._server.url.return_value = section_url
+        wanted = set(range(700, 700 + mock_plex._PER_SHOW_DATE_LIMIT + 1))
+        rows = "".join(
+            f'<Video ratingKey="{9000 + n}" type="episode" viewCount="1" '
+            f'grandparentRatingKey="{key}" lastViewedAt="{1_700_000_000 + n}"/>'
+            for n, key in enumerate(sorted(wanted))
+        )
+        route = respx.get(section_url).mock(
+            return_value=httpx.Response(
+                200, text=f'<MediaContainer size="{len(wanted)}" totalSize="{len(wanted)}">{rows}</MediaContainer>'
+            )
+        )
+
+        dates = mock_plex.newest_episode_dates("2", "TOK", wanted)
+
+        assert len(route.calls) == 1, "made a request per show instead of one library-wide read"
+        assert route.calls.last.request.url.params.get("type") == "4"
+        assert set(dates) == wanted
+
+    @respx.mock
+    def test_both_paths_agree_about_the_same_show(self, mock_plex):
+        """The per-show and library-wide paths must never date one show differently.
+
+        The per-show path filters on `viewCount` client-side because this endpoint family cannot be
+        trusted to filter. The bulk path used to lean on the server's `unwatched=0` instead — so the
+        two disagreed by four days on the commit's own recorded rows, and the bulk path picked the
+        episode nobody finished. This server does exclude those, but `viewedLeafCount!=0` and
+        `lastViewedAt>=` are both silently ignored by it, so the guard belongs in our code.
+        """
+        watched, abandoned = 1637199585, 1637560154
+        section_url = "http://pms:32400/library/sections/2/all"
+        mock_plex._server.url.return_value = section_url
+        # The server hands back BOTH, as an ignored filter would.
+        rows = (
+            f'<Video ratingKey="1" type="episode" grandparentRatingKey="460767" viewCount="1" '
+            f'lastViewedAt="{watched}"/>'
+            f'<Video ratingKey="2" type="episode" grandparentRatingKey="460767" viewOffset="1058389" '
+            f'lastViewedAt="{abandoned}"/>'
+        )
+        respx.get(section_url).mock(
+            return_value=httpx.Response(200, text=f'<MediaContainer size="2" totalSize="2">{rows}</MediaContainer>')
+        )
+
+        bulk = mock_plex._newest_episode_stamps("2", "TOK")
+
+        assert bulk[460767] == watched, "the bulk fold dated a show from a part-watched episode"
+
+    @respx.mock
+    def test_one_unreadable_show_does_not_cost_the_others_their_dates(self, mock_plex):
+        mock_plex._server.url.side_effect = lambda path, **k: f"http://pms:32400{path}"
+        respx.get("http://pms:32400/library/metadata/1/allLeaves").mock(return_value=httpx.Response(500))
+        respx.get("http://pms:32400/library/metadata/460767/allLeaves").mock(
+            return_value=httpx.Response(200, text=self._fixture())
+        )
+
+        dates = mock_plex.newest_episode_dates("2", "TOK", {1, 460767})
+
+        assert set(dates) == {460767}, "one failing show took the others' dates with it"
 
 
 class TestScrobbleAs:
@@ -1905,10 +2972,17 @@ class TestTheRecordedShowLibraryResponse:
         assert len(finished) == 5, "five of ten started shows did not count as watched"
 
     @respx.mock
-    def test_a_bulk_mark_as_played_carries_no_last_viewed_stamp(self, mock_plex: PlexClient):
-        """Recorded because it decides a real behaviour: `_watched_item` stamps a row with no
-        `lastViewedAt` as 1970, which an INCREMENTAL read then skips — so a bulk mark-as-played is
-        only ever picked up by the periodic full read."""
+    def test_a_finished_show_can_carry_NO_watched_stamp_at_all(self, mock_plex: PlexClient):
+        """Issue #108's shape, measured 20 times on a live server.
+
+        A show can have complete, correct episode counts and no `lastViewedAt` on its own row —
+        which is what happens when a series or season is marked watched rather than an episode
+        played. `?type=2&unwatched=0` filters on that stamp, so such a show never comes back from it
+        at all; the episode-level read is what recovers it.
+
+        This test previously asserted the opposite, after a probe "disproved" the shape by asking
+        `?type=2&unwatched=0` which of its rows lacked the stamp — the one query that excludes them.
+        """
         from datetime import UTC, datetime
 
         mock_plex._server.url.return_value = self._URL
@@ -1916,9 +2990,9 @@ class TestTheRecordedShowLibraryResponse:
 
         items = mock_plex.watched_titles("2", MediaType.SHOW, "TOK").items
 
-        marked = next(i for i in items if i.tmdb_id == 300006)
-        assert marked.watched_at == datetime(1970, 1, 1, tzinfo=UTC)
-        assert (marked.viewed_leaf_count, marked.leaf_count) == (100, 100)
+        finished = next(i for i in items if i.tmdb_id == 300006)
+        assert (finished.viewed_leaf_count, finished.leaf_count) == (100, 100), "the show is finished"
+        assert finished.watched_at == datetime(1970, 1, 1, tzinfo=UTC), "no stamp of its own"
 
 
 class TestTheRecordedUserRatingResponse:

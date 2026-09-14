@@ -14,6 +14,7 @@ import {
   formatDate,
   timeAgo,
   timeFromCron,
+  triggerLabel,
   weekStarting,
 } from "@/lib/format";
 
@@ -172,6 +173,21 @@ describe("small formatters", () => {
     expect(formatHitRate(1)).toBe("100%");
   });
 
+  it("formatHitRate withholds a zero until picks have had time to be watched", () => {
+    // Day one: every person's lifetime rate is 0 because no pick has had its chance yet, so the
+    // Users column read "0%" for everybody — a verdict, from a measurement that has not happened.
+    // The dashboard already withholds its own landing rate on exactly this rule.
+    expect(formatHitRate(0, false)).toBe("—");
+    // A zero once picks ARE old enough is a real finding and must show.
+    expect(formatHitRate(0, true)).toBe("0%");
+    // Non-zero always shows: somebody watched something, whatever the calendar says.
+    expect(formatHitRate(0.5, false)).toBe("50%");
+    // No picks at all is still an em dash, matured or not.
+    expect(formatHitRate(null, true)).toBe("—");
+    // Callers that cannot know keep the old behaviour rather than hiding real zeroes.
+    expect(formatHitRate(0)).toBe("0%");
+  });
+
   it("runElapsedMs measures finished − started, and is null while running or reversed", () => {
     const start = "2026-07-19T03:30:00Z";
     expect(runElapsedMs(start, "2026-07-19T03:52:30Z")).toBe(22.5 * 60 * 1000);
@@ -255,7 +271,6 @@ describe("buildLabel", () => {
   });
 });
 
-
 describe("formatDate", () => {
   // Nothing imported this function. Every mutation to it survived — both sentinels, the year and
   // month formats, and inverting `dateOnly`, which is the whole reason the option exists.
@@ -291,7 +306,10 @@ describe("timeAgo — the bucket boundaries", () => {
   // sits on an edge, so "exactly 60 seconds" could read "just now" and "exactly 24h" could read
   // "24h ago".
   const at = (secondsAgo: number) =>
-    timeAgo(new Date(Date.UTC(2026, 0, 2, 0, 0, 0) - secondsAgo * 1000).toISOString(), Date.UTC(2026, 0, 2));
+    timeAgo(
+      new Date(Date.UTC(2026, 0, 2, 0, 0, 0) - secondsAgo * 1000).toISOString(),
+      Date.UTC(2026, 0, 2),
+    );
 
   it("flips from 'just now' to minutes at exactly one minute", () => {
     expect(at(59)).toBe("just now");
@@ -306,5 +324,18 @@ describe("timeAgo — the bucket boundaries", () => {
   it("flips from hours to days at exactly one day", () => {
     expect(at(23 * 3600)).toBe("23h ago");
     expect(at(24 * 3600)).toBe("1d ago");
+  });
+});
+
+describe("triggerLabel", () => {
+  // The server's own words. The map was keyed on "scheduled" and "cron", which no run carries, so every
+  // nightly run read as a bare lowercase "schedule".
+  it.each([
+    ["schedule", "Scheduled"],
+    ["manual", "Manual"],
+    ["wizard", "Setup"],
+    ["resume", "Resumed after a restart"],
+  ])("says %s as %s", (trigger, label) => {
+    expect(triggerLabel(trigger)).toBe(label);
   });
 });

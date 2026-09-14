@@ -39,7 +39,9 @@ export const CURATOR_PROVIDERS: readonly CuratorProviderInfo[] = [
     id: "anthropic",
     label: "Claude",
     glyph: "anthropic",
-    defaultModel: "claude-haiku-4-5-20251001",
+    // Undated alias, matching the backend's DEFAULT_MODEL. A dated id rots on the provider's
+    // retirement schedule — which is exactly how `gemini-2.5-flash` below started 404ing.
+    defaultModel: "claude-haiku-4-5",
     needsKey: true,
     needsUrl: false,
     keyUrl: "https://console.anthropic.com/settings/keys",
@@ -49,7 +51,10 @@ export const CURATOR_PROVIDERS: readonly CuratorProviderInfo[] = [
     id: "openai",
     label: "OpenAI",
     glyph: "openai",
-    defaultModel: "gpt-5-mini",
+    // Must match DEFAULT_MODEL in shortlist/engine/curator/openai.py — the wizard WRITES this into
+    // `curator.model`, so a disagreement means two different defaults depending on how you set up.
+    // Measured 8x cheaper and 17x faster than gpt-5-mini for the same result; see that file.
+    defaultModel: "gpt-4o-mini",
     needsKey: true,
     needsUrl: false,
     keyUrl: "https://platform.openai.com/api-keys",
@@ -59,7 +64,9 @@ export const CURATOR_PROVIDERS: readonly CuratorProviderInfo[] = [
     id: "google",
     label: "Gemini",
     glyph: "google",
-    defaultModel: "gemini-2.5-flash",
+    // An alias, matching the backend's DEFAULT_MODEL. `gemini-2.5-flash` was here until Google
+    // retired it for new users, which 404'd every fresh Google setup on its first run.
+    defaultModel: "gemini-flash-latest",
     needsKey: true,
     needsUrl: false,
     keyUrl: "https://aistudio.google.com/apikey",

@@ -1,7 +1,7 @@
-import { AlertTriangle, CheckCircle2, Info } from "lucide-react";
-import { useState } from "react";
+import { AlertTriangle, CheckCircle2 } from "lucide-react";
 
 import { QueryBoundary } from "@/components/query-boundary";
+import { Why } from "@/components/why";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useEngagement } from "@/lib/queries";
@@ -166,40 +166,6 @@ function gaveUp(people: EngagementReport["people"]): Problem[] {
   }));
 }
 
-/**
- * The "why" behind a finding, behind an (i) rather than under it.
- *
- * These explanations were printed as a second grey line under every item, which doubled the height
- * of each and made the card's own findings harder to scan — the list is read at a glance and the
- * reasoning is consulted occasionally, so they do not deserve equal weight.
- *
- * A real `<button>`, not a `title` tooltip: a hover-only explanation does not exist on a phone, and
- * this app is read on one. Click or focus toggles it, `aria-expanded` says which, and the text lands
- * in the DOM where a screen reader can reach it rather than in an attribute it may skip.
- */
-export function Why({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <>
-      {" "}
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        aria-label={open ? "Hide why" : "Why?"}
-        className="inline-flex translate-y-px items-center rounded-full text-muted-foreground/60 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <Info className="h-3.5 w-3.5" aria-hidden="true" />
-      </button>
-      {open && (
-        <span className="mt-0.5 block text-xs leading-snug text-muted-foreground/70">
-          {text}
-        </span>
-      )}
-    </>
-  );
-}
-
 export function NeedsALook({
   report,
   reportWindow,
@@ -227,12 +193,38 @@ export function NeedsALook({
           skeleton={<Skeleton className="mt-3 h-16 w-full" />}
         >
           {(data) => {
+            // A maturity gate. `landing.rate === null` is the server saying no pick has had its full N
+            // days yet. Without it a five-minute-old install showed three amber warnings that nobody had
+            // watched anything. The card says so itself when it holds them back (below) — the Impact
+            // card that used to carry "Not enough time yet" now shows a viewing share instead.
+            // `?.` because an older report — or a caller that builds `overall` by hand — may carry no
+            // landing block at all. Absent is NOT the same as `null`: null is the server saying "too
+            // early to judge", absent is no opinion, and only the first may suppress a warning.
+            const tooEarly = report.overall.landing?.rate === null;
+            const idle = tooEarly ? null : idlePeople(report.coverage);
+            // Only when the line above covers EVERYONE. "3 of 3 people got picks and watched none"
+            // followed by one line per row saying the same of each row is one fact stated three
+            // ways. When only SOME people are idle, the per-row breakdown says which rows — which is
+            // new information and the reason this list exists.
+            const idleCoversEveryone =
+              idle !== null &&
+              report.coverage.users_idle === report.coverage.users_with_picks;
             const problems = [
-              idlePeople(report.coverage),
-              ...deadRows(report.per_row),
+              idle,
+              ...(tooEarly || idleCoversEveryone
+                ? []
+                : deadRows(report.per_row)),
               unwatchedRequests(report.requests),
               ...gaveUp(data.people),
             ].filter((p): p is Problem => p !== null);
+            const tooEarlyNote = tooEarly ? (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Too early to say who isn&rsquo;t watching: a pick gets{" "}
+                {report.overall.landing?.matured_days ?? 30} days before it
+                counts.
+              </p>
+            ) : null;
+            if (problems.length === 0 && tooEarly) return tooEarlyNote;
             if (problems.length === 0) {
               // The verdict card above totals EVERY abandonment, this list leaves out the ones under
               // 5% — so on a day whose only give-ups were bounces, a bare "everyone watched
@@ -255,22 +247,25 @@ export function NeedsALook({
               );
             }
             return (
-              <ul className="mt-3 space-y-2">
-                {problems.map((problem) => (
-                  <li key={problem.key} className="flex items-start gap-2.5">
-                    <AlertTriangle
-                      className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary/70"
-                      aria-hidden="true"
-                    />
-                    <div className="min-w-0 text-sm text-muted-foreground">
-                      <p className="leading-snug">
-                        {problem.text}
-                        {problem.hint && <Why text={problem.hint} />}
-                      </p>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+              <>
+                <ul className="mt-3 space-y-2">
+                  {problems.map((problem) => (
+                    <li key={problem.key} className="flex items-start gap-2.5">
+                      <AlertTriangle
+                        className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary/70"
+                        aria-hidden="true"
+                      />
+                      <div className="min-w-0 text-sm text-muted-foreground">
+                        <p className="leading-snug">
+                          {problem.text}
+                          {problem.hint && <Why text={problem.hint} />}
+                        </p>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {tooEarlyNote}
+              </>
             );
           }}
         </QueryBoundary>

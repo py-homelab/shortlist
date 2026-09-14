@@ -337,6 +337,8 @@ async def debug_bundle(request: Request) -> str:
             "tmdb": bool(store.get("tmdb.apikey")),
             "curator": store.get("curator.provider"),
             "requests": bool(store.get("requests.enabled")),
+            "request_target": store.get("requests.target"),
+            "overseerr": bool(store.get("requests.overseerr.url")),
             "radarr": bool(store.get("requests.radarr.url")),
             "sonarr": bool(store.get("requests.sonarr.url")),
         }
@@ -467,9 +469,15 @@ async def libraries(request: Request) -> list[dict]:
 
 
 class LibraryCollectionOut(PassthroughModel):
-    """A candidate anchor title. Title only — the shelf is ordered by title, not by rating key."""
+    """A candidate anchor. Title, because the shelf is ordered by title, not by rating key — plus
+    whether it has a position on a Plex shelf at all, which decides if it can anchor anything."""
 
     title: str
+    #: False for ANY hub Plex reports as promoted nowhere, built-in or collection — it occupies no
+    #: position a viewer can see, so there is nothing to sit beside. Built-ins used to be exempt
+    #: ("the engine never refuses one"); it now does, because accepting one placed nothing at all and
+    #: said nothing about it. Both sides read `can_anchor`, so this can only drift if that does.
+    on_shelf: bool
 
 
 @_authed.get("/libraries/{key}/collections", response_model=list[LibraryCollectionOut])
@@ -490,7 +498,7 @@ async def library_collections(key: str, request: Request) -> list[dict]:
     how the reporter came to have one saved: the option was a flicker, and it never placed anything.
     The marker is in the title we already have, so it cannot fail that way.
     """
-    from shortlist.engine.clients.plex_pms import PlexClient, has_shortlist_marker
+    from shortlist.engine.clients.plex_pms import PlexClient, can_anchor, has_shortlist_marker
     from shortlist.server.settings_store import SettingsStore
 
     state = request.app.state
@@ -505,12 +513,27 @@ async def library_collections(key: str, request: Request) -> list[dict]:
         section = next((s for s in client.sections() if str(s.key) == key), None)
         if section is None:
             raise HTTPException(status_code=404, detail="library not found")
-        titles: list[str] = []
+        # `on_shelf` decides whether an anchor can work at all. `managedHubs()` lists every hub the
+        # library CAN manage, and a COLLECTION promoted nowhere has no position on the shelf —
+        # following it buries the row (issue #106), which is why the engine now refuses to. The editor
+        # still shows them, greyed out and labelled, rather than dropping them: an owner who cannot
+        # see the collection they picked last week has no way to tell "not on the shelf" from
+        # "deleted".
+        #
+        # `can_anchor` is the ENGINE's own predicate, imported rather than restated: this endpoint
+        # exists to predict what the ordering pass will do, and a second copy of the rule is a
+        # disagreement waiting to happen.
+        #
+        # OR-accumulated per title, because the engine scans every hub with that title and takes the
+        # first that can anchor. Two hubs CAN share one ("Top Rated" is both a stock Plex hub and a
+        # stock Kometa collection), and first-hub-wins would grey out an anchor that places fine.
+        seen: dict[str, bool] = {}
         for hub in section.managedHubs():
             title = getattr(hub, "title", "") or ""
-            if title and not has_shortlist_marker(title) and title not in titles:
-                titles.append(title)
-        return [{"title": t} for t in titles]
+            if not title or has_shortlist_marker(title):
+                continue
+            seen[title] = seen.get(title, False) or can_anchor(hub)
+        return [{"title": t, "on_shelf": on_shelf} for t, on_shelf in seen.items()]
 
     return await asyncio.get_running_loop().run_in_executor(
         None, lambda: _cached_plex_read(state, f"collections:{key}", read)
@@ -1010,7 +1033,14 @@ class BackupRestoredOut(PassthroughModel):
 
 @_authed.post("/backups/restore", response_model=BackupRestoredOut)
 async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dict:
-    """Restore from a named backup. The app will need to be restarted after.
+    """Queue a restore from a named backup. It is applied when the app next starts.
+
+    Not applied here: the running app has the database open, and swapping the file under its pooled
+    connections let the shutdown checkpoint write the old database back over the restored one, so the
+    restart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the
+    pre-restore copy there (so it holds everything written until the restart), and audits it in the
+    database it restored. Until then it can be seen and cancelled (`GET`/`DELETE` below), and one left
+    waiting for over a day is not applied.
 
     A restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a
     copy taken before a shared row's audience was narrowed puts the wider audience back, and the
@@ -1021,16 +1051,19 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
     So it is stated, in the response and in the audit trail (rule 10), rather than left to be
     discovered on someone's Home screen.
     """
-    from shortlist.server.services.backup import restore_backup
+    from shortlist.server.services.backup import request_restore
 
     state = request.app.state
-    ok = await asyncio.get_running_loop().run_in_executor(None, lambda: restore_backup(state.config_dir, body.name))
+    max_keep = _backup_limit(state)
+    ok = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: request_restore(state.config_dir, body.name, max_keep=max_keep)
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="backup not found")
     with state.sessions() as session:
         session.add(
             Event(
-                scope="backup.restore",
+                scope="backup.restore_requested",
                 level="warning",
                 message={"backup": body.name, "at": datetime.now(UTC).isoformat()},
             )
@@ -1038,7 +1071,10 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
         session.commit()
     return {
         "restored": body.name,
-        "message": "Restored. Restart the container to pick up the restored database.",
+        "message": (
+            "Ready to restore. Restart the container to swap this backup in; a copy of the current "
+            "database is saved first."
+        ),
         # Named separately from `message` so the UI can render it as a warning rather than a receipt.
         "privacy_note": (
             "This also restores who could see which rows at the time of the backup. If you have "
@@ -1046,6 +1082,54 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
             "next run — check Rows before restarting."
         ),
     }
+
+
+class PendingRestore(PassthroughModel):
+    backup: str
+    requested_at: str
+
+
+class PendingRestoreOut(PassthroughModel):
+    """The restore waiting for a restart, if any."""
+
+    pending: PendingRestore | None
+
+
+@_authed.get("/backups/restore", response_model=PendingRestoreOut)
+async def pending_restore_endpoint(request: Request) -> dict:
+    """The restore waiting for the next start, so the owner can see it is still to come, or cancel it."""
+    from shortlist.server.services.backup import pending_restore
+
+    return {"pending": pending_restore(request.app.state.config_dir)}
+
+
+@_authed.delete("/backups/restore", response_model=PendingRestoreOut)
+async def cancel_restore_endpoint(request: Request) -> dict:
+    """Cancel the restore waiting for the next start. Nothing has been changed yet, so nothing is undone."""
+    from shortlist.server.services.backup import cancel_restore
+
+    state = request.app.state
+    cancelled = cancel_restore(state.config_dir)
+    if cancelled is not None:
+        with state.sessions() as session:
+            session.add(
+                Event(
+                    scope="backup.restore_cancelled",
+                    level="info",
+                    message={"backup": cancelled["backup"], "at": datetime.now(UTC).isoformat()},
+                )
+            )
+            session.commit()
+    return {"pending": None}
+
+
+def _backup_limit(state) -> int:
+    """The owner's backup limit, as the scheduled backup reads it, for the rotation a restore triggers."""
+    from shortlist.server.services.backup import DEFAULT_MAX_BACKUPS
+
+    with state.sessions() as session:
+        keep = SettingsStore(session).get("backup.max_keep")
+    return keep if isinstance(keep, int) and 1 <= keep <= 100 else DEFAULT_MAX_BACKUPS
 
 
 # Strong references to in-flight background drains. asyncio holds only a weak reference to a task,
@@ -1103,6 +1187,7 @@ async def list_jobs(
     kind: str | None = None,
     before_id: int | None = None,
     status: JobStatus | None = None,
+    exclude_routine: bool = False,
 ) -> list[dict]:
     """Recent background jobs, newest first — the "did that actually happen?" answer.
 
@@ -1118,7 +1203,18 @@ async def list_jobs(
     Measured on a real server: 8 failures, all `privacy.sync`, at ids 587-596 — the newest hundred
     jobs started at id 680, so filtering a fetched page client-side answered "8 failed" with an
     empty list. A count over the whole table needs a filter over the whole table.
+
+    `exclude_routine` also drops a finished job whose result says it was `quiet` — a scheduled privacy sync
+    that found nothing to change. And it drops the high-volume automatic kinds (`JobKind.routine`) unless they FAILED,
+    and exists for the same reason `status` does: a client filter over a fetched page cannot work
+    when the noise outnumbers the news. Measured on a 46-user server, `watch.reconcile` was 165 of
+    the 197 jobs queued in a day, so the newest 30 rows the header polls were almost all reconciles
+    and nothing else could be seen behind them. The Jobs page does not pass it — that is where you
+    go to look at reconciles — and a failure is never dropped, because a reconcile that fails is the
+    only thing that would say a partial watch went uncredited.
     """
+    from sqlalchemy import and_, func, or_
+
     from shortlist.server.db.models import Job
 
     with request.app.state.sessions() as session:
@@ -1127,6 +1223,12 @@ async def list_jobs(
             query = query.filter(Job.kind == kind)
         if status:
             query = query.filter(Job.status == status)
+        if exclude_routine:
+            if noisy := jobs.routine_kinds():
+                query = query.filter(or_(Job.kind.notin_(noisy), Job.status == "failed"))
+            # A finished job that says it was quiet (a scheduled privacy sync that changed nothing).
+            quiet = func.coalesce(func.json_extract(Job.result, "$.quiet"), 0) == 1
+            query = query.filter(~and_(Job.status == "done", quiet))
         if before_id is not None:
             query = query.filter(Job.id < before_id)
         rows = query.order_by(Job.created_at.desc(), Job.id.desc()).limit(min(limit, 200)).all()

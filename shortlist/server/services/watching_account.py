@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from loguru import logger
+from sqlalchemy import false as sa_false
 from sqlalchemy.orm import Session
 
 from shortlist.engine.models import MediaType, UserType
@@ -369,11 +370,16 @@ def _clear_emptied_shows(
     """Un-scrobble the SHOW key of any show whose episodes we just emptied.
 
     Un-scrobbling an episode does not clear its show: the show row keeps its own `viewCount` and
-    `lastViewedAt`, so it still comes back from `?type=2&unwatched=0` — the read `watched_titles` is
-    built from — now reading 0/N. The target then looks to Shortlist like someone who has watched a
-    show with none of it watched, and the engine stops offering it. It is the same residue that
-    explains the 63 zero-episode shows found on a real account, and §2 of the design records the
-    behaviour that causes it.
+    `lastViewedAt`, so the account is left flagged as having watched a show it has none of. It is the
+    same residue that explains the 63 zero-episode shows found on a real account, and §2 of the
+    design records the behaviour that causes it.
+
+    The reason is now the TARGET'S OWN PLEX, not Shortlist's cache. This used to argue that the row
+    "still comes back from `?type=2&unwatched=0` — the read `watched_titles` is built from"; both
+    halves stopped being true with issue #108, which moved the show read to `viewedLeafCount!=0` and
+    filters a 0/N row out client-side as well. Undoing a transfer still has to leave the person's own
+    library looking untouched, which is reason enough on its own — 62 phantom shows in their
+    Recently Watched is exactly what "Put back exactly as it was" promises not to leave behind.
 
     Only shows we actually emptied, and only when the SOURCE has nothing left in them — never a show
     the target still has episodes of, and never one the source watches.
@@ -732,27 +738,44 @@ def undo_transfer(
         snapshot.restored_at = utcnow()
         # The copied play events describe watches that are no longer represented on the account, so
         # they go with the restore. Only ours — `source='transfer'` — never Plex's own rows.
-        report.events_copied = -(
-            session.query(WatchEvent)
-            .filter(
-                WatchEvent.plex_account_id == _account_for(session, snapshot.user_id),
-                WatchEvent.source == "transfer",
-            )
-            .delete(synchronize_session=False)
-        )
-        # And the stamps beside them. `watch_cache` deliberately EXEMPTS rows carrying a
-        # `source_viewed_at` from both the full-read replace and the incremental drop — which is right
-        # while the transfer stands, and permanent once it is undone. Left stamped, those rows can
-        # never self-heal: Plex reports the account as no longer having watched the title, the cache
-        # keeps it anyway, and the engine's already-watched filter suppresses it for ever. On the one
-        # account this feature exists to set up, while the UI says "Put back exactly as it was."
         #
-        # Clearing the stamp does not delete the row — it just makes it an ordinary cached watch
-        # again, which the next full sync sweeps normally because Plex no longer reports it.
+        # Their rating keys are read FIRST, because they are also the scope of the cache cleanup
+        # below: they name exactly the titles this transfer put on the account.
+        copied = session.query(WatchEvent).filter(
+            WatchEvent.plex_account_id == _account_for(session, snapshot.user_id),
+            WatchEvent.source == "transfer",
+        )
+        copied_keys = {key for (key,) in copied.with_entities(WatchEvent.rating_key).all() if key is not None}
+        report.events_copied = -copied.delete(synchronize_session=False)
+        # And the cached rows beside them. `watch_cache` EXEMPTS rows carrying a `source_viewed_at`
+        # from every deletion path — right while the transfer stands, wrong the moment it is undone.
+        # Left behind, they can never self-heal: Plex reports the account as no longer having watched
+        # the title, the cache keeps it anyway, and the engine's already-watched filter suppresses it
+        # for ever. On the one account this feature exists to set up, while the UI says "Put back
+        # exactly as it was."
+        #
+        # DELETED here rather than merely un-stamped and left for the periodic sweep. This is the
+        # undo's own mess and it should clear it up itself: the sweep only runs on the
+        # `sync.watch_full_days` cadence, only when the read can prove it saw the whole library, and
+        # NEVER on a PMS that does not report `totalSize` — so relying on it left the rows in place
+        # indefinitely on exactly the servers least able to recover. Doing it here also frees
+        # `sync_section` to refuse an empty answer, which is the shape that erases a whole section.
+        #
+        # SCOPED to the rating keys this transfer actually copied, never "every stamped row".
+        # `stamp_true_dates` matches on rating key alone, so it also stamps a title the account had
+        # watched ITSELF before the transfer — and an unscoped delete took those too. The re-read
+        # that was supposed to heal them is not guaranteed: a library the account is no longer shared
+        # raises `SectionNotShared` and is deliberately skipped with its rows kept, and a managed
+        # account whose token cannot be minted is never refilled at all. On those two shapes an
+        # over-delete is permanent, not a one-cycle blip.
         report.titles_cached = -(
             session.query(WatchedTitle)
-            .filter(WatchedTitle.user_id == snapshot.user_id, WatchedTitle.source_viewed_at.isnot(None))
-            .update({"source_viewed_at": None}, synchronize_session=False)
+            .filter(
+                WatchedTitle.user_id == snapshot.user_id,
+                WatchedTitle.source_viewed_at.isnot(None),
+                WatchedTitle.rating_key.in_(copied_keys) if copied_keys else sa_false(),
+            )
+            .delete(synchronize_session=False)
         )
 
     logger.info(

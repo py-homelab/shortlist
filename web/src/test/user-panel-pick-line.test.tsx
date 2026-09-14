@@ -130,6 +130,21 @@ describe("run report pick line — look-it-up links", () => {
     );
   });
 
+  it("marks each link with its service's icon, as the requests inbox does", () => {
+    render(
+      <UserPanel
+        run={RUN}
+        result={result([{ ...BASE, year: 1999, rating: 8.2 }])}
+      />,
+    );
+    for (const name of ["TMDB", "IMDb", "Trakt"]) {
+      // The glyph is decorative — the link keeps its plain name — so it is found as an svg inside it.
+      expect(
+        screen.getByRole("link", { name }).querySelector("svg"),
+      ).not.toBeNull();
+    }
+  });
+
   it("searches IMDb by title, since a delivered pick carries no IMDb id", () => {
     render(
       <UserPanel

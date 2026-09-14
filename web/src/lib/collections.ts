@@ -4,6 +4,7 @@ import {
   watchedBadgeLabel,
 } from "@/lib/constants";
 import { placementLabel } from "@/lib/placement";
+import { showDaysSummary } from "@/lib/show-days";
 import { SOURCES, sourceBlockedReason, sourceShortLabel } from "@/lib/sources";
 import type {
   Collection,
@@ -29,14 +30,20 @@ export function blankInput(): CollectionInput {
     sort_order: 0,
     name_template: "",
     fallback_name: "",
+    // Empty = leave that field on Plex alone (issue #120).
+    description: "",
+    sort_title_prefix: "",
     min_watchers: 2,
     request_tag: "",
     candidate_sources: [],
     library_keys: [],
     watched_pct: null,
     rewatch: false,
+    // Mirrors the API default, so a row created as a rewatch row starts where the server would.
+    rewatch_cooldown_days: 30,
     unstarted_only: false,
     refresh_days: null,
+    idle_hold_days: null,
     recency: null,
     recent_count: null,
     max_seeds: null,
@@ -65,6 +72,7 @@ export function blankInput(): CollectionInput {
     pick_order: "best",
     placement: "both",
     placement_friends: "both",
+    show_days: [],
     pin_top: false,
     hub_anchor: {},
     poster: { mode: "", title: "", subtitle: "", style: "" },
@@ -86,6 +94,8 @@ export function toInput(collection: Collection): CollectionInput {
     sort_order: collection.sort_order,
     name_template: collection.name_template,
     fallback_name: collection.fallback_name ?? "",
+    description: collection.description ?? "",
+    sort_title_prefix: collection.sort_title_prefix ?? "",
     min_watchers: collection.min_watchers,
     request_tag: collection.request_tag,
     candidate_sources: collection.candidate_sources,
@@ -94,6 +104,8 @@ export function toInput(collection: Collection): CollectionInput {
     rewatch: collection.rewatch ?? false,
     unstarted_only: collection.unstarted_only ?? false,
     refresh_days: collection.refresh_days ?? null,
+    idle_hold_days: collection.idle_hold_days ?? null,
+    rewatch_cooldown_days: collection.rewatch_cooldown_days ?? 30,
     recency: collection.recency ?? null,
     recent_count: collection.recent_count ?? null,
     max_seeds: collection.max_seeds ?? null,
@@ -122,6 +134,7 @@ export function toInput(collection: Collection): CollectionInput {
     pick_order: collection.pick_order ?? "best",
     placement: collection.placement ?? "both",
     placement_friends: collection.placement_friends ?? "both",
+    show_days: collection.show_days ?? [],
     pin_top: collection.pin_top ?? false,
     hub_anchor: collection.hub_anchor ?? {},
     poster: {
@@ -243,9 +256,12 @@ export function rowOverrides(
 
   // Badged BEFORE the watched cap, and instead of it: on a rewatch row the cap is plumbing (it only
   // stops the pool dropping finished titles), so "Watched: no filter" describes the mechanism while
-  // "Rewatches first" describes the row. Showing both would read as two competing settings.
+  // this badge describes the row. Showing both would read as two competing settings.
+  //
+  // Worded as the row editor's own switch is ("Make this a 'watch it again' row"). "Rewatches
+  // first" was our internal name for the ordering rule and meant nothing on a card.
   if (collection.rewatch) {
-    parts.push("Rewatches first");
+    parts.push("“Watch it again” row");
   } else if (
     // null inherits the global recommendations.watched_pct, so there's nothing to badge. Unlike the
     // prompt, this override IS honoured on the default row, so it isn't gated on the slug.
@@ -272,18 +288,23 @@ export function rowOverrides(
     parts.push(recencyBadgeLabel(collection.recency));
   }
 
-  // null inherits the global recent_count (web-search recency), so only badge a per-row override.
+  // These two badges are the same unit — a number of watches — for two different scopes, and they
+  // used to read "Recent watches: 3" and "Built from 1 watch": two counts of watches, neither
+  // saying what counted them, on the same card. Named for the scope each governs instead, so the
+  // pair reads as one setting and the slice of it that it is (`candidates.py` searches
+  // `seeds[:recent_count]`). null inherits the global on both, so only an override is badged.
+  if (collection.max_seeds !== null && collection.max_seeds !== undefined) {
+    parts.push(
+      `All sources: ${collection.max_seeds} ${collection.max_seeds === 1 ? "watch" : "watches"}`,
+    );
+  }
+
   if (
     collection.recent_count !== null &&
     collection.recent_count !== undefined
   ) {
-    parts.push(`Recent watches: ${collection.recent_count}`);
-  }
-
-  // null inherits the engine's seed budget, so only badge a per-row override.
-  if (collection.max_seeds !== null && collection.max_seeds !== undefined) {
     parts.push(
-      `Built from ${collection.max_seeds} ${collection.max_seeds === 1 ? "watch" : "watches"}`,
+      `AI web search: ${collection.recent_count} ${collection.recent_count === 1 ? "watch" : "watches"}`,
     );
   }
 
@@ -297,6 +318,13 @@ export function rowOverrides(
   // otherwise the setting is invisible on the rows page and nobody discovers they turned it on.
   if ((collection.seed_window ?? 1) > 1) {
     parts.push(`Cycles ${collection.seed_window} recent watches`);
+  }
+
+  // Only a row that actually NARROWS its days is worth a badge. The API collapses all seven to [],
+  // so a non-empty list always means a real restriction.
+  const days = collection.show_days ?? [];
+  if (days.length > 0) {
+    parts.push(showDaysSummary(days));
   }
 
   // Only badge when placement differs from the "both" default.

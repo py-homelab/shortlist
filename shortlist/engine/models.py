@@ -165,6 +165,28 @@ class Seed:
     recency_days: int = 0  # days between this title's most-recent watch and the newest watch overall
 
 
+@dataclass(frozen=True)
+class Attribution:
+    """One signal's strongest evidence for a candidate — which watched title, and why.
+
+    Separate from `Candidate.top_seed`, which answers "which seed weighed most" and drives the row
+    NAME and `Pick.seed_title`. This answers "what can we honestly tell the person", which is a
+    different question once more than one signal fires: a sequel found through a shared franchise and
+    a title found through a shared lead are both "because you watched Dune", and saying only that
+    throws away the part that would actually explain it.
+
+    Deliberately not persisted. `Pick.reason` is already a plain string and already survives a
+    carried-forward row, so the richer sentence is rendered into it and this stays live for one run —
+    exactly as `top_seed` is Candidate-only and only its flattened `seed_title`/`seed_tmdb_id` reach
+    the database.
+    """
+
+    signal: str  # "similarity" | "franchise" | "cast"
+    seed_title: str
+    seed_tmdb_id: int
+    detail: str = ""  # the shared actor's name, or the franchise's
+
+
 @dataclass
 class Candidate:
     """A TMDB-suggested title, later intersected with the library."""
@@ -201,6 +223,21 @@ class Candidate:
     # penalising them for lacking a signal they never had is what `pre_rank`'s round-robin exists to
     # prevent. A title several seeds suggested keeps the strongest claim any of them made.
     affinity: float = 1.0
+    # This candidate's measured genre-avoidance signal: the mean of its genres' shrunk log ratios,
+    # negative half only (see `candidates.candidate_genre_penalty`). 0.0 = no opinion, which is what
+    # every candidate carries until the owner turns `recommendations.genre_avoidance` up. A log2
+    # adjustment, not a multiplier — `ranking.negative_multiplier` combines it with any future
+    # negative signal BEFORE flooring, so dampeners can never compound into a floor nobody chose.
+    genre_penalty: float = 0.0
+    # Shares a TMDB collection with one of its own seeds — the sequel/prequel signal. Movie-only:
+    # TMDB has no `belongs_to_collection` for TV, so this is inert for shows by construction.
+    in_seed_franchise: bool = False
+    # 0..1, how much top-billed cast this shares with its seeds, with prolific actors already
+    # discounted (see `candidates.cast_idf`). 0.0 = no shared cast, or the signal is switched off.
+    cast_overlap: float = 0.0
+    # Every signal that fired for this candidate, for the "why you're seeing this" line. Empty until
+    # a signal beyond the plain seed match actually has something to add.
+    attributions: list[Attribution] = field(default_factory=list)
 
     @property
     def seed_frequency(self) -> int:
@@ -251,6 +288,12 @@ class Pick:
     # mismatch means the owner changed a setting that decides row contents, so the row rebuilds
     # instead of waiting for its refresh cadence.
     recipe: str = ""
+    # When this row's CONTENTS were last chosen — stamped on a rebuild/refresh and carried through
+    # untouched on every reuse night. Deliberately not `PickRow.created_at`, which is re-stamped
+    # every run because a carried-forward row is re-persisted under the new run: that says "last
+    # delivered", and the idle hold needs "last decided". None on picks written before this existed,
+    # which reads as "unknown" and falls back to the plain cadence (`_held_for_idle`).
+    built_at: datetime | None = None
 
 
 @dataclass
@@ -276,6 +319,12 @@ class UserProfile:
     # moves, so renaming someone can't strand the exclusions that keep their row private.
     nickname: str = ""
     history: list[WatchedItem] = field(default_factory=list)
+    #: Whether `history` came from a read that can be trusted to have returned EVERYTHING — the only
+    #: thing that makes ABSENCE from it evidence. False by default, and deliberately so: withdrawing
+    #: pick credit acts on absence and cannot be undone, so a caller that has not proved completeness
+    #: must not be able to get it wrong by omission. A fail-soft read that skipped one unreadable
+    #: library still returns the other libraries' titles, which is non-empty and looks complete.
+    history_complete: bool = False
     excluded_genres: set[str] = field(default_factory=set)
     blocked_seeds: set[int] = field(default_factory=set)
     row_name_template: str | None = None
@@ -364,7 +413,14 @@ class RowSpec:
     # first and merely PERMITS up to that fraction of finished ones — so on a library with plenty of
     # unwatched candidates even 1.0 yields a mostly-unwatched row. A row named "Happy to see again"
     # needs the opposite preference, which is this flag.
+    #
+    # Its finished titles come from the person's own HISTORY (`rows._rewatch_candidates`), never from
+    # the similar-titles pool: that pool only holds a finished title when a different watch's search
+    # happens to name it, so a person with hundreds of finished films got a row of two (issue #114).
     rewatch: bool = False
+    # Rewatch rows only: leave out anything they finished within this many days, so the shelf holds
+    # old favourites rather than last night's film. 0 = no cooldown.
+    rewatch_cooldown_days: int = 30
     # Shows only: drop any series this person has STARTED, however little of it. Stricter than the
     # normal watched filter, which only drops shows they have FINISHED (>= watched_show_pct) — one they
     # are three episodes into is otherwise still eligible. This is what makes "a series to start" true.
@@ -373,6 +429,11 @@ class RowSpec:
     # How often this row re-picks its titles, in DAYS: 0 = never once built (frozen), 1 = nightly,
     # N = every N days. None -> inherit EngineConfig.refresh_days.
     refresh_days: int | None = None
+    # How long this row may wait when its owner has watched nothing since it was last built, in DAYS.
+    # 0 = never wait (rebuild on the cadence whatever they did); None -> inherit
+    # EngineConfig.idle_hold_days. An explicit 0 is a real choice, not an absent one — it is how a
+    # single row stays lively on a server that holds everything else.
+    idle_hold_days: int | None = None
     # How much a title's RELEASE DATE counts when ranking it: 0.0 = ignore age, 1.0 = strongly prefer
     # new. None -> inherit EngineConfig.recency.
     #
@@ -449,15 +510,35 @@ class RowSpec:
     # The same, for each FRIEND's (shared user's) own collection — "home" means Friends' Home there.
     # None = inherit from `placement` (backward compat); set explicitly to diverge.
     placement_friends: str | None = None
-    # Pin the row to the TOP of its library's Recommended shelf (ManagedHub.move). This is a
-    # server-wide managed-recommendations order, NOT per-viewing-user — Plex exposes no per-user order.
+    # This row is hidden TODAY by its day schedule (issue #102), as opposed to being switched off
+    # permanently. Both resolve `placement` to "off", so the placement alone cannot tell them apart —
+    # and promotion needs to, because it stops guessing about unidentifiable collections only when a
+    # schedule could be hiding one. Set by the server when it resolves the schedule; the engine never
+    # reads a clock.
+    hidden_by_schedule: bool = False
+    # LEGACY, and the engine no longer reads it. It used to pin the row to the top of its library's
+    # Recommended shelf with `ManagedHub.move(after=None)` on every promote — the one insert that can
+    # collapse a library's hub order (see `place_rows`), and redundant besides, since a row with no
+    # placement already sits at the top. Carried only so the row editor can migrate it into a
+    # per-library "Top" the first time that row is saved.
     pin_top: bool = False
-    # Per-library override of where THIS row sits in the Recommended shelf, keyed by section key ->
-    # HubAnchor. A library absent here inherits the global default (EngineConfig.hub_anchors); empty
-    # -> inherit everywhere. Lets one row anchor differently from the rest (global default + override).
+    # Where THIS row sits in the Recommended shelf, per library, keyed by section key -> HubAnchor.
+    # A library ABSENT here means the top of the shelf, which is the shipped default — there is no
+    # global default to inherit any more (`EngineConfig.hub_anchors` and the `rows.hub_anchor` setting
+    # were retired: they were a second place to set the same thing and disagreed with their own
+    # screen). Not "leave it alone" either — Plex appends new hubs at the bottom, so a new row nothing
+    # positions starts out of sight; opting out is `HubAnchor.enabled`, set deliberately per row.
     hub_anchors: dict[str, HubAnchor] = field(default_factory=dict)
     # Optional custom poster for this row's Plex collection(s). None -> leave Plex's own artwork alone.
     poster: PosterSpec | None = None
+    # The collection's Plex SUMMARY, with the same placeholders as the name (issue #120). "" -> Shortlist
+    # leaves the summary alone, so a value another tool (agregarr, Kometa) put there survives.
+    description: str = ""
+    # Put before the row's name to make its Plex SORT TITLE (issue #120), e.g. "!010_". It orders the
+    # row in the library's Collections tab only — Home and the Recommended shelf go by hub position,
+    # which is `hub_anchors`. "" -> the sort title is left alone. Always prefix + the CURRENT name, so
+    # a renamed or `{top_seed}` row goes on sorting under the prefix.
+    sort_title_prefix: str = ""
 
     @property
     def _effective_friends_placement(self) -> str:
@@ -631,6 +712,27 @@ class ArrTarget:
     tag: str = ""  # if set, tag every title Shortlist adds (created in the app if it doesn't exist)
 
 
+@dataclass(frozen=True)
+class SeerrTarget:
+    """Which Overseerr/Jellyseerr instance to file requests with, and as whom.
+
+    No quality profile, root folder or tag — that is the whole reason to route here rather than at
+    Radarr/Sonarr. The *seerr applies its own rules; Shortlist only says which title it wants.
+    """
+
+    url: str
+    api_key: str
+    #: The instance's user id to file as. 0/None -> omit ``userId`` and let the api key's own account
+    #: own the request, which normally means auto-approved (that account is an admin). Pointing this
+    #: at a non-auto-approve account is how the owner gets a second approval gate in the *seerr.
+    request_as_user_id: int = 0
+
+
+#: The two places a request can be filed. ``arr`` posts to Radarr/Sonarr directly (the original, and
+#: still the default); ``overseerr`` hands the title to Overseerr/Jellyseerr and lets it drive them.
+REQUEST_TARGETS = ("arr", "overseerr")
+
+
 @dataclass
 class RequestConfig:
     """Whether — and how conservatively — to ask Sonarr/Radarr for picks the library lacks.
@@ -643,8 +745,20 @@ class RequestConfig:
     """
 
     enabled: bool = False
+    # Which route the owner CHOSE, independent of whether its target resolved. Carried separately
+    # because "no target" and "no target on the route you picked" need different explanations: with
+    # only the targets to go on, a half-configured Overseerr was indistinguishable from an
+    # unconfigured Radarr, and every title came back "Radarr not fully configured (check quality
+    # profile and root folder)" — naming an app the owner had deliberately stopped using and two
+    # settings that do not exist on their route.
+    target: str = "arr"  # one of REQUEST_TARGETS
     radarr: ArrTarget | None = None  # None -> movie requests are skipped
     sonarr: ArrTarget | None = None  # None -> show requests are skipped
+    # Set INSTEAD of radarr/sonarr, never alongside: the context builder reads `requests.target` and
+    # populates one side or the other. When this is set the Arr targets are ignored entirely, so the
+    # per-row quality-profile/root-folder/monitor overrides have nothing to act on — the *seerr owns
+    # those choices, which is the point of routing through it.
+    overseerr: SeerrTarget | None = None
     # Which score gates a title. TMDB is always available (no setup); imdb/trakt/tomatoes/metacritic
     # come from MDBList (needs a key). The min_rating/min_votes floors read from whichever is chosen;
     # every non-TMDB score is normalised to 0..10 so one floor works across sources.
@@ -710,6 +824,12 @@ class RequestConfig:
     def __post_init__(self) -> None:
         if self.max_per_row is None:
             self.max_per_row = self.max_per_run
+        # A resolved *seerr target settles the route on its own. The reverse is a real state and must
+        # stay expressible — `target="overseerr"` with no target means "chosen, not connected yet",
+        # which is exactly what lets the run explain itself in the right app's words — but an
+        # `overseerr` target the route ignores is nothing but a way to send to the wrong app.
+        if self.overseerr is not None:
+            self.target = "overseerr"
 
 
 @dataclass(frozen=True)
@@ -863,6 +983,13 @@ class RequestReport:
     # Titles the LANGUAGE mode alone removed from that pool ("only" mode). Kept apart from the other
     # base floors so the "nothing qualified" alert can name the setting that actually bound.
     dropped_by_language: int = 0
+    # The LOWEST `min_demand` any row gated on this run — the fewest distinct wanters a title needed
+    # to reach the rating gate through the most permissive row. Recorded so a zero can be told apart
+    # from a zero that was arithmetically GUARANTEED: demand counts distinct people, so a run covering
+    # fewer people than this floor can never fill the pool, whatever the owner's settings say. Six
+    # such events on the maintainer's server (2026-09-02..03, all `users_ok=1` manual runs) raised
+    # "loosen your floors" while the nightly 46-user run was requesting normally.
+    demand_floor: int = 0
     examined: int = 0  # of those, how many the rating gate actually rated
     lookups_spent: int = 0  # live rating-API calls that cost; cached ratings are free and are not counted
     # The same three, per row slug, plus what each row actually got. A run-wide total cannot answer
@@ -928,10 +1055,13 @@ class HubAnchor:
     anchor_title: str = ""
     before: bool = False
     to_top: bool = False
-    # LAST, and it must stay last: `HubAnchor(title, before, to_top)` is constructed positionally in
-    # places, so a new field anywhere earlier silently re-binds their arguments — inserting this one
+    # LAST, and they must stay last: `HubAnchor(title, before, to_top)` is constructed positionally in
+    # places, so a new field anywhere earlier silently re-binds their arguments — inserting one
     # second turned `HubAnchor("Gems Anchor", False)` into a row anchor of `False`.
     anchor_row: str = ""
+    #: The owner's per-row switch. OFF means Shortlist never positions this row, so it sits wherever
+    #: Plex put it: a newly created hub goes to the BOTTOM of the shelf and stays there.
+    enabled: bool = True
 
 
 # The seeded default row title. ``{library_name}`` renders each library's own name at delivery, so a
@@ -1029,6 +1159,14 @@ class EngineConfig:
     # a magnitude nothing implements — and folding turnover in here would tie more variety to worse
     # picks, since the only way to swap more of a row is to reach further down the ranked list.
     refresh_days: int = 0
+    # The IDLE CEILING in days: how long a row may wait when the person it belongs to has watched
+    # nothing since it was last built. 0 (the default, and every existing install) = off, so a row
+    # always rebuilds on its `refresh_days` cadence whatever they have been doing.
+    #
+    # The pair is deliberately two numbers, not one: `refresh_days` is "is it this row's night?",
+    # this is "is there anything new to say?". Only when BOTH allow it does a row re-pick. See
+    # `rows._held_for_idle` for why the ceiling is a ceiling and not a freeze.
+    idle_hold_days: int = 0
     # How much a title's release date counts when ranking it: 0.0 (default) = ignore age entirely,
     # which is how this ranked before the setting existed; 1.0 = every ~8 years of age halves a
     # title's weight. A WEIGHT, never a filter — an old title is only ever asked to be a better
@@ -1045,15 +1183,33 @@ class EngineConfig:
     # web-search tool, Claude/GPT/Gemini only), 'exa', or 'searxng'. Either external is the only path
     # for a local Ollama model. ('auto', which unioned native with an external, was removed in 1.3.)
     web_search_provider: str = "native"
-    # Per-library placement of Shortlist's rows in Plex's Recommended shelf, keyed by section key
-    # (str). Empty -> leave Plex's default order (rows land wherever they're created — last, under a
-    # co-managing tool's collections). Applied at end of run, read-only against the anchor.
-    hub_anchors: dict[str, HubAnchor] = field(default_factory=dict)
     # Master switch for touching the Recommended-shelf ORDER. False -> Shortlist never reorders the
     # shelf (skips the whole order phase), so a co-managing tool (agregarr/Kometa) owns the order and
     # the two don't fight. True (default) -> apply the configured anchors. Independent of delivery and
     # promotion — turning it off still delivers and hides rows; it only stops the reordering.
     manage_shelf_order: bool = True
+    # How much a person's measured genre avoidance counts when ranking, 0.0 (ignore it, the default
+    # and every existing install) .. 1.0. A WEIGHT, never a filter: an avoided genre is only ever
+    # asked to be a better match, and `ranking.negative_multiplier` floors the total so it can shade
+    # the order without deciding it. Off by default in BOTH layers — unlike `recency`, which the
+    # product deliberately turned on for existing servers; that was its own decision, not a
+    # precedent.
+    genre_avoidance: float = 0.0
+    # How much "continues a story you already started" counts, 0.0 (off, the default) .. 1.0.
+    # Movie-only — TMDB has no franchise concept for TV.
+    franchise: float = 0.0
+    # How much shared top-billed cast counts, 0.0 (off, the default) .. 1.0. Prolific actors are
+    # discounted before this applies, so it means "shares someone NOTABLE", not "shares anyone".
+    cast: float = 0.0
+    # Wall-clock gap, in seconds, between the two independent "still unlabelled?" reads that
+    # `delivery.sweep_broken_rows` demands before DELETING an orphan row — the one irreversible write
+    # in the engine. A transient PMS miss (a mid library-index rebuild) clears within seconds; a
+    # genuine orphan's label never arrives however long you wait, so the wait is real discriminating
+    # power that a same-instant re-read does not have.
+    #
+    # The DATACLASS defaults to 0 (immediate, so tests stay fast and a library caller inherits no
+    # opinion). `settings_store` defaults the PRODUCT to a real delay.
+    orphan_confirm_delay_s: float = 0.0
     dry_run: bool = False
     # The curated rows to deliver. Empty -> a single default per-person row synthesized from
     # row_name_template/row_size, so existing callers behave exactly as before.
@@ -1119,6 +1275,19 @@ class StageCounts:
     picks: int = 0
 
 
+@dataclass(frozen=True)
+class WrittenDetails:
+    """What Shortlist last wrote to one collection's summary and sort title, from the delivery ledger.
+
+    None means Shortlist has no value there, which is the only thing that makes clearing a row's field
+    safe: the revert touches a field only while Plex still holds exactly what Shortlist wrote, so a
+    value somebody set by hand or with another tool is never wiped (issue #120).
+    """
+
+    summary: str | None = None
+    title_sort: str | None = None
+
+
 @dataclass
 class CollectionDiff:
     """What delivery changed (or would change, in dry-run) on the user's collections."""
@@ -1147,6 +1316,9 @@ class OwnedRow:
 
     label: str  # as stored by Plex, which title-cases labels
     rating_keys: list[int] = field(default_factory=list)
+    # The TYPES of library the rows are in ("movie", "show"). A share filter is per type
+    # (`filterMovies`, `filterTelevision`), so this is which filters have a row of theirs to hide.
+    section_types: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -1168,10 +1340,11 @@ class UserRunReport:
     # Plex reuses `metadata_items.id`, so that key can come to name a different collection under this
     # same label — and `promote_user_rows` reads the ledger too, so it is not only removals at stake.
     removed_deliveries: list[dict] = field(default_factory=list)
-    # Each delivered collection TITLE mapped to the slug of the row that produced it, so the promote
-    # phase applies the right row's placement/pin. Recorded per library because a {top_seed} title
-    # differs library to library. Transient (not persisted); populated during delivery.
-    placement_titles: dict[str, str] = field(default_factory=dict)
+    # Each delivered collection, as (section key, marked TITLE), mapped to the slug of the row that
+    # produced it, so the promote phase applies the right row's placement/pin. Keyed by library as well
+    # as title: a {top_seed} title differs library to library, and two of one person's rows may share a
+    # title when they build in different libraries (issue #121). Transient (not persisted).
+    placement_titles: dict[tuple[str, str], str] = field(default_factory=dict)
     # Per-(row, library) delivery result, so the UI can show "added X to Movies, Y to TV" instead of
     # one merged list. Each entry: row_slug/row_title, library_key/library_title, added/removed/kept/
     # deleted, created, and that library's own ranked picks. Persisted on RunUser.breakdown.
@@ -1187,6 +1360,9 @@ class UserRunReport:
     # Total AI tokens this user cost this run — the llm_web source (web-search title discovery) is
     # the only thing that spends them now.
     llm_tokens: int = 0
+    # The output share of `llm_tokens`. Billed at several times the input rate, so the run page shows
+    # the two apart rather than one total that hides where the money went.
+    llm_output_tokens: int = 0
     # The same total split by WHERE it went: {"llm_web": N}. Lets the UI answer "what did the AI
     # actually spend tokens on" per person, not just a lump sum.
     llm_tokens_by_step: dict[str, int] = field(default_factory=dict)
@@ -1256,9 +1432,15 @@ class RunReport:
     # any run's user list — so without this, "what changed on whose share at 03:31" would have no
     # answer for them at all (plex-safety rule 10).
     filter_writes: dict[int, dict] = field(default_factory=dict)
-    # Managed-recommendation shelf reorders applied this run, one per library actually moved (a title
-    # anchor + the row titles moved). Empty when no anchors are configured or everything was already
-    # in place — a run-level audit of a server-wide Plex write (plex-safety rule 10).
+    # Managed-recommendation shelf outcomes for this run — a run-level audit of a server-wide Plex
+    # write (plex-safety rule 10). TWO kinds of entry, and a consumer has to branch on them:
+    #   * a MOVE — `moved` (the row titles) and `verified` (did the shelf actually end up that way);
+    #   * a placement that could NOT be applied — `placed: False`, `moved: []`, `reason` in
+    #     a refused anchor, and deliberately NO `verified`, because nothing was asked of Plex.
+    # Reporting the second as the first is exactly what the Jobs detail line used to do: a buried row
+    # announced as "repositioned". Empty when every library was already in place, when none holds a
+    # row of ours, or when `manage_shelf_order` is off — NOT when no anchor is configured, which
+    # falls back to moving every row to the top and so fills this normally.
     hub_orderings: list[dict] = field(default_factory=list)
     # Sonarr/Radarr requests made (or, in dry-run, that would be made) for picks the library lacks.
     # None when the feature is off — distinct from an empty report (on, but nothing qualified).
@@ -1282,15 +1464,26 @@ class RunReport:
     # than asked, never less), but it is a state change the owner made that did not reach Plex, and
     # §12's whole register is that shape. `pipeline._leave_sharing_alone` fills it.
     left_alone_failures: dict[int, str] = field(default_factory=dict)
+    # {plex account id: username} — accounts whose filter held one of our excludes where Plex ORs it with a
+    # restriction the OWNER set (`X|label!=shortlist_*`), which this run moved to where Plex applies it.
+    # The pre-#116 merge wrote that shape onto every account with a restriction of its own, switching
+    # the owner's restriction off; repairing it switches it back on, and the people on those accounts
+    # will notice what they can see shrink. Reported so the owner hears it from Shortlist first.
+    restrictions_restored: dict[int, str] = field(default_factory=dict)
+    # {username: why} — accounts whose share filter Plex itself cannot read (a literal `&` inside one of the
+    # owner's labels makes that account's Home answer HTTP 500 — measured 2026-09-13), so no exclude of
+    # ours can be written into it and verified. Not a blocker, by owner decision: one label name must not
+    # take every other person's rows off Home. Read beside `unhideable_measured`, which says the privacy
+    # loop ran — an empty dict clears the alert only on a run that looked.
+    unreadable_filters: dict[str, str] = field(default_factory=dict)
     # {username: [ratingKey, ...]} — accounts whose share filter Shortlist DID write, that can still
     # see other people's rows. The read-back proves plex.tv STORED our exclusions; this asks whether
     # Plex ACTS on them.
     #
-    # NOTE (2026-08-18): this field reached `dev` inside a per-row-requests commit by mistake — the
-    # first commit of that branch staged the whole of models.py while the maintainer's privacy work
-    # was uncommitted in the same file. Its producer and consumer live on that in-flight branch, so
-    # in `dev` alone the field is currently written and read by nobody. It is left in place because
-    # removing it breaks that working tree; it becomes live when the privacy work lands.
+    # Written by `pipeline._verify_filters_enforced`, persisted by `run_persistence` and read by both
+    # the "Plex is ignoring the privacy filter" notification and `GET /api/privacy/status`. Read it
+    # beside `filters_enforcement_measured`, never alone: empty means "nothing exposed" ONLY when
+    # that flag says a check actually ran.
     filters_not_enforced: dict[str, list[int]] = field(default_factory=dict)
     # Whether the enforcement spot-check actually RAN. Without it an empty result is ambiguous — "we
     # looked and every account was clean" and "we never got that far" are the same empty dict — so the

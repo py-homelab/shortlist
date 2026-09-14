@@ -56,29 +56,55 @@ def watched(title: str, *, tmdb_id: int, days_ago: float = 1, rating_key=_SAME_A
     )
 
 
-def sync(cache, sessions, user_id, items, *, force_full=False, capture=None, section=SECTION, covers_window=True):
+def sync(
+    cache,
+    sessions,
+    user_id,
+    items,
+    *,
+    force_full=False,
+    reconcile=False,
+    capture=None,
+    section=SECTION,
+    covers_window=True,
+    library="",
+):
     """Run one section sync against a reader that returns `items` verbatim, whatever it was asked for.
 
     Use `sync_pms` unless the point of the test IS the mismatch: a real incremental read returns
     everything at or after `since`, including the deliberate overlap, so a reader that answers with
     only the newest titles is claiming every other title in the window was un-watched.
 
-    `covers_window` is the reader's claim that it returned everything at or after `since` — the only
-    thing that lets the cache delete on absence. Pass False to model a truncated walk.
+    `covers_window` is the reader's claim that it returned everything it was asked for — the only
+    thing that lets the cache delete on absence. It is the claim for BOTH read shapes: for an
+    incremental read, everything at or after `since`; for a complete one, the whole library. Pass
+    False to model a truncated walk of either.
     """
 
     def read(since):
         if capture is not None:
             capture.append(since)
-        return WatchedRead(items=list(items), covers_window=covers_window and since is not None)
+        return WatchedRead(items=list(items), covers_window=covers_window)
 
     with sessions() as session:
-        outcome = cache.sync_section(session, profile(), user_id, section, MediaType.MOVIE, read, force_full=force_full)
+        outcome = cache.sync_section(
+            session,
+            profile(),
+            user_id,
+            section,
+            MediaType.MOVIE,
+            read,
+            library=library,
+            force_full=force_full,
+            reconcile=reconcile,
+        )
         session.commit()
     return outcome
 
 
-def sync_pms(cache, sessions, user_id, library, *, force_full=False, capture=None, section=SECTION):
+def sync_pms(
+    cache, sessions, user_id, library, *, force_full=False, reconcile=False, capture=None, section=SECTION, name=""
+):
     """Run one section sync against a reader modelling a HEALTHY PMS: `library` is what the server
     holds NOW, the walk returns everything in it viewed at or after `since`, and it claims to have
     covered the window.
@@ -97,11 +123,21 @@ def sync_pms(cache, sessions, user_id, library, *, force_full=False, capture=Non
             capture.append(since)
         return WatchedRead(
             items=[item for item in library if since is None or item.watched_at >= since],
-            covers_window=since is not None,
+            covers_window=True,
         )
 
     with sessions() as session:
-        outcome = cache.sync_section(session, profile(), user_id, section, MediaType.MOVIE, read, force_full=force_full)
+        outcome = cache.sync_section(
+            session,
+            profile(),
+            user_id,
+            section,
+            MediaType.MOVIE,
+            read,
+            library=name,
+            force_full=force_full,
+            reconcile=reconcile,
+        )
         session.commit()
     return outcome
 
@@ -154,15 +190,213 @@ class TestFullVsIncremental:
 
 
 class TestCorrectness:
-    def test_a_full_read_drops_a_title_that_was_un_watched(self, sessions, user_id):
-        """The whole reason the weekly full read exists — nothing else can notice this."""
+    def test_a_reconcile_pass_drops_a_title_that_was_un_watched(self, sessions, user_id):
+        """The whole reason the periodic reconcile exists — nothing else can notice this."""
+        cache = WatchCache(sessions)
+        sync(cache, sessions, user_id, [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2)])
+
+        sync(cache, sessions, user_id, [watched("Heat", tmdb_id=1)], force_full=True, reconcile=True)
+
+        with sessions() as session:
+            assert [row.title for row in session.query(WatchedTitle).all()] == ["Heat"]
+
+    def test_a_complete_read_alone_does_NOT_drop_anything(self, sessions, user_id):
+        """Every sync reads the whole library now (issue #108). Only the periodic pass may DELETE.
+
+        Keeping those separate is what stopped the read getting 42x more frequent from making the
+        destructive path 42x more frequent with it — `covers_window` is derived from the same
+        response it validates, so a server that under-reports consistently proves itself complete.
+        """
         cache = WatchCache(sessions)
         sync(cache, sessions, user_id, [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2)])
 
         sync(cache, sessions, user_id, [watched("Heat", tmdb_id=1)], force_full=True)
 
         with sessions() as session:
-            assert [row.title for row in session.query(WatchedTitle).all()] == ["Heat"]
+            assert {row.title for row in session.query(WatchedTitle).all()} == {"Heat", "Dune"}
+
+    def test_a_read_that_loses_most_of_a_section_is_confirmed_before_anything_is_deleted(self, sessions, user_id):
+        """`covers_window` is derived from the response it validates, so a server that under-reports
+        `totalSize` proves itself complete — and `totalSize="0"` is the extreme of that, erasing the
+        section while reporting success. Reproduced in review against the real client.
+
+        A second read is asked for before dropping most of a library. Here it disagrees, so nothing
+        goes. One extra request, only on the rare pass that would delete half a library.
+        """
+        cache = WatchCache(sessions)
+        full = [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2), watched("Alien", tmdb_id=3)]
+        sync(cache, sessions, user_id, full)
+
+        answers = [[], full]  # the truncated answer first, the truth on the confirming read
+        with sessions() as session:
+            cache.sync_section(
+                session,
+                profile(),
+                user_id,
+                SECTION,
+                MediaType.MOVIE,
+                lambda since: WatchedRead(items=list(answers.pop(0)), covers_window=True),
+                force_full=True,
+                reconcile=True,
+            )
+            session.commit()
+
+        with sessions() as session:
+            assert {r.title for r in session.query(WatchedTitle).all()} == {"Heat", "Dune", "Alien"}
+        assert answers == [], "the confirming read was never made"
+
+    def test_a_section_that_really_did_empty_is_swept_once_a_second_read_agrees(self, sessions, user_id):
+        """The guard must not become a reason stale titles live for ever. Two reads agreeing that a
+        library is empty is the answer being consistent, not a blip — and `watching_account`'s undo
+        no longer depends on this, it deletes its own rows."""
+        cache = WatchCache(sessions)
+        sync(cache, sessions, user_id, [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2)])
+
+        sync(cache, sessions, user_id, [], force_full=True, reconcile=True)
+
+        with sessions() as session:
+            assert session.query(WatchedTitle).count() == 0
+
+    def test_transferred_rows_do_not_make_the_shrink_guard_fire(self, sessions, user_id):
+        """The guard compares the read against the DELETABLE rows, not against every cached row.
+
+        The replace only ever touches `source_viewed_at IS NULL`, so counting transferred rows on the
+        other side of the comparison put the two on different populations. On a watching account
+        carrying a transfer that inflated the count permanently: the guard fired on every reconcile
+        for ever, bought a second full page-walk each time, and told the operator that titles had
+        vanished when nothing had.
+        """
+        from datetime import UTC, datetime
+
+        cache = WatchCache(sessions)
+        ordinary = [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2)]
+        sync(cache, sessions, user_id, ordinary)
+        with sessions() as session:
+            for n in range(8):
+                session.add(
+                    WatchedTitle(
+                        user_id=user_id,
+                        section_key=SECTION,
+                        rating_key=900 + n,
+                        tmdb_id=900 + n,
+                        media_type="movie",
+                        title=f"Transferred {n}",
+                        viewed_at=datetime.now(UTC),
+                        source_viewed_at=datetime.now(UTC),
+                    )
+                )
+            session.commit()
+
+        reads = []
+
+        def read(since):
+            reads.append(since)
+            return WatchedRead(items=ordinary, covers_window=True)
+
+        with sessions() as session:
+            cache.sync_section(
+                session, profile(), user_id, SECTION, MediaType.MOVIE, read, force_full=True, reconcile=True
+            )
+            session.commit()
+
+        assert len(reads) == 1, "the guard fired on an account that had merely been transferred to"
+        with sessions() as session:
+            assert session.query(WatchedTitle).count() == 10, "nothing was gone, so nothing should go"
+
+    def test_a_confirming_read_that_RAISES_keeps_the_cached_titles(self, sessions, user_id):
+        """The likeliest real outcome of the second read: a full library re-read failing against a
+        PMS that just answered short. That is evidence against the first answer, not for it."""
+        cache = WatchCache(sessions)
+        full = [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2), watched("Alien", tmdb_id=3)]
+        sync(cache, sessions, user_id, full)
+
+        calls = []
+
+        def read(since):
+            calls.append(since)
+            if len(calls) > 1:
+                raise TimeoutError("PMS went away")
+            return WatchedRead(items=[], covers_window=True)
+
+        with sessions() as session:
+            cache.sync_section(
+                session, profile(), user_id, SECTION, MediaType.MOVIE, read, force_full=True, reconcile=True
+            )
+            session.commit()
+
+        assert len(calls) == 2
+        with sessions() as session:
+            assert session.query(WatchedTitle).count() == 3
+
+    def test_a_confirming_read_with_no_coverage_claim_keeps_the_cached_titles(self, sessions, user_id):
+        """A bare list carries no coverage claim, so it cannot corroborate a mass deletion — and it
+        is what every test double and any non-`WatchedRead` reader hands back."""
+        cache = WatchCache(sessions)
+        full = [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2), watched("Alien", tmdb_id=3)]
+        sync(cache, sessions, user_id, full)
+
+        answers = [WatchedRead(items=[], covers_window=True), []]
+
+        with sessions() as session:
+            cache.sync_section(
+                session,
+                profile(),
+                user_id,
+                SECTION,
+                MediaType.MOVIE,
+                lambda since: answers.pop(0),
+                force_full=True,
+                reconcile=True,
+            )
+            session.commit()
+
+        with sessions() as session:
+            assert session.query(WatchedTitle).count() == 3
+
+    def test_a_section_halving_exactly_is_below_the_bar(self, sessions, user_id):
+        """The boundary. `len(items) * 2 < cached` — 2 of 4 is not MORE than half gone, so it needs
+        no second read. Pinned because this is the one place an off-by-one would live."""
+        cache = WatchCache(sessions)
+        full = [watched(t, tmdb_id=i) for i, t in enumerate(["Heat", "Dune", "Alien", "Solaris"], start=1)]
+        sync(cache, sessions, user_id, full)
+
+        reads = []
+
+        def read(since):
+            reads.append(since)
+            return WatchedRead(items=full[:2], covers_window=True)
+
+        with sessions() as session:
+            cache.sync_section(
+                session, profile(), user_id, SECTION, MediaType.MOVIE, read, force_full=True, reconcile=True
+            )
+            session.commit()
+
+        assert len(reads) == 1, "an exact halving triggered a confirming read"
+        with sessions() as session:
+            assert {r.title for r in session.query(WatchedTitle).all()} == {"Heat", "Dune"}
+
+    def test_a_small_shrink_needs_no_confirmation(self, sessions, user_id):
+        """One or two un-watches is the ordinary case and must not cost a second request every time."""
+        cache = WatchCache(sessions)
+        full = [watched("Heat", tmdb_id=1), watched("Dune", tmdb_id=2), watched("Alien", tmdb_id=3)]
+        sync(cache, sessions, user_id, full)
+
+        reads = []
+
+        def read(since):
+            reads.append(since)
+            return WatchedRead(items=full[:2], covers_window=True)
+
+        with sessions() as session:
+            cache.sync_section(
+                session, profile(), user_id, SECTION, MediaType.MOVIE, read, force_full=True, reconcile=True
+            )
+            session.commit()
+
+        assert len(reads) == 1, "a routine un-watch triggered a confirming read"
+        with sessions() as session:
+            assert {r.title for r in session.query(WatchedTitle).all()} == {"Heat", "Dune"}
 
     def test_an_incremental_read_keeps_what_it_did_not_ask_about(self, sessions, user_id):
         """The opposite failure: an incremental top-up must not be mistaken for the whole truth. It
@@ -297,7 +531,7 @@ class TestUnwatching:
         with sessions() as session:
             assert {row.title for row in session.query(WatchedTitle).all()} == {"Heat", "Dune"}
 
-        sync_pms(cache, sessions, user_id, library, force_full=True)
+        sync_pms(cache, sessions, user_id, library, force_full=True, reconcile=True)
 
         with sessions() as session:
             assert [row.title for row in session.query(WatchedTitle).all()] == ["Dune"]
@@ -494,3 +728,371 @@ class TestUserRatingSurvivesTheCache:
         with sessions() as session:
             (item,) = cache.watched_set(session, user_id)
         assert item.user_rating is None, "an un-rating must clear the column, not be skipped"
+
+
+class TestLibraryNameIsCached:
+    """The library's DISPLAY name is cached beside its key, because nothing else can supply it later.
+
+    The watched page groups a title's library copies into one row and names the libraries on it
+    (issue #111), and that page is deliberately a pure DB read — it never talks to Plex. So if the
+    sync doesn't record the name, no later read can recover it.
+    """
+
+    def _names(self, sessions, user_id) -> list[str]:
+        with sessions() as session:
+            return [row.library for row in session.query(WatchedTitle).filter(WatchedTitle.user_id == user_id)]
+
+    def test_the_name_the_sync_was_given_lands_on_the_row(self, sessions, user_id):
+        cache = WatchCache(sessions)
+
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)], name="4K Movies")
+
+        assert self._names(sessions, user_id) == ["4K Movies"]
+
+    def test_renaming_the_library_in_plex_updates_the_cached_name(self, sessions, user_id):
+        """The name is Plex's to change, and a stale one would mislabel every row from that library."""
+        cache = WatchCache(sessions)
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)], name="4K Movies")
+
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)], name="Movies (4K)", force_full=True)
+
+        assert self._names(sessions, user_id) == ["Movies (4K)"]
+
+    def test_a_sync_that_does_not_know_the_name_leaves_the_recorded_one_alone(self, sessions, user_id):
+        """Writing "" unconditionally would let any caller without a name blank one already on record,
+        and the page would lose the library line until the next sync put it back."""
+        cache = WatchCache(sessions)
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)], name="4K Movies")
+
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)], force_full=True)
+
+        assert self._names(sessions, user_id) == ["4K Movies"]
+
+    def test_an_incremental_read_renames_only_the_rows_it_returned(self, sessions, user_id):
+        """The other half of the rename matrix, stated rather than implied away.
+
+        `_upsert` only rewrites rows the read RETURNED, and an incremental read stops at the cursor —
+        so a title watched before it keeps the old library name while a recent one gets the new one,
+        and the same library briefly appears under two names in the filter. It has a one-sync ceiling
+        in production, because every real sync reads FULL (issue #108: `watch_sync.refresh_watched`
+        and `prefill_history` both pass `force_full=True`), which is the case the test above covers.
+        Pinned so nobody reads that test as a promise this path does not make.
+        """
+        cache = WatchCache(sessions)
+        old_watch = watched("Watched Last Month", tmdb_id=1, days_ago=30)
+        recent = watched("Watched Yesterday", tmdb_id=2, days_ago=1)
+        sync_pms(cache, sessions, user_id, [old_watch, recent], name="4K Movies")
+
+        sync_pms(cache, sessions, user_id, [old_watch, recent], name="Movies (4K)")
+
+        with sessions() as session:
+            names = {
+                row.title: row.library for row in session.query(WatchedTitle).filter(WatchedTitle.user_id == user_id)
+            }
+        assert names == {"Watched Last Month": "4K Movies", "Watched Yesterday": "Movies (4K)"}
+
+    def test_a_row_cached_before_the_name_existed_gets_one_on_the_next_sync(self, sessions, user_id):
+        """The upgrade path: 0087 backfills nothing, because the name lives on the PMS."""
+        cache = WatchCache(sessions)
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)])
+        assert self._names(sessions, user_id) == [""]
+
+        sync_pms(cache, sessions, user_id, [watched("Dune", tmdb_id=1)], name="Movies", force_full=True)
+
+        assert self._names(sessions, user_id) == ["Movies"]
+
+
+class TestTheEpochNeverOverwritesARealDate:
+    """A show marked watched carries no `lastViewedAt` of its own and is dated from its newest
+    watched EPISODE. That repair is a second network read, so it can fail on its own — and when it
+    does the reader honestly degrades to 1970.
+
+    Writing that through would rewrite a correct cached date back to "finished 20697d ago" (the
+    reported symptom of #108) until some later sync happened to succeed. Worse, the date is what
+    `_drop_vanished_since` uses to decide whether a row is inside its window at all.
+    """
+
+    def test_a_failed_date_repair_does_not_reset_a_date_already_cached(self, sessions, user_id):
+        cache = WatchCache(sessions)
+        real = datetime.now(UTC) - timedelta(days=2)
+        sync(cache, sessions, user_id, [WatchedItem("Marked Series", MediaType.MOVIE, real, tmdb_id=7, rating_key=7)])
+
+        # The same title on a night the episode read failed: the reader can only offer the epoch.
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        sync(cache, sessions, user_id, [WatchedItem("Marked Series", MediaType.MOVIE, epoch, tmdb_id=7, rating_key=7)])
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=7).one()
+            assert row.viewed_at.replace(tzinfo=UTC) != epoch, "a failed date repair reset a good date to 1970"
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - real).total_seconds()) < 1
+
+    def test_a_first_sighting_still_records_the_epoch(self, sessions, user_id):
+        """The guard protects an EXISTING date; it must not refuse to store the only one there is.
+
+        A show nothing can date is genuinely unknown, and the epoch is how the rest of the system
+        reads "unknown" — it weighs zero as a seed. Dropping the write would leave `viewed_at` at
+        the insert-time default, i.e. today, which claims the opposite.
+        """
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        cache = WatchCache(sessions)
+        sync(
+            cache, sessions, user_id, [WatchedItem("No Date Anywhere", MediaType.MOVIE, epoch, tmdb_id=8, rating_key=8)]
+        )
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=8).one()
+            assert row.viewed_at.replace(tzinfo=UTC) == epoch
+
+    def test_a_real_date_still_replaces_an_epoch(self, sessions, user_id):
+        """The guard is one-way. Once the episode read succeeds, the row must take the real date."""
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        cache = WatchCache(sessions)
+        sync(cache, sessions, user_id, [WatchedItem("Marked Series", MediaType.MOVIE, epoch, tmdb_id=9, rating_key=9)])
+
+        real = datetime.now(UTC) - timedelta(hours=3)
+        sync(cache, sessions, user_id, [WatchedItem("Marked Series", MediaType.MOVIE, real, tmdb_id=9, rating_key=9)])
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=9).one()
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - real).total_seconds()) < 1
+
+
+class TestAKeylessRowIsNotChurnedEveryPass:
+    """The targeted delete exists so a quiet night writes nothing. It keys on `_cache_key`, which
+    stores an item with no `ratingKey` under its NEGATED tmdb_id — so a key set built from
+    `item.rating_key` alone left those rows out of it, and every pass deleted and re-inserted them.
+
+    No data was lost (the upsert immediately put them back), which is exactly why nothing noticed.
+    """
+
+    def test_a_row_with_no_rating_key_survives_a_reconcile_intact(self, sessions, user_id):
+        cache = WatchCache(sessions)
+        items = [watched("Keyless", tmdb_id=42, rating_key=None), watched("Normal", tmdb_id=43)]
+        sync(cache, sessions, user_id, items, force_full=True, reconcile=True)
+
+        with sessions() as session:
+            before = {r.title: r.id for r in session.query(WatchedTitle).filter_by(user_id=user_id)}
+        assert set(before) == {"Keyless", "Normal"}
+
+        sync(cache, sessions, user_id, items, force_full=True, reconcile=True)
+
+        with sessions() as session:
+            after = {r.title: r.id for r in session.query(WatchedTitle).filter_by(user_id=user_id)}
+        assert after == before, "the keyless row was deleted and re-inserted rather than left alone"
+
+
+def show(title: str, *, rating_key: int, viewed: int, leaf: int, watched_at: datetime) -> WatchedItem:
+    return WatchedItem(
+        title=title,
+        media_type=MediaType.SHOW,
+        watched_at=watched_at,
+        tmdb_id=rating_key,
+        rating_key=rating_key,
+        viewed_leaf_count=viewed,
+        leaf_count=leaf,
+    )
+
+
+class TestAMarkedWatchedShowGetsItsRealDate:
+    """Plex bumps a show's `viewedLeafCount` when its episodes are MARKED and leaves the show's own
+    `lastViewedAt` alone — so a partly-watched series finished today still reads as finished months
+    ago (issue #108, reported after the first round of fixes).
+
+    Not cosmetic: that date is the recency half of a seed's weight and halves every ~45 days, so a
+    series marked watched today but dated two years ago never seeds. The person finishes a show and
+    gets nothing like it recommended.
+
+    Reproduced on a real server before this existed: a show went 1/8 -> 8/8 and kept its 2024-10-11
+    date, while every one of its episodes carried that day's date.
+    """
+
+    def _sync(self, cache, sessions, user_id, items, repair=None):
+        with sessions() as session:
+            cache.sync_section(
+                session,
+                profile(),
+                user_id,
+                SECTION,
+                MediaType.SHOW,
+                lambda since: WatchedRead(items=list(items), covers_window=True),
+                repair_dates=repair,
+                force_full=True,
+                reconcile=True,
+            )
+            session.commit()
+
+    def test_the_count_rising_with_a_frozen_date_takes_the_episode_date(self, sessions, user_id):
+        cache = WatchCache(sessions)
+        old = datetime.now(UTC) - timedelta(days=700)
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=5, viewed=1, leaf=8, watched_at=old)])
+
+        real = datetime.now(UTC) - timedelta(minutes=5)
+        asked: list[set[int]] = []
+
+        def repair(keys):
+            asked.append(set(keys))
+            return {5: real}
+
+        # Plex now reports 8 of 8 — and the SAME stale date.
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=5, viewed=8, leaf=8, watched_at=old)], repair)
+
+        assert asked == [{5}], f"the wrong shows were sent for dating: {asked}"
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=5).one()
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - real).total_seconds()) < 1
+
+    def test_a_show_they_actually_PLAYED_is_left_alone(self, sessions, user_id):
+        """Playing updates the show's own date, so Plex is already right and there is nothing to ask."""
+        cache = WatchCache(sessions)
+        old = datetime.now(UTC) - timedelta(days=700)
+        self._sync(cache, sessions, user_id, [show("Played", rating_key=6, viewed=1, leaf=8, watched_at=old)])
+
+        asked: list[set[int]] = []
+        moved = datetime.now(UTC) - timedelta(hours=2)
+        self._sync(
+            cache,
+            sessions,
+            user_id,
+            [show("Played", rating_key=6, viewed=8, leaf=8, watched_at=moved)],
+            lambda keys: asked.append(set(keys)) or {},
+        )
+
+        assert asked == [], "asked Plex to re-date a show whose date had already moved"
+
+    def test_a_FIRST_sighting_is_never_re_dated(self, sessions, user_id):
+        """The guard that matters most, and the one whose absence would be worse than the bug.
+
+        A show seen for the first time has no previous count to have risen from. Treating that as
+        "the count went up" would re-date every row on a first sync, a rebuilt cache, or a newly
+        added library — telling Shortlist a person's entire back catalogue was watched today, so all
+        of it seeds at full strength. A wrong OLD date makes one show seed weakly; a wrong NEW date
+        poisons every recommendation they get.
+        """
+        cache = WatchCache(sessions)
+        asked: list[set[int]] = []
+        long_ago = datetime.now(UTC) - timedelta(days=900)
+        self._sync(
+            cache,
+            sessions,
+            user_id,
+            [show("Brand New", rating_key=7, viewed=40, leaf=40, watched_at=long_ago)],
+            lambda keys: asked.append(set(keys)) or {},
+        )
+
+        assert asked == [], "a never-before-seen show was treated as newly marked"
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=7).one()
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - long_ago).total_seconds()) < 1
+
+    def test_an_episode_date_OLDER_than_the_show_never_moves_it_backwards(self, sessions, user_id):
+        """A show can hold episodes watched years ago beside a recent play. The show's own date is
+        right in that case, so the episode answer is only ever an improvement, never a replacement."""
+        cache = WatchCache(sessions)
+        recent = datetime.now(UTC) - timedelta(days=1)
+        self._sync(cache, sessions, user_id, [show("Mixed", rating_key=8, viewed=2, leaf=20, watched_at=recent)])
+
+        ancient = datetime.now(UTC) - timedelta(days=2000)
+        self._sync(
+            cache,
+            sessions,
+            user_id,
+            [show("Mixed", rating_key=8, viewed=9, leaf=20, watched_at=recent)],
+            lambda keys: {8: ancient},
+        )
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=8).one()
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - recent).total_seconds()) < 1, "the date went backwards"
+
+    def test_the_repaired_date_SURVIVES_the_next_quiet_sync(self, sessions, user_id):
+        """The one that makes the repair worth anything. Missing it, the fix lasted a single night.
+
+        The repair only fires while the count is RISING, and `_upsert` then persists the new count.
+        So the next sync sees an unchanged count, does not repair, and Plex hands back the same stale
+        show date it always will — which used to be written straight over the good one. Every night.
+        Two syncs looked green; the third is where it showed.
+        """
+        cache = WatchCache(sessions)
+        old = datetime.now(UTC) - timedelta(days=700)
+        real = datetime.now(UTC) - timedelta(minutes=5)
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=11, viewed=1, leaf=8, watched_at=old)])
+        self._sync(
+            cache,
+            sessions,
+            user_id,
+            [show("Marked", rating_key=11, viewed=8, leaf=8, watched_at=old)],
+            lambda keys: {11: real},
+        )
+        # A quiet night. Plex reports the same count and the same stale date, for ever.
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=11, viewed=8, leaf=8, watched_at=old)])
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=11).one()
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - real).total_seconds()) < 1, (
+                "the stale show date overwrote the repaired one — the fix lasted exactly one sync"
+            )
+
+    def test_un_marking_still_moves_the_date_back(self, sessions, user_id):
+        """The guard above must not freeze a date for ever. A FALLING count is an un-mark, and the
+        date should follow it rather than keeping a repair for something no longer watched."""
+        cache = WatchCache(sessions)
+        old = datetime.now(UTC) - timedelta(days=700)
+        real = datetime.now(UTC) - timedelta(minutes=5)
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=12, viewed=1, leaf=8, watched_at=old)])
+        self._sync(
+            cache,
+            sessions,
+            user_id,
+            [show("Marked", rating_key=12, viewed=8, leaf=8, watched_at=old)],
+            lambda keys: {12: real},
+        )
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=12, viewed=2, leaf=8, watched_at=old)])
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=12).one()
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - old).total_seconds()) < 1, (
+                "a falling count did not re-date — the guard froze the date instead of following the un-mark"
+            )
+
+    def test_a_transferred_row_is_still_repaired(self, sessions, user_id):
+        """The detector must compare Plex's clock, not the transfer's.
+
+        A transferred row carries the ORIGINAL account's historical date in `source_viewed_at`, which
+        is always older than the replica's own stamp. Reading that as "the cached date" made
+        `item.watched_at > cached_date` true on every pass, so a transferred account's marked-watched
+        shows were silently never repaired.
+        """
+        cache = WatchCache(sessions)
+        old = datetime.now(UTC) - timedelta(days=700)
+        self._sync(cache, sessions, user_id, [show("Transferred", rating_key=13, viewed=1, leaf=8, watched_at=old)])
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=13).one()
+            row.source_viewed_at = datetime.now(UTC) - timedelta(days=1500)  # the true, much older date
+            session.commit()
+
+        asked: list[set[int]] = []
+        real = datetime.now(UTC) - timedelta(minutes=5)
+        self._sync(
+            cache,
+            sessions,
+            user_id,
+            [show("Transferred", rating_key=13, viewed=8, leaf=8, watched_at=old)],
+            lambda keys: asked.append(set(keys)) or {13: real},
+        )
+
+        assert asked == [{13}], "a transferred row was never offered for repair"
+
+    def test_a_failed_date_read_costs_the_date_and_nothing_else(self, sessions, user_id):
+        cache = WatchCache(sessions)
+        old = datetime.now(UTC) - timedelta(days=700)
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=9, viewed=1, leaf=8, watched_at=old)])
+
+        def boom(_keys):
+            raise RuntimeError("plex.tv would not mint a token")
+
+        self._sync(cache, sessions, user_id, [show("Marked", rating_key=9, viewed=8, leaf=8, watched_at=old)], boom)
+
+        with sessions() as session:
+            row = session.query(WatchedTitle).filter_by(user_id=user_id, rating_key=9).one()
+            assert row.viewed_leaf_count == 8, "a failed date read lost the count too"
+            assert abs((row.viewed_at.replace(tzinfo=UTC) - old).total_seconds()) < 1

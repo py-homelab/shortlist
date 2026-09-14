@@ -29,7 +29,6 @@ from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
@@ -38,11 +37,12 @@ from sqlalchemy import func
 from sqlalchemy import text as sa_text
 
 import shortlist
-from shortlist.engine import privacy
-from shortlist.engine.models import LABEL_PREFIX, SHARED_LABEL_PREFIX
+from shortlist.engine.models import SHARED_LABEL_PREFIX, EngineConfig, RowSpec
+from shortlist.engine.rows import effective_idle_hold_days
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
 from shortlist.server.db.models import (
+    DEFAULT_SLUG,
     Collection,
     CollectionUserOverride,
     Event,
@@ -54,7 +54,8 @@ from shortlist.server.db.models import (
     WatchedTitle,
     WatchSyncState,
 )
-from shortlist.server.services.redaction import known_identifiers, redact_all
+from shortlist.server.services import privacy_status
+from shortlist.server.services.redaction import known_identifiers, redact_all, scrub_secrets
 from shortlist.server.settings_store import SettingsStore
 
 #: How long a single "turn it on" lasts. Long enough to survive a slow chat exchange across
@@ -85,33 +86,6 @@ _MATCH_CAP = 2000
 #: How many WARNING+ log lines ride along in a report. Enough to show a repeating failure, few enough
 #: that the whole thing still pastes into a chat window. The full log zip is a separate download.
 _ERROR_LINES = 40
-
-#: The label prefix every Shortlist exclusion carries, lowercased. Plex title-cases new labels, so
-#: comparisons are always case-insensitive.
-_LABEL_PREFIX = "shortlist_"
-
-
-def _per_person_excludes(row: dict) -> list[str]:
-    """The Shortlist excludes on one account that "leave their sharing alone" would actually remove.
-
-    A restricted shared row's `shortlist__shared_*` exclude is deliberately kept, so it is not
-    evidence that a removal is owed. `_is_ours` matches on `shortlist_`, which a shared label also
-    starts with — the same collision that made the writer strip them in the first place.
-    """
-    shared = SHARED_LABEL_PREFIX.lower()
-    return [v for v in row["shortlist_excludes"] if not unquote(v).lower().startswith(shared)]
-
-
-def _is_ours(value: str) -> bool:
-    """Is this filter value one of Shortlist's own labels?
-
-    Matched URL-DECODED, the same way `privacy` matches them: plex.tv stores whatever encoding the
-    last writer used, so the same label reaches us written more than one way. Comparing raw bytes
-    here would report a label this account already excludes as missing — the opposite of the one
-    question this report exists to answer.
-    """
-    return unquote(value).lower().startswith(_LABEL_PREFIX)
-
 
 # --------------------------------------------------------------------------------------------
 # mode
@@ -220,15 +194,6 @@ def _audit(session, tool: str, detail: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-#: Anything shaped like a credential in a URL, a header line or a dict repr. Covers the `=`, `:` and
-#: quoted forms, because an exception message may carry any of them:
-#:     ?X-Plex-Token=abc      X-Plex-Token: abc      {'X-Plex-Token': 'abc'}
-_SECRET_PATTERN = re.compile(
-    r"((?:X-Plex-Token|token|apikey|api[-_]?key|key|secret)['\"]?\s*[:=]\s*['\"]?)[^&\s'\",;}\]]+",
-    re.IGNORECASE,
-)
-
-
 def _scrub(s: str) -> str:
     """Strip anything credential-shaped out of a string before it reaches a client.
 
@@ -242,8 +207,9 @@ def _scrub(s: str) -> str:
     `issue.tsx` prints `checks[].detail` and `error` on screen verbatim.
     """
     # `redact_all` owns the literals-then-patterns order; see its docstring for why it is not the
-    # other way round.
-    return redact_all(_SECRET_PATTERN.sub(r"\1<redacted>", s), _KNOWN.get())
+    # other way round. The credential pattern itself lives in `redaction` so the privacy status
+    # endpoint, which renders the same error strings outside support mode, cannot drift from it.
+    return redact_all(scrub_secrets(s), _KNOWN.get())
 
 
 #: Setting keys whose VALUE is a network location. Reported as a shape, never verbatim: a report is
@@ -253,6 +219,10 @@ def _scrub(s: str) -> str:
 _LOCATION_KEYS = {
     "plex.url",
     "tautulli.url",
+    # Only the URL. `requests.target` ("arr"/"overseerr") and `request_as_user_id` are not network
+    # locations, and shaping them would hide the one non-sensitive fact worth having in a bug report
+    # — which route this install is on — behind a "<set>".
+    "requests.overseerr.url",
     "requests.radarr.url",
     "requests.sonarr.url",
     "curator.ollama_url",
@@ -368,47 +338,6 @@ def _plex_client(store: SettingsStore):
     return PlexClient(url, token, timeout=_PROBE_TIMEOUT_S)
 
 
-def _existing_row_labels(store: SettingsStore) -> tuple[set[str], str | None]:
-    """Lowercased labels of the PER-PERSON rows that exist on Plex right now, plus why not if unread.
-
-    The engine hides a row by excluding the label it found on the PMS (`privacy.desired_excludes`
-    works off `stored_labels`), so "which labels belong in everyone's filter" is a question only the
-    server can answer — the user table cannot, because a user with no row yet has no label anywhere.
-
-    Shared rows are left out. They are public (or audience-scoped) by design and are deliberately NOT
-    excluded from everyone, so counting them here would report every account as leaking one.
-
-    Returns ``(labels, error)``. An error means UNKNOWN, never "none": a read that failed must not be
-    reported as a clean bill of health, which is the same fail-safe the engine applies to this
-    enumeration (see `collections_known` in `pipeline._privacy_sync_phase`).
-
-    "No labels came back" is checked against the title MARKER, not just against exceptions. A read
-    that succeeds and returns nothing looks identical to a server with no rows — and on a server whose
-    rows have LOST their labels, which is the state this whole area exists to defend against, those
-    rows are visible to everyone. Printing "there is nothing for anyone to hide" there would be the
-    most reassuring possible lie. The marker is independent of the label, so the two disagreeing says
-    which of the two is true.
-    """
-    try:
-        plex = _plex_client(store)
-        if plex is None:
-            return set(), "Plex isn't connected."
-        owned = plex.owned_collections(LABEL_PREFIX)
-        shared_prefix = SHARED_LABEL_PREFIX.lower()
-        labels = {row.label.lower() for row in owned.values() if not row.label.lower().startswith(shared_prefix)}
-        if not labels:
-            # Same client, so the collection list is already cached — this costs no extra listing read.
-            marked = sum(1 for row in plex.owned_row_surfaces(flags=False) if row.get("marked"))
-            if marked:
-                return set(), f"{marked} collection(s) are ours by title but carry no label"
-    except Exception as e:
-        # Building the client is inside the guard too. It is documented never to raise, but this is
-        # the fail-safe path for the tool that reports leaks — one that raises here would take out
-        # the whole section instead of reporting "unknown".
-        return set(), _fail(e)
-    return labels, None
-
-
 def _counts_as_watched(
     viewed: int | None, total: int | None, media_type: str, show_pct: float, *, cap: float, rewatch: bool = False
 ) -> bool:
@@ -474,8 +403,14 @@ def _check(name: str, fn) -> dict:
         ok, detail = fn()
         return {"name": name, "ok": bool(ok), "detail": str(detail)}
     except Exception as e:
-        logger.debug("support health probe {} failed: {}", name, e)
-        return {"name": name, "ok": False, "detail": _fail(e)}
+        # Scrub BEFORE logging, not just before responding. plexapi puts `X-Plex-Token` straight into
+        # its error text (see the note in `pipeline.py`), and the rotating file sink under
+        # /config/logs is always DEBUG regardless of the console level — so logging the raw exception
+        # wrote a live Plex token to disk on every failed probe, and into any support bundle taken
+        # afterwards. Rule 9: never logged, never in exception messages.
+        detail = _fail(e)
+        logger.debug("support health probe {} failed: {}", name, detail)
+        return {"name": name, "ok": False, "detail": detail}
 
 
 @_tool.get("/support/health")
@@ -927,9 +862,11 @@ async def rows(request: Request) -> dict:
         store = SettingsStore(session, state.secrets)
         global_pct = float(store.get("recommendations.watched_pct") or 0.0)
         global_days = int(store.get("recommendations.refresh_days") or 0)
+        global_hold = int(store.get("recommendations.idle_hold_days") or 0)
         out: list[dict] = []
         for c in session.query(Collection).order_by(Collection.sort_order, Collection.id).all():
             cap, cap_from = _effective_cap(c, global_pct)
+            hold, hold_from = _effective_hold(c, global_hold)
             out.append(
                 {
                     "slug": c.slug,
@@ -941,6 +878,8 @@ async def rows(request: Request) -> dict:
                     "watched_pct_source": cap_from,
                     "refresh_days": c.refresh_days if c.refresh_days is not None else global_days,
                     "refresh_days_source": "row" if c.refresh_days is not None else "global",
+                    "idle_hold_days": hold,
+                    "idle_hold_source": hold_from,
                     "rewatch": bool(c.rewatch),
                     "unstarted_only": bool(c.unstarted_only),
                 }
@@ -1071,6 +1010,67 @@ def _people_worth_including(findings: dict[str, dict]) -> list[str]:
 # --------------------------------------------------------------------------------------------
 
 
+def _effective_cadence(collection, global_days: int, global_template: str) -> int:
+    """How often this row rebuilds as the ENGINE will run it, in days.
+
+    Mirrors `RowPolicy.effective_refresh_days`, which FORCES 1 for a row that follows a watch — one
+    named after its seed (`{top_seed}`) or one that cycles between several. The stored number is
+    ignored for those, and the row editor hides the cadence control to match, so reporting it raw
+    says "every 8d" about a row that runs nightly.
+
+    That matters twice over now, because the hold is judged against this. A `{top_seed}` row with an
+    8-day hold is a real 7-night hold precisely BECAUSE its cadence is forced to 1 — compared against
+    the stored 8 it looks like a no-op, and the operator gets told to raise a setting already working.
+
+    Template resolution mirrors `context_builder`, which is the thing that actually builds the spec:
+    the DEFAULT row always renders the GLOBAL `row.name_template` (its own column is blank on purpose,
+    and on older databases still carries a stale value the engine ignores — see `api/collections.py`);
+    every other row uses `name_template or NAME`. The `or name` half is not optional: the Rows UI
+    writes a typed title into `name` and leaves `name_template` empty, so reading the column alone
+    misses every `{top_seed}` row made through the UI — which is most of them.
+
+    It cannot see a PER-USER `row_name_template` override, and that cuts BOTH ways: a row named after
+    a watch for one person only is reported at its stored cadence (the forcing missed), and a global
+    `{top_seed}` template that one person has overridden away is reported as forced when for them it
+    is not. The answer is per-person; this endpoint is per-row, so it reports the row's own.
+    """
+    template = (
+        global_template if collection.slug == DEFAULT_SLUG else (collection.name_template or collection.name)
+    ) or ""
+    if "{top_seed}" in template or int(collection.seed_window or 1) > 1:
+        return 1
+    return max(0, collection.refresh_days if collection.refresh_days is not None else global_days)
+
+
+def _effective_hold(collection, global_hold: int) -> tuple[int, str]:
+    """This row's idle ceiling as the ENGINE will apply it, and where the answer came from.
+
+    CALLS the engine's own resolver rather than restating its rule. `effective_max_seeds` records
+    why: two "identical" fallbacks written out twice is exactly how they drift apart. Only the
+    shared-row case and the source LABEL are decided here — neither is something the engine has an
+    opinion about, because `_shared_row` is a separate builder the hold never reaches, and a row with
+    no single owner has nobody whose watching could be idle.
+
+    Resolved at all — rather than reported raw — because these two endpoints exist to answer "why did
+    nothing happen". Naming a ceiling the engine ignores points the operator at the wrong setting,
+    which is worse than saying nothing: the same bug shape as the row editor hiding a control the
+    engine still applies (issue #57), one layer out.
+    """
+    if collection.build == "shared":
+        return 0, "n/a"
+    spec = RowSpec(
+        slug=collection.slug,
+        name_template="",
+        size=collection.size,
+        seed_window=int(collection.seed_window or 1),
+        idle_hold_days=collection.idle_hold_days,
+    )
+    days = effective_idle_hold_days(spec, EngineConfig(idle_hold_days=global_hold))
+    if days != (collection.idle_hold_days if collection.idle_hold_days is not None else global_hold):
+        return days, "forced"  # the engine overrode what is stored (a cycling row)
+    return days, "row" if collection.idle_hold_days is not None else "global"
+
+
 @_tool.get("/support/row-schedule")
 async def row_schedule(request: Request) -> dict:
     """When each row last rebuilt, and when it is next due to.
@@ -1084,21 +1084,51 @@ async def row_schedule(request: Request) -> dict:
     with state.sessions() as session:
         store = SettingsStore(session, state.secrets)
         global_days = int(store.get("recommendations.refresh_days") or 0)
+        global_hold = int(store.get("recommendations.idle_hold_days") or 0)
+        global_template = str(store.get("row.name_template") or "")
+        # `built_at`, NOT `created_at`. A carried-forward row is re-persisted under every run, so
+        # `created_at` means "last delivered" — on a nightly server it is always today, which made
+        # every row here report `days_since_built: 0, due: false`, the exact answer this endpoint
+        # exists to replace. `created_at` stays as the fallback wherever there is no stamp: picks
+        # written before 0086, and — permanently — SHARED rows (`_shared_row` builds its own picks and
+        # stamps nothing) and cold-start rows (that branch returns before the stamp). Those keep
+        # reporting `age 0d`, which for a shared row is honest enough, since `_shared_row` rebuilds it
+        # every run regardless. A wrong-but-familiar number still beats reporting every row on the
+        # server as never built on the night of the upgrade.
         last_built = dict(
-            session.query(PickRow.collection_slug, func.max(PickRow.created_at)).group_by(PickRow.collection_slug).all()
+            session.query(
+                PickRow.collection_slug,
+                func.max(func.coalesce(PickRow.built_at, PickRow.created_at)),
+            )
+            .group_by(PickRow.collection_slug)
+            .all()
         )
         out: list[dict] = []
         for c in session.query(Collection).order_by(Collection.sort_order, Collection.id).all():
             # 0 is "never refresh once built" — a frozen, pinned row, not a broken one.
-            period = max(0, c.refresh_days if c.refresh_days is not None else global_days)
+            period = _effective_cadence(c, global_days, global_template)
+            hold, hold_from = _effective_hold(c, global_hold)
             built = last_built.get(c.slug)
-            days_since = (datetime.now(UTC) - built.replace(tzinfo=built.tzinfo or UTC)).days if built else None
+            # CALENDAR days, the unit `_held_for_idle` and `_is_refresh_night` both count in.
+            # `(now - built).days` floors on elapsed 24h periods instead, so a row built later in the
+            # UTC day than the moment this is read prints one day younger than the engine believes —
+            # a row showing `age 27d` against `hold 28d` reads as "still held" on the night it in
+            # fact rebuilds, in the one readout whose job is explaining why nothing happened.
+            days_since = (
+                (datetime.now(UTC).date() - built.replace(tzinfo=built.tzinfo or UTC).date()).days if built else None
+            )
             out.append(
                 {
                     "slug": c.slug,
                     "enabled": c.enabled,
                     "refresh_days_source": "row" if c.refresh_days is not None else "global",
                     "rebuild_every_days": period,
+                    # Due says the CADENCE has come round. With a hold set it is necessary, not
+                    # sufficient: a due row whose owner has watched nothing waits until they do, or
+                    # until it is this many days old. Reported so "due but nothing happened" has an
+                    # answer here rather than only in that user's run trace.
+                    "idle_hold_days": hold,
+                    "idle_hold_source": hold_from,
                     "last_built_at": built.isoformat() if built else None,
                     "days_since_built": days_since,
                     # The actionable bit: a setting change does not reach the row until this is true.
@@ -1111,23 +1141,54 @@ async def row_schedule(request: Request) -> dict:
     block = _stamp(_Block("row schedule"))
     block.rule()
     block.table(
-        ["row", "rebuilds", "last built", "age", "due"],
+        ["row", "rebuilds", "hold", "last built", "age", "due"],
         [
             [
                 r["slug"],
                 "never (frozen)" if not r["rebuild_every_days"] else f"every {r['rebuild_every_days']}d",
+                # The column exists so "due but nothing happened" is answerable from the pasted
+                # block, not only from that one person's run trace.
+                "-" if not r["idle_hold_days"] else f"{r['idle_hold_days']}d",
                 (r["last_built_at"] or "never")[:10],
                 "-" if r["days_since_built"] is None else f"{r['days_since_built']}d",
                 "YES" if r["due"] else "no",
             ]
             for r in out
         ],
-        [16, 15, 12, 6, 5],
+        [16, 15, 6, 12, 6, 5],
     )
     stale = [r["slug"] for r in out if r["rebuild_every_days"] and not r["due"] and r["days_since_built"] is not None]
     if stale:
         block.rule()
         block.line("NOTE: a setting change does not affect a row until it next rebuilds.")
+    # A row is rebuilt on its due night, so at its NEXT due night its age is exactly its cadence —
+    # and the ceiling releases at >=. A hold therefore only ever bites when it is strictly GREATER
+    # than the cadence, and `hold == cadence` is a plausible thing to configure (both controls offer
+    # 14 and 30 as presets) that does nothing at all. Saying "this row stays put" about one of those
+    # is the confidently-wrong explanation this endpoint exists to prevent.
+    live_hold = [r for r in out if r["idle_hold_days"] > r["rebuild_every_days"] > 0]
+    # Both ways a hold can be inert: the cadence already beats it, or the row never comes due at all
+    # (frozen). The second fell between the two branches and was reported nowhere.
+    dead_hold = [
+        r
+        for r in out
+        if r["idle_hold_days"] > 0 and (r["rebuild_every_days"] == 0 or r["idle_hold_days"] <= r["rebuild_every_days"])
+    ]
+    if live_hold:
+        block.rule()
+        block.line("NOTE: a row with a hold stays put while its owner has watched nothing since it")
+        block.line("was built, even on a night it is due — until the hold's day count is reached.")
+    if dead_hold:
+        block.rule()
+        for r in dead_hold:
+            block.line(
+                f"NOTE: {r['slug']} hold {r['idle_hold_days']}d has NO EFFECT — this row never "
+                f"rebuilds (frozen), so there is no rebuild to hold."
+                if not r["rebuild_every_days"]
+                else f"NOTE: {r['slug']} hold {r['idle_hold_days']}d has NO EFFECT — the row already "
+                f"rebuilds every {r['rebuild_every_days']}d, so it never reaches that age. "
+                f"Raise the hold above {r['rebuild_every_days']}d to use it."
+            )
     return {"rows": out, "text": block.render()}
 
 
@@ -1923,97 +1984,20 @@ async def sharing(request: Request) -> dict:
     state = request.app.state
     with state.sessions() as session:
         store = SettingsStore(session, state.secrets)
-        client = _plextv_client(store, _machine_id(session))
-
-        # Which labels need hiding: the per-person rows that EXIST ON PLEX, read from the server.
-        #
-        # NOT the enabled-user list, which is what this used to do. The engine only ever excludes
-        # labels it found on the PMS (`desired_excludes` <- `stored_labels`), so an enabled user who
-        # has never received a row — a cold start, zero picks, a delivery that failed — contributes a
-        # label that can never appear in anybody's filter. Every account then read as "missing" it,
-        # and this reported `0 of N accounts hide every row` on a perfectly healthy server. One
-        # reporter's server had 13 of 24 users on `picks=0`; the tool told them their privacy was
-        # entirely broken (issue #76).
-        #
-        # Nor `len(accounts) - 1`, which is wrong in both directions: the OWNER has a row but is
-        # absent from the plex.tv roster (`list_users` returns shared + Home users only), so that
-        # undercounts; and a DISABLED user is in the roster with no row, so it also overcounts.
-        #
-        # Whose row is whose comes from ALL users, not just enabled ones: a paused or disabled person
-        # still owns their collection, and their own label must never count as something they should
-        # be hiding from themselves (see `privacy.desired_excludes`).
-        labelled = {u.plex_account_id: f"{_LABEL_PREFIX}{u.slug}".lower() for u in session.query(User).all()}
-        all_labels, rows_error = _existing_row_labels(store)
-        # plex.tv gives us a USERNAME; `person()` and every other tool key on a SLUG, and `slugify`
-        # lowercases and replaces punctuation — so they differ for essentially every real account
-        # ("MooHouse" -> "moohouse", "Chris Smith" -> "chris_smith"). Passing a username on as if it
-        # were a slug made the per-person section 404 for exactly the people with a privacy fault.
-        slug_of = {u.plex_account_id: u.slug for u in session.query(User).all()}
-        # Accounts the owner asked us to leave alone. They legitimately hide nothing, so counting them
-        # as a fault would make this tool cry wolf on a server that is exactly as its owner set it up.
-        unmanaged = {u.plex_account_id for u in session.query(User).filter_by(manage_sharing=False).all()}
-
-        rows: list[dict] = []
-        error = None
-        if client is None:
-            error = "Plex isn't linked."
-        else:
-            try:
-                for account in client.list_users():
-                    ours: dict[str, list[str]] = {}
-                    theirs: list[str] = []
-                    for name in ("filterMovies", "filterTelevision"):
-                        raw = account.filters.get(name) or ""
-                        if not raw:
-                            continue
-                        try:
-                            conditions = privacy.parse_filter(raw)
-                        except Exception:
-                            # A filter we cannot parse is reported verbatim rather than
-                            # mis-attributed — the engine refuses to rewrite one too.
-                            theirs.append(f"{name}: {raw} (unparseable)")
-                            continue
-                        for condition in conditions:
-                            mine = [v for v in condition.values if _is_ours(v)]
-                            others = [v for v in condition.values if not _is_ours(v)]
-                            if mine:
-                                ours.setdefault(name, []).extend(sorted(mine))
-                            if others or not mine:
-                                joined = ",".join(others)
-                                theirs.append(
-                                    f"{name}: {condition.field}{condition.op}{joined}" if joined else f"{name}: —"
-                                )
-                    ours_flat = sorted({label for labels in ours.values() for label in labels})
-                    rows.append(
-                        {
-                            "user": account.username,
-                            "slug": slug_of.get(account.id, ""),
-                            "account_id": account.id,
-                            # LABELS, not clauses. `merge_label_excludes` unions every shortlist label
-                            # into ONE `label!=` condition, so counting clauses reported "2
-                            # exclusions" on a server hiding forty rows — and classified a whole
-                            # clause as ours whenever it contained any shortlist label, blaming the
-                            # owner's own `label!=Kids` on Shortlist. That made this unable to answer
-                            # the one question it exists for: is every row excluded for this person.
-                            # The owner turned sharing management off for this account: `missing` below
-                            # is still reported truthfully, but it is a setting, not a fault.
-                            "manage_sharing": account.id not in unmanaged,
-                            "shortlist_excludes": ours_flat,
-                            "shortlist_excludes_by_filter": {k: sorted(set(v)) for k, v in ours.items()},
-                            "other_conditions": theirs,
-                            "filters": {k: v for k, v in account.filters.items() if v},
-                            # Every row that should be hidden from THIS person: all labelled people
-                            # bar themselves. Their own label must never sit in their own filter —
-                            # that would hide them from their own row (see `privacy.py`).
-                            "should_hide": sorted(all_labels - {labelled.get(account.id, "")}),
-                            "missing": sorted(
-                                (all_labels - {labelled.get(account.id, "")}) - {unquote(v).lower() for v in ours_flat}
-                            ),
-                        }
-                    )
-            except Exception as e:
-                error = _fail(e)
-        _audit(session, "sharing", {"accounts": len(rows)})
+        # ONE computation, shared with `GET /api/privacy/status`. The screen and this text block must
+        # never be able to disagree about whether a row is hidden.
+        status = privacy_status.read_sharing_status(
+            session,
+            store,
+            _machine_id(session),
+            fail=_fail,
+            # This module's own client builders, so the tools' existing stubs stay one seam.
+            plex_factory=_plex_client,
+            plextv_factory=_plextv_client,
+        )
+        _audit(session, "sharing", {"accounts": len(status.accounts)})
+    rows, error = status.accounts, status.error
+    all_labels, rows_error = set(status.rows_on_plex), status.rows_error
 
     # A left-alone account is expected to hide nothing, so it is never "a person who can see a row
     # that is not theirs" — it is listed separately, by name, so the state stays visible.
@@ -2063,8 +2047,8 @@ async def sharing(request: Request) -> dict:
             # shared row's exclude is KEPT on purpose (`privacy.clear_our_excludes`), so counting it
             # here reports a correct state as a permanent failure — and worse, makes the genuinely
             # stuck case (a 422'd removal) indistinguishable from the normal one.
-            cleared = [r["user"] for r in rows if not r["manage_sharing"] and not _per_person_excludes(r)]
-            still_held = [r for r in rows if not r["manage_sharing"] and _per_person_excludes(r)]
+            cleared = [r["user"] for r in rows if not r["manage_sharing"] and not privacy_status.per_person_excludes(r)]
+            still_held = [r for r in rows if not r["manage_sharing"] and privacy_status.per_person_excludes(r)]
             if cleared:
                 block.line(
                     f"Left alone by choice, so they hide nothing and can see other people's rows: "
@@ -2073,14 +2057,14 @@ async def sharing(request: Request) -> dict:
                 if len(cleared) > 8:
                     block.line(f"  …and {len(cleared) - 8} more")
             for row in still_held[:8]:
-                held = ", ".join(_per_person_excludes(row)[:6])
+                held = ", ".join(privacy_status.per_person_excludes(row)[:6])
                 block.line(f"{row['user']} (#{row['account_id']}) is set to be left alone, but our exclusions are")
                 block.line(f"  STILL on this account — the removal has not gone through: {held}")
             if len(still_held) > 8:
                 block.line(f"  …and {len(still_held) - 8} more account(s) in the same state")
         for row in (r for r in rows if r["missing"] and r["manage_sharing"]):
             block.line(f"{row['user']} (#{row['account_id']})")
-            block.line(f"  hides {len(row['shortlist_excludes'])} of {len(row['should_hide'])} other rows")
+            block.line(f"  hides {len(row['shortlist_excludes_enforced'])} of {len(row['should_hide'])} other rows")
             # Named, not counted: "which row can this person see" is the actual question.
             block.line(f"  NOT HIDDEN: {', '.join(row['missing'][:6])}")
             if len(row["missing"]) > 6:
@@ -2125,7 +2109,7 @@ async def surfaces(request: Request) -> dict:
     with state.sessions() as session:
         store = SettingsStore(session, state.secrets)
         owner = session.query(User).filter(User.user_type == "owner").one_or_none()
-        owner_label = f"{_LABEL_PREFIX}{owner.slug}".lower() if owner else None
+        owner_label = f"{privacy_status.PER_PERSON_LABEL_PREFIX}{owner.slug}".lower() if owner else None
         placements = {
             c.slug: (c.name, c.placement or "both", c.placement_friends or c.placement or "both")
             for c in session.query(Collection).filter(Collection.enabled.is_(True)).all()
@@ -2433,7 +2417,7 @@ async def recent_runs(request: Request) -> dict:
             # The 6-key truncation above is a readability cap on ordinary counters, but two keys
             # report a privacy FAULT — and both sort late enough to fall outside it. A bundle that
             # silently dropped them is exactly the artifact someone attaches when reporting the leak.
-            for key in ("filters_not_enforced", "left_alone_failures"):
+            for key in ("filters_not_enforced", "left_alone_failures", "unreadable_filters"):
                 if stats.get(key):
                     block.line(f"    !! {key}={stats[key]}")
         for failure in run["failed"][:5]:

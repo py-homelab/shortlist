@@ -80,6 +80,7 @@ function okTrace(
         picks: [
           {
             rank: 1,
+            rating_key: 0,
             title: "Toy Story 2",
             reason: "Because you loved Toy Story",
             media_type: "movie",
@@ -120,6 +121,84 @@ describe("TraceView", () => {
     );
     expect(within(searched).getByText("Cars")).toBeTruthy();
     expect(within(searched).getByText("already watched")).toBeTruthy();
+  });
+
+  it("reconciles the two counts on a source card, which count different things", () => {
+    // "It added 2 titles to the pool" and "1 made the shortlist · 1 dropped" have DIFFERENT
+    // denominators: `contributed` is net-new after dedup, kept/dropped covers everything the source
+    // returned including titles another source had already added. Both right; nothing said so, and
+    // the comment in the code recorded a real person being confused by it (audit, Sep 2026).
+    render(<TraceView data={okTrace()} />);
+
+    expect(screen.getByText(/added 2 new titles to the pool/i)).toBeTruthy();
+    expect(
+      screen.getByText(
+        /Counting everything it returned, including titles another source found first/i,
+      ),
+    ).toBeTruthy();
+  });
+
+  it("writes the discover genres as a sentence, with no media-type token in it", () => {
+    render(
+      <TraceView
+        data={okTrace({
+          trace: {
+            ...okTrace().trace,
+            gathers: [
+              {
+                pool: "movie · tmdb_discover",
+                discover_genres: { movie: ["Drama", "Thriller"], show: [] },
+                sources: [
+                  {
+                    source: "tmdb_discover",
+                    status: "ok",
+                    contributed: 4,
+                    detail: "",
+                  },
+                ],
+              },
+            ],
+          },
+        } as Partial<RunUserTraceResponse>)}
+      />,
+    );
+
+    expect(
+      screen.getByText(
+        /The genres they watch most — movies: Drama, Thriller\./,
+      ),
+    ).toBeTruthy();
+    // The media type with nothing to report is DROPPED, not printed as "Show — none".
+    expect(screen.queryByText(/— none/)).toBeNull();
+  });
+
+  it("says plainly when no genre stands out, rather than printing 'Movie — none'", () => {
+    render(
+      <TraceView
+        data={okTrace({
+          trace: {
+            ...okTrace().trace,
+            gathers: [
+              {
+                pool: "movie · tmdb_discover",
+                discover_genres: { movie: [] },
+                sources: [
+                  {
+                    source: "tmdb_discover",
+                    status: "ok",
+                    contributed: 4,
+                    detail: "",
+                  },
+                ],
+              },
+            ],
+          },
+        } as Partial<RunUserTraceResponse>)}
+      />,
+    );
+
+    expect(screen.getByText(/No genre stands out/i)).toBeTruthy();
+    expect(screen.queryByText(/Movie — none/)).toBeNull();
   });
 
   it("surfaces the error for a person the run failed on", () => {
@@ -443,6 +522,25 @@ describe("TraceView", () => {
     expect(screen.queryByText(/predates library-level tracing/i)).toBeNull();
   });
 
+  it("does not call a delivered person 'skipped' just because they carry a reason", () => {
+    // The regression this pins: `reason` used to mean "nothing was built for this person", and the
+    // engine now also sets it on an `ok` person to say why their rows hold what they held last
+    // night. On the second run of any night that is most of the roster, and every one of their
+    // trace pages said "Skipped this person" above a full, correct delivery trace.
+    const data = okTrace({
+      status: "ok",
+      reason:
+        "It wasn't any of their rows' night to rebuild, so last run's titles were redelivered unchanged.",
+    });
+
+    render(<TraceView data={data} />);
+
+    expect(screen.getByText(/night to rebuild/i)).toBeTruthy();
+    expect(screen.queryByText(/skipped this person/i)).toBeNull();
+    // The trace itself must still be there — it is the whole point of the page.
+    expect(screen.getByText(/Where we searched/)).toBeTruthy();
+  });
+
   it("still renders the library tabs when a reason coexists with stages", () => {
     // The other half of the same ternary: suppressing the EmptyState must not suppress the tabs.
     const data = okTrace({ reason: "Heads up about this run" });
@@ -688,6 +786,42 @@ describe("TraceView — the flow explains freshness, the cut and release date", 
     ).toBeInTheDocument();
   });
 
+  it("says a row was held because nobody watched anything, and until when", () => {
+    // The other half of "nothing moved": not "it wasn't due" but "it WAS due and we held it". Without
+    // naming the reason this is indistinguishable from the cadence line above, and the owner goes
+    // looking for a rebuild setting that is not the one holding their row.
+    render(
+      <TraceView
+        data={withSelection({
+          decision: "held_idle",
+          refresh_night: true,
+          idle_hold_days: 28,
+        })}
+      />,
+    );
+    expect(
+      screen.getByText(/haven't watched anything since it was built/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/28 days/i)).toBeInTheDocument();
+  });
+
+  it("says what a watch-it-again row was built from, and what the cooldown held back", () => {
+    // "Why is my rewatch row topped up with new titles?" is answered by these two numbers.
+    render(
+      <TraceView
+        data={withSelection({
+          decision: "rebuilt",
+          rewatch: true,
+          rewatches: 3,
+          cooling: 2,
+          rewatch_cooldown_days: 30,
+        })}
+      />,
+    );
+    expect(screen.getByText(/3 titles they've finished/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 finished in the last 30 days/i)).toBeInTheDocument();
+  });
+
   it("names a settings change as the reason a row rebuilt early", () => {
     render(
       <TraceView data={withSelection({ decision: "settings_changed" })} />,
@@ -707,6 +841,28 @@ describe("TraceView — the flow explains freshness, the cut and release date", 
     expect(
       screen.getByText(/strongest 40 per media type/i),
     ).toBeInTheDocument();
+  });
+
+  it("names a row the way the owner does, not by its slug", () => {
+    // `TraceSelection.row` is the SLUG the engine writes, and both these lines lead with it in
+    // bold — so a row configured as "✨ {library_name} Picked for You" introduced itself as
+    // **picked** mid-sentence (audit finding, Sep 2026).
+    render(
+      <TraceView
+        data={withSelection()}
+        rowNames={{ picked: "✨ Picked for You" }}
+      />,
+    );
+
+    expect(screen.getAllByText("✨ Picked for You").length).toBeGreaterThan(0);
+    expect(screen.queryByText("picked")).toBeNull();
+  });
+
+  it("falls back to the slug for a row that no longer exists", () => {
+    // A deleted row is not in the collections list, and a blank lead-in would be worse than a slug.
+    render(<TraceView data={withSelection()} rowNames={{}} />);
+
+    expect(screen.getAllByText("picked").length).toBeGreaterThan(0);
   });
 
   it("says release date applied to the CUT, not merely to the order", () => {

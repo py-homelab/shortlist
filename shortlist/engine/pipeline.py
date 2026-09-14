@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -19,9 +21,11 @@ from loguru import logger
 import shortlist.engine.rows as rows
 from shortlist.engine import requests as requests_mod
 from shortlist.engine.clients.http_retry import redact
+from shortlist.engine.clients.plex_pms import TOP, log_title
 from shortlist.engine.clients.plextv import FilterWriteRefused
 from shortlist.engine.context import EngineContext, _emit
 from shortlist.engine.delivery import (
+    is_name_freeing_helper,
     render_row_name,
     resolve_row_template,
     row_marker,
@@ -45,17 +49,24 @@ from shortlist.engine.models import (
 )
 from shortlist.engine.privacy import (
     RESTRICTED_FILTER_FIELDS,
+    FilterParseError,
     clear_our_excludes,
     shared_label_audiences,
     shortlist_labels_in,
     sync_user_restrictions,
+    unenforced_excludes,
     unhidden_rows_on_home,
     unhidden_rows_visible_to,
+    voids_owner_restriction,
 )
 from shortlist.engine.request_config import resolve_request_config
 
 #: How many accounts of one type the filter-enforcement spot-check may try before giving up.
 _ENFORCEMENT_SPOT_CHECK_ATTEMPTS = 3
+
+#: Plex takes ~25s to apply a share-filter change (measured, pms_share_filter_boolean_semantics.json), so
+#: an account written more recently than this still shows its OLD filter to a spot-check.
+_FILTER_APPLY_S = 30.0
 
 
 def _distinct_wanted(demand: dict[str, dict]) -> int:
@@ -76,7 +87,9 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
 
     Write ordering is leak-safe: rows are created/updated UNPROMOTED, then every user's
     share filters are merged, and only then are rows promoted onto shared Home — so a new
-    collection is never visible to anyone before the exclusions that hide it exist.
+    collection is never PROMOTED before the exclusions that hide it exist. Unpromoted is not
+    invisible (the Collections tab), which is why a person's first row is excluded as soon as it is
+    written — see `_deliver_phase` and plex-safety rule 1.
     """
     report = RunReport(started_at=datetime.now(UTC), dry_run=ctx.config.dry_run)
     # The header a log reader needs BEFORE anything else: a run that dies in the index build, or is
@@ -93,6 +106,10 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
     # disables rotation) so a caller/test can pin a specific day.
     if not ctx.run_day:
         ctx.run_day = report.started_at.toordinal()
+    if ctx.run_at is None:
+        # The same instant `run_day` is derived from, so the cadence and the idle hold cannot
+        # disagree about which night this is.
+        ctx.run_at = report.started_at
 
     # Tell the UI the full queue up front — cards can say "queued (3rd in line)"
     # instead of a bare "waiting…" while the indexes build.
@@ -217,25 +234,68 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
 INDEX_CACHE_TTL_S = 7 * 24 * 3600
 
 
-def _library_index(ctx: EngineContext, section) -> dict[int, int]:
+def _library_index(ctx: EngineContext, section, genre_counts: Counter[str] | None = None) -> dict[int, int]:
     """This section's ``tmdb_id -> ratingKey`` index — from the cross-run cache when unchanged.
 
     Keyed on the section + a cheap change signature (item count + last-updated); a signature change
     (a title added/removed/edited) misses and re-scans. JSON object keys are strings, so tmdb ids
     round-trip through ``str()``/``int()``. A missing signature or NullCache just always re-scans.
+
+    ``genre_counts``, when given, is also filled with this section's genre tally. It has to ride the
+    CACHE as well as the scan: genres come free from the listing, but only when the listing is
+    actually fetched, and a cache hit fetches nothing — so a cached section would otherwise
+    contribute an empty tally and silently skew the baseline toward whichever libraries happened to
+    miss.
     """
     signature = ctx.plex.section_signature(section)
-    # v2 key: the cached payload dropped the old {"index", "episodes"} envelope for the bare index
-    # dict. A new prefix makes any old-format entry a clean miss (re-scan) instead of a parse crash.
-    cache_key = f"index2:{section.key}:{signature}" if signature else None
+    # v3 key: the payload regained an envelope, this time to carry the genre tally beside the index.
+    # A new prefix makes any older entry a clean miss (re-scan) rather than a parse crash — the same
+    # move v2 made when it dropped the original {"index", "episodes"} envelope.
+    cache_key = f"index3:{section.key}:{signature}" if signature else None
     if cache_key and (cached := ctx.index_cache.get(cache_key)):
-        index = {int(k): v for k, v in json.loads(cached).items()}
-        _emit(ctx, section.title, "indexed (cached)", {"items": len(index)})
-        return index
+        payload = json.loads(cached)
+        # A run with the dial OFF writes no tally under this same key. Serving that to a later run
+        # with the dial ON is worse than useless: with every section cached the tally is empty and the
+        # dial silently does nothing, and with only SOME sections re-scanned the baseline becomes
+        # whichever libraries happened to miss — so movie candidates get scored against a TV-only
+        # population and are demoted on arithmetic derived from the wrong library.
+        #
+        # Gated on `tallied`, which records that a tally was TAKEN — not on the tally being non-empty.
+        # Those differ for a real library whose items simply carry no <Genre> children (or whose
+        # `.genres` raises per item, which `build_library_index` suppresses): a full index and an
+        # empty tally. Inferring from emptiness would make such a section miss on every single run,
+        # for ever — a complete `section.all()` walk per run, which is exactly the "thousands of PMS
+        # reads" `_build_indexes` avoids. Entries written before this key existed carry no `tallied`,
+        # so they miss once and self-heal.
+        if genre_counts is None or payload.get("tallied"):
+            index = {int(k): v for k, v in payload["index"].items()}
+            if genre_counts is not None:
+                genre_counts.update(payload.get("genres", {}))
+            _emit(ctx, section.title, "indexed (cached)", {"items": len(index)})
+            return index
     _emit(ctx, section.title, "indexing", {})
-    index = ctx.plex.build_library_index(section)
+    section_genres: Counter[str] = Counter()
+    # Only ask for the tally when someone wants it. Passing `genre_counts=` unconditionally would
+    # make the call signature-sensitive for every caller and stub, for a value nobody reads when the
+    # dial is off — an owner who never enables this makes exactly the call they always did.
+    if genre_counts is None:
+        index = ctx.plex.build_library_index(section)
+    else:
+        index = ctx.plex.build_library_index(section, genre_counts=section_genres)
+        genre_counts.update(section_genres)
     if cache_key:
-        ctx.index_cache.set(cache_key, json.dumps({str(k): v for k, v in index.items()}), INDEX_CACHE_TTL_S)
+        ctx.index_cache.set(
+            cache_key,
+            json.dumps(
+                {
+                    "index": {str(k): v for k, v in index.items()},
+                    "genres": dict(section_genres),
+                    # Whether a tally was TAKEN, which is not the same as whether it found anything.
+                    "tallied": genre_counts is not None,
+                }
+            ),
+            INDEX_CACHE_TTL_S,
+        )
     _emit(ctx, section.title, "indexed", {"items": len(index)})
     return index
 
@@ -295,9 +355,12 @@ def _build_indexes(
     # no users they are thousands of PMS reads thrown away, in front of the sweep, on the one path (a
     # closed gate) where the sweep is the entire point and must not be preceded by anything that can fail.
     index_sections = ctx.delivery_sections if users else []
+    # Only tally genres when something will actually read them. An owner who has never turned
+    # genre avoidance on pays nothing — not even the dict churn.
+    want_genres = ctx.config.genre_avoidance > 0
     for section in index_sections:
         kind = MediaType.MOVIE if section.type == "movie" else MediaType.SHOW
-        index = _library_index(ctx, section)
+        index = _library_index(ctx, section, ctx.library_genre_counts if want_genres else None)
         seed_index.update({rating_key: tmdb_id for tmdb_id, rating_key in index.items()})
         # Every library of a deliverable type is both a recommendation source (union) and a possible
         # delivery target (its own per-section index) — a row picks which ones under library_keys.
@@ -351,6 +414,36 @@ def _deliver_phase(
 ) -> tuple[list[UserProfile], list[tuple[RowSpec, UserProfile]]]:
     """Deliver every per-person and shared row, all UNPROMOTED. Returns the promotion candidates."""
     to_promote: list[UserProfile] = []
+    # Whose rows were on the server before this run. Anyone else who ends up with a stored label got their
+    # FIRST row tonight, and nobody's share filter excludes it yet. Until one does, that row is listed in
+    # every shared account's Collections tab — collection mode "hide" does not cover that tab (measured,
+    # tests/fixtures/pms_collections_tab_filter_visibility.json) — and the end-of-run merge waits for
+    # every later person's delivery, an hour or more on a large library. So it is merged from inside the
+    # same hold of the write lock that wrote it (`rows._deliver_row`). A row that already existed was
+    # excluded by an earlier merge.
+    already_on_server = set(stored_labels)
+    early_merges = {"stopped": False}
+
+    def first_row_hider(user: UserProfile) -> Callable[[], None] | None:
+        """Hide this person's first row once, from inside the write lock that wrote it. Never raises."""
+        if user.slug in already_on_server:
+            return None
+        done = False
+
+        def hide() -> None:
+            nonlocal done
+            if done or early_merges["stopped"]:
+                return
+            done = True
+            try:
+                merged = _exclude_first_rows(ctx, users, stored_labels, report, who=user.slug)
+            except Exception:
+                logger.exception("{}: could not hide a first row early — the end-of-run merge will", user.slug)
+                merged = False
+            if not merged:
+                early_merges["stopped"] = True
+
+        return hide
 
     def process(user: UserProfile) -> tuple[UserProfile, UserRunReport, bool]:
         user_report = UserRunReport(username=user.username, slug=user.slug)
@@ -365,6 +458,7 @@ def _deliver_phase(
         # run-level record, so a paused user's deletion is never lost just because they have no
         # UserRunReport.
         swept_titles = report.swept_rows.get(user.slug, [])
+        hide_first_row = first_row_hider(user)
         started = time.monotonic()
         delivered = False
         try:
@@ -373,7 +467,15 @@ def _deliver_phase(
             # night catastrophic — SFLIX run 3, 2026-07-19). A timeout that exhausts the delivery
             # retries, or one from a non-delivery PMS read, falls through here and fails just this user.
             delivered = rows._run_user(
-                ctx, user, seed_index, library_index, stored_labels, user_report, demand, order_work
+                ctx,
+                user,
+                seed_index,
+                library_index,
+                stored_labels,
+                user_report,
+                demand,
+                order_work,
+                on_first_row=hide_first_row,
             )
         except Exception as e:
             user_report.status = "error"
@@ -441,6 +543,82 @@ def _deliver_phase(
         if agg is not None:
             shared_to_promote.append((spec, agg))
     return to_promote, shared_to_promote
+
+
+def _exclude_first_rows(
+    ctx: EngineContext, users: list[UserProfile], stored_labels: dict[str, str], report: RunReport, *, who: str
+) -> bool:
+    """Merge the excludes for `who`'s just-created first row into every other account. Returns False when
+    plex.tv could not be read or written, so the caller stops trying early merges for the rest of the run.
+
+    Additive only: `collections_known=False` and no departure evidence, so `sync_user_restrictions`
+    removes nothing but a person's own label from their own filter. Best-effort — anything that fails
+    here is written by `_privacy_sync_phase` at the end of the run, which still gates promotion.
+    """
+    started = time.monotonic()
+    try:
+        roster = {remote.id: remote for remote in ctx.plextv.list_users()}
+    except Exception as e:
+        logger.warning("{}: could not read the plex.tv user list to hide a first row early ({})", who, type(e).__name__)
+        return False
+    own_slugs = {**ctx.known_slugs, **{u.plex_account_id: u.slug for u in users}}
+    shared_labels = shared_label_audiences(ctx.config)
+    written_accounts = 0
+    for user in _server_audience(users, roster, own_slugs):
+        if user.plex_account_id in ctx.unmanaged_account_ids:
+            continue
+        own_slug = own_slugs.get(user.plex_account_id)
+        try:
+            written = sync_user_restrictions(
+                ctx.plextv,
+                user,
+                roster.get(user.plex_account_id),
+                stored_labels,
+                ctx.snapshots,
+                own_label=stored_labels.get(own_slug) if own_slug else None,
+                own_row_label=f"{LABEL_PREFIX}_{own_slug}" if own_slug else None,
+                label_prefix=LABEL_PREFIX,
+                shared_labels=shared_labels,
+                hide_all_shared=(
+                    ctx.config.hide_shared_from_disabled and user.plex_account_id in ctx.disabled_account_ids
+                ),
+                refused={},
+                dry_run=ctx.config.dry_run,
+            )
+        except FilterWriteRefused:
+            continue  # this one account's Plex settings refuse label filters; the end pass measures it
+        except Exception as e:
+            # Every failing write retries with backoff under the write lock, and every other delivery waits
+            # on it. Stop here rather than repeat that for each account and each new person.
+            logger.warning(
+                "{}: stopped hiding a first row early at {} ({}) — the privacy sync at the end of the run will",
+                who,
+                user.username,
+                type(e).__name__,
+            )
+            return False
+        if written:
+            written_accounts += 1
+            _record_filter_write(report, user, written)
+            _record_restored_restriction(ctx, user, written, report)
+    # Its own line: this runs under the write lock inside the person's row delivery, so its time is also in
+    # that row's timing — which would otherwise read as Plex being slow.
+    logger.info(
+        "{}: first row excluded early — {} share filter(s) written in {:.1f}s",
+        who,
+        written_accounts,
+        time.monotonic() - started,
+    )
+    return True
+
+
+def _record_filter_write(report: RunReport, user: UserProfile, written: dict[str, tuple[str, str]]) -> None:
+    """Audit a share-filter write (rule 10), keeping the earliest `before` when one account is written twice
+    in a run — once for new rows, again at the end — so the record still says what the account started as."""
+    entry = report.filter_writes.setdefault(user.plex_account_id, {"username": user.username, "fields": {}})
+    for field_name, (before, after) in written.items():
+        entry["fields"][field_name] = (entry["fields"].get(field_name, (before, after))[0], after)
+    entry["at"] = time.monotonic()
 
 
 def _record_unhideable(ctx, user, remote, owned, collections_known, report) -> None:
@@ -540,7 +718,25 @@ def _leave_sharing_alone(ctx: EngineContext, user, remote, report: RunReport) ->
     if written:
         # Audited like any other share write (rule 10): this one changes who can see what, and it is
         # the only write in the run that widens rather than narrows.
-        report.filter_writes[user.plex_account_id] = {"username": user.username, "fields": written}
+        _record_filter_write(report, user, written)
+        _record_restored_restriction(ctx, user, written, report)
+
+
+def _record_restored_restriction(
+    ctx: EngineContext, user: UserProfile, written: dict[str, tuple[str, str]], report: RunReport
+) -> None:
+    """Note an account whose OWN Plex restriction this write switched back on (#116).
+
+    Only for a real write: a dry run computes the same diff and changes nothing on Plex, so recording it
+    would have the notice claim a repair that never happened, every night in safe mode.
+    """
+    if ctx.config.dry_run:
+        return
+    if any(
+        voids_owner_restriction(before, LABEL_PREFIX) and not voids_owner_restriction(after, LABEL_PREFIX)
+        for before, after in written.values()
+    ):
+        report.restrictions_restored[user.plex_account_id] = user.username
 
 
 def _verify_filters_enforced(ctx, audience, roster, owned, collections_known, report) -> None:
@@ -582,6 +778,9 @@ def _verify_filters_enforced(ctx, audience, roster, owned, collections_known, re
     # settled at the bottom of this function — a type that never produced a reading must not be
     # reported as clean on the strength of a different type that did.
     attempts: dict[str, int] = {}
+    # Types passed over only because this run just wrote them. Still owed a reading before the run may
+    # claim that type is clean.
+    skipped_types: set[str] = set()
     for user in audience:
         if user.user_type is UserType.OWNER or user.plex_account_id in ctx.unmanaged_account_ids:
             continue
@@ -589,6 +788,14 @@ def _verify_filters_enforced(ctx, audience, roster, owned, collections_known, re
         if remote is None or getattr(remote, "restriction_profile", ""):
             continue  # profiled accounts are `_record_unhideable`'s job, and have a different remedy
         kind = str(user.user_type)
+        write = report.filter_writes.get(user.plex_account_id)
+        now = time.monotonic()
+        if write is not None and now - write.get("at", now) < _FILTER_APPLY_S:
+            # Written seconds ago, and Plex takes ~25s to apply a change (measured, #116): its Home would
+            # still show the OLD filter. The first run after the #116 fix writes exactly the accounts that
+            # were leaking, so sampling them raised "Plex is ignoring the filter" on the repair itself.
+            skipped_types.add(kind)
+            continue
         if kind in seen_types:
             continue
         # Only an account that HAS our exclusions can demonstrate they are being ignored. One with
@@ -629,7 +836,7 @@ def _verify_filters_enforced(ctx, audience, roster, owned, collections_known, re
     # whole budget went on failures, the run persists `filters_not_enforced: {}`, and the "Plex is
     # ignoring the privacy filter" card CLEARS while the leak is live. `attempts` is per type and
     # this flag is one bool for the run, which is exactly how that slips past (review 2026-08-18).
-    fully_covered = bool(seen_types) and set(attempts) <= seen_types
+    fully_covered = bool(seen_types) and (set(attempts) | skipped_types) <= seen_types
     report.filters_enforcement_measured = bool(report.filters_not_enforced) or fully_covered
 
 
@@ -706,8 +913,19 @@ def _privacy_sync_phase(
         # what keeps those deletions in the audit trail (rule 10).
         report.error = f"could not read the plex.tv user list: {type(e).__name__}: {e}"
         report.finished_at = datetime.now(UTC)
+        # Any restriction the early merge reported as working again is unconfirmed without this read.
+        report.restrictions_restored.clear()
         logger.exception("could not read the plex.tv user list — no filters written, nothing promoted")
         return None
+
+    # This fresh read is the read-back for `_exclude_first_rows`, which has none of its own: a restriction
+    # it reported as working again that plex.tv did not keep is withdrawn here (and re-written below).
+    for account_id in list(report.restrictions_restored):
+        remote = roster.get(account_id)
+        if remote is None or any(
+            voids_owner_restriction(remote.filters.get(f, ""), LABEL_PREFIX) for f in RESTRICTED_FILTER_FIELDS
+        ):
+            report.restrictions_restored.pop(account_id)
 
     # Whose row is whose, by ACCOUNT ID. Never by name: people rename themselves, and two display
     # names can slugify to the same string — either would quietly hand one account another's row.
@@ -752,6 +970,7 @@ def _privacy_sync_phase(
             continue
         try:
             own_slug = own_slugs.get(user.plex_account_id)
+            refused: dict[str, str] = {}
             written = sync_user_restrictions(
                 ctx.plextv,
                 user,
@@ -759,6 +978,7 @@ def _privacy_sync_phase(
                 stored_labels,
                 ctx.snapshots,
                 own_label=stored_labels.get(own_slug) if own_slug else None,
+                own_row_label=f"{LABEL_PREFIX}_{own_slug}" if own_slug else None,
                 label_prefix=LABEL_PREFIX,
                 shared_labels=shared_labels,
                 collections_known=collections_known,
@@ -770,17 +990,28 @@ def _privacy_sync_phase(
                 hide_all_shared=(
                     ctx.config.hide_shared_from_disabled and user.plex_account_id in ctx.disabled_account_ids
                 ),
+                refused=refused,
                 dry_run=ctx.config.dry_run,
             )
+            if refused:
+                # A field Plex itself cannot read (a literal `&` in one of the owner's labels). Reported, NOT
+                # a blocker (owner decision 2026-09-13): the other field was still written if it could be,
+                # and blocking would take everyone else's rows off Home every night for one label name.
+                report.unreadable_filters[user.username] = "; ".join(
+                    f"{'Movies' if field == 'filterMovies' else 'TV'}: {refused[field]}" for field in sorted(refused)
+                )
+                logger.error("{}: {}", user.username, report.unreadable_filters[user.username])
             if written:
                 # Every share we touch, audited by account id — most of these accounts have no
                 # UserRunReport to record it on (rule 10).
-                report.filter_writes[user.plex_account_id] = {"username": user.username, "fields": written}
+                _record_filter_write(report, user, written)
+                _record_restored_restriction(ctx, user, written, report)
                 if not ctx.config.dry_run:
                     # {field: expected merged value} — read back once, after every write, below.
                     to_verify[user.plex_account_id] = {field: after for field, (_before, after) in written.items()}
             if user_report is not None:
-                user_report.privacy_synced = bool(written)
+                # Written now or earlier in the run, for a person who just got their first row.
+                user_report.privacy_synced = user.plex_account_id in report.filter_writes
             if not written:
                 # Nothing was written for this account. For a profiled managed account that is
                 # expected (Plex refuses label filters) — but "expected" was doing too much work: the
@@ -856,11 +1087,16 @@ def _privacy_sync_phase(
     # promotion (the caller promotes only when this returns True). A missing shortlist exclude means a
     # row would be visible to someone it shouldn't, so it fails the whole sync (blocks promotion) exactly
     # as the old per-user read-back-and-raise did — just without a full roster fetch per account.
-    if to_verify and not sync_failed:
+    # Run even when something already failed: it is read-only, and it is what confirms (or withdraws) every
+    # restriction this pass reports as working again (#116) — a pass another account blocked still wrote.
+    if to_verify:
         try:
             fresh = {r.id: r for r in ctx.plextv.list_users()}
         except Exception as e:
             sync_failed = True
+            # Nothing written this pass is confirmed, so no restriction may be reported as working again.
+            for account_id in to_verify:
+                report.restrictions_restored.pop(account_id, None)
             note = f"could not verify filters: {type(e).__name__}"
             report.error = f"{report.error} | {note}" if report.error else note
             logger.exception("could not read the plex.tv roster to verify filter writes — nothing promoted")
@@ -869,9 +1105,18 @@ def _privacy_sync_phase(
                 remote2 = fresh.get(account_id)
                 for fieldname, expected in expected_fields.items():
                     got = remote2.filters[fieldname] if remote2 is not None else ""
-                    missing = shortlist_labels_in(expected, LABEL_PREFIX) - shortlist_labels_in(got, LABEL_PREFIX)
+                    # ENFORCED, not merely present (#116): plex.tv hands back whatever it stored, and an
+                    # exclude behind a `|` is stored perfectly and applied never. A filter we cannot parse
+                    # proves nothing either, so it counts as every exclude missing.
+                    wanted_here = shortlist_labels_in(expected, LABEL_PREFIX)
+                    try:
+                        missing = unenforced_excludes(got, wanted_here)
+                    except FilterParseError:
+                        missing = wanted_here
                     if missing:
                         sync_failed = True
+                        # plex.tv accepted the write and did not keep it: the owner's restriction is NOT back.
+                        report.restrictions_restored.pop(account_id, None)
                         msg = f"read-back missing excludes {missing} on {fieldname} for account {account_id}"
                         stamp = reports.get(own_slugs.get(account_id, ""))
                         if stamp is not None:
@@ -890,6 +1135,63 @@ def _privacy_sync_phase(
     return not sync_failed
 
 
+def live_delivered_keys(ctx: EngineContext, report: RunReport) -> dict[tuple[str, str, str], int]:
+    """The delivery ledger with THIS run's own deliveries laid over the top.
+
+    ``(user_slug, row_slug, library_key) -> ratingKey``. ``ctx.delivered_keys`` is a SNAPSHOT taken
+    when the context was built — before this run delivered anything — so a row created tonight (a
+    first delivery, or a repair that recreates one: wrong type, or refusing every add) has a ratingKey
+    the snapshot cannot know. The overlay replays the adapter's ledger write in ITS order: forget what
+    the run removed, then record what it delivered. Recording alone is not the same write — Plex
+    ratingKeys are rowids and get reused, so an id freed by an in-run removal can be handed to a
+    collection created later in the same run, and keeping the dead entry claims one collection for two
+    rows.
+
+    Shared rows come through here too: their report is filed under `shared_<row slug>`, the same
+    string the ledger's `user_slug` holds for them, so the overlay replaces rather than duplicates.
+
+    A dry run carries ``rating_key: 0`` and contributes nothing, which is right — it created no
+    collection.
+    """
+    keys: dict[tuple[str, str, str], int] = dict(ctx.delivered_keys)
+    for user in report.users:
+        for entry in user.removed_deliveries or []:
+            keys.pop((user.slug, entry.get("row_slug") or "", str(entry.get("library_key") or "")), None)
+    for user in report.users:
+        for entry in user.breakdown or []:
+            rating_key = int(entry.get("rating_key") or 0)
+            row_slug, library_key = entry.get("row_slug") or "", str(entry.get("library_key") or "")
+            if rating_key and row_slug and library_key:
+                keys[(user.slug, row_slug, library_key)] = rating_key
+    return keys
+
+
+def identity_map(keys: dict[tuple[str, str, str], int]) -> dict[str, dict[int, str]]:
+    """Ledger tuples -> ``{user_slug: {ratingKey: row_slug}}``, dropping anything ambiguous.
+
+    A ratingKey claimed by TWO rows is left OUT rather than arbitrated to whichever entry the dict
+    happened to hold last. `Delivery`'s primary key is (row, user, library), so a ratingKey is not
+    unique across rows, and a stale entry surviving an out-of-band delete plus Plex's rowid reuse
+    produces exactly this. A dropped key falls through to the title map, which is what
+    ``user.restore`` does for the same reason.
+
+    Keyed per user because the map is only ever consulted for collections already found under that
+    user's own label, so two people cannot collide.
+    """
+    # ROWS, not entries: one row legitimately holds the same ratingKey in two ledger rows only if the
+    # data is odd, but counting entries would ALSO drop a key a single row claims twice — narrowing the
+    # map for no safety gain. The rule is "two rows disagree", so count distinct rows.
+    claims: dict[tuple[str, int], set[str]] = {}
+    for (user_slug, row_slug, _lib), rating_key in keys.items():
+        if rating_key:
+            claims.setdefault((user_slug, rating_key), set()).add(row_slug)
+    out: dict[str, dict[int, str]] = {}
+    for (user_slug, row_slug, _lib), rating_key in keys.items():
+        if rating_key and len(claims[(user_slug, rating_key)]) == 1:
+            out.setdefault(user_slug, {})[rating_key] = row_slug
+    return out
+
+
 def _promote_phase(
     ctx: EngineContext,
     to_promote: list[UserProfile],
@@ -900,14 +1202,23 @@ def _promote_phase(
     """Promote delivered rows onto shared Home — never before the excludes that hide them exist.
 
     Promotion runs across EVERY delivery library, not just one per type: promote() is the only call
-    that hides a collection from that library's normal browse view (modeUpdate), and a row can now be
-    delivered into any library (library_keys). A row promoted in only the lowest-key library would sit
-    unhidden — and browse-visible to everyone — in whatever other library it actually landed in.
+    that GUARANTEES a collection is hidden from that library's normal browse view (modeUpdate) — the
+    hide at creation is best-effort, and only for new rows — and a row can now be delivered into any
+    library (library_keys). A row promoted in only the lowest-key library would sit unhidden — and
+    browse-visible to everyone — in whatever other library it actually landed in.
 
     Returns the ratingKeys actually promoted, so the converge phase can tell "this row was set
     correctly tonight" from "nothing has touched this row in weeks" and only walk the remainder.
     A collection skipped by an exception mid-loop is correctly absent, so converge picks it up."""
     promoted: set[int] = set()
+    ledger = identity_map(live_delivered_keys(ctx, report))
+    # When SOME row is hidden today, an unidentifiable collection might BE that row — and promotion's
+    # no-spec fallback shows what it cannot identify, which would undo the midnight schedule for the
+    # rest of the day. So the run stops guessing exactly when guessing could over-show, and keeps the
+    # fallback on every server that schedules nothing (where guessing is what stops rows vanishing).
+    any_row_hidden_today = any(
+        spec.placement == "off" or spec._effective_friends_placement == "off" for spec in ctx.config.per_person_rows()
+    )
     for position, user in enumerate(to_promote, start=1):
         _emit(ctx, "Shortlist", "promoting", {"done": position, "total": len(to_promote)})
         user_report = next((r for r in report.users if r.slug == user.slug), None)
@@ -929,7 +1240,18 @@ def _promote_phase(
             # `into=promoted`, not `promoted |= ...`: a PMS failure part-way through this user must
             # still leave behind the ratingKeys already promoted, or converge would see them as
             # untouched and demote rows this run had just correctly set.
-            promote_user_rows(ctx, user, user_report.placement_titles if user_report else {}, into=promoted)
+            # `placement_keys` as well as titles: a `{top_seed}` title cannot be re-rendered without
+            # picks, so a row this run did not REBUILD (a scoped run, a row with no picks) stamps no
+            # title and would fall to `_promote_one`'s no-spec branch — which SHOWS it. That is how a
+            # 03:30 run put a row the midnight schedule had just hidden back onto Friends' Home.
+            promote_user_rows(
+                ctx,
+                user,
+                user_report.placement_titles if user_report else {},
+                placement_keys=ledger.get(user.slug, {}),
+                into=promoted,
+                skip_unmatched=any_row_hidden_today,
+            )
         except Exception as e:
             if user_report is not None:
                 user_report.status = "error"
@@ -940,12 +1262,7 @@ def _promote_phase(
     for spec, agg in shared_to_promote if not ctx.config.dry_run and filters_ok else []:
         shared_report = next((r for r in report.users if r.slug == agg.slug), None)
         try:
-            # Every library, same reason as the per-user loop above: a shared row whose library_keys
-            # narrowed leaves its collection in the dropped library, otherwise never revisited.
-            for section in ctx.plex.sections():
-                for collection in ctx.plex.find_owned_collections(section, spec.label):
-                    _promote_one(ctx, collection, spec)
-                    promoted.add(int(collection.ratingKey))
+            promote_shared_row(ctx, spec, into=promoted)
         except Exception as e:
             if shared_report is not None:
                 shared_report.status = "error"
@@ -955,13 +1272,42 @@ def _promote_phase(
     return promoted
 
 
+def promote_shared_row(ctx: EngineContext, spec: RowSpec, *, into: set[int]) -> None:
+    """Put a SHARED row's one public collection on the surfaces its placement asks for.
+
+    Every library, not just the first: a shared row whose ``library_keys`` narrowed leaves its
+    collection in the library it walked away from, which promotion would otherwise never revisit.
+
+    Split out of ``_promote_phase`` so the scheduled-visibility tick converges shared rows through
+    the identical code path a run uses — a second implementation of "where does this row go" is how
+    the two drift apart.
+
+    Writes into ``into`` as it goes rather than returning a set, for the same reason
+    ``promote_user_rows`` takes one: a PMS failure part-way through must still leave behind the
+    ratingKeys already promoted, or converge sees them as untouched and demotes rows this pass had just
+    correctly set. A local set unioned on return would discard exactly those.
+    """
+    for section in ctx.plex.sections():
+        for collection in ctx.plex.find_owned_collections(section, spec.label):
+            if ctx.config.dry_run:
+                # HERE, not in the callers (plex-safety rule 8). `PlexClient.promote` has no dry-run
+                # branch of its own, and an outside-only guard is exactly what let a `SHORTLIST_DRY_RUN`
+                # un-pause preview the hiding and perform the showing once `user.restore` became a
+                # second caller of `promote_user_rows`. This function is written to be reused.
+                logger.info("[dry-run] {}: would promote shared row '{}'", collection.title, spec.slug)
+                continue
+            _promote_one(ctx, collection, spec)
+            into.add(int(collection.ratingKey))
+
+
 def promote_user_rows(
     ctx: EngineContext,
     user: UserProfile,
-    placement_titles: dict[str, str] | None = None,
+    placement_titles: dict[tuple[str, str], str] | None = None,
     *,
     placement_keys: dict[int, str] | None = None,
     into: set[int] | None = None,
+    skip_unmatched: bool = False,
 ) -> set[int]:
     """Put every collection under one user's label onto the surfaces its row asks for.
 
@@ -975,7 +1321,7 @@ def promote_user_rows(
     * ``placement_keys`` — {Plex ratingKey -> row slug}, from the delivery ledger. Authoritative, and
       the only thing that works for a ``{top_seed}`` row, whose title is different every run and so
       matches nothing computed. The restore path passes it.
-    * ``placement_titles`` — {delivered title -> row slug}, recorded live by a run. What
+    * ``placement_titles`` — {(section key, delivered title) -> row slug}, recorded live by a run. What
       ``_promote_phase`` passes, where it is complete by construction.
 
     With neither, a static-titled row still matches via the rendered-title fallback below, and only a
@@ -996,7 +1342,9 @@ def promote_user_rows(
     # collection fell to the no-spec fallback — placement silently ignored.
     effective_rows = ctx.config.per_person_rows()
     spec_by_slug = {spec.slug: spec for spec in effective_rows}
-    placements = {title: spec_by_slug[slug] for title, slug in (placement_titles or {}).items() if slug in spec_by_slug}
+    # Keyed (section key, title), never title alone: two of one person's rows may share a title when they
+    # build in different libraries (issue #121), and a title-only map handed one of them both collections.
+    placements = {key: spec_by_slug[slug] for key, slug in (placement_titles or {}).items() if slug in spec_by_slug}
     # Fallback for rows that EXIST but got no picks this run (so they're absent from placement_titles):
     # a STATIC-titled row's title is stable, so map it to its spec by that title — otherwise
     # _promote_one would fall to the everywhere-visible default and yank a "Library only" row onto Home
@@ -1004,24 +1352,49 @@ def promote_user_rows(
     # safe hide-everywhere fallback. resolve_row_template is the shared source of truth for the template
     # precedence delivery also uses — they must not drift.
     marker = row_marker(user.plex_account_id)
-    for spec in effective_rows:
-        if spec.audience is not None and user.plex_account_id not in spec.audience:
-            continue
-        title_template = resolve_row_template(spec, user, ctx.config)
-        if "{top_seed}" not in title_template:
-            # A {library_name} title differs per library, so map one per library — across EVERY library
-            # of the row's media type, not just where it delivers now. `library_keys` says where the row
-            # goes today; its collections may still sit in a library it was narrowed away from, and
-            # since promotion now reaches those, an unmatched one would take the no-spec fallback EVERY
-            # run rather than never being touched. A synthesized title matching no collection is inert,
-            # and setdefault leaves the recorded per-library titles (placement_titles) winning.
-            for section in target_sections(ctx.plex.sections(), replace(spec, library_keys=[])):
+    sections = ctx.plex.sections()
+    static_rows = [
+        (spec, template)
+        for spec in effective_rows
+        if (spec.audience is None or user.plex_account_id in spec.audience)
+        and "{top_seed}" not in (template := resolve_row_template(spec, user, ctx.config))
+    ]
+    # Two passes, so a row's title in a library it BUILDS in always beats another row's leftover there.
+    # First the libraries each row targets today; then EVERY library of its media type, because its
+    # collections may still sit in a library it was narrowed away from, and since promotion reaches
+    # those, an unmatched one would take the no-spec fallback every run rather than never being
+    # touched. A synthesized title matching no collection is inert, and setdefault leaves the recorded
+    # per-library titles (placement_titles) winning. A {library_name} title differs per library, which
+    # is the other reason this is per library.
+    for leftovers in (False, True):
+        for spec, title_template in static_rows:
+            own = target_sections(sections, spec)
+            scope = target_sections(sections, replace(spec, library_keys=[])) if leftovers else own
+            own_keys = {str(s.key) for s in own}
+            for section in scope:
+                if leftovers and str(section.key) in own_keys:
+                    continue
                 name = render_row_name(title_template, user, [], library_name=getattr(section, "title", "") or "")
-                # `{top_seed}` templates never reach here (guarded above), so the only way this is
+                # `{top_seed}` templates never reach here (filtered above), so the only way this is
                 # empty is a template that renders to nothing — and mapping the bare marker would
                 # claim every unnamed collection of this person's for this one spec.
-                if name:
-                    placements.setdefault(name + marker, spec)
+                if not name:
+                    continue
+                key = (str(section.key), name + marker)
+                held = placements.get(key)
+                if not leftovers and held is not None and held.slug != spec.slug:
+                    # Two rows building in ONE library under one title. First in Rows-page order wins,
+                    # which is arbitrary from the owner's side and means one row's schedule silently
+                    # governs the other's collection. Delivery already warns on its own side of this.
+                    logger.warning(
+                        "rows '{}' and '{}' both render '{}' in {} — the first decides that "
+                        "collection's placement, so their day schedules cannot differ there",
+                        held.slug,
+                        spec.slug,
+                        name,
+                        getattr(section, "title", "") or "this library",
+                    )
+                placements.setdefault(key, spec)
 
     promoted = into if into is not None else set()
     # Every row the user has, in every library — they can have several rows (all sharing their label),
@@ -1051,7 +1424,25 @@ def promote_user_rows(
                 logger.info("[dry-run] {}: would promote for {}", collection.title, user.username)
                 continue
             # Identity first: a ratingKey cannot be wrong, a title can be stale or unrenderable.
-            spec = by_key.get(int(collection.ratingKey)) or placements.get(collection.title)
+            spec = by_key.get(int(collection.ratingKey)) or placements.get((str(section.key), collection.title))
+            if spec is None and skip_unmatched:
+                # For a RUN, `_promote_one`'s no-spec branch showing the row is the safe direction —
+                # under-showing makes people's rows silently disappear. For a caller converging a
+                # SCHEDULE it is the opposite: a `{top_seed}` row whose ledger key is missing matches
+                # nothing, and promoting it would put a row scheduled OFF onto Home — the exact
+                # inverse of what was asked. Leaving it exactly as it is cannot do that.
+                # WARNING, not debug: for the schedule pass this means a row will silently never
+                # hide, every night, until somebody notices. Naming the collection is what makes it
+                # findable — the usual cause is a delivery-ledger entry that went missing.
+                # `log_title`, not the raw title: every delivered collection carries ~64 zero-width
+                # marker characters, and a warning meant to make a collection FINDABLE cannot be a
+                # line nobody can match by eye.
+                logger.warning(
+                    "{}: no row matched it, so its surfaces are left as they are — a day schedule "
+                    "cannot be applied to it until its delivery record is rebuilt",
+                    log_title(collection.title),
+                )
+                continue
             _promote_one(ctx, collection, spec, user.user_type)
             promoted.add(int(collection.ratingKey))
     return promoted
@@ -1225,6 +1616,8 @@ def _promote_one(ctx: EngineContext, collection, spec: RowSpec | None, user_type
     (https://support.plex.tv/articles/manage-recommendations/). Routing a managed user through the
     owner flag would hide their row from them and put it on the owner's Home instead.
     """
+    if is_name_freeing_helper(collection.title):
+        return  # debris from a stopped run, not a row: the next sweep deletes it
     if spec is None:
         # No spec could be matched to this title. This is NOT a rare path — the title->spec map
         # misses routinely (the full-stack suite reaches it for every collection), so whatever this
@@ -1256,112 +1649,12 @@ def _promote_one(ctx: EngineContext, collection, spec: RowSpec | None, user_type
         shared = spec.show_friends_home
         recommended = spec.show_library
     else:
-        # The owner's (or a managed user's) own collection — only the owner side of the placement.
+        # The OWNER's own collection — only the owner side of the placement. A managed user went
+        # with SHARED above, which is what Plex's own docs say and what this diff's test pins.
         home = spec.show_home
         shared = False
         recommended = spec.show_owner_library
-    ctx.plex.promote(
-        collection,
-        shared=shared,
-        home=home,
-        recommended=recommended,
-        pin_top=spec.pin_top,
-    )
-
-
-def _anchor_group_order(
-    groups: dict[tuple, set[int]],
-    group_of_slug: dict[str, tuple],
-    section_title: str,
-) -> list[tuple]:
-    """The order anchor-groups must be applied in, with any that cannot be resolved left out.
-
-    A group anchored to one of OUR rows can only be placed once that row is where it belongs, so this
-    is a topological sort over "group G follows the group holding row R". Groups anchored to a foreign
-    collection or to the top depend on nothing and keep their input order — which is the owner's row
-    order, so a shelf stays in the order the Rows page shows.
-
-    Two things are dropped rather than guessed at: a CYCLE ("A after B, B after A", including a row
-    naming itself), and anything downstream of one. Placing half a cycle would produce a shelf order
-    that changes every run depending on which half won, and a co-managing tool reordering the same
-    shelf makes that indistinguishable from losing the race. Not moving them is stable and says so.
-    """
-    ordered: list[tuple] = []
-    state: dict[tuple, str] = {}
-
-    def visit(group: tuple) -> bool:
-        seen = state.get(group)
-        if seen == "done":
-            return True
-        if seen == "visiting":
-            return False  # closes a cycle
-        if seen == "broken":
-            return False
-        state[group] = "visiting"
-        anchor_row = group[2]
-        dependency = group_of_slug.get(anchor_row) if anchor_row else None
-        # A row we do NOT move is a fine anchor and imposes no ordering — it is already wherever it
-        # is. Only a sibling this run also places creates a dependency.
-        if dependency is not None and (dependency == group or not visit(dependency)):
-            state[group] = "broken"
-            logger.warning(
-                "hub order: row {!r} is part of a placement cycle in {} — leaving those rows where "
-                "they are rather than picking a winner",
-                anchor_row,
-                section_title,
-            )
-            return False
-        state[group] = "done"
-        ordered.append(group)
-        return True
-
-    for group in groups:
-        visit(group)
-    return ordered
-
-
-def _apply_order(
-    ctx: EngineContext,
-    report: RunReport,
-    section,
-    anchor,
-    only_keys: set[int] | None,
-    anchor_keys: set[int] | None = None,
-    anchor_label: str = "",
-) -> None:
-    """One best-effort, gated reorder call + its audit. A shelf reorder is cosmetic and privacy-neutral
-    (hubs are already promoted and browse-hidden; only position changes), so a failure never fails the
-    run — next run re-applies. Only our hubs move; the anchor is read-only (Kometa coexistence)."""
-    try:
-        with ctx.write_lock:
-            result = ctx.plex.order_owned_hubs(
-                section,
-                label_prefix=LABEL_PREFIX,
-                anchor_title=anchor.anchor_title,
-                anchor_keys=anchor_keys,
-                anchor_label=anchor_label,
-                before=anchor.before,
-                to_top=anchor.to_top,
-                dry_run=ctx.config.dry_run,
-                only_keys=only_keys,
-            )
-        # Recorded when anything MOVED, verified or not. An unverified pass (Plex took the moves and
-        # dropped them) is exactly the case the report has to be able to show, so it is not filtered
-        # out here for looking like a failure.
-        if result.get("moved") and not result.get("skipped"):
-            report.hub_orderings.append({"library": section.title, **result})
-    except Exception as e:
-        # `redact` because this is plexapi error text (rule 9). plexapi raises
-        # `f'({status}) {codename}; {response.url} {errtext}'`, and `response.url` carries the
-        # X-Plex-Token whenever `log.show_secrets` is on — which `PlexConfig.get` reads from the
-        # environment first, so `PLEXAPI_LOG_SHOW_SECRETS=true` on the container turns this into a
-        # token in the logs without touching our code. Safe by default is not the same as guarded.
-        logger.warning(
-            "{}: hub ordering failed ({}: {}) — left Plex's order",
-            section.title,
-            type(e).__name__,
-            redact(str(e)),
-        )
+    ctx.plex.promote(collection, shared=shared, home=home, recommended=recommended)
 
 
 def _collection_order_phase(ctx: EngineContext, order_work: list[tuple]) -> None:
@@ -1399,32 +1692,38 @@ def _collection_order_phase(ctx: EngineContext, order_work: list[tuple]) -> None
     logger.info("ordered {} collection(s), {} move(s) total", len(deduped), total)
 
 
-def _row_keys_by_slug(ctx: EngineContext, section_key: str) -> dict[str, set[int]]:
-    """row slug -> the Plex ratingKeys that row's collections have in this library, from the DURABLE
-    delivery ledger.
+def _row_keys_by_slug(ctx: EngineContext, report: RunReport, section_key: str) -> dict[str, set[int]]:
+    """row slug -> the Plex ratingKeys that row's collections have in this library: the DURABLE
+    delivery ledger, with THIS run's own deliveries laid over the top.
 
-    The ledger, not this run's report, on purpose. This used to read `report.users[].placement_titles`,
-    which only ever holds rows delivered by THE RUN IN PROGRESS — so a `privacy.sync`
-    (`engine_run(ctx, [])`, which is what the nightly privacy-sync job and the "Fix privacy" button both
-    run) had an empty map, every group came out empty, and the whole ordering pass silently did nothing.
-    On SFLIX that was 31 runs in one day reaching this code and issuing not one move (2026-08-12).
-    The ledger is written by past runs, so it answers the same question for a run with no users at all.
+    The ledger is the base, not this run's report, on purpose. This used to read
+    `report.users[].placement_titles`, which only ever holds rows delivered by THE RUN IN PROGRESS —
+    so a `privacy.sync` (`engine_run(ctx, [])`, which is what the scheduled privacy-sync job and the
+    "Fix privacy" button both run) had an empty map, every group came out empty, and the whole
+    ordering pass silently did nothing. On SFLIX that was 31 runs in one day reaching this code and
+    issuing not one move (2026-08-12). The ledger is written by past runs, so it answers the same
+    question for a run with no users at all.
+
+    The overlay of this run's own deliveries, and why it replays both the forget and the record steps
+    in that order, lives in `live_delivered_keys` — this function is only about grouping the result
+    per library.
     """
+    keys = live_delivered_keys(ctx, report)
     out: dict[str, set[int]] = {}
-    for (_user_slug, row_slug, key), rating_key in ctx.delivered_keys.items():
+    for (_user_slug, row_slug, key), rating_key in keys.items():
         if key == section_key and rating_key:
             out.setdefault(row_slug, set()).add(rating_key)
     return out
 
 
 def _order_phase(ctx: EngineContext, report: RunReport) -> None:
-    """Place each library's Shortlist rows in its Recommended shelf per the configured anchors.
+    """Place each library's Shortlist rows in its Recommended shelf, per that row's own placement.
 
-    Each row's effective anchor is its own per-library override (``RowSpec.hub_anchors``) if set, else
-    the global default (``EngineConfig.hub_anchors``). When every row in a library resolves to the SAME
-    anchor — which is every ordinary server, and every server with one row — they all move together in
-    one call that names no rows at all, so it works identically on a full run and on a `privacy.sync`
-    with no users. Only when rows genuinely disagree are they partitioned, by delivery-ledger ratingKey.
+    Each row carries its placement per library (``RowSpec.hub_anchors``); a row with none configured
+    defaults to the top. There is no global per-library default any more — it was a second source of
+    truth for the same decision, and it disagreed with the screen that set it: "Wherever Plex puts
+    them" wrote no entry, and no entry anywhere meant "top of the shelf", while the moment one
+    library WAS configured every other one silently meant "leave alone".
     """
     if not ctx.config.manage_shelf_order:
         # The owner turned shelf ordering off (a co-managing tool like agregarr/Kometa owns the order),
@@ -1434,108 +1733,266 @@ def _order_phase(ctx: EngineContext, report: RunReport) -> None:
     _apply_shelf_anchors(ctx, report)
 
 
+def _shelf_sequence(
+    rows_here: list,
+    key: str,
+    keys_by_slug: dict[str, set[int]],
+    section_title: str,
+    names: dict[str, str],
+    report: RunReport,
+) -> list[tuple[str, object]]:
+    """The wanted arrangement of this library's shelf, top first, as ``place_rows`` takes it.
+
+    Two entries per row: a POSITION marker — ``("anchor", title)``, ``("anchor_before", title)`` or
+    ``("top", "")`` — followed by that row's block, ``("rows", ratingKeys)``. A row's collections are a
+    SET: one per person, nobody sees anyone else's, so their order among themselves is not a thing to
+    maintain.
+
+    This replaces the group/cycle/refusal machinery that used to live here. That existed to sequence
+    many separate ``move(after=…)`` calls, and those are exactly what breaks Plex: an anchored move
+    halves the float gap between two hubs, so a shelf dies after ~50 of them. One sequence, realised
+    from the top, needs no sequencing of calls at all.
+    """
+    placements: dict[str, object] = {}
+    for spec in rows_here:
+        # NO entry means the shipped default: on, at the top. Not "leave it alone" — Plex appends a
+        # new hub at the BOTTOM, so a new row nothing positions starts out of sight. Opting out is
+        # `enabled=False`, which the owner sets deliberately per row.
+        #
+        # This replaced a per-LIBRARY default that also decided it, and decided it differently
+        # depending on whether any other library had been configured: with none configured it meant
+        # "top", and the moment one was, every unconfigured library silently meant "leave alone" —
+        # while the UI read "Wherever Plex puts them" in both cases.
+        entry = spec.hub_anchors.get(key) or HubAnchor(to_top=True)
+        if not entry.enabled:
+            continue
+        if not keys_by_slug.get(spec.slug):
+            # Nothing delivered for this row here yet. Said out loud and recorded, because an
+            # unplaced row does not stay put — Plex appends new hubs at the bottom.
+            logger.info(
+                "hub order: row '{}' has nothing recorded in {} yet, so it is not placed this run",
+                spec.slug,
+                section_title,
+            )
+            report.hub_orderings.append(
+                {
+                    "library": section_title,
+                    "placed": False,
+                    "row": names.get(spec.slug, spec.slug),
+                    "anchor": "",
+                    "moved": [],
+                    "reason": "row not in the delivery ledger — not placed this run",
+                }
+            )
+            continue
+        placements[spec.slug] = entry
+
+    if not placements:
+        return []
+
+    # Row order: a row placed relative to ANOTHER row follows (or precedes) it; everything else keeps
+    # the owner's own row order. A cycle is impossible to honour, so it is reported and the rows fall
+    # back to declaration order rather than being dropped — an unplaced row sinks to the bottom.
+    declared = [spec.slug for spec in rows_here if spec.slug in placements]
+
+    def follows(slug: str, ancestor: str) -> bool:
+        """Whether ``slug`` is somewhere in ``ancestor``'s chain of followers.
+
+        The sibling scan below needs the whole SUBTREE, not the direct children: with two rows
+        following one row and one of them carrying a follower of its own, scanning past direct
+        children only inserted the second sibling INSIDE the first one's subtree, breaking that
+        deeper row's "right after <row>" silently.
+        """
+        seen: set[str] = set()
+        current = target_of(slug)
+        while current and current not in seen:
+            if current == ancestor:
+                return True
+            seen.add(current)
+            current = target_of(current)
+        return False
+
+    def target_of(slug: str) -> str:
+        """The row this one is placed against, or "" — a row naming ITSELF included.
+
+        The editor refuses self-reference for the row being saved but deliberately tolerates one
+        further down a chain it did not create, so it reaches here and must not be followed.
+        """
+        target = getattr(placements[slug], "anchor_row", "")
+        return target if target and target != slug and target in placements else ""
+
+    # Built by INSERTION, not by settling a fixpoint. A row is placed next to its target's group as
+    # soon as that target has a place, so "after X" is expressed by construction — immediately so,
+    # unless two rows name the same target, which no single arrangement can satisfy for both; they
+    # then sit together on the named side in the owner's row order. Asking
+    # for it as an index could not express two rows following one target — that is unsatisfiable for
+    # two distinct positions, so the loop oscillated, burned its passes, and reported the owner's
+    # perfectly legal config as a placement cycle before dropping both followers ABOVE their target.
+    order: list[str] = []
+    pending = list(declared)
+    while pending:
+        progress = False
+        for slug in list(pending):
+            target = target_of(slug)
+            if not target:
+                order.append(slug)  # a landmark of its own, or none — keeps the owner's row order
+            elif target in order:
+                at = order.index(target)
+                if placements[slug].before:
+                    # Immediately above the target — which is the target's own index, so an earlier
+                    # sibling that also sits above it stays above this one, in the owner's row order.
+                    order.insert(at, slug)
+                else:
+                    at += 1
+                    # Below the target, and below everything already following it — its whole
+                    # subtree, so several rows sharing one target keep the order the Rows page has
+                    # them in without either of them landing inside the other's chain.
+                    while at < len(order) and follows(order[at], target) and not placements[order[at]].before:
+                        at += 1
+                    order.insert(at, slug)
+            else:
+                continue  # its target has no place yet — settle that first
+            pending.remove(slug)
+            progress = True
+        if not progress:
+            # Nothing left can be resolved, so the remainder point at each other. A cycle cannot be
+            # honoured; dropping the rows would let them sink to the bottom, so they take the owner's
+            # row order — recorded, not just logged, because a setting doing nothing has to be
+            # answerable from the UI (plex-safety rule 10).
+            logger.warning(
+                "hub order: the row placements in {} refer to each other in a loop — using your row order instead",
+                section_title,
+            )
+            report.hub_orderings.append(
+                {
+                    "library": section_title,
+                    "placed": False,
+                    "row": ", ".join(names.get(slug, slug) for slug in pending),
+                    "anchor": "",
+                    "moved": [],
+                    "repositioned": 0,
+                    "reason": "these rows are placed relative to each other in a loop — put in your row order instead",
+                }
+            )
+            order.extend(pending)
+            pending = []
+
+    def marker_for(slug: str) -> tuple[str, str]:
+        """This row's POSITION marker: its own landmark, or the one at the head of its chain.
+
+        A row placed relative to ANOTHER row names no landmark itself, so it has to adopt whatever
+        the chain it belongs to ends at. `order` above has already put chain members next to each
+        other in the right sequence, and `place_rows` accumulates repeated markers for one anchor in
+        sequence order, so repeating the head's marker realises the whole chain.
+
+        Walking the chain is what makes "after another row" work at all. It used to work by
+        INHERITANCE — a block with no marker fell into whatever bucket the block before it had left
+        open — and that mechanism was load-bearing for exactly this and silently wrong for everything
+        else: a row on Top after an anchored row landed under that row's collection. Emitting each
+        row's own marker fixed that and broke this, until the chain was resolved here instead.
+
+        A chain that leads nowhere Shortlist places — the head is on Top, or names a row whose own
+        placement is off, or one with nothing in this library yet — means the top of the shelf, in
+        your row order. NOT "left alone": Plex appends new hubs at the bottom.
+        """
+        seen: set[str] = set()
+        current = slug
+        while current not in seen:
+            seen.add(current)
+            entry = placements[current]
+            title = getattr(entry, "anchor_title", "")
+            if title:
+                return ("anchor_before" if entry.before else "anchor", title)
+            target = getattr(entry, "anchor_row", "")
+            if not target or target == current or target not in placements:
+                break
+            current = target
+        return (TOP, "")
+
+    # One POSITION marker per block, always, and never de-duplicated. `place_rows` accumulates
+    # repeats of the same anchor correctly, whereas dropping a repeated marker made that block
+    # inherit whatever position the block before it had.
+    sequence: list[tuple[str, object]] = []
+    for slug in order:
+        sequence.append(marker_for(slug))
+        sequence.append(("rows", keys_by_slug[slug]))
+    return sequence
+
+
 def _apply_shelf_anchors(ctx: EngineContext, report: RunReport) -> None:
-    """The ordering itself: resolve each library's anchor and move our rows there."""
-    global_anchors = ctx.config.hub_anchors
-    any_override = any(spec.hub_anchors for spec in ctx.config.rows)
-    if not global_anchors and not any_override:
-        # No explicit anchors configured — default to moving all owned rows to the top of each
-        # library's Recommended shelf. Without this, aborted runs or new promotions scatter rows to
-        # wherever Plex appends them, which looks broken (issue: some at top, some at bottom).
-        for section in ctx.delivery_sections:
-            default = HubAnchor(anchor_title="", before=False, to_top=True)
-            _apply_order(ctx, report, section, default, only_keys=None)
-        return
+    """Put each library's Recommended shelf into the arrangement the owner configured."""
+    names = {spec.slug: (spec.name_template or ctx.config.row_name_template or spec.slug) for spec in ctx.config.rows}
     for section in ctx.delivery_sections:
         key = str(section.key)
-        anchors_by_slug = {}
-        for spec in ctx.config.rows:
-            effective = spec.hub_anchors.get(key) or global_anchors.get(key)
-            if effective is not None:
-                anchors_by_slug[spec.slug] = effective
-        if not anchors_by_slug:
-            # No ROW resolves to an anchor here — but the library may still have one, and rows of ours
-            # may still be sitting on its shelf: every row switched off or deleted leaves its retired
-            # collections behind, and `ctx.config.rows` is then empty while `rows.hub_anchor` is not.
-            # Falling through to `continue` skipped the library in silence, which is the same shape of
-            # quiet nothing this whole function was just fixed for.
-            default = global_anchors.get(key)
-            if default is not None:
-                _apply_order(ctx, report, section, default, only_keys=None)
-            else:
-                logger.debug("hub order: no anchor configured for {} — leaving its shelf alone", section.title)
+        rows_here = [spec for spec in ctx.config.rows if target_sections([section], spec)]
+        if not rows_here:
             continue
-        distinct = {(a.to_top, a.anchor_title, a.anchor_row, a.before) for a in anchors_by_slug.values()}
-        unanchored = [spec.slug for spec in ctx.config.rows if spec.slug not in anchors_by_slug]
-        # A ROW anchor can never take the one-block path: the anchor is itself one of the things being
-        # moved, so the rows have to be placed in dependency order, one group at a time.
-        any_row_anchor = any(a.anchor_row for a in anchors_by_slug.values())
-        if len(distinct) == 1 and not unanchored and not any_row_anchor:
-            # Every row here wants the same slot, so there is nothing to tell apart: move ALL our rows
-            # in this library with one call. Naming no rows is what makes this independent of who was
-            # delivered tonight — the bug that left a run with no users ordering nothing at all.
-            _apply_order(ctx, report, section, next(iter(anchors_by_slug.values())), only_keys=None)
+        keys_by_slug = _row_keys_by_slug(ctx, report, key)
+        sequence = _shelf_sequence(rows_here, key, keys_by_slug, section.title, names, report)
+        if not sequence:
+            logger.debug("hub order: nothing to place in {} — leaving its shelf alone", section.title)
             continue
-        # Rows genuinely disagree about where they belong (or some have no anchor at all), so ours have
-        # to be partitioned. The ledger is the only durable link from a collection back to its row.
-        keys_by_slug = _row_keys_by_slug(ctx, key)
-        groups: dict[tuple[bool, str, str, bool], set[int]] = {}
-        group_of_slug: dict[str, tuple[bool, str, str, bool]] = {}
-        for slug, effective in anchors_by_slug.items():
-            keys = keys_by_slug.get(slug, set())
-            if not keys:
-                # Nothing delivered for this row here yet (a first run, or a row that has never
-                # reached this library). Said out loud rather than skipped in silence — silence here
-                # is exactly what made the original bug invisible. The next run places it.
-                logger.debug(
-                    "hub order: row '{}' has no delivered collection in {} yet — not ordering it this run",
-                    slug,
-                    section.title,
-                )
-                continue
-            group = (effective.to_top, effective.anchor_title, effective.anchor_row, effective.before)
-            groups.setdefault(group, set()).update(keys)
-            group_of_slug[slug] = group
-        # What the audit CALLS each row. The default row carries no template of its own — its title is
-        # the global one — so without that fallback the most likely anchor of all audits as a bare
-        # internal slug, which is not an answer to "what moved where" (rule 10).
-        names = {
-            spec.slug: (spec.name_template or ctx.config.row_name_template or spec.slug) for spec in ctx.config.rows
-        }
-        for group in _anchor_group_order(groups, group_of_slug, section.title):
-            to_top, anchor_title, anchor_row, before = group
-            # Anchor to the GROUP the anchor row was placed as part of, not to that row's own keys.
-            # Rows sharing a slot are moved in one call and land contiguously, so a follower aimed at
-            # just the anchor row's last hub is inserted INSIDE that block — and the next run's group
-            # pass, restoring contiguity, evicts it again. Neither call ever converges, both report
-            # `verified: True` every night, and on a 40-account server that is ~40 needless PUTs per
-            # library forever. Following the whole block is stable, and "after Picked" when Picked
-            # shares its slot with another row can only sensibly mean after that slot.
-            anchor_group = group_of_slug.get(anchor_row) if anchor_row else None
-            anchor_keys = (
-                groups.get(anchor_group) if anchor_group else (keys_by_slug.get(anchor_row) if anchor_row else None)
-            )
-            if anchor_row and not anchor_keys:
-                # The row someone anchored to has nothing in this library. Left alone rather than
-                # quietly falling back to the library default: reinterpreting where a row was asked to
-                # go is worse than not moving it, and the next run places it once that row delivers.
-                logger.info(
-                    "hub order: anchor row '{}' has nothing in {} yet — leaving the rows that follow it "
-                    "where they are this run",
-                    anchor_row,
-                    section.title,
-                )
-                continue
-            anchor = HubAnchor(anchor_title=anchor_title, anchor_row=anchor_row, before=before, to_top=to_top)
-            _apply_order(
-                ctx,
-                report,
+        _apply_placement(ctx, report, section, sequence)
+
+
+def _apply_placement(ctx: EngineContext, report: RunReport, section, sequence: list[tuple[str, object]]) -> None:
+    """One best-effort placement call plus its audit.
+
+    A shelf reorder is cosmetic and privacy-neutral — the hubs are already promoted and already
+    covered by the share-filter excludes, and the only Plex call made here changes a position — so a
+    failure never fails the run; the next run re-applies it.
+    """
+    try:
+        with ctx.write_lock:
+            result = ctx.plex.place_rows(
                 section,
-                anchor,
-                only_keys=groups[group],
-                anchor_keys=anchor_keys,
-                anchor_label=f"the {names.get(anchor_row, anchor_row)!r} row" if anchor_row else "",
+                label_prefix=LABEL_PREFIX,
+                sequence=sequence,
+                dry_run=ctx.config.dry_run,
             )
+        # One record per anchor we could not use, naming it. `place_rows` refuses only the rows
+        # pointed at that anchor and places the rest, so several can be refused in one pass and the
+        # owner needs to know WHICH of their settings is doing nothing — the single joined `anchor`
+        # string could not say.
+        refused = result.pop("refused", None) or []
+        for title in refused:
+            report.hub_orderings.append(
+                {
+                    "library": section.title,
+                    "placed": False,
+                    "anchor": title,
+                    "moved": [],
+                    "repositioned": 0,
+                    "reason": "anchor not found",
+                }
+            )
+        # Then the pass itself, gated on WORK rather than on our titles: a bottom-build moves the
+        # backbone too, and when our only row here is already the shelf's last hub the move loop skips
+        # it — so `moved` comes back empty while real hub moves went to Plex. Gating on `moved` left
+        # those unaudited, including the `verified: False` shape this whole change exists to fix
+        # (plex-safety rule 10). Both facts can hold at once — hubs moved AND a placement refused —
+        # so this runs alongside the loop above rather than instead of it.
+        if not result.get("skipped") and (result.get("moved") or result.get("repositioned")):
+            report.hub_orderings.append({"library": section.title, **result})
+    except Exception as e:
+        logger.warning(
+            "{}: hub ordering failed ({}: {}) — left Plex's order",
+            section.title,
+            type(e).__name__,
+            redact(str(e)),
+        )
+        # A raise can land MID-SEQUENCE: some hubs moved, the rest not. Recorded, because the events
+        # feed otherwise says the run touched no shelf at all (plex-safety rule 10).
+        report.hub_orderings.append(
+            {
+                "library": section.title,
+                "placed": False,
+                "row": "",
+                "anchor": "",
+                "moved": [],
+                "reason": f"the shelf write failed part-way ({type(e).__name__}) — order left as Plex has it",
+            }
+        )
 
 
 def _rows_to_request(ctx: EngineContext, demand: requests_mod.RowDemand) -> list[requests_mod.RowRequest]:

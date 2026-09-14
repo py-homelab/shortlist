@@ -140,10 +140,81 @@ class TestScheduledWorkIsDurable:
         self._fire(app, job_id)
 
         assert [k for k, _ in queued] == [kind]
+        if kind == "privacy.sync":
+            # Only a scheduled pass may count as quiet and stay out of Recent.
+            assert queued[0][1] == {"scheduled": True}
         if kind == "backup.take":
             # The payload the SUT controls, not just that something was queued: the keep limit comes
             # from settings and a dropped `max_keep` would silently prune to the built-in default.
             assert set(queued[0][1]) == {"label", "max_keep"}
+
+    def test_a_scheduled_privacy_sync_is_not_queued_behind_one_still_waiting(self, app, monkeypatch):
+        """Every 30 minutes, and writer jobs wait out a run: a two-hour run used to leave four passes queued,
+        run back to back afterwards, each redoing the merge the run itself had just done."""
+        from shortlist.server.db.models import Job
+        from shortlist.server.services import jobs
+
+        async def no_drain(state, reason):
+            return None
+
+        monkeypatch.setattr(jobs, "drain_now", no_drain)
+
+        self._fire(app, "privacy-sync")
+        self._fire(app, "privacy-sync")
+
+        with app.state.sessions() as session:
+            assert session.query(Job).filter_by(kind="privacy.sync").count() == 1
+
+    def test_a_scheduled_privacy_sync_is_not_queued_beside_one_waiting_to_retry(self, app, monkeypatch):
+        """A pass that failed (plex.tv down) goes back to `queued` with its `started_at` kept while it backs
+        off, and it re-reads everything when it retries. Counting only never-started jobs queued a fresh
+        pass beside it on every tick of an outage: more plex.tv reads while it is failing, more failure cards."""
+        from datetime import UTC, datetime
+
+        from shortlist.server.db.models import Job
+        from shortlist.server.services import jobs
+
+        async def no_drain(state, reason):
+            return None
+
+        monkeypatch.setattr(jobs, "drain_now", no_drain)
+        with app.state.sessions() as session:
+            session.add(
+                Job(
+                    kind="privacy.sync",
+                    status="queued",
+                    attempts=1,
+                    started_at=datetime.now(UTC),
+                    finished_at=datetime.now(UTC),
+                    error="RuntimeError: could not read the plex.tv user list",
+                )
+            )
+            session.commit()
+
+        self._fire(app, "privacy-sync")
+
+        with app.state.sessions() as session:
+            assert session.query(Job).filter_by(kind="privacy.sync").count() == 1
+
+    def test_a_scheduled_privacy_sync_is_queued_once_the_last_one_finished(self, app, monkeypatch):
+        from datetime import UTC, datetime
+
+        from shortlist.server.db.models import Job
+        from shortlist.server.services import jobs
+
+        async def no_drain(state, reason):
+            return None
+
+        monkeypatch.setattr(jobs, "drain_now", no_drain)
+        with app.state.sessions() as session:
+            for status in ("done", "failed"):
+                session.add(Job(kind="privacy.sync", status=status, attempts=1, started_at=datetime.now(UTC)))
+            session.commit()
+
+        self._fire(app, "privacy-sync")
+
+        with app.state.sessions() as session:
+            assert session.query(Job).filter_by(kind="privacy.sync", status="queued").count() == 1
 
     @pytest.mark.parametrize("kind", ["sync.users", "sync.history", "backup.take", "maintenance.prune"])
     def test_each_handler_actually_runs(self, kind):
@@ -218,7 +289,7 @@ class TestSyncUsersOnAnUnlinkedServer:
 
 
 class TestPrivacySyncSchedule:
-    """The nightly share-filter re-merge.
+    """The scheduled share-filter re-merge (every 30 minutes by default).
 
     It exists because the automatic Privacy Check + write gate was removed on 2026-07-16 at the
     owner's request: nothing verifies hiding after the fact any more, so leak-safe write ORDERING is
@@ -235,7 +306,7 @@ class TestPrivacySyncSchedule:
 
         # `next_run_time` only exists once the scheduler is STARTED, so registration + a trigger is
         # the whole claim available here — matching how the other schedule tests assert.
-        assert job is not None, "the nightly privacy sync is not scheduled"
+        assert job is not None, "the privacy sync is not scheduled"
         assert job.trigger is not None
 
     def test_the_retention_prune_has_a_timer_of_its_own(self, app):
@@ -259,8 +330,23 @@ class TestPrivacySyncSchedule:
             minute, hour = cron.split()[:2]
             return int(hour) * 60 + int(minute)
 
-        others = {key: minutes(cron) for key, cron in DEFAULT_CRONS.items() if key != "maintenance.prune_cron"}
+        def daily(cron: str) -> bool:
+            minute, hour = cron.split()[:2]
+            return minute.isdigit() and hour.isdigit()
+
+        # A schedule that repeats through the day (the privacy sync, every 30 minutes) has no "after".
+        others = {
+            key: minutes(cron) for key, cron in DEFAULT_CRONS.items() if key != "maintenance.prune_cron" and daily(cron)
+        }
         assert minutes(DEFAULT_CRONS["maintenance.prune_cron"]) > max(others.values()), others
+
+    def test_the_privacy_sync_runs_every_30_minutes_out_of_the_box(self, app):
+        """It also reads the plex.tv account list, so it is what hides everyone's rows from an account
+        newly shared with the server. Once a day left such an account able to browse every row in the
+        Collections tab for up to 24 hours; a clean pass takes ~20s and writes nothing."""
+        from shortlist.server.scheduler import DEFAULT_CRONS
+
+        assert DEFAULT_CRONS["privacy.sync_cron"] == "*/30 * * * *"
 
     def test_the_drift_check_runs_nightly_out_of_the_box(self, app):
         """Drift is the failure nobody notices — a row left on the wrong shelf stays there until
@@ -380,3 +466,139 @@ class TestCronResolverEdges:
             SettingsStore(session).set("backup.cron", "not a cron")
 
         assert build_scheduler(app).get_job(BACKUP_JOB_ID) is not None
+
+
+class TestRowVisibilitySchedule:
+    """The midnight tick behind "When it appears" (issue #102).
+
+    Rows build at 03:30. If a run were the only thing that turned a row over, a Monday row would sit
+    on people's Home until 03:30 Tuesday — and a row rebuilding weekly would be days late. So this
+    schedule is not a convenience; without it a day schedule does not mean what the screen says.
+    """
+
+    def test_it_is_registered_with_a_trigger_by_default(self, app):
+        from shortlist.server.scheduler import ROW_VISIBILITY_JOB_ID, build_scheduler
+
+        job = build_scheduler(app).get_job(ROW_VISIBILITY_JOB_ID)
+
+        assert job is not None, "nothing would ever apply a row's day schedule"
+        assert job.trigger is not None
+
+    def test_it_fires_at_midnight(self, app):
+        """Not 03:30 with the runs, and not an arbitrary quiet minute: a day schedule that turned over
+        at 04:17 would show a Monday row for four hours of Tuesday."""
+        from shortlist.server.scheduler import DEFAULT_CRONS
+
+        assert DEFAULT_CRONS["rows.visibility_cron"] == "0 0 * * *"
+
+
+class TestCrontabWeekdays:
+    """Cron counts weekdays from 0 = Sunday; APScheduler 3's `from_crontab` counts from 0 = Monday, so
+    every numeric weekday fired a day late (issue #123: `0 4 * * 1,4` ran Tuesday and Friday)."""
+
+    @pytest.mark.parametrize(
+        ("cron", "expected"),
+        [
+            ("0 4 * * 1,4", ["Mon", "Thu", "Mon", "Thu"]),
+            ("0 4 * * 0", ["Sun", "Sun", "Sun", "Sun"]),
+            ("0 4 * * 7", ["Sun", "Sun", "Sun", "Sun"]),
+            ("0 4 * * 1-5", ["Mon", "Tue", "Wed", "Thu"]),
+            ("0 4 * * 0-2", ["Mon", "Tue", "Sun", "Mon"]),
+            ("0 4 * * 5-7", ["Fri", "Sat", "Sun", "Fri"]),
+            ("0 4 * * 0,6", ["Sat", "Sun", "Sat", "Sun"]),
+            ("0 4 * * */2", ["Tue", "Thu", "Sat", "Sun"]),
+            ("0 4 * * mon,thu", ["Mon", "Thu", "Mon", "Thu"]),
+            ("0 4 * * *", ["Mon", "Tue", "Wed", "Thu"]),
+            # A named range may END on Sunday. `sun` is 0, so read literally `sat-sun` is 6-0 and was
+            # refused, silently stopping a schedule APScheduler's own names had always accepted.
+            ("0 4 * * sat-sun", ["Sat", "Sun", "Sat", "Sun"]),
+            ("0 4 * * fri-sun", ["Fri", "Sat", "Sun", "Fri"]),
+            ("0 4 * * mon-sun", ["Mon", "Tue", "Wed", "Thu"]),
+            ("0 4 * * SAT-SUN", ["Sat", "Sun", "Sat", "Sun"]),
+            ("0 4 * * sun-sat", ["Mon", "Tue", "Wed", "Thu"]),
+        ],
+    )
+    def test_weekdays_fire_on_the_day_cron_means_when_numbered_from_sunday(self, cron, expected):
+        from datetime import UTC, datetime, timedelta
+
+        from shortlist.server.scheduler import crontab_trigger
+
+        trigger = crontab_trigger(cron, timezone=UTC)
+        now, previous, fired = datetime(2026, 9, 6, 12, tzinfo=UTC), None, []  # a Sunday, after 04:00
+        for _ in expected:
+            previous = trigger.get_next_fire_time(previous, now)
+            fired.append(previous.strftime("%a"))
+            now = previous + timedelta(seconds=1)
+        assert fired == expected
+
+    @pytest.mark.parametrize(
+        "cron",
+        ["0 4 * * 8", "0 4 * * 5-2", "0 4 * *", "0 4 * * funday", "0 4 * * 1/", "0 4 * * */0", "0 4 * * sat-mon"],
+    )
+    def test_an_invalid_weekday_raises_value_error_when_parsed(self, cron):
+        from shortlist.server.scheduler import crontab_trigger
+
+        with pytest.raises(ValueError):
+            crontab_trigger(cron)
+
+    def test_nothing_calls_from_crontab_directly_when_the_wrapper_exists(self):
+        root = Path(__file__).resolve().parents[2] / "shortlist"
+        offenders = [str(p) for p in root.rglob("*.py") if "from_crontab(" in p.read_text()]
+        assert offenders == []
+
+
+class TestCrontabDayOfMonthAndWeekday:
+    """Cron runs a job when the day of the month OR the weekday matches, if both are restricted.
+    APScheduler requires both, so `0 4 1 * 1` ran only on a 1st that was a Monday (next: 2027-02-01),
+    not every Monday and every 1st. A field that starts with `*` is not a restriction (Vixie cron's
+    DOM_STAR/DOW_STAR), so `*/2` still combines with AND."""
+
+    @staticmethod
+    def _fires(cron: str, count: int) -> list[str]:
+        from datetime import UTC, datetime, timedelta
+
+        from shortlist.server.scheduler import crontab_trigger
+
+        trigger = crontab_trigger(cron, timezone=UTC)
+        now, previous, fired = datetime(2026, 9, 6, 12, tzinfo=UTC), None, []  # a Sunday, after 04:00
+        for _ in range(count):
+            previous = trigger.get_next_fire_time(previous, now)
+            fired.append(previous.strftime("%a %m-%d"))
+            now = previous + timedelta(seconds=1)
+        return fired
+
+    def test_both_restricted_fires_on_either(self):
+        assert self._fires("0 4 1 * 1", 6) == [
+            "Mon 09-07",
+            "Mon 09-14",
+            "Mon 09-21",
+            "Mon 09-28",
+            "Thu 10-01",
+            "Mon 10-05",
+        ]
+
+    def test_a_list_of_days_or_a_weekday_range(self):
+        assert self._fires("0 4 12,13 * sat-sun", 5) == [
+            "Sat 09-12",
+            "Sun 09-13",
+            "Sat 09-19",
+            "Sun 09-20",
+            "Sat 09-26",
+        ]
+
+    def test_a_starred_day_of_month_still_means_both(self):
+        """`*/2` is 1, 3, 5, … AND Monday — Mondays on odd dates only."""
+        assert self._fires("0 4 */2 * 1", 3) == ["Mon 09-07", "Mon 09-21", "Mon 10-05"]
+
+    def test_a_starred_weekday_still_means_both(self):
+        """`*/2` weekdays are Sun, Tue, Thu, Sat; with the 1st, only a 1st that falls on one of them."""
+        assert self._fires("0 4 1 * */2", 2) == ["Thu 10-01", "Sun 11-01"]
+
+    def test_only_a_day_of_month_fires_on_that_day(self):
+        assert self._fires("0 4 1 * *", 2) == ["Thu 10-01", "Sun 11-01"]
+
+    def test_an_invalid_day_of_month_still_raises_value_error(self):
+        from shortlist.server.scheduler import crontab_trigger
+
+        with pytest.raises(ValueError):
+            crontab_trigger("0 4 32 * 1")

@@ -23,7 +23,7 @@ section outright. Incremental is an optimisation on top of a full read, not a re
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
@@ -32,6 +32,11 @@ from sqlalchemy.orm import Session
 
 from shortlist.engine.models import MediaType, UserProfile, WatchedItem
 from shortlist.server.db.models import WatchedTitle, WatchSyncState, utcnow
+
+#: What the reader dates a row it can find no watch date for — a show marked watched rather than
+#: played carries no `lastViewedAt`, and when its episodes cannot date it either this is the honest
+#: answer. A real and common value, so it is compared against, never treated as corrupt.
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 #: How far BEHIND the newest thing seen the cursor is left.
 #:
@@ -121,7 +126,10 @@ class WatchCache:
         media_type: MediaType,
         read,
         *,
+        library: str = "",
         force_full: bool = False,
+        reconcile: bool = False,
+        repair_dates=None,
         now: datetime | None = None,
     ) -> SyncOutcome:
         """Bring one (person, library) up to date. `read(since)` performs the PMS call.
@@ -131,6 +139,22 @@ class WatchCache:
 
         `read` may return a `WatchedRead` (what the PMS client gives back) or a bare list of items.
         A bare list carries no coverage claim, so it never deletes — see `_read_items`.
+
+        Args:
+            library: The library's display name, for the watched page to group and filter on. Blank
+                from a caller that doesn't know it, which never CLEARS a name already on record —
+                see `_upsert`.
+            force_full: Read the whole library rather than resuming from the cursor. Every sync sets
+                this (issue #108); it says nothing about whether anything may be DELETED.
+            reconcile: May this pass drop cached titles the read did not return? Separate from
+                `force_full` because reading completely and deleting are different risks; the sync
+                sets both, `prefill_history` sets both, and the guards on the replace branch below
+                are what make deleting at that cadence safe.
+            repair_dates: ``f(show_keys) -> {rating_key: datetime}`` — the real watch date for shows
+                Plex re-counted without re-dating (see `_shows_plex_recounted_but_did_not_redate`).
+                Optional: without it those shows keep their stale date, which is what happened before
+                this existed. Called at most once per section, and only when something actually
+                changed, so a quiet night makes no request at all.
         """
         now = now or utcnow()
         full = force_full or self.needs_full(session, user_id, section_key, now=now)
@@ -138,24 +162,78 @@ class WatchCache:
         since = None if full else _aware(state.cursor_viewed_at) if state else None
 
         items, covers_window = _read_items(read(since))
+        if repair_dates is not None:
+            items = _repair_stale_show_dates(session, user_id, section_key, items, repair_dates)
 
-        if full:
-            # Replace, don't merge: a full read is the ONLY thing that can notice an un-watch of
-            # something watched long ago, and merging would keep the very rows it exists to drop.
+        # THREE conditions before this section may be REPLACED — deleted, then refilled from what the
+        # read returned. It is the only path here that destroys watch history, and every one of them
+        # answers a way it has been shown to go wrong:
+        #
+        # * `reconcile` — every sync sets this now. It was confined to the periodic pass while a
+        #   complete read could delete on no proof at all; that made UN-WATCHING take up to a week,
+        #   reported by a user the day the #108 fix shipped. The two conditions below are therefore
+        #   the whole guarantee, not a second line behind a rare cadence.
+        # * `covers_window` — a PMS that omits `totalSize` and caps the container answers a short
+        #   page with a 200, indistinguishable from "they un-watched all of it".
+        #
+        # * a SECOND read agreeing, when the first would delete most of the section. `covers_window`
+        #   is derived from the same response it validates, so a server that under-reports
+        #   `totalSize` proves itself complete — and `totalSize="0"` is the extreme of that, erasing
+        #   the section outright while reporting success. One extra request, only on the rare pass
+        #   that would drop half a library, is the same shape as plex-safety rule 4's second read
+        #   before an orphan delete. A server lying CONSISTENTLY still defeats it; a transient short
+        #   answer, which is the realistic failure, does not.
+        replace = full and reconcile and covers_window
+        refused_by_confirm = False
+        if replace:
+            cached = _section_count(session, user_id, section_key)
+            if cached and len(items) * 2 < cached:
+                items, replace = _confirm_shrink(read, items, cached, user.username, section_key)
+                refused_by_confirm = not replace
+        if replace:
+            # Delete what the read did NOT return — the un-watches — rather than deleting the section
+            # and rebuilding it. Same end state; hugely less churn now that this runs on every sync
+            # instead of weekly. Measured on a 47-user server, the blanket version rewrote ~14,700
+            # rows every pass and cost ~35s of the 65s sync; the targeted one deletes nothing on a
+            # quiet night, which is almost every night.
             #
-            # TRANSFERRED rows are the exception and must survive (`source_viewed_at IS NOT NULL`).
-            # They did not come from this read and Plex may not know them at all: a watch-history
-            # transfer that did not scrobble leaves rows the PMS has never heard of, so a blind
-            # replace deletes the entire transfer on the first sync — and `needs_full` is True for a
-            # brand-new watching account, so that is the FIRST sync, every time. A scrobbled row is
-            # returned by the read and simply gets updated in place, keeping its true date because
-            # `_upsert` never writes that column.
-            session.query(WatchedTitle).filter(
+            # TRANSFERRED rows are exempt (`source_viewed_at IS NOT NULL`). They did not come from
+            # this read and Plex may not know them at all: a watch-history transfer that did not
+            # scrobble leaves rows the PMS has never heard of, so a blind replace deletes the entire
+            # transfer on the first sync — and `needs_full` is True for a brand-new watching account,
+            # so that is the FIRST sync, every time.
+            #
+            # Keyed exactly as `_upsert` WRITES them — `_cache_key`, not `item.rating_key`. An item
+            # the PMS gave no `ratingKey` is stored under its negated tmdb_id, so building this set
+            # from `rating_key` alone left every such row out of it: they matched `notin_` on every
+            # pass and were deleted and re-inserted each time, which is the churn the targeted delete
+            # exists to avoid. `rating_key` is NOT NULL on the table, so there is no null case to
+            # handle here — the keyless rows are the negative ones.
+            keys = {key for key in (_cache_key(item) for item in items) if key is not None}
+            stale = session.query(WatchedTitle).filter(
                 WatchedTitle.user_id == user_id,
                 WatchedTitle.section_key == section_key,
                 WatchedTitle.source_viewed_at.is_(None),
-            ).delete(synchronize_session=False)
+            )
+            if keys:
+                # `notin_` expands to one bound parameter per key, and the runtime image is
+                # python:3.12-slim on Debian, whose SQLite caps host parameters at 32,766 (upstream's
+                # own default is 250,000). The ceiling is on the number of watched TITLES in one
+                # section — bounded by the library's size, ~5k on the largest server measured — so it
+                # is out of reach here, unlike the returned-set diff `_drop_vanished_since` avoids.
+                stale = stale.filter(WatchedTitle.rating_key.notin_(keys))
+            stale.delete(synchronize_session=False)
             session.flush()
+        elif full and reconcile and not refused_by_confirm:
+            # Only for genuine unproven coverage. `_confirm_shrink` has already said its piece, and
+            # adding this line after it sent the operator hunting a `totalSize` problem that isn't
+            # there — the read DID prove coverage; a second read disagreed with it.
+            logger.warning(
+                "watch cache: {} section {} — the complete read could not prove it saw the whole "
+                "library, so this reconcile tops up without deleting",
+                user.username,
+                section_key,
+            )
         elif since is not None and covers_window:
             _drop_vanished_since(session, user_id, section_key, since, items, user.username)
         elif since is not None:
@@ -171,7 +249,7 @@ class WatchCache:
             )
 
         for item in items:
-            _upsert(session, user_id, section_key, media_type, item)
+            _upsert(session, user_id, section_key, media_type, item, library)
         session.flush()
 
         total = (
@@ -183,7 +261,10 @@ class WatchCache:
         if state is None:
             state = WatchSyncState(user_id=user_id, section_key=section_key)
             session.add(state)
-        if full:
+        # Only a PROVEN complete read stamps `last_full_at` — `needs_full` asks "was this library read
+        # end to end?", and an unproven walk cannot answer yes. Not gated on `reconcile`: this records
+        # the READ, not the deletion.
+        if full and covers_window:
             state.last_full_at = now
             # A full read that returned nothing still establishes a cursor — otherwise a person with
             # an empty library would be read in full for ever.
@@ -240,6 +321,70 @@ class WatchCache:
         return dropped
 
 
+def _section_count(session: Session, user_id: int, section_key: str) -> int:
+    """How many DELETABLE titles are cached for this (person, library) right now.
+
+    Excludes transferred rows for the same reason the replace does (`source_viewed_at IS NOT NULL`):
+    they are exempt from deletion, so counting them puts the two sides of the shrink comparison on
+    different populations. On a watching account carrying a transfer that inflated the count
+    permanently — the guard fired on every reconcile pass for ever, bought a second full page-walk
+    each time, and told the operator that titles had vanished when nothing had.
+    """
+    return (
+        session.query(WatchedTitle)
+        .filter(
+            WatchedTitle.user_id == user_id,
+            WatchedTitle.section_key == section_key,
+            WatchedTitle.source_viewed_at.is_(None),
+        )
+        .count()
+    )
+
+
+def _confirm_shrink(read, items, cached: int, username: str, section_key: str) -> tuple[list[WatchedItem], bool]:
+    """Ask the server a second time before dropping most of a library.
+
+    Returns `(items, replace)` — the CONFIRMING read's items when it agrees, so the delete acts on
+    the fresher answer, and `replace=False` when it does not. A read that RAISES is a refusal: the
+    likeliest real outcome here is a second full library read failing against a PMS that just
+    answered short, and that is evidence against the first answer, not for it.
+    """
+    try:
+        second, second_covers = _read_items(read(None))
+    except Exception as e:
+        logger.warning(
+            "watch cache: {} section {} — the read returned {} of {} cached titles and the confirming "
+            "read failed ({}); keeping them rather than treating it as a mass un-watch",
+            username,
+            section_key,
+            len(items),
+            cached,
+            type(e).__name__,
+        )
+        return items, False
+    if second_covers and len(second) * 2 < cached:
+        logger.info(
+            "watch cache: {} section {} — {} of {} cached titles are gone, confirmed by a second read",
+            username,
+            section_key,
+            cached - len(second),
+            cached,
+        )
+        return second, True
+    logger.warning(
+        "watch cache: {} section {} — the read returned {} of {} cached titles but a second read "
+        "returned {}; keeping them rather than treating the first as a mass un-watch",
+        username,
+        section_key,
+        len(items),
+        cached,
+        len(second),
+    )
+    # Keep whichever answer saw MORE — nothing is being deleted either way, and the richer read is
+    # the better thing to upsert from.
+    return (second if len(second) > len(items) else items), False
+
+
 def _read_items(result) -> tuple[list[WatchedItem], bool]:
     """Normalise what `read(since)` handed back into (items, covers_window).
 
@@ -276,10 +421,14 @@ def _drop_vanished_since(
     un-watch of something viewed BEFORE the cursor leaves no trace in an incremental response at all,
     so that one still waits for the periodic full read.
 
-    Safe against the missing-timestamp case by construction: a title the PMS reports with no
-    `lastViewedAt` is stamped 1970 by the reader and cached as 1970, so it sits outside every window
-    and this can never delete it — which matters, because the incremental walk skips such a title
-    rather than returning it.
+    The missing-timestamp case used to be safe by construction — a title the PMS reports with no
+    `lastViewedAt` was stamped 1970 by the reader, sat outside every window, and so could never be
+    deleted here. That is no longer true on its own: a show marked watched carries no `lastViewedAt`
+    and the full read now dates it from its newest watched EPISODE, which puts it squarely inside the
+    window. Two things keep it safe instead, and both are needed. The reader RETURNS such a show on
+    an incremental walk rather than skipping it (`plex_pms.watched_titles`), so it is never absent
+    from one; and `_upsert` refuses to write the epoch over a real date, so a failed episode read
+    cannot push the row back outside the window and lose its date.
 
     Args:
         since: The cutoff handed to the reader. Must be UTC — SQLite strips tzinfo on bind rather
@@ -340,6 +489,110 @@ def _aware(value: datetime | None) -> datetime | None:
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
+def _shows_plex_recounted_but_did_not_redate(
+    session: Session, user_id: int, section_key: str, items: list[WatchedItem]
+) -> set[int]:
+    """Shows whose episode count went UP while the show's own date stood still.
+
+    That combination has exactly one cause: the episodes were MARKED rather than played. Plex updates
+    a show's own `lastViewedAt` when the show is played and not when its episodes are marked, so a
+    series someone finishes by ticking "mark as watched" keeps whatever date it had — a partly-watched
+    series finished today still reads as finished months ago (issue #108, reported after the first
+    round of fixes).
+
+    That date is not cosmetic: it is the recency half of a seed's weight, halving every ~45 days. A
+    series marked watched today but dated two years ago weighs about zero, so it never seeds — the
+    person finishes a show and Shortlist cannot use it to find them anything similar.
+
+    Only titles with a PREVIOUS cached count qualify, and this is the load-bearing guard rather than
+    an optimisation. A show being seen for the first time has no count to have risen from, so
+    "it went up" would be true of every row on a first sync, a rebuilt cache, or a newly added
+    library — and re-dating those to now would tell Shortlist that everything in a person's history
+    was watched today. That is far worse than the stale date this repairs: a wrong OLD date makes one
+    show seed weakly, a wrong NEW date makes their whole back catalogue seed at full strength.
+    """
+    counted = {
+        item.rating_key: item for item in items if item.rating_key is not None and item.viewed_leaf_count is not None
+    }
+    if not counted:
+        return set()
+    stale: set[int] = set()
+    rows = (
+        session.query(WatchedTitle)
+        .filter(
+            WatchedTitle.user_id == user_id,
+            WatchedTitle.section_key == section_key,
+            WatchedTitle.rating_key.in_(list(counted)),
+        )
+        .all()
+    )
+    for row in rows:
+        item = counted[row.rating_key]
+        if row.viewed_leaf_count is None or item.viewed_leaf_count <= row.viewed_leaf_count:
+            continue  # nothing new was watched or marked
+        # `viewed_at`, never `source_viewed_at`. The question here is whether the date PLEX reports
+        # stood still, so it has to be compared against the last date Plex gave us. A transferred row
+        # carries the ORIGINAL account's historical date in `source_viewed_at`, which is always older
+        # than the replica's stamp — so mixing the two clocks made `item.watched_at > cached_date`
+        # true every pass and a transferred account's marked-watched shows were silently never
+        # repaired. `_to_item` still prefers `source_viewed_at`, so the transfer's true date keeps
+        # winning everywhere it should.
+        cached_date = _aware(row.viewed_at)
+        if cached_date is None or item.watched_at > cached_date:
+            continue  # Plex moved the date too, so they PLAYED it and Plex is already right
+        stale.add(row.rating_key)
+    return stale
+
+
+def _repair_stale_show_dates(
+    session: Session, user_id: int, section_key: str, items: list[WatchedItem], repair_dates
+) -> list[WatchedItem]:
+    """Give the shows Plex re-counted but did not re-date their real date, from their episodes.
+
+    Never moves a date BACKWARDS. The episode answer replaces the show's date only when it is newer:
+    a show can hold episodes watched long ago beside a recent play, and the show's own row is right
+    in that case.
+
+    Dates are best-effort. A failure here logs and returns the items untouched — they keep the stale
+    date, which is exactly the behaviour before this existed, and no read is lost over it.
+    """
+    stale = _shows_plex_recounted_but_did_not_redate(session, user_id, section_key, items)
+    if not stale:
+        return items
+    try:
+        dates = repair_dates(stale)
+    except Exception as e:
+        logger.warning(
+            "watch cache: section {} — could not date {} re-counted show(s) from their episodes ({})",
+            section_key,
+            len(stale),
+            type(e).__name__,
+        )
+        return items
+    if not dates:
+        return items
+    out = []
+    repaired = 0
+    for item in items:
+        # Gated on OUR `stale` set, not merely on what the callback returned. The "must have a
+        # previous cached count" rule is computed here and is the one thing standing between this and
+        # re-dating a whole back catalogue, so it is enforced here too rather than trusted to a
+        # different module's key handling.
+        when = dates.get(item.rating_key) if item.rating_key in stale else None
+        if when is not None and when > item.watched_at:
+            repaired += 1
+            out.append(replace(item, watched_at=when))
+        else:
+            out.append(item)
+    if repaired:
+        logger.info(
+            "watch cache: section {} — took the real watch date from the episodes of {} marked-watched show(s)",
+            section_key,
+            repaired,
+        )
+    return out
+
+
 def _cache_key(item: WatchedItem) -> int | None:
     """The stable per-section identity to upsert on.
 
@@ -354,7 +607,14 @@ def _cache_key(item: WatchedItem) -> int | None:
     return -item.tmdb_id if item.tmdb_id else None
 
 
-def _upsert(session: Session, user_id: int, section_key: str, media_type: MediaType, item: WatchedItem) -> None:
+def _upsert(
+    session: Session,
+    user_id: int,
+    section_key: str,
+    media_type: MediaType,
+    item: WatchedItem,
+    library: str = "",
+) -> None:
     """Insert or refresh one title. Keyed on `rating_key`, which is Plex's own stable id within a
     section — so an overlap re-read updates a row rather than duplicating it."""
     rating_key = _cache_key(item)
@@ -374,8 +634,16 @@ def _upsert(session: Session, user_id: int, section_key: str, media_type: MediaT
     if row is None:
         row = WatchedTitle(user_id=user_id, section_key=section_key, rating_key=rating_key)
         session.add(row)
+    # BEFORE the assignments below overwrite it: the date guard needs to know whether anything new
+    # was watched or marked since last time, and `viewed_leaf_count` is about to be replaced.
+    previous_leaf_count = row.viewed_leaf_count
     row.tmdb_id = item.tmdb_id
     row.media_type = media_type.value
+    # Only when the caller knows it. Writing "" unconditionally would let any caller that doesn't
+    # pass a name (an older test, a future one-off backfill) silently blank a name already on record,
+    # and the page would lose the library line until the next sync put it back.
+    if library:
+        row.library = library
     row.title = item.title or ""
     row.year = item.year
     row.watch_count = item.watch_count or 1
@@ -388,7 +656,38 @@ def _upsert(session: Session, user_id: int, section_key: str, media_type: MediaT
     # someone who thumbs-downs a title and then changes their mind would keep the old value for ever,
     # and their row would stay quietly shaped by a judgement they withdrew.
     row.user_rating = item.user_rating
-    row.viewed_at = item.watched_at or utcnow()
+    # A WORSE date never overwrites a better one. Two ways that happens, and both put back the exact
+    # symptom of #108 within a night, silently, with no other copy of the good value.
+    #
+    # 1. The epoch. A show marked watched has no `lastViewedAt` of its own and is dated from its
+    #    newest watched episode; when that episode read fails the reader honestly degrades to 1970,
+    #    and writing that here would rewrite a correct date back to "finished 20697d ago".
+    #
+    # 2. Plex's still-stale show date, on a quiet night. This is subtler and it defeated the repair
+    #    entirely. `_repair_stale_show_dates` only fires while the count is RISING, and this function
+    #    then persists the new count — so the next sync sees an unchanged count, does not repair, and
+    #    Plex reports the same stale show date it always did. Writing it through reverted the repair
+    #    after exactly one night, every night, for ever. An unchanged count means Plex has learnt
+    #    nothing new about this show, so its date carries no new information and must not win.
+    #
+    # A FALLING count still writes through: that is an un-mark, and the date should follow it back.
+    # A first insert still records whatever it has, epoch included — it is all that is known.
+    incoming = item.watched_at or utcnow()
+    cached = _aware(row.viewed_at)
+    keep_cached = (
+        cached is not None
+        and incoming < cached
+        and (
+            incoming <= _EPOCH
+            or (
+                media_type is MediaType.SHOW
+                and previous_leaf_count is not None
+                and item.viewed_leaf_count == previous_leaf_count
+            )
+        )
+    )
+    if not keep_cached:
+        row.viewed_at = incoming
 
 
 def _to_item(row: WatchedTitle) -> WatchedItem:
@@ -397,7 +696,7 @@ def _to_item(row: WatchedTitle) -> WatchedItem:
         media_type=MediaType(row.media_type),
         # The true date, not the scrobble date — same reason `watched_set` orders on it. Everything
         # downstream (recency windows, "because you recently watched X") reads this field.
-        watched_at=_aware(row.source_viewed_at) or _aware(row.viewed_at) or datetime(1970, 1, 1, tzinfo=UTC),
+        watched_at=_aware(row.source_viewed_at) or _aware(row.viewed_at) or _EPOCH,
         tmdb_id=row.tmdb_id,
         year=row.year,
         # The negative fallback key is ours, not Plex's — hand back None rather than a rating key

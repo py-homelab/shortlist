@@ -4,14 +4,29 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 import respx
 
-from shortlist.engine.clients.search import EXA_SEARCH_URL, ExaClient, SearchResult, SearxngClient
+from shortlist.engine.clients.search import (
+    _EXA_TIMEOUTS,
+    _EXA_TITLE_SCHEMA,
+    DEFAULT_EXA_SEARCH_TYPE,
+    EXA_SEARCH_TYPES,
+    EXA_SEARCH_URL,
+    ExaClient,
+    SearchResult,
+    SearxngClient,
+    TitleCandidate,
+    extracts_titles,
+)
 
 _FIXTURE = json.loads((Path(__file__).parents[1] / "fixtures" / "searxng_search.json").read_text())
+# A real Exa `deep-lite` response with `outputSchema` attached, recorded 2026-09-02. Verbatim except
+# the `grounding` array, trimmed from 93 near-identical entries to 3 (40KB of the 59KB).
+_EXA_STRUCTURED = json.loads((Path(__file__).parents[1] / "fixtures" / "exa_search_structured.json").read_text())
 
 _RESULTS = {
     "results": [
@@ -43,9 +58,25 @@ class TestExaClient:
         ]
 
     @respx.mock
-    def test_ping_returns_ok_string(self):
+    def test_ping_confirms_the_key_when_exa_answers(self):
         respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(200, json={"results": [{"title": "x"}]}))
-        assert "ok" in ExaClient("k").ping()
+        assert ExaClient("k").ping() == "Exa key works"
+
+    @respx.mock
+    def test_ping_still_confirms_the_key_when_the_probe_finds_nothing(self):
+        """A working key that happened to return no rows read as "ok — 0 result" in green, which is
+        how a success renders as a failure. The probe runs on the cheapest mode, which measurably
+        returns nothing sometimes, so this is the normal case rather than an edge one. Whether Exa
+        answered at all is the entire question the Test button asks."""
+        respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(200, json={"results": []}))
+        assert ExaClient("k").ping() == "Exa key works"
+
+    @respx.mock
+    def test_ping_still_raises_on_a_bad_key(self):
+        """The message must not become reassuring in every case — a dead key still has to fail."""
+        respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(401, json={"error": "bad key"}))
+        with pytest.raises(httpx.HTTPStatusError):
+            ExaClient("bad").ping()
 
     @respx.mock
     def test_search_raises_on_http_error(self):
@@ -65,6 +96,78 @@ class TestExaClient:
         assert len(route.calls) == 2  # rate-limited once, retried once
 
 
+class TestExaStructuredExtraction:
+    """Exa's `outputSchema` synthesis — the titles the found pages recommend, extracted server-side."""
+
+    @respx.mock
+    def test_extracts_titles_from_a_recorded_response(self):
+        """Shape proven against a real response, not a hand-built one (rule 11).
+
+        The synthesis lands at `output.content`, NOT at the top level and not where `/answer` puts
+        it (`answer`) or where `/agent` does (`output.structured`) — three sibling endpoints, three
+        different keys.
+        """
+        respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(200, json=_EXA_STRUCTURED))
+        results, titles = ExaClient("k").search_detailed("shows like Severance")
+
+        assert len(results) == 3  # the page snippets still come back alongside
+        assert len(titles) == 31
+        assert TitleCandidate(title="Lost", year=2004, media="show") in titles
+        # Half the extraction carries no year, because the source article never printed one. The
+        # recorded response has 15 of 31 — the resolver has to cope, so the parser must not drop them.
+        assert sum(1 for t in titles if t.year is None) == 16
+        assert TitleCandidate(title="From", year=None, media="show") in titles
+
+    @respx.mock
+    def test_sends_the_configured_search_type_and_a_schema(self):
+        route = respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(200, json=_EXA_STRUCTURED))
+        ExaClient("k", search_type="deep").search_detailed("q", num_results=10)
+
+        body = json.loads(route.calls.last.request.content)
+        assert body["type"] == "deep"
+        assert body["numResults"] == 10
+        assert body["outputSchema"]["properties"]["titles"]["type"] == "array"
+        assert body["systemPrompt"]
+
+    def test_an_unknown_search_type_falls_back_to_the_default(self):
+        """A typo in the setting would otherwise be a 400 on every seed of every run, all night."""
+        assert ExaClient("k", search_type="deep-litex")._search_type == DEFAULT_EXA_SEARCH_TYPE
+        assert ExaClient("k", search_type="")._search_type == DEFAULT_EXA_SEARCH_TYPE
+
+    def test_the_default_is_not_auto(self):
+        """`auto` returned ZERO titles on a live run with 26k characters of page text in front of it,
+        and 8-13 where `deep-lite` found 36-47. It is offered, but it must not be what people get."""
+        assert DEFAULT_EXA_SEARCH_TYPE == "deep-lite"
+
+    def test_the_schema_stays_at_three_fields(self):
+        """A regression guard with a live cause: adding a fourth field (a one-line `why` per title)
+        made every `deep-lite` search exceed Cloudflare's 100s limit and return an HTML 524 — 5 of 5
+        attempts at ~125s each, against 200-in-10s without it. Exa's synthesis time scales with what
+        it is asked to write and the ceiling is the CDN's, so a new field needs a live check first."""
+        fields = _EXA_TITLE_SCHEMA["properties"]["titles"]["items"]["properties"]
+        assert sorted(fields) == ["media", "title", "year"]
+
+    @respx.mock
+    def test_a_response_with_no_synthesis_still_returns_its_snippets(self):
+        """Degrade, never fail: a mode that declines to synthesise (or a shape change at Exa) leaves
+        the page text, and the caller falls back to the prose path that shipped before this."""
+        respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(200, json=_RESULTS))
+        results, titles = ExaClient("k").search_detailed("q")
+        assert titles == []
+        assert [r.title for r in results] == ["The 25 best sci-fi films of 2024", "What to watch next"]
+
+    @respx.mock
+    def test_plain_search_still_returns_only_snippets(self):
+        """`search()` is the protocol both backends share; the extraction rides on the same request."""
+        respx.post(EXA_SEARCH_URL).mock(return_value=httpx.Response(200, json=_EXA_STRUCTURED))
+        assert all(isinstance(r, SearchResult) for r in ExaClient("k").search("q"))
+
+    def test_only_exa_advertises_extraction(self):
+        """SearXNG is a metasearch proxy with no synthesis of its own — the source branches on this."""
+        assert extracts_titles(ExaClient("k")) is True
+        assert extracts_titles(SearxngClient(_SEARX)) is False
+
+
 _SEARX = "http://searx.local:8080"
 
 
@@ -79,6 +182,9 @@ class TestSearxngClient:
         assert params["q"] == "shows like Severance"
         assert params["format"] == "json"  # without this SearXNG serves HTML, and parsing would explode
         assert params["categories"] == "general"
+        # Free — measured against a real instance, identical yield with and without — and a
+        # "what to watch next" row has no business surfacing adult results.
+        assert params["safesearch"] == "1"
 
         expected = _FIXTURE["results"][:3]
         assert [r.title for r in out] == [r["title"] for r in expected]
@@ -190,8 +296,10 @@ class TestSearxngClient:
 
     @respx.mock
     def test_ping_reports_the_result_count(self):
+        # Names the service, not "ok" — a Test button's answer should say WHICH thing responded, the
+        # way the Plex and TMDB cards beside it do.
         respx.get(f"{_SEARX}/search").mock(return_value=httpx.Response(200, json=_FIXTURE))
-        assert "ok" in SearxngClient(_SEARX).ping()
+        assert "SearXNG responded" in SearxngClient(_SEARX).ping()
 
     @respx.mock
     def test_ping_names_the_dead_engines_when_nothing_came_back(self):
@@ -212,6 +320,92 @@ class TestSearxngClient:
         assert SearxngClient(_SEARX).search("q")
         assert len(route.calls) == 2
 
-    def test_pulls_a_wider_page_than_exa_because_it_is_free(self):
-        """Exa bills per search so it stays lean; SearXNG is local, and keyword hits need more depth."""
-        assert SearxngClient(_SEARX).results_per_query > ExaClient("k").results_per_query
+    def test_both_backends_ask_for_ten_results_for_different_reasons(self):
+        """Ten each, and neither number is arbitrary.
+
+        Exa used to ask for five because it bills per search and each result carried 800 characters
+        of page text that had to fit a capped RAG prompt. Neither half holds now: Exa includes the
+        first ten results in the base price (past ten bills $1/1k on top), a measured sweep found
+        n=5, 10 and 20 all yielding the same range of usable titles, and the structured path sends a
+        title list rather than prose so prompt size no longer rations the count. SearXNG returns a
+        whole page regardless, so ten is simply how much of it we keep.
+        """
+        assert ExaClient("k").results_per_query == 10
+        assert SearxngClient(_SEARX).results_per_query == 10
+
+
+class TestSchemaSupportIsRemembered:
+    """A model that rejects the response schema rejects it every time. Learning that once per process
+    is the difference between one wasted request and one per user per night, seen only at DEBUG."""
+
+    def test_openai_stops_sending_the_schema_after_a_rejection(self):
+        from shortlist.engine.curator.openai import OpenAICurator
+
+        curator = OpenAICurator.__new__(OpenAICurator)
+        curator._model = "gpt-4o-mini"
+        curator._schema_supported = True
+        sent: list[bool] = []
+
+        class _Responses:
+            def create(self, **kw):
+                sent.append("text" in kw)
+                if "text" in kw:
+                    import openai
+
+                    # The base error class, because what matters is that the SDK raised something we
+                    # catch — not which subclass a given model happens to answer with.
+                    raise openai.OpenAIError("this model does not support text.format with web_search")
+                return SimpleNamespace(output_text='[{"title": "Silo", "year": 2023, "media": "show"}]', usage=None)
+
+        curator._client = SimpleNamespace(responses=_Responses())
+        profile = SimpleNamespace(history=[])
+
+        assert curator.recommend_web(profile, [], 5)[0]["title"] == "Silo"
+        assert sent == [True, False]  # tried with the schema, fell back without it
+
+        assert curator.recommend_web(profile, [], 5)[0]["title"] == "Silo"
+        assert sent == [True, False, False]  # second run never tries the schema again
+
+
+class TestExaTimeouts:
+    def test_the_wait_matches_the_mode(self):
+        """One timeout cannot serve every mode, and the deep ones need far longer than a serial
+        measurement suggests. The first real 46-user run lost 13 of 21 searches to ReadTimeout at a
+        45s ceiling: mainstream titles synthesise much more slowly than the prestige TV the original
+        numbers came from ("Anyone But You" 35.6s, "Avatar: The Way of Water" 32.7s), and the run's
+        own concurrency adds to it. Exa's CDN returns a 524 past ~100s, so 90s is the useful ceiling.
+        """
+        assert ExaClient("k", search_type="instant")._timeout < ExaClient("k", search_type="deep-lite")._timeout
+        assert ExaClient("k", search_type="deep-lite")._timeout == ExaClient("k", search_type="deep")._timeout
+        assert ExaClient("k", search_type="instant")._timeout >= 20
+
+    def test_the_deep_modes_clear_the_slowest_real_response(self):
+        """A regression guard with a number behind it: the slowest successful search observed on a
+        real seed was 35.6s, and the run saw worse under load. A ceiling near that is how 13 of 21
+        searches were lost, so it must stay comfortably clear of it — and under Exa's ~100s 524."""
+        deep = ExaClient("k", search_type="deep-lite")._timeout
+        assert 60 <= deep <= 100, deep
+
+    def test_every_offered_mode_is_one_the_client_accepts(self):
+        """The clamp makes a wrong mode SILENT, so nothing else would catch this.
+
+        The Settings Test button hardcoded `search_type="fast"`. When `fast` was dropped for
+        returning no titles, `ExaClient` clamped the unknown value to the DEFAULT — so every
+        auto-test on the Settings page quietly ran `deep-lite` at 1.7x the price, and the only
+        evidence was a log line. Found on a live provider check, not by any test.
+        """
+        for mode in EXA_SEARCH_TYPES:
+            assert ExaClient("k", search_type=mode)._search_type == mode, mode
+            assert mode in _EXA_TIMEOUTS, f"{mode} has no timeout, so it would fall back silently"
+
+    def test_instant_is_first_because_the_test_button_pings_whatever_is(self):
+        """`settings.py` pings `EXA_SEARCH_TYPES[0]`, so this order is load-bearing, not cosmetic.
+
+        Asserts the IDENTITY, not "the smallest timeout": `instant` and `auto` share a 30s ceiling,
+        so a timeout comparison stays green if they swap — and `auto` measured the worst of every
+        mode (2 picks where `instant` gave 7, at the same price).
+        """
+        assert EXA_SEARCH_TYPES[0] == "instant", EXA_SEARCH_TYPES
+
+    def test_an_explicit_timeout_still_wins(self):
+        assert ExaClient("k", search_type="deep", timeout=5.0)._timeout == 5.0

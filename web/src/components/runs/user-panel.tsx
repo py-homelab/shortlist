@@ -3,6 +3,8 @@ import { useState } from "react";
 import { Link } from "react-router";
 
 import { PickList } from "@/components/pick-list";
+import { TitleLinkIcons } from "@/components/title-link-icons";
+import { TitlePoster } from "@/components/title-poster";
 import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
 import { provenanceLabel } from "@/lib/pick-provenance";
@@ -10,13 +12,14 @@ import { titleLinks } from "@/lib/title-links";
 import {
   friendlyError,
   rankClass,
+  rowTimingTitle,
   tokenStepBreakdown,
   webSearchSummary,
 } from "@/lib/run-format";
 import { formatDuration, runStatusLabel, runStatusVariant } from "@/lib/format";
 import { Badge } from "@/components/ui/badge";
 import { githubIssueSnippet } from "@/lib/github";
-import { STAGE_LABELS } from "@/lib/run-stages";
+import { describeStage } from "@/lib/run-stages";
 import { useCopy } from "@/lib/use-copy";
 import { cn } from "@/lib/utils";
 import type {
@@ -113,23 +116,36 @@ function sharedPoolsTokens(pools: RunPoolCost[]): number {
   return pools.reduce((n, pool) => n + pool.tokens, 0);
 }
 
+/** The match-quality half of `provenanceLabel` — "close match", "related" — without the "suggested
+ *  by TMDB" prefix, which repeated a word the score and the links on the same line already carry. */
+function matchQuality(pick: Pick): string {
+  const label = provenanceLabel(pick);
+  const [, quality] = label.split(" · ");
+  return quality ?? "";
+}
+
 /** One ranked pick: rank, a status dot (green = new this run), title + reason, and where it
  *  came from. */
 function PickLine({ pick, isNew }: { pick: Pick; isNew: boolean }) {
   const links = titleLinks(pick);
   return (
-    <li className="flex items-baseline gap-3 py-1.5">
+    // `items-start`, not `items-baseline`: a poster and a text baseline do not align.
+    <li className="flex items-start gap-3 py-1.5">
       <span
         className={cn(
-          "w-9 shrink-0 text-right text-sm font-semibold tabular-nums",
+          "w-9 shrink-0 pt-0.5 text-right text-sm font-semibold tabular-nums",
           rankClass(pick.rank),
         )}
       >
         #{pick.rank}
       </span>
+      {/* The same artwork `PickList` shows, from the same `rating_key`, because this is the page
+          where you eyeball what went into someone's row. Only five picks render per library before
+          the show-all toggle, so the cost is bounded. */}
+      <TitlePoster ratingKey={pick.rating_key} />
       <span
         className={cn(
-          "mt-1.5 h-2 w-2 shrink-0 rounded-full",
+          "mt-2 h-2 w-2 shrink-0 rounded-full",
           isNew ? "bg-success" : "bg-muted-foreground/30",
         )}
         aria-label={isNew ? "new this run" : "kept"}
@@ -157,21 +173,14 @@ function PickLine({ pick, isNew }: { pick: Pick; isNew: boolean }) {
         {(ratingLabel(pick) || provenanceLabel(pick) || links.length > 0) && (
           <span className="flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground/80">
             <span className="truncate">
-              {[ratingLabel(pick), provenanceLabel(pick)]
+              {/* Not `provenanceLabel` as well: it renders "suggested by TMDB", which put the word
+                  TMDB three times in one line meaning the score, the source and the link. The match
+                  quality is the half that adds something the links do not. */}
+              {[ratingLabel(pick), matchQuality(pick)]
                 .filter(Boolean)
                 .join(" · ")}
             </span>
-            {links.map((link) => (
-              <a
-                key={link.label}
-                href={link.href}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
-              >
-                {link.label}
-              </a>
-            ))}
+            <TitleLinkIcons title={pick} labelled />
           </span>
         )}
       </span>
@@ -280,12 +289,16 @@ function ResultsLegend() {
         />
         Kept from last run
       </span>
+      {/* The `{" "}` is load-bearing. JSX drops the newline between a tag and the text after it, so
+          without it the accessible text and any copy-paste read "TitleRotated out for variety" —
+          flexbox `gap` spaces the two apart visually, which is why this survived review, but a
+          screen reader announces the run-together string. The sibling entries above are unaffected
+          because their first child is an aria-hidden dot, not a word. */}
       <span className="inline-flex items-center gap-1.5">
-        <span className="line-through">Title</span>
-        Rotated out for variety
+        <span className="line-through">Title</span> Rotated out for variety
       </span>
       <span className="inline-flex items-center gap-1.5">
-        <span className="font-semibold tabular-nums text-amber-400">#1–3</span>
+        <span className="font-semibold tabular-nums text-amber-400">#1–3</span>{" "}
         Top picks
       </span>
     </div>
@@ -365,18 +378,36 @@ export function UserPanel({
                 Timing not recorded for this run
               </p>
             ) : (
-              <p className="text-right text-sm text-muted-foreground">
-                {formatDuration(cost.duration_ms - cost.blocked_ms)}
-                {/* `blocked_ms > 0` first: a row whose every source `continue`s in microseconds
-                    truncates BOTH numbers to 0, and 0 >= 0 * 0.1 would otherwise read as "waiting"
-                    for a row that did no work at all. */}
-                {cost.blocked_ms > 0 &&
-                  cost.blocked_ms >= cost.duration_ms * 0.1 &&
-                  ` · ${formatDuration(cost.blocked_ms)} waiting`}
+              // The TOTAL, with the split behind it. "25ms · 8ms waiting · shared setup 159ms" put
+              // two engineer concepts on screen — "waiting" is blocked on the Plex write lock,
+              // "shared setup" is work amortised across everyone in the run — neither of which the
+              // owner acts on, and neither guessable. The AI-token and web-search figures stay
+              // visible: those are money, not internals.
+              //
+              // Left as a `title` on purpose, unlike the remedies elsewhere in this audit that were
+              // moved out of one. The difference is what the text IS: those were the only statement
+              // of how to fix an alarming thing, so hover-only made them unreachable. This is a
+              // glossary for a number nobody acts on, and making every row of a run's timing line a
+              // tab stop costs more than the gap it closes.
+              <p
+                className="text-right text-sm text-muted-foreground"
+                title={
+                  rowTimingTitle(
+                    cost.duration_ms,
+                    // Same floor as before: a row whose every source `continue`s in microseconds
+                    // truncates BOTH numbers to 0, and 0 >= 0 * 0.1 would otherwise claim it spent
+                    // its time waiting when it did no work at all.
+                    cost.blocked_ms >= cost.duration_ms * 0.1
+                      ? cost.blocked_ms
+                      : 0,
+                    setup?.setup_ms,
+                    formatDuration,
+                  ) || undefined
+                }
+              >
+                {formatDuration(cost.duration_ms)}
                 {setup && setup.setup_ms > 0 && (
                   <>
-                    {" · shared setup "}
-                    {formatDuration(setup.setup_ms)}
                     {poolTokens > 0 &&
                       ` · ${poolTokens.toLocaleString()} AI tokens${sharedPoolsNote(setup.pools)}`}
                     {webSearchSummary(sharedPoolsExaSearches(setup.pools))}
@@ -446,11 +477,13 @@ function UserPanelBody({
           className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground"
           aria-hidden="true"
         />
+        {/* No heading. `RunUser.reason` is one of eight specific sentences, and two of them are
+            cancellations ("The run was cancelled before this person's turn") — under a heading
+            reading "Nothing to build for this person" the page contradicted itself: there WAS
+            something to build, the run stopped. The reasons are already complete sentences and are
+            already rendered heading-free on the cold-start path below, which reads better. */}
         <div>
-          <p className="font-medium text-foreground">
-            Nothing to build for this person
-          </p>
-          <p className="mt-1 text-muted-foreground">
+          <p className="text-foreground">
             {result.reason ??
               "No row was due for them in this run. Check that a per-person row is enabled and that they’re in its audience."}
           </p>
@@ -503,14 +536,10 @@ function UserPanelBody({
     // Show the latest stage from the live log for this user.
     const userLog = liveLog?.filter((e) => e.user === result.slug);
     const latest = userLog?.at(-1);
-    const stageLabel = latest
-      ? (STAGE_LABELS[latest.stage] ?? latest.stage)
-      : null;
-    const rowName = latest?.counts?.row as string | undefined;
     return (
       <p className="text-sm text-muted-foreground">
-        {stageLabel
-          ? `${stageLabel}${rowName ? ` — ${rowName}` : ""}…`
+        {latest
+          ? `${describeStage(latest.stage, latest.counts ?? {})}…`
           : "Working on this person…"}
       </p>
     );
@@ -521,6 +550,14 @@ function UserPanelBody({
   }
   return (
     <div className="space-y-6">
+      {/* Why their rows look identical to last night's, when that is the answer. A second run of a
+          night redelivers most people unchanged, and without this the panel shows the same titles
+          as the run before it and says nothing at all — which reads as a run that did nothing
+          rather than as a run that decided there was nothing to do. The engine sets this only when
+          NO row of theirs was rebuilt, so it never argues with a change shown below it. */}
+      {result.reason && (
+        <p className="text-sm text-muted-foreground">{result.reason}</p>
+      )}
       <ResultsLegend />
       {[...rows.values()].map((entries) => (
         <RowSection key={entries[0]?.row_slug} entries={entries} />

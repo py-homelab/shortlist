@@ -56,6 +56,7 @@ PICK_KEYS = {
     "rank",
     "title",
     "reason",
+    "rating_key",
     "media_type",
     "collection_slug",
     "library",
@@ -135,6 +136,35 @@ class TestUsersApi:
             "something_new": {"deep": True},
         }
 
+    def test_an_explicit_null_clears_a_pref_rather_than_being_ignored(self, client: TestClient):
+        """ "Don't mention it" and "set it to null" are different instructions and only the first means
+        "leave it alone". The merge used to filter on `is not None`, which collapsed them — so a pref
+        could be set but never removed, and unpausing stored a `false` instead of dropping the key."""
+        with client.app.state.sessions() as session:
+            user = session.query(User).filter_by(username="sarah").one()
+            user.prefs = {"row_name_tpl": "Just for {user}", "history_depth": 7}
+            session.commit()
+            user_id = user.id
+
+        r = client.patch(f"/api/users/{user_id}", json={"prefs": {"row_name_tpl": None}})
+
+        assert r.status_code == 200
+        assert "row_name_tpl" not in r.json()["prefs"], "an explicit null must clear the override"
+        assert r.json()["prefs"]["history_depth"] == 7, "a key the request never mentioned is untouched"
+
+    def test_a_pref_the_request_omits_survives_the_patch(self, client: TestClient):
+        with client.app.state.sessions() as session:
+            user = session.query(User).filter_by(username="sarah").one()
+            user.prefs = {"excluded_genres": ["Horror"], "paused": True}
+            session.commit()
+            user_id = user.id
+
+        r = client.patch(f"/api/users/{user_id}", json={"prefs": {"row_name_tpl": "Picked for {user}"}})
+
+        assert r.status_code == 200
+        assert r.json()["prefs"]["excluded_genres"] == ["Horror"]
+        assert r.json()["prefs"]["paused"] is True
+
     def test_a_nickname_changes_the_row_title_but_never_the_label(self, client: TestClient):
         """Plex usernames are often a handle nobody uses, and `{user}` put it on a Home screen (#4).
         The slug — and so `shortlist_<slug>`, which every other account's share filter excludes —
@@ -172,7 +202,7 @@ class TestUsersApi:
         col = MagicMock(title="sarah's Picks" + marker)
         col.editTitle.side_effect = lambda new: renames.append((col.title, new))
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: [col] if label == "shortlist_sarah" else []
         ctx = SimpleNamespace(plex=plex, config=EngineConfig())
         monkeypatch.setattr(client.app.state.run_service, "build_context", lambda **kw: ctx)
@@ -349,7 +379,7 @@ class TestUsersApi:
 
         deleted: list[str] = []
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda s, label: (
             [SimpleNamespace(title="✨ Picked for You" + row_marker(0))] if label == f"shortlist_{slug}" else []
         )
@@ -429,7 +459,7 @@ class TestUsersApi:
         # Record the actual Plex removals, keyed by the shortlist label they came in on.
         removed_labels: list[str] = []
         plex = MagicMock()
-        plex.sections.return_value = [SimpleNamespace(title="Movies")]
+        plex.sections.return_value = [SimpleNamespace(title="Movies", key="1", type="movie")]
         plex.find_owned_collections.side_effect = lambda section, label: [SimpleNamespace(title=label, _label=label)]
         plex.delete_owned_collection.side_effect = lambda collection, prefix: removed_labels.append(collection._label)
         ctx = SimpleNamespace(plex=plex, config=EngineConfig())
@@ -487,9 +517,11 @@ class TestUserSync:
 
         calls: list = []
 
-        async def spy(state, was_called):
+        async def spy(state, was_called, *, holds_writer_lock=False):
             if was_called:  # a no-op call with nothing renamed is not Plex work
                 calls.append(was_called)
+                # Inside the `sync.users` job's writer lock, so a refused name is freed now, not next run.
+                assert holds_writer_lock is True
 
         monkeypatch.setattr(user_sync, "rename_after_nickname", spy)
         monkeypatch.setattr(

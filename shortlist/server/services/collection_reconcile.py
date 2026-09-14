@@ -12,22 +12,33 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from loguru import logger
 
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import (
+    DEFERRED,
+    HELD,
+    KEPT,
+    REBUILD,
     remove_row_collections,
+    rename_or_keep,
     render_row_name,
     reset_row_posters,
+    resolve_row_template,
     row_marker,
+    rows_can_share_a_library,
     strip_marker,
+    titles_other_rows_build,
 )
-from shortlist.engine.models import LABEL_PREFIX, SHARED_LABEL_PREFIX, UserProfile, UserType
+from shortlist.engine.models import LABEL_PREFIX, SHARED_LABEL_PREFIX, EngineConfig, RowSpec, UserProfile, UserType
+from shortlist.engine.pipeline import identity_map
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Delivery, Run, User
 from shortlist.server.safe_mode import force_dry_run
+from shortlist.server.services import jobs
 from shortlist.server.services.audit import write_audit
+from shortlist.server.services.context_builder import ContextBuilder
 from shortlist.server.settings_store import SettingsStore
 
 
@@ -69,6 +80,72 @@ def row_template(session, slug: str, secrets=None) -> str:
     if slug == DEFAULT_SLUG:
         return SettingsStore(session, secrets).get("row.name_template") or ""
     return (collection.name_template or collection.name) if collection else ""
+
+
+@dataclass(frozen=True)
+class _OtherRows:
+    """What this person's OTHER rows are titled, read once so the Plex walk runs outside the session."""
+
+    specs: list[RowSpec]
+    global_template: str
+    #: {(user slug, row slug) -> {(library key, title)}} as the delivery ledger last recorded them.
+    delivered: dict[tuple[str, str], set[tuple[str, str]]]
+
+
+def _other_rows(session, secrets, slug: str) -> _OtherRows:
+    """Every OTHER enabled per-person row: as the specs `titles_other_rows_build` renders, and as the
+    titles the delivery ledger last recorded them wearing.
+
+    Only enabled rows: a switched-off row builds nothing, and its own collections are on their way out
+    by the same removal this guards.
+    """
+    account_by_user, audience_by_collection = ContextBuilder._audience_maps(session)
+    specs = [
+        RowSpec(
+            slug=other.slug,
+            # Who it builds for, resolved exactly as a run resolves it: a row that builds nothing for a
+            # person claims no title of theirs.
+            audience=ContextBuilder._subset_audience(other, account_by_user, audience_by_collection),
+            # The default row's title is the global template (or that user's own override), which
+            # `resolve_row_template` supplies from the profile and config when this is left empty.
+            name_template="" if other.slug == DEFAULT_SLUG else (other.name_template or other.name),
+            size=0,
+            media=other.media,
+            library_keys=[str(k) for k in (other.library_keys or [])],
+            fallback_name=other.fallback_name or "",
+        )
+        for other in session.query(Collection).filter_by(enabled=True, build="per_person")
+        if other.slug != slug
+    ]
+    delivered: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    slugs = {spec.slug for spec in specs}
+    for row in session.query(Delivery).filter(Delivery.title != ""):
+        if row.collection_slug in slugs:
+            delivered.setdefault((row.user_slug, row.collection_slug), set()).add((row.library_key, row.title))
+    return _OtherRows(specs, SettingsStore(session, secrets).get("row.name_template") or "", delivered)
+
+
+def _claimed_titles(ctx, udata: dict, other_rows: _OtherRows) -> set[tuple[str, str]]:
+    """``{(section key, display)}`` another of this person's rows builds under — never this row's (#121).
+
+    All of a person's rows share one label and marker, so every title match below is only as good as
+    this: a Movies-only and a TV-only row may share a title, and matching it in every library deleted,
+    renamed or reset the other row's collection.
+    """
+    profile = replace(_profile_of(udata), row_name_template=udata["prefs"].get("row_name_tpl"))
+    config = EngineConfig(row_name_template=other_rows.global_template)
+    claimed = titles_other_rows_build(ctx.plex.sections(), profile, config, other_rows.specs, slug="")
+    # A `{top_seed}` title cannot be rendered without picks, so rendering never claims one — yet two such
+    # rows seeded by one watch wear the same title in different libraries. The ledger records what each
+    # was last delivered as, in which library, whichever run that was. It is read as a CLAIM only, never
+    # to select a collection, and only for `{top_seed}` rows: a static title is claimed by rendering
+    # already, and its ledger title goes stale on a rename, which writes no ledger entry.
+    for spec in other_rows.specs:
+        if spec.audience is not None and profile.plex_account_id not in spec.audience:
+            continue
+        if "{top_seed}" in resolve_row_template(spec, profile, config):
+            claimed |= other_rows.delivered.get((udata["slug"], spec.slug), set())
+    return claimed
 
 
 #: A library name no real library has, for `title_key`. NOT the empty string: `render_row_name`
@@ -120,9 +197,42 @@ def _title_keys(session, collection: Collection, secrets) -> set[str]:
 
 
 def row_titled_from(
-    session, template: str, *, secrets=None, exclude_slug: str = "", build: str = "", fallback_name: str = ""
+    session,
+    template: str,
+    *,
+    secrets=None,
+    exclude_slug: str = "",
+    build: str = "",
+    fallback_name: str = "",
+    media: str = "both",
+    library_keys=(),
 ) -> Collection | None:
-    """The row (if any) whose collections are ALREADY titled from ``template``, or None.
+    """The first of `rows_titled_from`, or None."""
+    clashes = rows_titled_from(
+        session,
+        template,
+        secrets=secrets,
+        exclude_slug=exclude_slug,
+        build=build,
+        fallback_name=fallback_name,
+        media=media,
+        library_keys=library_keys,
+    )
+    return clashes[0] if clashes else None
+
+
+def rows_titled_from(
+    session,
+    template: str,
+    *,
+    secrets=None,
+    exclude_slug: str = "",
+    build: str = "",
+    fallback_name: str = "",
+    media: str = "both",
+    library_keys=(),
+) -> list[Collection]:
+    """The rows whose collections are ALREADY titled from ``template`` in a library this row could reach.
 
     The clash test for every path that sets a row title. Two rows resolving to one template render to
     one title, and `delivery._find_this_rows_collection` matches a per-person row by title alone (they
@@ -138,6 +248,13 @@ def row_titled_from(
     and the two silently shared one collection per user per library.
 
     ``exclude_slug`` is the row being edited, which must not clash with itself.
+
+    ``media`` and ``library_keys`` are where the incoming row builds; a row that can never build in any
+    of the same libraries is skipped (issue #121). A title identifies a per-person row only within one
+    library: delivery matches within the library it writes to, and the removal, rename, poster and
+    placement paths refuse a title another row builds under there. The defaults ("both", every
+    library) overlap everything, which is the old server-wide check. `rows_can_share_a_library` is
+    static and errs towards "they can", so a library added to the server later cannot reopen the trap.
 
     ``build`` is the build of the row being written; a row of the OTHER build is skipped. A shared row
     and a per-person row cannot become one collection however alike their titles: they carry different
@@ -161,15 +278,18 @@ def row_titled_from(
     # genuinely titled that. A `{top_seed}` row's real collision is between two PEOPLE-less renders
     # at delivery time, which `_run_user` logs when it happens.
     if not wanted_keys:
-        return None
+        return []
+    clashes: list[Collection] = []
     for other in session.query(Collection).all():
         if other.slug == exclude_slug:
             continue
         if build and other.build and other.build != build:
             continue
+        if not rows_can_share_a_library(media, library_keys, other.media or "both", other.library_keys or []):
+            continue
         if _title_keys(session, other, secrets) & wanted_keys:
-            return other
-    return None
+            clashes.append(other)
+    return clashes
 
 
 def _ledger_keys(session, slug: str) -> dict[str, set[int]]:
@@ -182,11 +302,29 @@ def _ledger_keys(session, slug: str) -> dict[str, set[int]]:
 
     Empty for a row delivered before the ledger existed, or never delivered at all; the title-based
     sources below then carry it, exactly as they did before.
+
+    A ratingKey another row also claims for that person is DROPPED, through the same
+    `pipeline.identity_map` a run uses. These keys select collections to delete, and an ambiguous one is
+    reachable: a leftover copy of this row that a same-titled row in that library adopted is recorded
+    under both (issue #121). Dropped, it falls to the title match, which refuses the other row's title.
     """
+    rows = list(session.query(Delivery).filter(Delivery.rating_key != 0))
+    unambiguous = identity_map({(d.user_slug, d.collection_slug, d.library_key): d.rating_key for d in rows})
     keys: dict[str, set[int]] = {}
-    for row in session.query(Delivery).filter_by(collection_slug=slug):
-        if row.rating_key:
-            keys.setdefault(row.user_slug, set()).add(row.rating_key)
+    for user_slug, by_key in unambiguous.items():
+        for rating_key, row_slug in by_key.items():
+            if row_slug == slug:
+                keys.setdefault(user_slug, set()).add(rating_key)
+    dropped = {d.rating_key for d in rows if d.collection_slug == slug} - {k for ks in keys.values() for k in ks}
+    if dropped:
+        # A `{top_seed}` row has no other handle, so its collection may now stay on the server — say so,
+        # or a row that survived its own removal leaves no trace of why.
+        logger.warning(
+            "row '{}': {} ledger key(s) are also claimed by another row, so they will not select anything "
+            "for removal — those collections are matched by title only",
+            slug,
+            len(dropped),
+        )
     return keys
 
 
@@ -387,6 +525,7 @@ def _reconcile_row_removal(
         users = _users_data(session)
         if template is None:
             template = row_template(session, slug, state.secrets)
+        other_rows = _other_rows(session, state.secrets, slug)
     swept: set[str] = set()
 
     def remove_for(user: dict, displays: set[str]) -> None:
@@ -403,6 +542,7 @@ def _reconcile_row_removal(
                 rating_keys=rating_keys,
                 dry_run=dry_run,
                 in_sections=in_sections,
+                claimed_titles=_claimed_titles(ctx, user, other_rows),
             )
         )
 
@@ -448,6 +588,7 @@ def _reconcile_poster_reset(state, *, slug: str, build: str, reset: list[str]) -
         titles_by_user = _delivered_titles_by_user(session, slug)
         users = _users_data(session)
         template = row_template(session, slug, state.secrets)
+        other_rows = _other_rows(session, state.secrets, slug)
 
     def reset_for(user: dict, displays: set[str]) -> None:
         if not displays:
@@ -459,6 +600,7 @@ def _reconcile_poster_reset(state, *, slug: str, build: str, reset: list[str]) -
                 label=f"{LABEL_PREFIX}_{user['slug']}",
                 displays=displays,
                 dry_run=dry_run,
+                claimed_titles=_claimed_titles(ctx, user, other_rows),
             )
         )
 
@@ -515,6 +657,65 @@ async def run_reconcile(
     return removed, error
 
 
+async def preview_row_removal(
+    state,
+    *,
+    slug: str,
+    build: str,
+    only_user_ids: set[int] | None = None,
+    in_sections: set[str] | None = None,
+    template: str | None = None,
+) -> tuple[list[str], str | None]:
+    """Which collections a removal WOULD strip, without removing them. Returns ``(titles, error)``.
+
+    The read-only sibling of :func:`run_reconcile`, which cannot answer this: it takes neither
+    ``in_sections`` — the whole subject of a NARROWING preview, where the row keeps the libraries it
+    still targets — nor ``template``, which the delete preview needs because the row it names is
+    about to stop existing.
+
+    ``dry_run=True`` is passed, never computed. `_reconcile_row_removal`'s chokepoint may only
+    STRENGTHEN it (``ctx.config.dry_run or dry_run``), so nothing — safe mode, a setting, a future
+    caller — can turn this into a deletion. Nothing is audited either: plex-safety rule 10 records
+    writes, and this makes none.
+
+    Runs the walk in an executor because it is blocking Plex I/O across every library. It takes no
+    lock, and needs none: ``jobs.plex_writer_lock`` serialises Plex WRITES and is held AROUND
+    `_reconcile_row_removal` by the job worker rather than inside it, so a preview can neither
+    deadlock against a live run nor perform the writes that lock exists to order.
+
+    Args:
+        state: The app state, for the Plex context and DB sessions.
+        slug: The row whose collections would go.
+        build: The row's build — ``shared`` goes by its own label, ``per_person`` per user.
+        only_user_ids: Limit to these users' copies; ``None`` means everyone.
+        in_sections: Limit to these section keys; ``None`` means every library.
+        template: Override the title template read from the DB, for a row about to be deleted.
+
+    Returns:
+        The display titles that would be removed, and a redacted error string if the walk failed
+        part-way (the titles found before it did are still returned).
+    """
+    removed: list[str] = []
+
+    def _work() -> None:
+        _reconcile_row_removal(
+            state,
+            slug=slug,
+            build=build,
+            dry_run=True,
+            removed=removed,
+            only_user_ids=only_user_ids,
+            template=template,
+            in_sections=in_sections,
+        )
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _work)
+    except Exception as e:
+        return removed, redact(f"{type(e).__name__}: {e}")  # a PMS error can carry a tokened URL (rule 9)
+    return removed, None
+
+
 def reconcile_row_rename_iter(
     state,
     *,
@@ -524,8 +725,12 @@ def reconcile_row_rename_iter(
     old_display_names: dict[str, str] | None = None,
     build: str = "per_person",
     dry_run: bool = False,
+    holds_writer_lock: bool = False,
 ):
     """Rename a row's collections on Plex, yielding one event per user renamed (for SSE streaming).
+
+    ``holds_writer_lock`` is for a caller already inside the Plex writer lock (the roster sync). Everyone
+    else renames outside it, so freeing a refused name waits while a run or writer job is writing.
 
     Finds collections directly from Plex (by label), not from run history — so it works even after
     runs are cleared. For each user: finds their collections by label on Plex, identifies this row's
@@ -546,8 +751,10 @@ def reconcile_row_rename_iter(
     and {"user", "library", "error"} for a per-collection PMS failure.
     At the end yields {"done": True, "total": n}.
     """
+    may_free_name = None if holds_writer_lock else (lambda: not jobs.plex_writer_busy(state))
     with state.sessions() as session:
         users_data = _users_data(session)
+        other_rows = _other_rows(session, state.secrets, slug)
     ctx = state.run_service.build_context(dry_run=dry_run, plex_only=True)
     dry_run = ctx.config.dry_run or dry_run  # the chokepoint may force a preview ON, never off
     total = 0
@@ -566,17 +773,44 @@ def reconcile_row_rename_iter(
             for collection in ctx.plex.find_owned_collections(section, label):
                 if collection.title == new_display:
                     continue
+                old_title = collection.title
                 try:
-                    if not dry_run:
-                        collection.editTitle(new_display)
-                    total += 1
-                    yield {
+                    outcome = (
+                        rename_or_keep(
+                            ctx.plex,
+                            collection,
+                            new_display,
+                            _shared_profile(),
+                            section,
+                            label=label,
+                            # Names a helper only: ours by marker even if its label write fails.
+                            marker=row_marker(0),
+                            read_spare_item=lambda c=collection: next(iter(c.items()), None),
+                            may_free_name=may_free_name,
+                        )
+                        if not dry_run
+                        else None
+                    )
+                    if outcome in (KEPT, HELD):
+                        yield {
+                            "user": slug,
+                            "display_name": "Everyone",
+                            "library": lib_name,
+                            "error": _refusal(outcome, new_display, lib_name),
+                        }
+                        continue
+                    event = {
                         "user": slug,
                         "display_name": "Everyone",
-                        "old": collection.title,
+                        "old": old_title,
                         "new": new_display,
                         "libraries": [lib_name],
                     }
+                    if outcome in (REBUILD, DEFERRED):
+                        event["next_run"] = True
+                    else:
+                        total += 1
+                    yield event
                 except Exception as e:  # pragma: no cover - PMS failure shape
                     yield {"user": slug, "library": lib_name, "error": redact(str(e))}
         yield {"done": True, "total": total}
@@ -593,6 +827,7 @@ def reconcile_row_rename_iter(
         old_profile = replace(profile, nickname=was) if was else profile
         label = f"{LABEL_PREFIX}_{udata['slug']}"
         marker = row_marker(udata["plex_account_id"])
+        claimed = _claimed_titles(ctx, udata, other_rows)
         for section in ctx.plex.sections():
             lib_name = getattr(section, "title", "") or ""
             new_display = render_row_name(effective_template, profile, [], library_name=lib_name)
@@ -628,17 +863,49 @@ def reconcile_row_rename_iter(
                 # row USED to render as.
                 if strip_marker(current_title) != old_display:
                     continue
+                if (str(section.key), old_display) in claimed:
+                    # Another of this person's rows builds here under that very title (issue #121), so
+                    # this is ITS collection, however well the old title matches.
+                    continue
                 try:
-                    if not dry_run:
-                        collection.editTitle(new_with_marker)
-                    total += 1
-                    yield {
+                    outcome = (
+                        rename_or_keep(
+                            ctx.plex,
+                            collection,
+                            new_with_marker,
+                            profile,
+                            section,
+                            label=label,
+                            marker=marker,
+                            read_spare_item=lambda c=collection: next(iter(c.items()), None),
+                            may_free_name=may_free_name,
+                        )
+                        if not dry_run
+                        else None
+                    )
+                    if outcome in (KEPT, HELD):
+                        yield {
+                            "user": udata["slug"],
+                            "display_name": profile.display_name,
+                            "library": lib_name,
+                            "error": _refusal(outcome, new_display, lib_name),
+                        }
+                        continue
+                    event = {
                         "user": udata["slug"],
                         "display_name": profile.display_name,
                         "old": strip_marker(current_title),
                         "new": new_display,
                         "libraries": [lib_name],
                     }
+                    if outcome in (REBUILD, DEFERRED):
+                        # Plex lets only a new collection share a name their row in another library has, and a
+                        # rename has no titles to build one from; or freeing the name waits for a run that is
+                        # writing. Either way the next run gives the row this name.
+                        event["next_run"] = True
+                    else:
+                        total += 1
+                    yield event
                 except Exception as e:
                     # Yielded, not just logged: one user's PMS failure must not stop the other users'
                     # renames, but it must still reach the audit and the SSE stream. Swallowing it
@@ -651,6 +918,19 @@ def reconcile_row_rename_iter(
     yield {"done": True, "total": total}
 
 
+def _refusal(outcome: str, name: str, library: str) -> str:
+    """Why a rename left the old name, in words that are true for this outcome."""
+    if outcome == HELD:
+        return (
+            f"Plex refused '{name}' in {library}: something in that library already has that name, so the row "
+            "keeps its old name there."
+        )
+    return (
+        f"Plex refused '{name}' in {library} and Shortlist could not free the name, so the row keeps its old "
+        "name there for now. The next run tries again."
+    )
+
+
 async def run_row_rename_from_plex(
     state,
     *,
@@ -659,6 +939,7 @@ async def run_row_rename_from_plex(
     old_template: str,
     scope: str,
     old_display_names: dict[str, str] | None = None,
+    holds_writer_lock: bool = False,
 ) -> tuple[list[dict], str | None]:
     """Rename a row's collections by reading Plex, not run history. Audited (rule 10), best-effort.
 
@@ -679,6 +960,7 @@ async def run_row_rename_from_plex(
             new_template=new_template,
             old_template=old_template,
             old_display_names=old_display_names,
+            holds_writer_lock=holds_writer_lock,
         ):
             if event.get("error"):
                 failures.append(f"{event.get('user', '?')}: {event['error']}")
@@ -695,6 +977,10 @@ async def run_row_rename_from_plex(
         error = "; ".join(failures)
     write_audit(state, scope, "info", slug=slug, renames=entries, new_template=new_template, error=error)
     logger.info(
-        "{} '{}': renamed {} collection(s){}", scope, slug, len(entries), f" then FAILED: {error}" if error else ""
+        "{} '{}': renamed {} collection(s){}",
+        scope,
+        slug,
+        sum(1 for entry in entries if not entry.get("next_run")),
+        f" then FAILED: {error}" if error else "",
     )
     return entries, error

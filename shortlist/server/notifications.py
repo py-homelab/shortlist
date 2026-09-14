@@ -16,12 +16,14 @@ Shape (rendered by the React bell, so the fields are plain text — no HTML, no 
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from shortlist.server.db.models import Event, Run
+from shortlist.server.services.audit import RESTRICTION_RESTORED_SCOPE
 from shortlist.server.services.watch_stream import STREAM_DOWN_ALERT_MINUTES, STREAM_DOWN_SINCE_KEY
 from shortlist.server.settings_store import SettingsStore
 from shortlist.server.version_check import check_for_update
@@ -119,21 +121,65 @@ def _playback_listener_down(store: SettingsStore) -> dict | None:
     }
 
 
+def _secrets_we_cannot_read(store: SettingsStore) -> dict | None:
+    """Credentials encrypted with a key this instance no longer holds — a lost `/config/secret.key`.
+
+    Not dismissable, for the same reason "runs are paused" is not: every one of these is a credential
+    the app cannot use and cannot recover, so silencing the alert leaves an owner believing a server
+    is working that quietly is not. It clears itself the moment each key is re-entered.
+    """
+    lost = store.undecryptable_secrets()
+    if not lost:
+        return None
+    return {
+        "id": "secrets-we-cannot-read",
+        "severity": "error",
+        "title": "Some saved credentials can no longer be read",
+        "body": (
+            f"{len(lost)} saved credential(s) were encrypted with a different /config/secret.key than "
+            f"the one here now, so Shortlist cannot read them: {', '.join(lost)}. This usually means "
+            "secret.key was lost or the container was recreated without its /config volume. They "
+            "cannot be recovered without the original file — restore it from a backup, or re-enter "
+            "each one in Settings. Nothing has been overwritten, so restoring the old key still works."
+        ),
+        "action_url": "/settings",
+        "action_label": "Settings",
+        "dismissable": False,
+    }
+
+
+def run_failed_alert(run: Run) -> dict:
+    """The alert for a run that failed outright — one wording, two destinations.
+
+    Public because `services/notify.py` sends this same dict to the owner's webhook. Keeping one
+    definition is the point: a second wording written for the external channel is how a webhook
+    message and the bell start describing the same failure differently.
+
+    Args:
+        run: The failed run. Only its `id` is read.
+
+    Returns:
+        A notification dict in the registry's usual shape. It names no account, which is what makes it
+        safe to send off the server (see `notify.py`).
+    """
+    # A whole-run failure is usually a service being down (Plex/plex.tv unreachable, PMS too old).
+    return {
+        "id": f"run-failed-{run.id}",
+        "severity": "error",
+        "title": "The last run failed",
+        "body": "The most recent run ended in an error — open it to see what went wrong.",
+        "action_url": f"/runs/{run.id}",
+        "action_label": "See the run",
+        "dismissable": True,  # id is per-run, so a NEW failed run re-surfaces
+    }
+
+
 def _last_run_problem(session: Session) -> dict | None:
     last = session.query(Run).filter(Run.status.in_(("ok", "error"))).order_by(Run.id.desc()).first()
     if last is None:
         return None
     if last.status == "error":
-        # A whole-run failure is usually a service being down (Plex/plex.tv unreachable, PMS too old).
-        return {
-            "id": f"run-failed-{last.id}",
-            "severity": "error",
-            "title": "The last run failed",
-            "body": "The most recent run ended in an error — open it to see what went wrong.",
-            "action_url": f"/runs/{last.id}",
-            "action_label": "See the run",
-            "dismissable": True,  # id is per-run, so a NEW failed run re-surfaces
-        }
+        return run_failed_alert(last)
     failed = (last.stats or {}).get("users_error", 0)
     if failed:
         return {
@@ -152,6 +198,25 @@ def _usable_fallback(row) -> bool:
     """A fallback name that can actually produce a title — non-blank, and not itself needing a seed."""
     value = (row.fallback_name or "").strip()
     return bool(value) and "{top_seed}" not in value
+
+
+def _row_display_name(name: str) -> str:
+    """A row's configured name with its ``{placeholder}`` segments removed.
+
+    The SPA's ``rowDisplayName`` (``web/src/lib/run-rows.ts``), on this side of the wire and for the
+    same reason: a row is stored as a TEMPLATE, so an alert that quotes the name verbatim reads
+    "Because you watched {top_seed} won't be built for…" — braces and all, in a sentence otherwise
+    written for a person. Rendering the template instead is no good either; the whole point of this
+    alert is that there is nobody to render it for.
+
+    Args:
+        name: The row's configured name or name template.
+
+    Returns:
+        The name with every ``{...}`` segment dropped and the whitespace it left collapsed. Empty
+        when the name is nothing but placeholders, which callers must have a fallback for.
+    """
+    return re.sub(r"\s+", " ", re.sub(r"\{[^}]*\}", " ", name)).strip()
 
 
 def _rows_with_no_name_for_newcomers(session: Session, store: SettingsStore) -> dict | None:
@@ -194,7 +259,15 @@ def _rows_with_no_name_for_newcomers(session: Session, store: SettingsStore) -> 
     if not rows:
         return None
     names = sorted(set(display.values()))
-    shown = names[0] if len(names) == 1 else f"{len(names)} rows"
+    # Stripped, never raw. Every row here has `{top_seed}` in its name BY DEFINITION — that is the
+    # condition being reported — so quoting the name verbatim guaranteed a brace-laden title:
+    # "Because you watched {top_seed} won't be built for…". Stripping can leave nothing at all (a
+    # row named only after the placeholder), which is what the last fallback is for.
+    if len(names) == 1:
+        stripped = _row_display_name(names[0])
+        shown = f"“{stripped}”" if stripped else "A row"
+    else:
+        shown = f"{len(names)} rows"
     return {
         "id": "rows-unnamed-" + ",".join(sorted({row.slug for row in rows})),
         "severity": "info",
@@ -278,6 +351,17 @@ def _mdblist_quota(session: Session) -> dict | None:
     }
 
 
+def _is_evidence_of_nothing_requested(event: Event) -> bool:
+    """Whether one ``requests.none_qualified`` event says anything about the owner's SETTINGS.
+
+    See :func:`_requests_found_nothing` for why a dry run and a demand-unreachable run don't. An
+    event predating those fields counts as evidence — the old behaviour, which is the safe default
+    for an alert whose whole job is to break a five-day silence.
+    """
+    data = event.message if isinstance(event.message, dict) else {}
+    return not data.get("dry_run") and not data.get("demand_unreachable")
+
+
 def _requests_found_nothing(session: Session) -> dict | None:
     """Recent runs wanted titles but the rating gate passed none of them, so nothing reached
     Sonarr/Radarr and nothing reached the inbox either.
@@ -286,15 +370,29 @@ def _requests_found_nothing(session: Session) -> dict | None:
     and queues nothing shows "0 requested" on a green run, which is also what a run with nothing to
     do shows. It went unnoticed for five days in production. Fires only after TWO runs, so a single
     quiet night — genuinely common — never nags.
+
+    Two shapes of that zero are NOT evidence and are filtered out before counting, because both
+    fired this alert on the maintainer's server while the nightly run was requesting normally
+    (2026-09-03: six events, every one of them from a one-user manual run):
+
+    * a **dry run** asked for nothing by definition, so it can't be short of things to ask for;
+    * a run covering fewer people than its own ``min_demand`` (``demand_unreachable``) could not have
+      filled the pool whatever the settings were — telling that owner to loosen their floors is
+      advice they can follow forever without effect. Same mis-attribution the language branch below
+      exists to prevent, one level up.
+
+    Filtered in Python rather than SQL: both facts live inside the event's JSON message, and the
+    fetch is widened so a burst of skipped test runs cannot crowd the real ones out of the window.
     """
     since = datetime.now(UTC) - timedelta(days=3)
-    events = (
+    candidates = (
         session.query(Event)
         .filter(Event.scope == "requests.none_qualified", Event.ts >= since)
         .order_by(Event.ts.desc())
-        .limit(5)
+        .limit(50)
         .all()
     )
+    events = [e for e in candidates if _is_evidence_of_nothing_requested(e)][:5]
     if len(events) < 2:
         return None
     latest = events[0]
@@ -409,6 +507,11 @@ def _owner_sees_all_rows(session: Session) -> dict | None:
     }
 
 
+def _aware(moment: datetime) -> datetime:
+    """SQLite hands back naive datetimes for values stored as UTC; compare them as UTC."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
 def _failed_jobs(session: Session) -> dict | None:
     """Background jobs that ran out of retries.
 
@@ -421,8 +524,22 @@ def _failed_jobs(session: Session) -> dict | None:
     than staying hidden behind the old one.
     """
     from shortlist.server.db.models import Job
+    from shortlist.server.services import jobs as jobs_service
 
     failed = session.query(Job).filter(Job.status == "failed").order_by(Job.id.desc()).all()
+    # A failure a later successful run of the same whole-job kind has already repaired is not news. By FINISH
+    # time, not id: ids follow queue order, and a pass retrying through an outage can fail after a later one
+    # already succeeded.
+    for kind in {e.kind for e in jobs_service.CATALOG if e.later_success_clears_failure}:
+        last_success = session.query(func.max(Job.finished_at)).filter(Job.kind == kind, Job.status == "done").scalar()
+        if last_success is not None:
+            failed = [
+                job
+                for job in failed
+                if not (
+                    job.kind == kind and job.finished_at is not None and _aware(job.finished_at) < _aware(last_success)
+                )
+            ]
     if not failed:
         return None
     kinds = sorted({job.kind for job in failed})
@@ -431,7 +548,6 @@ def _failed_jobs(session: Session) -> dict | None:
     # false: it never touches Plex, and it is not in the manual allow-list, so "run it again" points
     # at a button that returns 422. The same wrongness was already latent for `backup.take` and
     # `maintenance.prune`.
-    from shortlist.server.services import jobs as jobs_service
 
     entries = {e.kind: e for e in jobs_service.CATALOG}
     touched_plex = any(entries[k].writes_plex for k in kinds if k in entries)
@@ -553,12 +669,31 @@ def _shelf_contention(session: Session) -> dict | None:
         message = event.message if isinstance(event.message, dict) else {}
         if message.get("dry_run"):
             continue  # a preview moved nothing, so it is no evidence of anything
+        if message.get("verified") is not True:
+            # We asked, and the re-read said the shelf did NOT end up as asked — so the row was never
+            # put back, and there is nothing here for another tool to have undone. Counting these was
+            # reading our own failures as somebody else's interference: on the maintainer's server
+            # (2026-09-08) all 50 records in the window were `verified: False`, Plex was answering 200
+            # to every move and applying none, and the bell reported "Shortlist has had to put the same
+            # row back 50 times ... so something else is moving it" and named Kometa and Agregarr.
+            #
+            # `is not True` rather than `is False`: a record with no verdict at all — an older row, a
+            # shape from before this field existed — is not evidence either. `_shelf_unreachable` is
+            # where the failures are reported, in their own words.
+            continue
         library = message.get("library") or "a library"
         moved = message.get("moved")
         if not isinstance(moved, list):
             continue
         counts = per_library.setdefault(library, {})
-        for title in moved:
+        # ONE count per row per PASS, which is what this dict has always claimed to hold. Counting
+        # every occurrence instead made the alert fire on servers where nothing was fighting us: a
+        # `{top_seed}` row renders the SAME title for everyone who watched that title, so two people
+        # who both watched one film give one pass two entries for "one row". Two ordinary passes then
+        # crossed a threshold meant for three genuine re-moves, and the notification named Kometa and
+        # Agregarr as the likely cause of something neither had done. Measured on the maintainer's
+        # server: two rows over the line on three consecutive days, with no other tool involved.
+        for title in set(moved):
             counts[title] = counts.get(title, 0) + 1
 
     contended = {library: max(counts.values()) for library, counts in per_library.items() if counts}
@@ -639,12 +774,94 @@ def _filters_not_enforced(session: Session) -> dict | None:
             "it. Those rows are visible to them right now. Shortlist spot-checks ONE account of each "
             "kind, so this is likely every shared or managed account on the server, not only the "
             f"{'one' if len(names) == 1 else 'ones'} named. Please open an issue and include this "
-            "run's id — the Sharing report will look healthy, because every hide rule really is "
-            "present and read back correctly; that is the fault."
+            "run's id and what the Sharing page shows for them, including any restrictions of your own "
+            "on that account."
         ),
         "action_url": f"/runs/{run.id}",
         "action_label": "See the run",
         "dismissable": False,
+    }
+
+
+def _filters_plex_cannot_read(session: Session) -> dict | None:
+    """An account whose share filter Plex itself cannot read, so no row can be hidden from it.
+
+    A literal `&` inside one of the owner's labels ("Kids & Family") makes Plex answer that account's
+    Home with HTTP 500 — measured 2026-09-13. Shortlist refuses to write its exclude into a filter
+    nothing can verify, and by owner decision does not block everyone else's rows over it, so this card
+    is the whole warning. Error, undismissable, and cleared by the next run that looked and found none.
+    """
+    run = next(
+        (
+            r
+            for r in session.query(Run).filter(Run.finished_at.isnot(None)).order_by(Run.finished_at.desc()).limit(50)
+            if "unreadable_filters" in (r.stats or {})
+        ),
+        None,
+    )
+    unreadable = ((run.stats or {}).get("unreadable_filters") or {}) if run else {}
+    if not unreadable:
+        return None
+    lines = "\n".join(f"• {name}: {why}" for name, why in sorted(unreadable.items()))
+    return {
+        "id": f"filters-unreadable-{run.id}",
+        "severity": "error",
+        "title": "Shortlist can't hide rows from some accounts",
+        "body": (
+            "Shortlist can't hide other people's rows from these accounts in the libraries named, because "
+            f"Plex can't read the restrictions set on them:\n\n{lines}\n\n"
+            "Everyone else's rows are still hidden and still showing on Home. Rename the label in Plex "
+            "(Settings → Manage Library Access → the person → Restrictions, and the label itself on your "
+            "titles) and the next run fixes it."
+        ),
+        "action_url": "/sharing",
+        "action_label": "See sharing",
+        "dismissable": False,
+    }
+
+
+def _restrictions_restored(session: Session) -> dict | None:
+    """A privacy pass moved our excludes out from behind a `|`, and an account's OWN Plex restriction applies again.
+
+    Before #116 Shortlist joined its excludes to an account's existing restriction with `|`, which Plex
+    reads as OR — so a rating exclude or an allow-list the owner set stopped applying, silently. The
+    repair turns it back on, and the people on those accounts will find less on the server than they
+    had yesterday. Said for a week, so the owner hears it from Shortlist before they hear it from a
+    friend. Info, not a fault.
+
+    Read from audit events rather than run stats: several jobs run the privacy pass without persisting
+    a run, and whichever runs first after upgrading is the one that repairs.
+    """
+    since = datetime.now(UTC) - timedelta(days=7)
+    events = (
+        session.query(Event)
+        .filter(Event.scope == RESTRICTION_RESTORED_SCOPE, Event.ts >= since)
+        .order_by(Event.ts.desc())
+        .limit(200)
+        .all()
+    )
+    if not events:
+        return None
+    names = sorted({str((e.message or {}).get("username") or "") for e in events} - {""})
+    if not names:
+        return None
+    who = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+    return {
+        "id": f"restrictions-restored-{events[0].id}",
+        "severity": "info",
+        "title": "Plex restrictions you set are working again",
+        "body": (
+            f"{who} had a restriction of your own in Plex — a content rating or label rule. An earlier "
+            "version of Shortlist joined its hide rule to it in a way Plex reads as 'either/or', which "
+            "quietly switched your restriction off: an exclude rule also let them see other people's rows, "
+            "and an allow-list let them see the whole library. Shortlist has fixed that, so your "
+            "restriction applies again and they may notice less on the server than before.\n\n"
+            "One thing to know if it is an allow-list: Plex now applies it to Shortlist's rows too, so they "
+            "only see their own row if it carries one of the allowed labels."
+        ),
+        "action_url": "/sharing",
+        "action_label": "See sharing",
+        "dismissable": True,
     }
 
 
@@ -655,6 +872,7 @@ def build_notifications(session: Session, store: SettingsStore, current_version:
     candidates = [
         _update_available(store, current_version),
         _runs_paused(store),
+        _secrets_we_cannot_read(store),
         _last_run_problem(session),
         _failed_jobs(session),
         _mdblist_quota(session),
@@ -663,6 +881,8 @@ def build_notifications(session: Session, store: SettingsStore, current_version:
         _rows_with_no_name_for_newcomers(session, store),
         _rows_we_cannot_hide(session),
         _filters_not_enforced(session),
+        _filters_plex_cannot_read(session),
+        _restrictions_restored(session),
         _owner_sees_all_rows(session),
         _shelf_contention(session),
         _playback_listener_down(store),

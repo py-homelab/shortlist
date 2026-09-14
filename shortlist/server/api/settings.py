@@ -13,16 +13,18 @@ from loguru import logger
 from pydantic import BaseModel
 
 from shortlist.engine.clients.http_retry import redact
+from shortlist.engine.clients.search import EXA_SEARCH_TYPES
 from shortlist.engine.models import (
     LANGUAGE_MODES,
     MAX_REFRESH_DAYS,
     MAX_ROW_SIZE,
     MIN_ROW_SIZE,
+    REQUEST_TARGETS,
     SONARR_MONITOR_MODES,
 )
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
-from shortlist.server.db.models import DEFAULT_SLUG, Server
+from shortlist.server.db.models import DEFAULT_SLUG, Collection, Server
 from shortlist.server.net_guard import BlockedUrl, check_url
 from shortlist.server.services import collection_reconcile as reconcile
 from shortlist.server.services import jobs
@@ -43,7 +45,7 @@ REDACTED_PLACEHOLDER = "•••••"
 # (rule 10); the value never is, in either direction (rule 9).
 _AUDIT_SECRET = "<redacted>"
 
-# A few settings hold whole objects (`rows.hub_anchor`, `candidates.sources`). The audit wants the
+# A few settings hold whole objects (`candidates.sources`). The audit wants the
 # fact and the shape of a change, not a second copy of the config, so long values are summarised.
 _MAX_AUDIT_VALUE_CHARS = 200
 
@@ -191,27 +193,6 @@ def _is_bool(value: object) -> str | None:
     return None if isinstance(value, bool) else "must be true or false"
 
 
-def _hub_anchors(value: object) -> str | None:
-    """`{sectionKey: {"top": true} | {"anchor": str, "before": bool}}` — the per-library
-    Recommended-shelf placement. A `top` entry needs no anchor; otherwise `anchor` must be non-empty.
-    An empty dict clears it. Bad shapes reached the engine and skipped ordering silently."""
-    if not isinstance(value, dict):
-        return "must be an object keyed by library id"
-    for key, entry in value.items():
-        if not isinstance(key, str):
-            return "library ids must be strings"
-        if not isinstance(entry, dict):
-            return f"{key}: must be an object with 'top', or 'anchor' and 'before'"
-        if entry.get("top"):
-            continue  # top mode ignores anchor/before
-        anchor = entry.get("anchor")
-        if not isinstance(anchor, str) or not anchor.strip():
-            return f"{key}: needs 'top', or a non-empty 'anchor' title"
-        if not isinstance(entry.get("before", False), bool):
-            return f"{key}: 'before' must be true or false"
-    return None
-
-
 def _int_list(value: object) -> str | None:
     """A list of TMDB ids. Reached only by API/config today (there is no UI for it), which is exactly
     why it needs validating — an untyped blob here would reach the engine as a set of whatever."""
@@ -282,7 +263,6 @@ VALIDATORS = {
     "row.size": _bounded_int(MIN_ROW_SIZE, MAX_ROW_SIZE),
     "runs.retention": _bounded_int(0, 24),  # months; 0 = keep forever
     "events.retention": _bounded_int(0, 24),  # months; 0 = keep forever (the default)
-    "sync.watch_incremental": _is_bool,
     "sync.watch_full_days": _bounded_int(1, 90),
     # The FLOOR (minimum seconds) between plex.tv writes. 0 = fire as fast as plex.tv accepts; the
     # client backs off adaptively on 429 (rule 6), so 0 is safe, not an "off switch" like it once was.
@@ -291,16 +271,29 @@ VALIDATORS = {
     "run.concurrency": _bounded_int(1, 16),  # 1 = sequential; writes stay serial regardless
     "paused_all": _is_bool,
     "requests.enabled": _is_bool,
+    "requests.target": _one_of(*REQUEST_TARGETS),
     "requests.auto_send": _is_bool,
     "candidates.sources": _known_sources,
-    "rows.hub_anchor": _hub_anchors,
     "llm_web.search_provider": _one_of("native", "exa", "searxng"),
+    # Validated here as well as clamped in the client: a typo saved through the API would otherwise
+    # be a 400 from Exa on every seed of every run, and the owner would see an empty row, not a bad
+    # setting. The client's fallback is the second line of defence, for a value written before this.
+    "exa.search_type": _one_of(*EXA_SEARCH_TYPES),
     "searxng.url": _url_without_credentials,
     "recommendations.watched_pct": _bounded_float(0.0, 1.0),
+    "recommendations.genre_avoidance": _bounded_float(0.0, 1.0),
+    "recommendations.franchise": _bounded_float(0.0, 1.0),
+    "recommendations.cast": _bounded_float(0.0, 1.0),
+    # Bounded, and not only for tidiness. `ContextBuilder.build` consumes this with a bare
+    # `float()`, so an unvalidated "30s" wedges every run and every context-building job with
+    # no way back except editing the DB — and the sweep sleeps this PER CANDIDATE while holding
+    # the Plex writer lock, so a large value stalls the run and everything queued behind it.
+    "plex.orphan_confirm_delay_s": _bounded_float(0.0, 300.0),
     # Refresh cadence in days. 0 = frozen; the ceiling is a validation bound, not a behaviour cap —
     # the old 0..1 fraction could not express anything slower than a fortnight, and a monthly or
     # quarterly row is a legitimate thing to want.
     "recommendations.refresh_days": _bounded_int(0, MAX_REFRESH_DAYS),
+    "recommendations.idle_hold_days": _bounded_int(0, MAX_REFRESH_DAYS),
     "recommendations.recency": _bounded_float(0.0, 1.0),
     "recommendations.recent_count": _bounded_int(1, 25),
     "recommendations.max_seeds": _bounded_int(5, 100),
@@ -333,6 +326,7 @@ VALIDATORS = {
     "requests.min_year": _bounded_int(0, 2100),
     "requests.max_year": _bounded_int(0, 2100),
     "requests.max_per_run": _bounded_int(0, 100),
+    "requests.overseerr.request_as_user_id": _bounded_int(0, 1_000_000),
     "requests.radarr.quality_profile_id": _bounded_int(0, 1_000_000),
     "requests.sonarr.quality_profile_id": _bounded_int(0, 1_000_000),
     # Sonarr 400s the whole add on a value outside its enum, so the typo is refused here rather than
@@ -358,11 +352,16 @@ def _check(key: str, value: object) -> str | None:
 _FETCHED_URL_KEYS = (
     "plex.url",
     "tautulli.url",
+    "requests.overseerr.url",
     "requests.radarr.url",
     "requests.sonarr.url",
     "curator.ollama_url",
     "curator.openai_base_url",
     "searxng.url",  # fetched by the Test button and by the llm_web source on every run
+    # POSTed to by `notify.send` on every failed run, and by the Send-a-test button. Being an
+    # outbound alert rather than an integration does not change what it is: a URL the server fetches
+    # because the owner typed it.
+    "notify.webhook.url",
     # NB: `curator_models` fetches an ollama_url WITHOUT saving it, so it checks the URL itself.
     # Anything else that fetches a caller-supplied URL without going through `PUT /settings` must
     # do the same — this tuple is not the only door.
@@ -380,6 +379,12 @@ def _reject_blocked_urls(values: dict[str, object]) -> None:
         value = values.get(key)
         if not value or not isinstance(value, str) or not value.strip():
             continue  # blank clears the setting — nothing to fetch
+        # `notify.webhook.url` is the first key that is BOTH a fetched URL and a secret, so the
+        # redacted sentinel now reaches this guard. It means "leave the stored value alone", exactly
+        # as it does in the write loop and in `_re_points_plex` — checking it as an address would
+        # 422 the whole settings save every time anyone pressed Save with a webhook configured.
+        if key in SECRET_KEYS and value == REDACTED_PLACEHOLDER:
+            continue
         try:
             check_url(value, what=f"{key}")
         except BlockedUrl as e:
@@ -485,6 +490,7 @@ async def put_settings(
         # refusal leaves every setting in this request unwritten rather than half-applied.
         proposed_row_name = str(update.values.get("row.name_template") or "").strip()
         if proposed_row_name and proposed_row_name != old_row_name:
+            default_row = session.query(Collection).filter_by(slug=DEFAULT_SLUG).first()
             clash = reconcile.row_titled_from(
                 session,
                 proposed_row_name,
@@ -492,13 +498,17 @@ async def put_settings(
                 exclude_slug=DEFAULT_SLUG,
                 # The default row is per-person, and only a per-person row can share its collection.
                 build="per_person",
+                # ...and only one that can build in a library the default row reaches (issue #121). A
+                # deleted default row reaches nothing, but "both, everywhere" is the safe reading.
+                media=default_row.media if default_row else "both",
+                library_keys=(default_row.library_keys or []) if default_row else [],
             )
             if clash is not None:
                 raise HTTPException(
                     status_code=422,
                     detail=f"{proposed_row_name!r} is already the title of the row {clash.name!r} "
-                    f"({clash.slug}) — two rows with the same title become a single collection on Plex, "
-                    "so pick a different name",
+                    f"({clash.slug}), which can build in the same library — two rows with the same title in one "
+                    "library become a single collection on Plex, so pick a different name",
                 )
         for key, value in update.values.items():
             if key in SECRET_KEYS and value == REDACTED_PLACEHOLDER:
@@ -583,11 +593,13 @@ _TESTABLE_SERVICES = frozenset(
         "tmdb",
         "radarr",
         "sonarr",
+        "overseerr",
         "mdblist",
         "trakt",
         "exa",
         "searxng",
         "native_search",
+        "notify",
         "llm",
     }
 )
@@ -616,7 +628,9 @@ async def test_connection(service: str, request: Request) -> dict:
                 from shortlist.engine.clients.plex_pms import PlexClient
 
                 plex = PlexClient(get("plex.url"), get("plex.token"))
-                return f"Connected to {plex.server_name} (PMS {plex.version})"
+                # "PMS" is our word for it, not Plex's own UI's — an owner reading this on the
+                # Connections card has no reason to know the abbreviation.
+                return f"Connected to {plex.server_name} (Plex Media Server {plex.version})"
             if service == "tautulli":
                 from shortlist.engine.clients.tautulli import TautulliClient
 
@@ -639,6 +653,15 @@ async def test_connection(service: str, request: Request) -> dict:
                     raise RuntimeError(f"{service.title()} URL and API key are both required")
                 target = ArrTarget(url=url, api_key=api_key, quality_profile_id=0, root_folder="")
                 return make_arr_client(service, target).ping()
+            if service == "overseerr":
+                from shortlist.engine.clients.seerr import SeerrClient
+                from shortlist.engine.models import SeerrTarget
+
+                url = (get("requests.overseerr.url") or "").strip()
+                api_key = get("requests.overseerr.apikey") or ""
+                if not url or not api_key:
+                    raise RuntimeError("Overseerr URL and API key are both required")
+                return SeerrClient(SeerrTarget(url=url, api_key=api_key)).ping()
             if service == "mdblist":
                 from shortlist.engine.clients.mdblist import MdbListClient
 
@@ -659,7 +682,15 @@ async def test_connection(service: str, request: Request) -> dict:
                 api_key = get("exa.apikey") or ""
                 if not api_key:
                     raise RuntimeError("An Exa API key is required for AI web search")
-                return ExaClient(api_key).ping()
+                # Ping on the CHEAPEST OFFERED mode, whatever the configured one: Test should answer
+                # in a couple of seconds and cost as little as possible, and proving the key is the
+                # only thing this button claims to do.
+                #
+                # Taken from EXA_SEARCH_TYPES rather than named literally. It used to hardcode
+                # "fast"; when that mode was dropped for returning no titles, `ExaClient` clamped the
+                # unknown value to the DEFAULT — so every auto-test on the Settings page silently ran
+                # `deep-lite` at 1.7x the price and logged a warning nobody had asked for.
+                return ExaClient(api_key, search_type=EXA_SEARCH_TYPES[0]).ping()
             if service == "native_search":
                 # A REAL web search, not a capability lookup. `supports_native_web_search` says the
                 # provider offers the tool; it cannot say this account's plan or model may use it.
@@ -690,6 +721,13 @@ async def test_connection(service: str, request: Request) -> dict:
                         "or SearXNG as the search backend instead, or switch to a model that can."
                     )
                 return f"ok — the provider's own web search returned {len(found)} titles"
+            if service == "notify":
+                # The one test on this page that is not a ping: it really posts a message, because a
+                # test button that exercised its own private send path would prove nothing about the
+                # 3am one. Same `deliver`, same body builder, same settings — only the trigger differs.
+                from shortlist.server.services import notify
+
+                return notify.deliver(SettingsStore(session, state.secrets), notify.test_item())
             if service == "searxng":
                 from shortlist.engine.clients.search import SearxngClient
 
@@ -755,6 +793,54 @@ async def arr_options(service: str, request: Request) -> dict:
         target = ArrTarget(url=url, api_key=api_key, quality_profile_id=0, root_folder="")
         client = make_arr_client(service, target)
         return {"quality_profiles": client.quality_profiles(), "root_folders": client.root_folders()}
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, fetch)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=redact(f"{type(e).__name__}: {e}")) from e
+
+
+class SeerrUserOut(PassthroughModel):
+    id: int
+    name: str
+    # Whether this account's requests skip Overseerr's own approval queue. The screen needs it to say
+    # what picking the account will actually DO, rather than leaving the owner to find out later.
+    auto_approve_movies: bool = False
+    auto_approve_tv: bool = False
+    # True for a real person on the server, false for a local account made inside Overseerr. Drives
+    # the grouping in the picker — see the note on `is_plex_user` in the client.
+    is_plex_user: bool = False
+
+
+class SeerrOptionsOut(PassthroughModel):
+    users: list[SeerrUserOut]
+    # Which of those accounts the API key itself is, so the UI can resolve "Server default" to a real
+    # row and say whether it approves. None when the instance would not say.
+    default_user_id: int | None = None
+
+
+@router.get("/overseerr/options", response_model=SeerrOptionsOut)
+async def overseerr_options(request: Request) -> dict:
+    """The instance's accounts, so the UI can offer a "request as" dropdown.
+
+    The *seerr equivalent of ``arr_options``, and deliberately much smaller: quality profiles and
+    root folders are Overseerr's business on this route, so the only choice left to Shortlist is
+    whose name the request goes out under.
+    """
+    state = request.app.state
+    with state.sessions() as session:
+        store = SettingsStore(session, state.secrets)
+        url = (store.get("requests.overseerr.url") or "").strip()
+        api_key = store.get("requests.overseerr.apikey") or ""
+    if not url or not api_key:
+        raise HTTPException(status_code=409, detail="Overseerr isn't connected yet")
+
+    def fetch() -> dict:
+        from shortlist.engine.clients.seerr import SeerrClient
+        from shortlist.engine.models import SeerrTarget
+
+        client = SeerrClient(SeerrTarget(url=url, api_key=api_key))
+        return {"users": client.users(), "default_user_id": client.whoami()}
 
     try:
         return await asyncio.get_running_loop().run_in_executor(None, fetch)

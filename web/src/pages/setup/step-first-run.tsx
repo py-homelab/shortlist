@@ -19,20 +19,17 @@ import { runOutcome } from "@/lib/run-outcome";
 import type { RunFinishedEvent } from "@/lib/types";
 import { api, apiErrorMessage } from "@/lib/api";
 import { useUsers } from "@/lib/queries";
-import { RUN_STAGES, STAGE_LABELS } from "@/lib/run-stages";
+import { describeCounts, RUN_STAGES, STAGE_LABELS } from "@/lib/run-stages";
 import { useSSE } from "@/lib/sse";
 import type { RunUserStageEvent, User } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import type { StepProps } from "./step-props";
 
-/** What each stage's counts mean, phrased for humans ("113 history · 40 seeds"). */
+/** What each stage's counts mean, phrased for humans. The queue position is left out. */
 function countsLine(counts: Record<string, number | string>): string {
-  const entries = Object.entries(counts).filter(
-    ([name]) => name !== "position",
-  );
-  if (entries.length === 0) return "";
-  return entries.map(([name, value]) => `${value} ${name}`).join(" · ");
+  const { position: _position, ...rest } = counts;
+  return describeCounts(rest);
 }
 
 interface UserProgress {
@@ -366,7 +363,7 @@ export function StepFirstRun({ complete }: StepProps) {
             <p className="text-sm text-muted-foreground">
               Want more? In Settings you can add extra recommendation sources
               (Trakt, AI web search), auto-request missing titles via
-              Sonarr/Radarr, and add more rows.
+              Sonarr/Radarr or Overseerr, and add more rows.
             </p>
           )}
           <Button onClick={() => void complete()}>

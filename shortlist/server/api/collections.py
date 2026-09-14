@@ -8,15 +8,15 @@ import re
 from datetime import UTC, datetime
 from typing import Annotated
 
-from apscheduler.triggers.cron import CronTrigger
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from loguru import logger
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
+import shortlist.server.services.context_builder as context_builder
 from shortlist.engine.candidates import KNOWN_SOURCES
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import target_sections
@@ -34,19 +34,33 @@ from shortlist.engine.models import (
     row_monitor_or_inherit,
     slugify,
 )
+from shortlist.engine.rows import row_is_shown
 from shortlist.server.api.row_changes import (
     POSTER_RESET,
     PRIVACY_SYNC,
     RECONCILE,
     RENAME,
+    VISIBILITY,
     PlannedWork,
     RowChange,
     plan_row_changes,
 )
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
-from shortlist.server.db.models import DEFAULT_SLUG, Collection, CollectionAudience, Event, PickRow, User
-from shortlist.server.scheduler import rebuild_schedule
+from shortlist.server.db.models import (
+    DEFAULT_SLUG,
+    Collection,
+    CollectionAudience,
+    Delivery,
+    Event,
+    Job,
+    PickRow,
+    RequestCandidate,
+    RunSharedRow,
+    SharedRowWatch,
+    User,
+)
+from shortlist.server.scheduler import crontab_trigger, rebuild_schedule
 from shortlist.server.services import collection_reconcile as reconcile
 from shortlist.server.services import jobs, poster_service, report_service
 from shortlist.server.services.poster_service import load_upload
@@ -101,7 +115,8 @@ def _closed_set_out(values: set[str], description: str) -> Field:
 class HubAnchorIn(BaseModel):
     """A per-library shelf placement for one row: the very TOP (``top``), or after/before either
     another Shortlist ROW (``row``, a row slug) or a foreign collection (``anchor``, a title).
-    ``top`` needs neither; otherwise exactly one of ``row``/``anchor`` must be set.
+    ``top`` needs neither; otherwise exactly one of ``row``/``anchor`` must be set. ``enabled``
+    false is a placement in its own right — "never position this row" — and needs neither.
 
     ``row`` is a slug rather than a title because a per-person row is one Plex collection PER PERSON:
     a title names one account's copy and is meaningless for everyone else, which is what made the
@@ -111,6 +126,9 @@ class HubAnchorIn(BaseModel):
     row: str = Field(default="", max_length=255)
     before: bool = False
     top: bool = False
+    #: The owner's per-row switch for this library. False means Shortlist never positions this row,
+    #: so it sits wherever Plex put it — a new row starts at the bottom of the shelf.
+    enabled: bool = True
 
 
 class PosterIn(BaseModel):
@@ -167,11 +185,24 @@ class CollectionIn(BaseModel):
     # saves the template but leaves the Plex work alone, instead of renaming everything inline and
     # leaving the stream to report "renamed 0 collections" for a rename that did happen.
     defer_rename: bool = False
+    # Preview only: validate this edit, work out what it would owe Plex, and write NOTHING — not the
+    # row, not the audience, not `row.name_template`, not the job queue (plex-safety rule 8).
+    # Implemented by PROJECTING the post-edit snapshot (`_projected_snapshot`), never by applying the
+    # edit and rolling back: `SettingsStore.set` commits inside itself, so a rollback would not undo
+    # a default-row rename and the "preview" would have permanently retitled every row on the server.
+    # Composes with `defer_rename` rather than clashing with it — a deferred rename simply plans no
+    # RENAME, in the preview exactly as in the save.
+    dry_run: bool = False
     # Lead the row with already-finished titles (a rewatch shelf) rather than merely permitting them.
     rewatch: bool = False
+    # Rewatch rows only: leave out titles finished within this many days. 0 = no cooldown.
+    rewatch_cooldown_days: int = Field(default=30, ge=0, le=MAX_REFRESH_DAYS)
     # Shows only: exclude every series this person has started, not just the ones they finished.
     unstarted_only: bool = False
     refresh_days: int | None = Field(default=None, ge=0, le=MAX_REFRESH_DAYS)  # None -> inherit the global cadence
+    # How long this row waits when its owner has watched nothing since it was built. 0 = never wait;
+    # None -> inherit the global recommendations.idle_hold_days.
+    idle_hold_days: int | None = Field(default=None, ge=0, le=MAX_REFRESH_DAYS)
     # How much this row weights a title's release date. None -> inherit recommendations.recency.
     recency: float | None = Field(default=None, ge=0.0, le=1.0)
     recent_count: int | None = Field(default=None, ge=1, le=25)  # None -> inherit global recent_count
@@ -229,11 +260,42 @@ class CollectionIn(BaseModel):
     library_keys: list[str] = Field(default_factory=list)  # [] -> every library of the row's media type
     placement: str = _closed_set(PLACEMENTS, "both", "Where the OWNER's own collection appears.")
     placement_friends: str = _closed_set(PLACEMENTS, "both", "Where each FRIEND's own collection appears.")
+    # WHICH DAYS the row appears, as ISO weekdays (1=Mon .. 7=Sun). [] -> every day. The pair with
+    # `placement` is the whole of "When it appears" (issue #102): placement is WHERE, this is WHEN.
+    show_days: list[int] = Field(
+        default_factory=list,
+        description="Days this row appears, as ISO weekdays (1=Monday .. 7=Sunday). Empty means every day.",
+    )
     pin_top: bool = False  # pin to top of the library's Recommended shelf
     # Per-library Recommended-shelf override for this row, keyed by section key. {} -> inherit the
-    # global default (settings `rows.hub_anchor`).
+    # the default, which is the top of the shelf.
     hub_anchor: dict[str, HubAnchorIn] = Field(default_factory=dict)
     poster: PosterIn = Field(default_factory=PosterIn)
+    # The collection's Plex summary and sort title (issue #120). "" leaves that field on Plex alone.
+    description: str = Field(
+        default="",
+        max_length=2000,
+        description="The collection's Plex summary; takes {user}, {library_name} and {top_seed}. "
+        "Empty leaves the summary on Plex alone.",
+    )
+    sort_title_prefix: str = Field(
+        default="",
+        max_length=64,
+        description="Put before the row's name to make its Plex sort title, e.g. '!010_'. Orders the row "
+        "in the library's Collections tab, not on Home. Empty leaves the sort title alone.",
+    )
+
+    @field_validator("description", "sort_title_prefix")
+    @classmethod
+    def _blank_is_empty(cls, value: str) -> str:
+        """Whitespace alone is no value. Anything else is kept verbatim — a prefix's trailing space
+        (`01 `) is part of how it sorts."""
+        return value if value.strip() else ""
+
+    @field_validator("show_days")
+    @classmethod
+    def _check_show_days(cls, days: list[int]) -> list[int]:
+        return _normalise_show_days(days)
 
 
 class HubAnchorOut(PassthroughModel):
@@ -257,6 +319,24 @@ class PosterOut(PassthroughModel):
     has_image: bool  # whether the image endpoint has something to serve for this row right now
 
 
+class PlanEntryOut(PassthroughModel):
+    """One unit of Plex work an edit would cause."""
+
+    kind: str = _closed_set_out({RECONCILE, PRIVACY_SYNC, RENAME, POSTER_RESET, VISIBILITY}, "What this step would do.")
+    #: The audit scope the real edit would use — why this step is owed.
+    reason: str
+    #: The collection titles a RECONCILE would remove from Plex. Empty for every other kind, and
+    #: empty on a RECONCILE whose Plex walk failed (`preview_incomplete` then says so).
+    collections: list[str]
+    #: WHOSE copies a RECONCILE would remove; empty means everyone who has the row. Reported rather
+    #: than left implicit because it is what an audience shrink turns on, and a preview that names
+    #: the right KIND of work against the wrong people is the shape of bug this whole item exists to
+    #: prevent.
+    only_user_ids: list[int]
+    #: WHICH libraries a RECONCILE is limited to (Plex section keys); empty means every library.
+    in_sections: list[str]
+
+
 class CollectionOut(PassthroughModel):
     """A curated-row definition — the response shape of :func:`_serialize`."""
 
@@ -275,13 +355,17 @@ class CollectionOut(PassthroughModel):
     sort_order: int
     name_template: str
     fallback_name: str
+    description: str
+    sort_title_prefix: str
     min_watchers: int
     request_tag: str
     candidate_sources: list[str]
     watched_pct: float | None
     rewatch: bool
+    rewatch_cooldown_days: int
     unstarted_only: bool
     refresh_days: int | None
+    idle_hold_days: int | None
     recency: float | None
     recent_count: int | None
     max_seeds: int | None
@@ -343,10 +427,54 @@ class CollectionOut(PassthroughModel):
     pick_order: str = _closed_set_out(ORDERS, "How the delivered collection is ordered.")
     placement: str = _closed_set_out(PLACEMENTS, "Where the OWNER's own collection appears.")
     placement_friends: str = _closed_set_out(PLACEMENTS, "Where each FRIEND's own collection appears.")
+    show_days: list[int] = Field(
+        description="Days this row appears, as ISO weekdays (1=Monday .. 7=Sunday). Empty means every day."
+    )
+    shown_today: bool = Field(
+        description=(
+            "Whether this row is on its surfaces today, judged on the SERVER's clock — which is the "
+            "clock the midnight schedule and Plex follow, not the viewer's."
+        )
+    )
     pin_top: bool
     hub_anchor: dict[str, HubAnchorOut]  # keyed by Plex section key, so the KEYS vary by library
     library_keys: list[str]
     poster: PosterOut
+    # The three keys below exist ONLY on a dry-run PATCH, where the row comes back unchanged and the
+    # preview rides alongside it. Optional-with-None is a deliberate exception to `_closed_set_out`'s
+    # "declare responses required so a dropped field fails loudly": these are genuinely absent on a
+    # live edit, and making them required would force every real save to invent them.
+    #: True on a preview. Absent on a live edit, which HAS written by the time it answers.
+    dry_run: bool | None = None
+    #: What this edit would owe Plex, in the order it would happen. Empty means it owes Plex nothing.
+    plan: list[PlanEntryOut] | None = None
+    #: Why this preview may UNDER-report, in plain English, or null when it is complete.
+    #:
+    #: The third state, and the reason it is a field rather than an inference. `_stranded_sections`
+    #: answers an unreachable Plex with an EMPTY set — correct for a live edit ("not knowing which
+    #: libraries exist must mean delete nothing") and a lie in a preview, because the planner then
+    #: emits no reconcile at all and "this edit is harmless" and "I could not find out" arrive as the
+    #: same empty plan. Nothing can be read back off `plan` to tell them apart, so it is said here.
+    preview_incomplete: str | None = None
+
+
+class RowDeletePreviewOut(PassthroughModel):
+    """What `DELETE /collections/{id}?dry_run=true` WOULD do. Nothing is written."""
+
+    dry_run: bool
+    #: Collection titles that would be removed from Plex, for everyone who has this row.
+    collections: list[str]
+    #: Slugs of OTHER rows that would lose their shelf placement because it is positioned relative to
+    #: this one. `_forget_anchor_row` clears these; nothing warned about it before the fact.
+    anchors_cleared: list[str]
+    #: Whether every account's share filter would be recomputed (this row's label stops being
+    #: declared shared, so the exclude has to come out of all of them).
+    privacy_sync: bool
+    #: Whether this row's cron schedule would stop firing.
+    schedule_cleared: bool
+    #: Why this preview may under-report, in plain English, or null when it is complete.
+    preview_incomplete: str | None
+    message: str
 
 
 class CleanupOut(PassthroughModel):
@@ -360,6 +488,23 @@ class CleanupOut(PassthroughModel):
 class PosterUploadOut(PassthroughModel):
     ok: bool
     mode: str
+
+
+def _normalise_show_days(days: list[int]) -> list[int]:
+    """Sorted, de-duplicated ISO weekdays. Raises ValueError for anything outside 1..7.
+
+    0 is the one to care about: JavaScript's `Date.getDay()` calls Sunday 0, so an untyped client
+    would send it and the row would silently never appear on a Sunday — a bug with no error message
+    and no visible cause.
+    """
+    bad = sorted({d for d in days if d < 1 or d > 7})
+    if bad:
+        raise ValueError(f"show_days must be ISO weekdays 1 (Monday) to 7 (Sunday); got {bad}")
+    chosen = sorted(set(days))
+    # ALL SEVEN collapses to "every day", so there is ONE stored form for one meaning. Otherwise the
+    # midnight job treats the row as scheduled and converges the whole server nightly for a row that is
+    # never hidden, and the Rows page badges it as an override of the default it actually is.
+    return [] if len(chosen) == 7 else chosen
 
 
 def _validate(body: CollectionIn) -> None:
@@ -416,12 +561,14 @@ def _validate(body: CollectionIn) -> None:
         raise HTTPException(status_code=422, detail=f"poster mode must be one of {sorted(POSTER_MODES)}")
     if body.schedule.strip():
         try:
-            CronTrigger.from_crontab(body.schedule.strip())
+            crontab_trigger(body.schedule.strip())
         except ValueError as e:
             raise HTTPException(
                 status_code=422, detail=f"invalid schedule — needs a 5-field cron (e.g. '30 3 * * *'): {e}"
             ) from e
     for lib, anchor in body.hub_anchor.items():
+        if not anchor.enabled:
+            continue  # "never position this row" needs no anchor of any kind
         if not anchor.top and not anchor.anchor.strip() and not anchor.row.strip():
             raise HTTPException(
                 status_code=422, detail=f"hub_anchor[{lib}]: needs 'top', a 'row' slug, or a non-empty 'anchor'"
@@ -437,9 +584,10 @@ def _validate_anchor_rows(session: Session, body: CollectionIn, editing_slug: st
     """Refuse a row anchor that names a row which doesn't exist, itself, or a cycle.
 
     Checked HERE and not only in the engine because the engine's only sane response to a cycle is to
-    leave those rows where they are — silently, once a night, in a log nobody is reading. The moment
-    to say "these two rows point at each other" is while someone is looking at the screen that
-    created it.
+    drop the placement and fall back to the library default — so the row lands somewhere the owner
+    did not choose. It is recorded (`placed: False` in the run's shelf audit) rather than silent, but
+    the moment to say "these two rows point at each other" is still while someone is looking at the
+    screen that created it.
 
     ``editing_slug`` is "" when creating: a brand-new row has no slug yet and nothing can point at it,
     so it cannot be part of a cycle — only its own outgoing edges need checking.
@@ -478,6 +626,25 @@ def _validate_anchor_rows(session: Session, body: CollectionIn, editing_slug: st
             hop = str(entry.get(lib, {}).get("row") or "").strip() if isinstance(entry.get(lib), dict) else ""
 
 
+def _anchored_to(entry: object, gone: str) -> bool:
+    """Whether one ``hub_anchor`` entry positions its row relative to row ``gone``.
+
+    The single definition of that match, so the DELETE preview's warning and the delete that carries
+    it out cannot disagree about which rows lose their placement. Only ``row`` is matched: a
+    placement anchored to a foreign collection TITLE names no row and survives the delete.
+    """
+    return isinstance(entry, dict) and str(entry.get("row") or "").strip() == gone
+
+
+def _rows_anchored_to(session: Session, gone: str) -> list[str]:
+    """Slugs of the rows whose shelf placement is positioned relative to row ``gone`` — read only."""
+    return [
+        row.slug
+        for row in session.query(Collection).all()
+        if any(_anchored_to(entry, gone) for entry in (row.hub_anchor or {}).values())
+    ]
+
+
 def _forget_anchor_row(session: Session, gone: str) -> list[str]:
     """Drop every placement that positioned a row relative to ``gone``. Returns the slugs changed.
 
@@ -488,17 +655,9 @@ def _forget_anchor_row(session: Session, gone: str) -> list[str]:
     difference is invisible from inside the run. Clearing the reference falls them back to the
     library default, which is where a row with no placement of its own belongs.
     """
-    changed: list[str] = []
-    for row in session.query(Collection).all():
-        anchors = row.hub_anchor or {}
-        kept = {
-            lib: entry
-            for lib, entry in anchors.items()
-            if not (isinstance(entry, dict) and str(entry.get("row") or "").strip() == gone)
-        }
-        if len(kept) != len(anchors):
-            row.hub_anchor = kept
-            changed.append(row.slug)
+    changed = _rows_anchored_to(session, gone)
+    for row in session.query(Collection).filter(Collection.slug.in_(changed)).all():
+        row.hub_anchor = {lib: entry for lib, entry in (row.hub_anchor or {}).items() if not _anchored_to(entry, gone)}
     return changed
 
 
@@ -563,7 +722,7 @@ def _poster_view(session, collection: Collection) -> dict:
     }
 
 
-def _serialize(session, collection: Collection) -> dict:
+def _serialize(session, collection: Collection, now: datetime | None = None) -> dict:
     audience_ids = [
         row.user_id for row in session.query(CollectionAudience).filter_by(collection_id=collection.id).all()
     ]
@@ -598,13 +757,17 @@ def _serialize(session, collection: Collection) -> dict:
         # Neutralising it here rather than in a migration keeps one place responsible for the rule.
         "name_template": "" if collection.slug == DEFAULT_SLUG else collection.name_template,
         "fallback_name": collection.fallback_name or "",
+        "description": collection.description or "",
+        "sort_title_prefix": collection.sort_title_prefix or "",
         "min_watchers": collection.min_watchers,
         "request_tag": collection.request_tag or "",
         "candidate_sources": list(collection.candidate_sources or []),
         "watched_pct": collection.watched_pct,
         "rewatch": bool(collection.rewatch),
+        "rewatch_cooldown_days": collection.rewatch_cooldown_days,
         "unstarted_only": bool(collection.unstarted_only),
         "refresh_days": collection.refresh_days,
+        "idle_hold_days": collection.idle_hold_days,
         "recency": collection.recency,
         "recent_count": collection.recent_count,
         "max_seeds": collection.max_seeds,
@@ -634,6 +797,11 @@ def _serialize(session, collection: Collection) -> dict:
         "req_auto_user_tag": collection.req_auto_user_tag,
         "pick_order": collection.pick_order or "best",
         "placement": collection.placement or "both",
+        "show_days": list(collection.show_days or []),
+        # Resolved HERE, on the server's clock — the same one the midnight job and Plex follow. A
+        # badge computed in the browser reads the admin's timezone, which can disagree with what
+        # Plex is actually showing for as long as the offset lasts.
+        "shown_today": row_is_shown(collection.show_days, now or context_builder.local_now()),
         "placement_friends": collection.placement_friends or "both",
         "pin_top": bool(collection.pin_top),
         "hub_anchor": collection.hub_anchor or {},
@@ -643,7 +811,16 @@ def _serialize(session, collection: Collection) -> dict:
 
 
 def _reject_duplicate_name(
-    session, secrets, template: str, *, exclude_slug: str = "", build: str = "", fallback_name: str = ""
+    session,
+    secrets,
+    template: str,
+    *,
+    exclude_slug: str = "",
+    build: str = "",
+    fallback_name: str = "",
+    media: str = "both",
+    library_keys=(),
+    already_clashing: frozenset[str] = frozenset(),
 ) -> None:
     """Refuse a row title another row is already titled from — see `reconcile.row_titled_from` for
     what "already titled from" means and why the `name` column is the wrong thing to compare.
@@ -651,9 +828,27 @@ def _reject_duplicate_name(
     ``template`` is the EFFECTIVE template being proposed (`name_template or name`), not the raw name:
     a row that carries its own template is titled from that, so changing only its `name` cannot clash
     with anything, and changing only its `name_template` very much can.
+
+    ``media``/``library_keys`` are where the row builds: a title only has to be unique among rows that
+    could build in one library with it (issue #121). ``already_clashing`` holds the slugs this row
+    clashed with BEFORE the edit, which are not refused again — the rule is "no NEW clashes".
     """
-    clash = reconcile.row_titled_from(
-        session, template, secrets=secrets, exclude_slug=exclude_slug, build=build, fallback_name=fallback_name
+    clash = next(
+        (
+            row
+            for row in reconcile.rows_titled_from(
+                session,
+                template,
+                secrets=secrets,
+                exclude_slug=exclude_slug,
+                build=build,
+                fallback_name=fallback_name,
+                media=media,
+                library_keys=library_keys,
+            )
+            if row.slug not in already_clashing
+        ),
+        None,
     )
     if clash is None:
         return
@@ -675,14 +870,50 @@ def _reject_duplicate_name(
         where = "\u201cName for people with nothing watched yet\u201d"
     raise HTTPException(
         status_code=422,
-        detail=f"{culprit!r} is already the title of {whose} — two rows with the same title become a "
-        f"single collection on Plex, so pick a different {where}",
+        detail=f"{culprit!r} is already the title of {whose}, which can build in the same library — two rows "
+        f"with the same title in one library become a single collection on Plex, so pick a different {where} "
+        "or build the two rows in different libraries",
     )
 
 
 def _unique_slug(session, base: str) -> str:
-    base = base if base not in RESERVED_SLUGS else f"{base}_row"
-    return dedupe_slug(base, lambda slug: session.query(Collection).filter_by(slug=slug).first() is not None)
+    """A slug no row has now AND no history still names.
+
+    The slug is a row's identity in every history table, and deleting a row frees it in `collections`
+    alone. A new row that took it over inherited the deleted row's last picks (redelivered as "not due
+    to rebuild"), its delivery ledger, its shared-row picks and watch credits, and its queued requests —
+    seen live on 2026-09-13. A delivered row's history is kept (run pruning leaves picks, deliveries and
+    watch credits alone), so in practice its slug stays reserved for good.
+
+    A pending `row.reconcile` for the slug counts too. DELETE queues it before dropping the row, and it
+    cannot start while a run is in flight — a run that still holds the old row, and persists its picks
+    under the slug as each person finishes. When the job does start it removes by the slug's ledger
+    keys, which would by then be the NEW row's collections.
+
+    The default row's slug is never handed out: `picked` makes a row the default one everywhere,
+    titled from the global template and credited with legacy picks stored under a blank slug.
+    """
+    base = base if base not in RESERVED_SLUGS | {DEFAULT_SLUG} else f"{base}_row"
+    columns = (
+        Collection.slug,
+        PickRow.collection_slug,
+        Delivery.collection_slug,
+        RunSharedRow.collection_slug,
+        SharedRowWatch.collection_slug,
+        RequestCandidate.row_slug,
+    )
+
+    def is_taken(slug: str) -> bool:
+        if any(session.query(column).filter(column == slug).first() is not None for column in columns):
+            return True
+        pending_removal = session.query(Job.id).filter(
+            Job.kind == "row.reconcile",
+            Job.status.in_(("queued", "running")),
+            func.json_extract(Job.payload, "$.slug") == slug,
+        )
+        return pending_removal.first() is not None
+
+    return dedupe_slug(base, is_taken)
 
 
 def _set_audience(session, collection: Collection, body: CollectionIn) -> None:
@@ -695,28 +926,68 @@ def _set_audience(session, collection: Collection, body: CollectionIn) -> None:
     share filter, so silently dropping an id nobody recognises is the wrong direction to fail in.
     """
     session.query(CollectionAudience).filter_by(collection_id=collection.id).delete()
+    _validate_audience_ids(session, body)
+    for user_id in _audience_after_set(body):
+        session.add(CollectionAudience(collection_id=collection.id, user_id=user_id))
+
+
+def _audience_after_set(body: CollectionIn) -> list[int]:
+    """The membership :func:`_set_audience` leaves behind, deduped and in request order.
+
+    Gated on the RAW ``body.audience``, NOT the row's merged value — and that distinction is the
+    whole reason this is a function. `CollectionIn.audience` defaults to "everyone", so a PATCH that
+    sends ``audience_user_ids`` ALONE clears the membership of a row that stays "subset": everyone
+    is dropped, not just the ids left out. A preview that reasoned from the merged audience instead
+    reported one person's collection going while the save removed all forty.
+    """
     if body.audience != "subset":
-        return
-    wanted = list(dict.fromkeys(body.audience_user_ids))  # dedupe, keep order
+        return []
+    return list(dict.fromkeys(body.audience_user_ids))  # dedupe, keep order
+
+
+def _validate_audience_ids(session, body: CollectionIn) -> None:
+    """Refuse an audience naming a user who does not exist.
+
+    Hoisted out of `_set_audience` so the PATCH handler can run it BEFORE its first write. It used to
+    fire from inside the apply half, after `SettingsStore.set` had already committed — so a
+    default-row rename refused for an unknown id answered 422 while every row on the server had been
+    permanently retitled.
+
+    Raises:
+        HTTPException: 422 naming the unknown ids. `CollectionAudience.user_id` is a foreign key and
+            the connection runs with ``PRAGMA foreign_keys=ON``, so an unknown id otherwise surfaced
+            as an `IntegrityError` at commit — an unhandled 500 carrying a SQL string, where every
+            other bad input on this router is a 422. And on a SHARED row this list decides who is
+            excluded from the share filter, so silently dropping an unrecognised id is the wrong
+            direction to fail in.
+    """
+    wanted = _audience_after_set(body)
     if not wanted:
         return
     known = {user_id for (user_id,) in session.query(User.id).filter(User.id.in_(wanted)).all()}
-    unknown = [user_id for user_id in wanted if user_id not in known]
-    if unknown:
+    if unknown := [user_id for user_id in wanted if user_id not in known]:
         raise HTTPException(status_code=422, detail=f"no such user(s): {unknown} — the audience must be existing users")
-    for user_id in wanted:
-        session.add(CollectionAudience(collection_id=collection.id, user_id=user_id))
 
 
 @router.get("", response_model=list[CollectionOut])
 async def list_collections(request: Request) -> list[dict]:
     with request.app.state.sessions() as session:
         collections = session.query(Collection).order_by(Collection.sort_order, Collection.id).all()
-        return [_serialize(session, c) for c in collections]
+        # ONE clock read for the whole response, the same rule `_build_rows` follows: served a
+        # millisecond either side of midnight, two rows in one list would otherwise report different
+        # days.
+        now = context_builder.local_now()
+        return [_serialize(session, c, now) for c in collections]
 
 
 @router.post("", status_code=201, response_model=CollectionOut)
 async def create_collection(body: CollectionIn, request: Request) -> dict:
+    # `CollectionIn` is the body model for PATCH as well, which is where `dry_run` belongs — but that
+    # makes it part of the POST schema too, and creation has nothing to preview. Silently ignoring it
+    # would mean `POST {"dry_run": true}` answers 201 having created the row: a documented preview
+    # flag that writes, which is the exact shape plex-safety rule 8 exists to prevent.
+    if body.dry_run:
+        raise HTTPException(status_code=422, detail="dry_run is only supported on PATCH and DELETE")
     _validate(body)
     with request.app.state.sessions() as session:
         # The template this row will actually be titled from, not the bare name — a POST may set both.
@@ -726,6 +997,8 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             body.name_template or body.name,
             build=body.build,
             fallback_name=body.fallback_name,
+            media=body.media,
+            library_keys=body.library_keys,
         )
         _validate_anchor_rows(session, body, editing_slug="")
         slug = _unique_slug(session, slugify(body.name))
@@ -749,8 +1022,10 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             candidate_sources=body.candidate_sources,
             watched_pct=body.watched_pct,
             rewatch=body.rewatch,
+            rewatch_cooldown_days=body.rewatch_cooldown_days,
             unstarted_only=body.unstarted_only,
             refresh_days=body.refresh_days,
+            idle_hold_days=body.idle_hold_days,
             recency=body.recency,
             recent_count=body.recent_count,
             max_seeds=body.max_seeds,
@@ -758,11 +1033,14 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             seed_window=body.seed_window,
             pick_order=body.pick_order,
             placement=body.placement,
+            show_days=body.show_days,
             placement_friends=body.placement_friends,
             pin_top=body.pin_top,
             hub_anchor={k: v.model_dump() for k, v in body.hub_anchor.items()},
             library_keys=body.library_keys,
             poster=body.poster.model_dump(),
+            description=body.description,
+            sort_title_prefix=body.sort_title_prefix,
         )
         session.add(collection)
         session.flush()
@@ -785,13 +1063,18 @@ _PATCHABLE_COLUMNS = (
     "sort_order",
     "name_template",
     "fallback_name",
+    # Reach Plex on the row's next run, like its poster — they owe Plex nothing at save time.
+    "description",
+    "sort_title_prefix",
     "min_watchers",
     "request_tag",
     "candidate_sources",
     "watched_pct",
     "rewatch",
+    "rewatch_cooldown_days",
     "unstarted_only",
     "refresh_days",
+    "idle_hold_days",
     "recency",
     "recent_count",
     "max_seeds",
@@ -819,12 +1102,21 @@ _PATCHABLE_COLUMNS = (
     "pick_order",
     "placement",
     "placement_friends",
+    "show_days",
     "pin_top",
     "library_keys",
 )
 
 
-def _stranded_sections(state, *, old_media: str, old_keys: list[str], new_media: str, new_keys: list[str]) -> set[str]:
+def _stranded_sections(
+    state,
+    *,
+    old_media: str,
+    old_keys: list[str],
+    new_media: str,
+    new_keys: list[str],
+    unreadable: list[str] | None = None,
+) -> set[str]:
     """Section keys this row USED to deliver into and no longer does.
 
     Narrowing a row is not the same as removing it: the collections in the libraries it still targets
@@ -834,6 +1126,14 @@ def _stranded_sections(state, *, old_media: str, old_keys: list[str], new_media:
     Empty when the row widened, when nothing moved, or when Plex cannot be reached — the last of those
     deliberately: not knowing which libraries exist must mean "delete nothing", never "delete
     everything". The next edit or a sync check picks it up.
+
+    Args:
+        unreadable: Out-param for the THIRD state, and the only reason it exists. An empty result
+            means "nothing was stranded" to a live edit and "I could not find out" to a preview, and
+            the two are indistinguishable from the return value alone — so a caller that needs to
+            tell them apart passes a list here and gets the plain-English reason appended. Live
+            callers pass nothing and behave exactly as before. Same out-param idiom as
+            `_reconcile_row_removal`'s ``removed``.
     """
     if (old_media, sorted(old_keys)) == (new_media, sorted(new_keys)):
         return set()
@@ -841,6 +1141,11 @@ def _stranded_sections(state, *, old_media: str, old_keys: list[str], new_media:
         sections = state.run_service.build_context(dry_run=True).plex.sections()
     except Exception as e:
         logger.warning("could not read libraries to narrow row scope ({}) — nothing removed", type(e).__name__)
+        if unreadable is not None:
+            unreadable.append(
+                "Plex could not be reached, so which libraries this row would leave is unknown — "
+                "it may remove collections this preview does not list. Check the connection and preview again."
+            )
         return set()
 
     def targeted(media: str, keys: list[str]) -> set[str]:
@@ -880,6 +1185,83 @@ def _queue_reconcile(
     jobs.enqueue(state.sessions, "row.reconcile", payload)
 
 
+def _apply_patch(
+    session,
+    secrets,
+    collection: Collection,
+    body: CollectionIn,
+    sent: set[str],
+    *,
+    is_default: bool,
+    default_rename_to: str,
+) -> None:
+    """Write a validated PATCH onto the row. Every write the handler makes, and nothing else.
+
+    Split out so the handler reads validate → (preview and stop) → apply, and so the one write that a
+    transaction cannot take back — `SettingsStore.set`, which commits inside itself — sits on this
+    side of that line rather than up among the checks.
+
+    Args:
+        session: Open session; the caller commits.
+        secrets: Secret store, for `SettingsStore`.
+        collection: The row to write onto.
+        body: The validated edit.
+        sent: ``body.model_fields_set`` — only these fields move.
+        is_default: Whether this is the DEFAULT row, whose title is a global setting.
+        default_rename_to: The new global ``row.name_template`` a default-row rename resolved to,
+            or "" for every other edit. Resolved by the caller before the preview branch.
+    """
+    if default_rename_to:
+        SettingsStore(session, secrets).set("row.name_template", default_rename_to)
+    elif "name" in sent and not is_default:
+        collection.name = body.name
+    for column in _PATCHABLE_COLUMNS:
+        if column in sent:
+            # The DEFAULT row must never carry its own `name_template`: its title IS the global
+            # `row.name_template`, written just above. The engine already knows this and forces
+            # the field empty for this row when it builds specs (`context_builder.py:604,698`),
+            # so a stored value never reaches delivery — but `report_service.py` PREFERS it over
+            # the global, so a row that has one shows a stale name in reports the moment
+            # Settings → Defaults changes. The rename screen sends `name` and `name_template`
+            # together, which is right for every other row, so the guard belongs here rather
+            # than in one caller: any client sending the field would otherwise reintroduce it.
+            if column == "name_template" and is_default:
+                continue
+            setattr(collection, column, getattr(body, column))
+    if "schedule" in sent:
+        collection.schedule = body.schedule.strip()  # a whitespace-only cron means "no schedule"
+    if "poster" in sent:
+        collection.poster = body.poster.model_dump()
+        session.add(
+            Event(
+                scope="collection.poster",
+                level="info",
+                message={
+                    "slug": collection.slug,
+                    "mode": body.poster.mode or "default",
+                    "at": datetime.now(UTC).isoformat(),
+                },
+            )
+        )
+    if "hub_anchor" in sent:
+        collection.hub_anchor = {k: v.model_dump() for k, v in body.hub_anchor.items()}
+    if sent & {"audience", "audience_user_ids"}:
+        _set_audience(session, collection, body)
+
+
+def _merged_template(collection: Collection, body: CollectionIn, sent: set[str]) -> str:
+    """This row's effective title template once the PATCH lands.
+
+    Delivery renders from ``name_template or name``, and a PATCH may send either half — so both are
+    taken from the request when the request sent them and off the row when it did not. One
+    definition because the duplicate-title check and the rename plan must agree on the title: they
+    used to compute it separately, and a check that disagrees with the rename is a check of nothing.
+    """
+    return (body.name_template if "name_template" in sent else collection.name_template) or (
+        body.name if "name" in sent else collection.name
+    )
+
+
 @router.patch("/{collection_id}", response_model=CollectionOut)
 async def update_collection(collection_id: int, body: CollectionIn, request: Request) -> dict:
     """Edit a row: validate → apply → plan the Plex work → enqueue it → drain.
@@ -907,6 +1289,43 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
         touching_name = before["build"] == "per_person" and not is_default and bool(sent & {"name", "name_template"})
         template_before = (collection.name_template or collection.name) if touching_name else ""
         template_after = template_before
+        # Where the row builds, merged from the request and the row: a title only has to be unique among rows that could
+        # build in one library with it (issue #121), so moving the LIBRARIES — or flipping a shared row
+        # to per-person, the one build that collides with per-person rows — is a door onto the same
+        # collision as renaming. "No NEW clashes" is tracked per ROW, not per library: a row that already
+        # shared a title and a library with another (only a database from before this check) may move to
+        # a second library they share. Tracking libraries would need the server's library list here.
+        old_keys = [str(k) for k in (collection.library_keys or [])]
+        merged_media = body.media if "media" in sent else collection.media
+        merged_keys = [str(k) for k in body.library_keys] if "library_keys" in sent else old_keys
+        merged_build = body.build if "build" in sent else collection.build
+        if (merged_media, sorted(merged_keys), merged_build) != (collection.media, sorted(old_keys), collection.build):
+            title_now = reconcile.row_template(session, collection.slug, state.secrets)
+            fallback_now = collection.fallback_name or ""
+            before_clashes = frozenset(
+                row.slug
+                for row in reconcile.rows_titled_from(
+                    session,
+                    title_now,
+                    secrets=state.secrets,
+                    exclude_slug=collection.slug,
+                    build=collection.build,
+                    fallback_name=fallback_now,
+                    media=collection.media,
+                    library_keys=old_keys,
+                )
+            )
+            _reject_duplicate_name(
+                session,
+                state.secrets,
+                title_now if is_default else _merged_template(collection, body, sent),
+                exclude_slug=collection.slug,
+                build=merged_build,
+                fallback_name=(body.fallback_name if "fallback_name" in sent else fallback_now) or "",
+                media=merged_media,
+                library_keys=merged_keys,
+                already_clashing=before_clashes,
+            )
         # The clash check runs on the MERGED effective template, for the same reason `_validate_pairing`
         # does: a PATCH may send either half. Sending `name_template` ALONE changes the title and used
         # to be checked by nothing at all, while sending `name` alone on a row that carries its own
@@ -917,9 +1336,7 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
         # so it was the one write on the row editor with no duplicate-title check behind it. Two rows
         # rendering one title for one person in one library share a single Plex collection.
         if (sent & {"fallback_name"}) or (not is_default and sent & {"name", "name_template"}):
-            merged = (body.name_template if "name_template" in sent else collection.name_template) or (
-                body.name if "name" in sent else collection.name
-            )
+            merged = _merged_template(collection, body, sent)
             # The FALLBACK is a real title that really gets written, so two rows carrying the same one
             # land on a single collection for every person who needs it — the same trap the template
             # check exists for. POST checked it from the start; PATCH did not, and PATCH is the path
@@ -941,91 +1358,108 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
                     state.secrets,
                     merged,
                     exclude_slug=collection.slug,
-                    build=before["build"],
+                    build=merged_build,
                     fallback_name=merged_fallback,
+                    media=merged_media,
+                    library_keys=merged_keys,
                 )
         # The default row has no per-collection name: its title IS the global `row.name_template`
         # (Settings → Defaults), which delivery renders per library. So a rename of it writes that
         # global setting — NOT this column — because a per-collection template would win over each
         # user's own `row_name_tpl` override in `resolve_row_template`. Its `name` column is never
         # touched (the editor round-trips the template as the name, which must not clobber it).
+        #
+        # RESOLVED here, WRITTEN below the dry-run return: `SettingsStore.set` commits inside itself,
+        # so writing it at this point would make a PREVIEW of this rename permanent — the one edit on
+        # this handler that an end-of-request rollback could not take back.
+        default_rename_to = ""
         if "name" in sent and is_default:
-            store = SettingsStore(session, state.secrets)
             new_template = body.name.strip()
-            previous = store.get("row.name_template") or ""
+            previous = SettingsStore(session, state.secrets).get("row.name_template") or ""
             if new_template and new_template != previous:
                 # Renaming the default row retitles it on Plex just as surely as renaming any other,
                 # so it owes the same clash check — onto the title EVERY other row already renders.
                 _reject_duplicate_name(
-                    session, state.secrets, new_template, exclude_slug=DEFAULT_SLUG, build="per_person"
+                    session,
+                    state.secrets,
+                    new_template,
+                    exclude_slug=DEFAULT_SLUG,
+                    build="per_person",
+                    media=merged_media,
+                    library_keys=merged_keys,
                 )
-                store.set("row.name_template", new_template)
+                default_rename_to = new_template
                 template_before, template_after = previous, new_template
-        elif "name" in sent:
-            collection.name = body.name
         # Checked against the MERGED row, never the request body — see `_validate_pairing`.
         _validate_pairing(
             rewatch=body.rewatch if "rewatch" in sent else bool(collection.rewatch),
             unstarted_only=body.unstarted_only if "unstarted_only" in sent else bool(collection.unstarted_only),
             media=body.media if "media" in sent else collection.media,
         )
-        for column in _PATCHABLE_COLUMNS:
-            if column in sent:
-                # The DEFAULT row must never carry its own `name_template`: its title IS the global
-                # `row.name_template`, written just above. The engine already knows this and forces
-                # the field empty for this row when it builds specs (`context_builder.py:604,698`),
-                # so a stored value never reaches delivery — but `report_service.py` PREFERS it over
-                # the global, so a row that has one shows a stale name in reports the moment
-                # Settings → Defaults changes. The rename screen sends `name` and `name_template`
-                # together, which is right for every other row, so the guard belongs here rather
-                # than in one caller: any client sending the field would otherwise reintroduce it.
-                if column == "name_template" and is_default:
-                    continue
-                setattr(collection, column, getattr(body, column))
-        if "schedule" in sent:
-            collection.schedule = body.schedule.strip()  # a whitespace-only cron means "no schedule"
-        if "poster" in sent:
-            collection.poster = body.poster.model_dump()
-            session.add(
-                Event(
-                    scope="collection.poster",
-                    level="info",
-                    message={
-                        "slug": collection.slug,
-                        "mode": body.poster.mode or "default",
-                        "at": datetime.now(UTC).isoformat(),
-                    },
-                )
-            )
-        if "hub_anchor" in sent:
-            collection.hub_anchor = {k: v.model_dump() for k, v in body.hub_anchor.items()}
+        # Hoisted above the writes: `_set_audience` raises this from inside the apply half, which on a
+        # default-row rename meant answering 422 after `SettingsStore.set` had already committed.
         if sent & {"audience", "audience_user_ids"}:
-            _set_audience(session, collection, body)
-        session.commit()
-        after = _snapshot(session, collection)
-        if touching_name:
-            template_after = collection.name_template or collection.name
-        result = _serialize(session, collection)
+            _validate_audience_ids(session, body)
+
+        # Everything above VALIDATES; everything below WRITES. A preview leaves between the two, so it
+        # is refused by exactly what would refuse the save and has still written nothing.
+        if body.dry_run:
+            if touching_name:
+                template_after = _merged_template(collection, body, sent)
+            preview_change = _row_change(
+                before,
+                _projected_snapshot(session, collection, body, sent),
+                template_before=template_before,
+                template_after=template_after,
+                defer_rename=body.defer_rename,
+            )
+            preview_row = _serialize(session, collection)
+        else:
+            _apply_patch(
+                session,
+                state.secrets,
+                collection,
+                body,
+                sent,
+                is_default=is_default,
+                default_rename_to=default_rename_to,
+            )
+            session.commit()
+            after = _snapshot(session, collection)
+            if touching_name:
+                template_after = collection.name_template or collection.name
+            result = _serialize(session, collection)
+
+    if body.dry_run:
+        warnings: list[str] = []
+
+        def preview_stranded() -> set[str]:
+            return _stranded_sections(
+                state,
+                old_media=preview_change.media_before,
+                old_keys=list(preview_change.libraries_before),
+                new_media=preview_change.media_after,
+                new_keys=list(preview_change.libraries_after),
+                unreadable=warnings,
+            )
+
+        plan = await run_in_threadpool(plan_row_changes, preview_change, preview_stranded)
+        return {
+            **preview_row,
+            "dry_run": True,
+            "plan": await _plan_view(state, plan, preview_change, warnings=warnings),
+            "preview_incomplete": " ".join(warnings) or None,
+        }
+
     # A schedule or enable/disable change alters which cron jobs should exist — re-derive them.
     if sent & {"schedule", "enabled"}:
         rebuild_schedule(request.app)
 
-    change = RowChange(
-        slug=before["slug"],
-        build_before=before["build"],
-        build_after=after["build"],
-        enabled_before=before["enabled"],
-        enabled_after=after["enabled"],
-        media_before=before["media"],
-        media_after=after["media"],
-        libraries_before=before["libraries"],
-        libraries_after=after["libraries"],
-        audience_before=before["audience"],
-        audience_after=after["audience"],
+    change = _row_change(
+        before,
+        after,
         template_before=template_before,
         template_after=template_after,
-        poster_mode_before=before["poster_mode"],
-        poster_mode_after=after["poster_mode"],
         defer_rename=body.defer_rename,
     )
 
@@ -1070,7 +1504,140 @@ def _snapshot(session, collection: Collection) -> dict:
         "libraries": tuple(str(k) for k in (collection.library_keys or [])),
         "audience": audience,
         "poster_mode": (collection.poster or {}).get("mode") or "",
+        "show_days": tuple(collection.show_days or []),
     }
+
+
+def _projected_snapshot(session, collection: Collection, body: CollectionIn, sent: set[str]) -> dict:
+    """What :func:`_snapshot` WOULD return after this PATCH, computed without touching the row.
+
+    The dry-run counterpart to `_snapshot`, and deliberately NOT "apply it and roll back": the
+    handler's default-row rename goes through `SettingsStore.set`, which commits inside itself, so a
+    rollback would not undo it — a preview of one row's rename would permanently retitle every row on
+    the server.
+
+    Every field here is one `_snapshot` reads, resolved the way the apply path resolves it. A
+    projection that drifts is a preview that lies about a deletion, which is worse than no preview at
+    all, so two tests pin it: `test_a_dry_run_projects_exactly_what_the_real_patch_produces` runs both
+    over the matrix `plan_row_changes` branches on, and
+    `test_a_dry_run_reports_the_wipe_that_ids_without_an_audience_actually_perform` covers the
+    audience branch that matrix CANNOT reach — every row in it is `audience="everyone"`, which
+    resolves to the whole roster on both sides and so agrees trivially.
+
+    Args:
+        session: Open session, for resolving the audience against the roster.
+        collection: The row as it stands, unmodified.
+        body: The requested edit.
+        sent: ``body.model_fields_set`` — a PATCH only moves the fields it actually sent.
+
+    Returns:
+        The same shape `_snapshot` returns.
+
+    The caller must have run `_validate_audience_ids` first; this projects a VALID edit and does not
+    re-check one.
+    """
+    before = _snapshot(session, collection)
+    # The row's `audience` column takes the request's value only when the request sent it...
+    audience_kind = body.audience if "audience" in sent else collection.audience
+    if audience_kind == "everyone":
+        # ...and "everyone" ignores the membership table entirely, resolving to whoever is on the
+        # roster right now — which is what makes a row switched to everyone drop nobody.
+        audience = frozenset(user_id for (user_id,) in session.query(User.id).all())
+    elif sent & {"audience", "audience_user_ids"}:
+        # ...but the MEMBERSHIP is rewritten by `_set_audience`, which gates on the RAW body value.
+        # Deferring to `_audience_after_set` is what keeps the two from disagreeing: read from the
+        # merged audience instead and a PATCH sending only `audience_user_ids` previews one removal
+        # where the save performs one per person on the server.
+        audience = frozenset(_audience_after_set(body))
+    else:
+        audience = before["audience"]
+    return {
+        "slug": collection.slug,
+        "build": body.build if "build" in sent else before["build"],
+        "enabled": bool(body.enabled) if "enabled" in sent else before["enabled"],
+        "media": body.media if "media" in sent else before["media"],
+        "libraries": tuple(str(k) for k in body.library_keys) if "library_keys" in sent else before["libraries"],
+        "audience": audience,
+        "poster_mode": (body.poster.mode or "") if "poster" in sent else before["poster_mode"],
+        "show_days": tuple(body.show_days) if "show_days" in sent else before["show_days"],
+    }
+
+
+def _row_change(
+    before: dict, after: dict, *, template_before: str, template_after: str, defer_rename: bool
+) -> RowChange:
+    """The before/after pair the planner reads, built the same way for a save and for a preview.
+
+    One construction site on purpose: the two paths differ only in how ``after`` was obtained, and a
+    second copy of this mapping is a place for a preview to describe a different edit from the one
+    the save performs.
+    """
+    return RowChange(
+        slug=before["slug"],
+        build_before=before["build"],
+        build_after=after["build"],
+        enabled_before=before["enabled"],
+        enabled_after=after["enabled"],
+        media_before=before["media"],
+        media_after=after["media"],
+        libraries_before=before["libraries"],
+        libraries_after=after["libraries"],
+        audience_before=before["audience"],
+        audience_after=after["audience"],
+        template_before=template_before,
+        template_after=template_after,
+        poster_mode_before=before["poster_mode"],
+        poster_mode_after=after["poster_mode"],
+        days_before=before["show_days"],
+        days_after=after["show_days"],
+        defer_rename=defer_rename,
+    )
+
+
+async def _plan_view(state, plan: list[PlannedWork], change: RowChange, *, warnings: list[str]) -> list[dict]:
+    """`PlannedWork` rendered as the would-be diff, resolving the removals against Plex.
+
+    A reconcile is the only kind that DELETES, so it is the only one that pays for a real read — the
+    same walk, at the same cost, that `POST /{id}/cleanup?dry_run=true` already makes. The other
+    kinds are declarative and need no read, which is why an edit that owes Plex nothing destructive
+    previews for free.
+
+    A failed walk appends to ``warnings`` rather than raising: the rest of the plan is still worth
+    showing, but the entry's empty ``collections`` must not read as "this would remove nothing".
+
+    Titles are resolved against the row's CURRENT template, because that is what the collections on
+    Plex are wearing at the moment the operator is looking at them. The live job resolves the same
+    question after the edit has committed, so an edit that renames AND narrows in one save previews
+    the old titles and removes the new ones. Both find the same collections — `_reconcile_row_removal`
+    matches on rendered titles UNIONED with the delivery ledger's recorded ones — but the strings
+    shown here are the ones on the server today, which is the pair a person can actually check.
+    """
+    view: list[dict] = []
+    for work in plan:
+        entry = {
+            "kind": work.kind,
+            "reason": work.scope,
+            "collections": [],
+            "only_user_ids": list(work.only_user_ids or ()),
+            "in_sections": list(work.in_sections or ()),
+        }
+        if work.kind != RECONCILE:
+            view.append(entry)
+            continue
+        removed, error = await reconcile.preview_row_removal(
+            state,
+            slug=change.slug,
+            build=change.build_before,  # the collections at stake are the OLD build's
+            only_user_ids=set(work.only_user_ids) if work.only_user_ids is not None else None,
+            in_sections=set(work.in_sections) if work.in_sections is not None else None,
+        )
+        if error:
+            warnings.append(
+                f"Plex could not be read all the way through, so this list may be incomplete ({error}). "
+                "Check the connection and preview again."
+            )
+        view.append({**entry, "collections": removed})
+    return view
 
 
 async def _apply_plan(state, plan: list[PlannedWork], *, slug: str, build: str) -> None:
@@ -1106,6 +1673,15 @@ async def _apply_plan(state, plan: list[PlannedWork], *, slug: str, build: str) 
             )
         elif work.kind == POSTER_RESET:
             await reconcile.run_poster_reset(state, slug=slug, build=build, scope=work.scope)
+        elif work.kind == VISIBILITY:
+            # Server-wide converge rather than a targeted write: the handler compares every row's
+            # resolved placement against the state it last applied, so it settles this row AND any
+            # other whose day turned over while Plex was unreachable. Durable, so an outage right now
+            # is retried rather than lost.
+            # Names the row: when its days are CLEARED and no other row on the server carries a
+            # schedule, the job's gate would otherwise see nothing to do and skip the very pass that
+            # puts this row back.
+            jobs.enqueue(state.sessions, "rows.visibility", {"row": slug})
     # Anything queued above happens NOW when Plex is reachable; when it isn't, the worker retries it.
     # AWAITED, unlike the delete below. An edit's Plex work IS the request: narrowing a row's
     # libraries means "take it off those libraries", so returning 200 before that happened would
@@ -1114,8 +1690,28 @@ async def _apply_plan(state, plan: list[PlannedWork], *, slug: str, build: str) 
     await jobs.drain_now(state, f"row '{slug}' was edited")
 
 
-@router.delete("/{collection_id}", status_code=204)
-async def delete_collection(collection_id: int, request: Request) -> None:
+# `response_model=None` because the return annotation is a union: FastAPI would otherwise try to
+# build a body model from it, which a 204 route may not have. The preview's shape is documented via
+# `responses` instead, so the SPA's generated types still know about it.
+@router.delete(
+    "/{collection_id}",
+    status_code=204,
+    response_model=None,
+    responses={200: {"model": RowDeletePreviewOut, "description": "A dry-run preview; nothing was deleted."}},
+)
+async def delete_collection(collection_id: int, request: Request, dry_run: bool = False) -> Response | None:
+    """Delete a row, or with ``dry_run=true`` report what deleting it would do and write nothing.
+
+    A query parameter rather than a body: `DELETE` bodies are awkward through both `fetch` and
+    FastAPI, and this works with the SPA's existing `request()` helper unchanged.
+
+    `POST /{id}/cleanup?dry_run=true` already previews the PLEX half. What only this can show is the
+    LOCAL half, and one part of it is a genuine surprise: deleting this row silently strips every
+    OTHER row's shelf placement that was positioned relative to it, changing where two other people's
+    rows appear. That was logged after the fact and warned about nowhere.
+
+    A preview answers 200 with :class:`RowDeletePreviewOut` instead of the delete's 204.
+    """
     state = request.app.state
     with state.sessions() as session:
         collection = session.get(Collection, collection_id)
@@ -1131,6 +1727,37 @@ async def delete_collection(collection_id: int, request: Request) -> None:
         # there is nothing left to resolve the title its collections were built under, so a retry
         # (Plex down at this moment, container killed mid-write) would have nothing to address.
         template = reconcile.row_template(session, slug, state.secrets)
+        if dry_run:
+            # The same walk `_forget_anchor_row` does, minus the write — one shared predicate, so the
+            # warning and the delete that carries it out cannot disagree.
+            anchors = _rows_anchored_to(session, slug)
+            has_schedule = bool((collection.schedule or "").strip())
+            # Resolved, not read off the column: the DEFAULT row's `name` is stale seed data and its
+            # real title is the global template — `_serialize` substitutes it for exactly this
+            # reason, so naming the raw column here would preview a title the UI shows nowhere.
+            name = template if slug == DEFAULT_SLUG else collection.name
+
+    if dry_run:
+        removed, error = await reconcile.preview_row_removal(state, slug=slug, build=build, template=template)
+        # Built through the model rather than as a bare dict: a hand-written `JSONResponse` is not
+        # validated by FastAPI, so a renamed key or an inverted flag would ship silently while
+        # `RowDeletePreviewOut` went on describing the old shape in the schema the SPA generates from.
+        return JSONResponse(
+            RowDeletePreviewOut(
+                dry_run=True,
+                collections=removed,
+                anchors_cleared=anchors,
+                privacy_sync=build == "shared",
+                schedule_cleared=has_schedule,
+                preview_incomplete=(
+                    f"Plex could not be read all the way through, so this list may be incomplete ({error}). "
+                    "Check the connection and preview again."
+                    if error
+                    else None
+                ),
+                message=f"Would remove {len(removed)} collection(s) from Plex for “{name}”.",
+            ).model_dump()
+        )
 
     # Queue the Plex removal FIRST, then drop the DB row. Draining after the delete is deliberate:
     # `is_default` aside, the removal no longer needs the row to exist, and queueing means a Plex outage
@@ -1140,6 +1767,9 @@ async def delete_collection(collection_id: int, request: Request) -> None:
         collection = session.get(Collection, collection_id)
         if collection is not None:
             session.query(CollectionAudience).filter_by(collection_id=collection.id).delete()
+            # Keyed by id, and SQLite hands a freed highest id to the next row — which would otherwise
+            # serve, and could push to Plex, this row's artwork.
+            poster_service.clear_assets(session, collection.id)
             session.delete(collection)
             orphaned = _forget_anchor_row(session, slug)
             if orphaned:
@@ -1200,7 +1830,15 @@ async def rename_collection_stream(collection_id: int, body: RenameRequest, requ
             # endpoint documents standalone use one line up, and an API client taking that route
             # could hand two rows one title, or overwrite the global template, with nothing to stop
             # it. Checked BEFORE either write, so a refusal renames nothing here or on Plex.
-            _reject_duplicate_name(session, request.app.state.secrets, new_template, exclude_slug=slug, build=build)
+            _reject_duplicate_name(
+                session,
+                request.app.state.secrets,
+                new_template,
+                exclude_slug=slug,
+                build=build,
+                media=collection.media,
+                library_keys=collection.library_keys or [],
+            )
             # Same rule as the PATCH handler: the DEFAULT row's title IS the global setting, and its
             # own column must stay empty. Writing it here would undo that guard within the same
             # flow — the rename screen PATCHes and then immediately POSTs to this endpoint, so a

@@ -1,10 +1,14 @@
-"""Request missing picks: ask Sonarr/Radarr for titles the curator wanted that the library lacks.
+"""Request missing picks: ask for titles the curator wanted that the library lacks.
 
 The engine already drops every candidate that isn't in a delivery library (``filter_candidates``);
 this module keeps a record of those drops instead, ranks them by how many people wanted them and how
-well-regarded they are, and — only when the owner has turned requests on — asks Sonarr/Radarr for the
-top few. It never touches Plex, so it lives entirely outside the privacy machinery: a request pass
-can fail without affecting a single row's visibility.
+well-regarded they are, and — only when the owner has turned requests on — asks for the top few. It
+never touches Plex, so it lives entirely outside the privacy machinery: a request pass can fail
+without affecting a single row's visibility.
+
+Two routes, chosen by ``RequestConfig`` and never both at once: straight to Radarr/Sonarr
+(``clients/arr.py``), or as a request in Overseerr/Jellyseerr (``clients/seerr.py``), which then
+drives those apps under its own rules. Each seam below branches once, at the top.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from shortlist.engine.clients.mdblist import (
     MdbListClient,
     MdbListRateLimitError,
 )
+from shortlist.engine.clients.seerr import SeerrClient, SeerrError
 from shortlist.engine.clients.tmdb import TmdbClient
 from shortlist.engine.models import (
     OTHER_LANGUAGE_BAR_GAP,
@@ -33,6 +38,7 @@ from shortlist.engine.models import (
     RequestOutcome,
     RequestReport,
     RequestWhy,
+    SeerrTarget,
 )
 from shortlist.engine.request_alloc import allocate
 
@@ -194,6 +200,10 @@ QUEUE_REASON_PREFIXES = (
     "auto-send is off",
     "this row's own limit",
     "on an Arr exclusion list",
+    "on the blocklist",  # the same fact, on the *seerr route
+    "Radarr isn't fully set up",
+    "Sonarr isn't fully set up",
+    "no TheTVDB id",
     "demand below",
     "rating below",
     "max_per_run",
@@ -353,6 +363,10 @@ def _gate_rows(
     # can exceed `wanted` and claim the language setting is the sole cause when it is not — the very
     # mis-attribution this counter exists to prevent, reintroduced one level up.
     dropped_language_keys: set[tuple[int, MediaType]] = set()
+    # The most permissive row's demand floor, so the server can tell a zero the settings caused from
+    # one the run's own population made impossible (see `RequestReport.demand_floor`). Taken across
+    # rows, not per row: if ANY row could have passed a title, the floor was reachable this run.
+    report.demand_floor = min((row.cfg.min_demand for row in rows), default=0)
     for index, row in enumerate(rows):
         in_play = [
             m
@@ -385,7 +399,10 @@ def _gate_rows(
 
 
 def _auto_eligible(
-    cfg: RequestConfig, survivors: list[MissingTitle], blocked: Counter[str]
+    cfg: RequestConfig,
+    survivors: list[MissingTitle],
+    blocked: Counter[str],
+    no_tvdb: set[tuple[int, MediaType]] | None = None,
 ) -> tuple[list[MissingTitle], list[MissingTitle]]:
     """Split one row's qualifying titles into ``(eligible, held_back)`` on its auto-send bar.
 
@@ -396,15 +413,40 @@ def _auto_eligible(
     The run cap is deliberately NOT applied here: allocation decides who gets the slots, so no row can
     fill the cap before another has been considered. A held-back title keeps its reason ON itself —
     that is what the DB row and the run trace carry, and the only answer to "why didn't THIS one go?".
+
+    A title that can never land is held here, BEFORE allocation, rather than skipped at the send: a
+    skip is recorded nowhere, so the same title qualified again the next night and took a slot again.
+    That covers a media type with no usable Arr on the Arr route, and ``no_tvdb`` — the shows Sonarr
+    can never be sent (see :func:`_shows_without_tvdb`).
     """
     eligible: list[MissingTitle] = []
     held_back: list[MissingTitle] = []
     other_bar = other_language_bar(cfg)
+    via_arr = cfg.target != "overseerr"
     for m in survivors:  # already ranked best-first by the gate
         if not cfg.auto_send:
             reason = "auto-send is off"
+        elif via_arr and m.media_type is MediaType.MOVIE and cfg.radarr is None:
+            reason = "Radarr isn't fully set up — connect it and pick a quality profile and root folder"
+        elif via_arr and m.media_type is not MediaType.MOVIE and cfg.sonarr is None:
+            reason = "Sonarr isn't fully set up — connect it and pick a quality profile and root folder"
+        elif (m.tmdb_id, m.media_type) in (no_tvdb or set()):
+            reason = "no TheTVDB id on TMDB, and Sonarr needs one — add this show in Sonarr yourself"
         elif m.excluded:
-            reason = "on an Arr exclusion list"
+            # Named for the route: the Arrs call it an import-exclusion list and a *seerr calls it a
+            # blocklist, and a reason line that names the wrong one sends the owner to the wrong app
+            # to undo it. Both spellings are in QUEUE_REASON_PREFIXES.
+            #
+            # Written as a plain if/else with a literal in each arm, NOT a conditional expression:
+            # `test_every_queue_reason_the_gate_can_emit_classifies_as_a_threshold` walks this
+            # function's AST and refuses any reason it cannot read as a literal, precisely so a
+            # reason built by a lookup or a helper cannot slip past the classifier unchecked. Ruff's
+            # SIM108 asks for the ternary that test rejects, so it is silenced rather than obeyed —
+            # the linter is arguing about shape, the test is protecting a contract.
+            if cfg.target == "overseerr":  # noqa: SIM108 — see above; a ternary fails that test
+                reason = "on the blocklist"
+            else:
+                reason = "on an Arr exclusion list"
         elif m.demand < cfg.auto_min_demand:
             reason = f"demand below auto_min_demand ({cfg.auto_min_demand})"
         elif m.rating < cfg.auto_min_rating:
@@ -471,19 +513,28 @@ def request_missing(
 
     gated = _gate_rows(rows, handled, report, mdblist=mdblist, budget=budget)
 
-    # 1. One Arr reconcile for the whole run: what Radarr/Sonarr already hold is a fact about the
-    #    server, not about a row, and the per-row targets differ only in profile and root folder.
-    #    Built from `base_cfg` for the same reason. Fails OPEN — see `_apply_arr_state`.
+    # 1. One reconcile for the whole run against whichever app is the route: what it already holds
+    #    is a fact about the server, not about a row, and the per-row targets differ only in profile
+    #    and root folder (and not at all on the *seerr route, which has neither). Built from
+    #    `base_cfg` for the same reason. Fails OPEN — see `_apply_arr_state` / `_apply_seerr_state`.
+    seerr = SeerrClient(base_cfg.overseerr, min_write_interval=min_write_interval) if base_cfg.overseerr else None
     radarr = RadarrClient(base_cfg.radarr, min_write_interval=min_write_interval) if base_cfg.radarr else None
     sonarr = SonarrClient(base_cfg.sonarr, min_write_interval=min_write_interval) if base_cfg.sonarr else None
     flat = [m for _, _, qualifying in gated for m in qualifying]
-    kept, in_arr, report.arr_present = _apply_arr_state(tmdb, flat, radarr, sonarr)
+    if seerr is not None:
+        kept, in_arr, report.arr_present = _apply_seerr_state(flat, seerr)
+    else:
+        kept, in_arr, report.arr_present = _apply_arr_state(tmdb, flat, radarr, sonarr)
     kept_keys = {(m.tmdb_id, m.media_type) for m in kept}
     # Fold every row's evidence about a title into every copy of it, BEFORE one of them is claimed
     # and sent — the claimed copy has to carry all of it (see _merge_across_rows).
     _merge_across_rows(gated)
     if in_arr:
-        logger.info("requests: {} qualifying already in Sonarr/Radarr — dropped", in_arr)
+        # Names the app actually asked. It read "already in Sonarr/Radarr" on the Overseerr route,
+        # which is the sort of log line that sends someone to check the wrong server.
+        logger.info(
+            "requests: {} qualifying already in {} — dropped", in_arr, "Overseerr" if seerr else "Sonarr/Radarr"
+        )
 
     # 2. Per row: keep what survived the Arr drop, enrich it, and split auto-eligible from queued on
     #    THIS row's auto-send bar. The run cap is deliberately NOT applied here — allocation below
@@ -497,7 +548,10 @@ def request_missing(
         report.considered_by_row[slug] = len(survivors)
         cfg_by_row[slug] = cfg
         _enrich(tmdb, survivors)
-        eligible, held_back = _auto_eligible(cfg, survivors, blocked)
+        # Both routes end at Sonarr for a show: the *seerr passes it on by TVDB id, and deletes it when
+        # it has none (see `_request_one_seerr`).
+        no_tvdb = _shows_without_tvdb(tmdb, survivors) if cfg.target == "overseerr" or cfg.sonarr else set()
+        eligible, held_back = _auto_eligible(cfg, survivors, blocked, no_tvdb)
         report.queued.extend(held_back)
         auto_by_row.append((slug, eligible))
 
@@ -584,7 +638,9 @@ def request_missing(
         return report
 
     # 5. Send, each title under the target of the row that claimed it.
-    report.outcomes = _send_claims(claims, cfg_by_row, tmdb, dry_run=dry_run, min_write_interval=min_write_interval)
+    report.outcomes = _send_claims(
+        claims, cfg_by_row, tmdb, dry_run=dry_run, min_write_interval=min_write_interval, seerr=seerr
+    )
     # Only the ones the Arr actually accepted. A send that failed, or was skipped for want of a TVDB
     # id, must stay requestable — suppressing it would lose the title silently.
     landed = {(o.tmdb_id, o.media_type) for o in report.outcomes if o.status in ("requested", "would_request")}
@@ -730,6 +786,7 @@ def _send_claims(
     *,
     dry_run: bool,
     min_write_interval: float,
+    seerr: SeerrClient | None = None,
 ) -> list[RequestOutcome]:
     """Send each claimed title under the target of the row that claimed it.
 
@@ -737,11 +794,23 @@ def _send_claims(
     and its rate limiter — the plex-safety throttle is per client, and one per row would multiply the
     write rate by the number of rows.
     """
-    clients: dict[ArrTarget, RadarrClient | SonarrClient] = {}
+    clients: dict[ArrTarget | SeerrTarget, RadarrClient | SonarrClient | SeerrClient] = {}
     clocks: dict[str, list[float]] = {}
+    # Seed the run's own reconcile client, so the send reuses its memoised media state instead of
+    # walking /media a second time. Seeded into the SAME cache rather than special-cased in the loop
+    # below: keyed by its target, it is reused only for rows that actually point at that instance,
+    # and the loop keeps one code path. The inbox-approval path passes none and builds its own.
+    if seerr is not None:
+        clients[seerr.target] = seerr
     outcomes: list[RequestOutcome] = []
     for slug, title in claims:
         cfg = cfg_by_row[slug]
+        if cfg.target == "overseerr":
+            # On the ROUTE, not on the target: a chosen-but-unconnected Overseerr must not fall
+            # through to the Arr branch below and be explained in that branch's words.
+            target = _cached_client(clients, clocks, cfg.overseerr, SeerrClient, min_write_interval)
+            outcomes.append(_request_one_seerr(title, target, tmdb, dry_run=dry_run))
+            continue
         radarr = _cached_client(clients, clocks, cfg.radarr, RadarrClient, min_write_interval)
         sonarr = _cached_client(clients, clocks, cfg.sonarr, SonarrClient, min_write_interval)
         outcomes.append(_request_one(title, radarr, sonarr, tmdb, dry_run=dry_run, sonarr_monitor=cfg.sonarr_monitor))
@@ -749,7 +818,11 @@ def _send_claims(
 
 
 def _cached_client(
-    clients: dict, clocks: dict[str, list[float]], target: ArrTarget | None, factory, min_write_interval: float
+    clients: dict,
+    clocks: dict[str, list[float]],
+    target: ArrTarget | SeerrTarget | None,
+    factory,
+    min_write_interval: float,
 ):
     """One client per distinct target, but one write clock per SERVER.
 
@@ -821,6 +894,16 @@ def _apply_arr_state(
     kept: list[MissingTitle] = []
     dropped = 0
     for m in pool:
+        # Sonarr's own tmdbId settles a show without a TVDB crossing — and MUST settle it, because
+        # `arr_present` is keyed that way for the server's stale-row prune. Matching presence on TVDB
+        # here and on TMDB there gave two answers to one question: a show whose TVDB id TMDB maps
+        # differently (or not at all) was simultaneously "the arr already has it" and "queue it", so
+        # the run re-sent it to Sonarr AND the persist both pruned and re-filed one inbox key — which
+        # dies on its UNIQUE constraint, losing the whole run's report (issue #104). For movies the
+        # two keyings are the same set, so this changes nothing there.
+        if (m.tmdb_id, m.media_type.value) in arr_present:
+            dropped += 1
+            continue
         if m.media_type is MediaType.MOVIE:
             present, excluded = movie_present, movie_excluded
             key: int | None = m.tmdb_id
@@ -835,6 +918,57 @@ def _apply_arr_state(
             m.excluded = True  # surfaced as its own inbox flag; the app is inferred from media_type
         kept.append(m)
     return kept, dropped, arr_present
+
+
+def _apply_seerr_state(
+    pool: list[MissingTitle],
+    seerr: SeerrClient,
+) -> tuple[list[MissingTitle], int, set[tuple[int, str]]]:
+    """``_apply_arr_state`` for an Overseerr/Jellyseerr target — one fetch instead of four.
+
+    Overseerr's media table already IS the union of "in the Plex library" and "requested and on its
+    way", both keyed by TMDB id for movies AND shows. So there is no TVDB crossing to do here, and
+    ``present`` needs no separate exclusion set: a title the instance knows about in any actionable
+    state is one Shortlist must not ask for again.
+
+    ``m.excluded`` is set from the instance's BLOCKLIST, which is the *seerr's own spelling of an Arr
+    import-exclusion list. Flagged and KEPT rather than dropped — the same choice the Arr twin makes
+    — so the inbox can say why approving it would not help, and `_auto_eligible` holds it back from
+    auto-send. An instance too old to serve `/blocklist` simply contributes no exclusions.
+
+    Fails OPEN, exactly like its Arr twin: a fetch error skips the check entirely, because a
+    redundant request is a far smaller sin than silently dropping a title the owner wanted.
+
+    ``SeerrError`` only, where ``_safe_ids`` casts a deliberately wide net. The client funnels every
+    transport and body problem into that one type — including the non-JSON reply that made the Arr
+    version broad — so anything else reaching here is a bug in our own code, and this file already
+    records what swallowing one of those costs: the ``MediaType.TV`` AttributeError in
+    ``api/requests.py`` that made a fallback silently no-op for every show, for ever.
+    """
+    if not pool:
+        return pool, 0, set()
+    try:
+        state = seerr.media_state()
+        # Inside the same guard, not after it. `blocklisted()` swallows its own transport errors, but
+        # a shape it cannot parse must not be the one thing in this function that fails the request
+        # pass — the whole point here is that a reconcile problem costs a redundant request, never a
+        # run.
+        blocked = seerr.blocklisted()
+    except SeerrError as e:
+        logger.warning("Overseerr state fetch failed, skipping that check this run: {}", e)
+        return pool, 0, set()
+    # Note the flip: `media_state` keys (media_type, tmdb_id) — the shape the inbox reads it in —
+    # while `arr_present` is (tmdb_id, media_type). Getting it round the wrong way costs nothing
+    # loudly: every lookup simply misses, so the run silently re-requests the whole library.
+    known = {(tmdb_id, kind) for (kind, tmdb_id) in state}
+    kept: list[MissingTitle] = []
+    for m in pool:
+        if (m.tmdb_id, m.media_type.value) in known:
+            continue
+        if (m.media_type.value, m.tmdb_id) in blocked:
+            m.excluded = True
+        kept.append(m)
+    return kept, len(pool) - len(kept), known
 
 
 def _safe_ids(fetch) -> set[int]:
@@ -859,6 +993,25 @@ def _safe_id_pair(fetch) -> tuple[set[int], set[int]]:
     except Exception as e:
         logger.warning("Arr state fetch failed, skipping that check this run: {}", e)
         return set(), set()
+
+
+def _shows_without_tvdb(tmdb: TmdbClient, titles: list[MissingTitle]) -> set[tuple[int, MediaType]]:
+    """The shows TMDB answered for and has no TheTVDB id — which Sonarr can never be asked for.
+
+    Decided BEFORE allocation, not left to the send. A show skipped at the send landed in neither
+    `sent` nor `queued`, so the next night it was the same qualifying title and won a slot again: in
+    production one show took a slot 15 nights running, and over one week 25 of 40 slots went to shows
+    that could never be added.
+
+    A lookup that RAISES is deliberately not in the set. TMDB being down says nothing about the show,
+    so that one still goes to the send, which retries the lookup and records the failure as a failure.
+    The lookup is TMDB's cached external-ids payload, which `_enrich` has just read for the IMDb id.
+    """
+    return {
+        (m.tmdb_id, m.media_type)
+        for m in titles
+        if m.media_type is not MediaType.MOVIE and _tvdb_for_sonarr(m, tmdb)[1][0] == "skipped_no_tvdb"
+    }
 
 
 def _resolve_tvdb(tmdb: TmdbClient, m: MissingTitle) -> int | None:
@@ -967,6 +1120,84 @@ def _gate_by_source(
     return [title for title, _, _ in scored]
 
 
+def _tvdb_for_sonarr(title: MissingTitle, tmdb: TmdbClient) -> tuple[int | None, tuple[str, str]]:
+    """A show's TheTVDB id for Sonarr, or ``(None, (status, detail))`` saying why it cannot be sent.
+
+    Both routes need this. The Arr route names the show to Sonarr by TVDB id itself; a *seerr is asked
+    by TMDB id but hands the show to Sonarr by TVDB id, and Seerr 3.4.1 DELETES a request it cannot map
+    (`MediaRequestSubscriber.sendToSonarr`: no `external_ids.tvdb_id` -> remove the media and the
+    request, throw "TVDB ID not found") — after Shortlist had already filed it as sent.
+
+    Reuses the id if the reconcile or the auto-send bar already resolved it this run.
+    """
+    if title.tvdb_id is not None:
+        return title.tvdb_id, ("", "")
+    try:
+        title.tvdb_id = tmdb.tvdb_id(title.tmdb_id, title.media_type)
+    except Exception as e:
+        # The TVDB lookup is a TMDB call, not an Arr one, so it raises RuntimeError/httpx errors rather
+        # than ArrError — caught here so one show's lookup hiccup becomes that title's outcome, never an
+        # escape that discards the whole pass's recorded outcomes.
+        logger.warning("TVDB lookup for {!r} failed: {}", title.title, e)
+        # Distinct from the skip below on purpose: THIS one is a lookup that failed (TMDB down, a
+        # timeout), so retrying may well work. The skip is a settled fact about the data and never will.
+        return None, ("error", "couldn't reach TMDB to look up this show's TheTVDB id — it may work next run")
+    if title.tvdb_id is None:
+        # Says what to DO, because nothing here can. Sonarr identifies shows by TheTVDB id and TMDB is
+        # where we look it up; when TMDB has not recorded one there is no way to name the show to
+        # Sonarr, and guessing is worse than skipping — the nearest title match for "The Haunting of
+        # Bly Manor" is "The Haunting", a different and much larger series.
+        #
+        # The old text was "no TheTVDB id for this show": true, and useless. It reads as a fault report
+        # to anyone who does not already know what a TVDB id is, so the reader cannot tell whether
+        # Shortlist is broken, their Sonarr is misconfigured, or this is simply how it is. None of
+        # those, and there is exactly one remedy.
+        return None, (
+            "skipped_no_tvdb",
+            "TMDB has no TheTVDB id for this show, and Sonarr needs one — add it in Sonarr yourself",
+        )
+    return title.tvdb_id, ("", "")
+
+
+def _request_one_seerr(
+    title: MissingTitle, seerr: SeerrClient | None, tmdb: TmdbClient, *, dry_run: bool
+) -> RequestOutcome:
+    """``_request_one`` for an Overseerr/Jellyseerr target.
+
+    Shorter than its Arr twin because the *seerr takes movies and shows through one endpoint, both
+    keyed by TMDB id — so there is no app to choose. A show still needs a TheTVDB id, because the
+    *seerr needs one to pass it on to Sonarr (see :func:`_tvdb_for_sonarr`).
+
+    ``seerr`` is None when the route is chosen but the instance is not connected — the same shape as
+    ``_request_one``'s missing Arr, and it earns the same kind of skip rather than being explained in
+    the other route's words.
+    """
+
+    def outcome(status: str, detail: str, slug: str | None = None) -> RequestOutcome:
+        return RequestOutcome(
+            tmdb_id=title.tmdb_id,
+            title=title.title,
+            media_type=title.media_type,
+            status=status,
+            detail=detail,
+            arr_slug=slug,
+        )
+
+    if seerr is None:
+        return outcome("skipped_no_target", "Overseerr is the chosen request target but has no address or API key")
+    if title.media_type is not MediaType.MOVIE:
+        tvdb_id, blocked = _tvdb_for_sonarr(title, tmdb)
+        if tvdb_id is None:
+            return outcome(*blocked)
+    try:
+        status, detail, slug = seerr.request_title(title.tmdb_id, title.media_type, dry_run=dry_run)
+    except SeerrError as e:
+        # A request failing is a footnote, never a run failure — the *seerr is optional plumbing.
+        logger.warning("request for {!r} failed: {}", title.title, e)
+        status, detail, slug = "error", str(e), None
+    return outcome(status, detail, slug)
+
+
 def _request_one(
     title: MissingTitle,
     radarr: RadarrClient | None,
@@ -1002,31 +1233,9 @@ def _request_one(
         # whole pass's recorded outcomes (the run-level handler would otherwise lose the audit trail).
         if sonarr is None:
             return outcome("skipped_no_target", "Sonarr not fully configured (check quality profile and root folder)")
-        # Reuse the TVDB id if the arr-state check already resolved it this run; else look it up now.
-        tvdb_id = title.tvdb_id
+        tvdb_id, blocked = _tvdb_for_sonarr(title, tmdb)
         if tvdb_id is None:
-            try:
-                tvdb_id = tmdb.tvdb_id(title.tmdb_id, title.media_type)
-            except Exception as e:
-                logger.warning("TVDB lookup for {!r} failed: {}", title.title, e)
-                # Distinct from the skip below on purpose: THIS one is a lookup that failed (TMDB
-                # down, a timeout), so retrying may well work. The skip is a settled fact about the
-                # data and never will.
-                return outcome("error", "couldn't reach TMDB to look up this show's TheTVDB id — it may work next run")
-        if tvdb_id is None:
-            # Says what to DO, because nothing here can. Sonarr identifies shows by TheTVDB id and
-            # TMDB is where we look it up; when TMDB has not recorded one there is no way to name the
-            # show to Sonarr, and guessing is worse than skipping — the nearest title match for
-            # "The Haunting of Bly Manor" is "The Haunting", a different and much larger series.
-            #
-            # The old text was "no TheTVDB id for this show": true, and useless. It reads as a fault
-            # report to anyone who does not already know what a TVDB id is, so the reader cannot tell
-            # whether Shortlist is broken, their Sonarr is misconfigured, or this is simply how it is.
-            # None of those, and there is exactly one remedy.
-            return outcome(
-                "skipped_no_tvdb",
-                "TMDB has no TheTVDB id for this show, and Sonarr needs one — add it in Sonarr yourself",
-            )
+            return outcome(*blocked)
         status, detail, slug = sonarr.add_series(
             tvdb_id, dry_run=dry_run, extra_tags=title.tags, monitor=sonarr_monitor
         )

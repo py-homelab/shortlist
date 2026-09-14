@@ -27,9 +27,16 @@ vi.mock("@/lib/api", async (importOriginal) => {
   };
 });
 
+function lib(name: string, media_type: string) {
+  return { name, media_type };
+}
+
 function title(over: Partial<WatchedTitle>): WatchedTitle {
   return {
     title: "Teacup",
+    // Any key the poster proxy would accept; the tests stub no image, so what matters is only that
+    // the row has one to draw with.
+    rating_key: 90210,
     tmdb_id: 1,
     media_type: "show",
     watched_at: "2026-08-03T00:00:00+00:00",
@@ -38,6 +45,7 @@ function title(over: Partial<WatchedTitle>): WatchedTitle {
     viewed_leaf_count: 3,
     leaf_count: 8,
     user_rating: null,
+    libraries: ["TV Shows"],
     ...over,
   };
 }
@@ -46,6 +54,7 @@ function page(over: Partial<WatchedPage>): WatchedPage {
   return {
     items: [title({})],
     total: 1,
+    libraries: [lib("TV Shows", "show")],
     last_full_sync_at: "2026-08-05T00:00:00+00:00",
     synced_titles: 1284,
     // Ratings on, nobody has rated anything — the default state for nearly every real person, and
@@ -121,6 +130,7 @@ describe("WatchHistory", () => {
       expect(getUserWatched).toHaveBeenCalledWith(7, {
         q: "bear",
         mediaType: "",
+        library: "",
         limit: 25,
       }),
     );
@@ -136,6 +146,7 @@ describe("WatchHistory", () => {
       expect(getUserWatched).toHaveBeenCalledWith(7, {
         q: "",
         mediaType: "movie",
+        library: "",
         limit: 25,
       }),
     );
@@ -151,6 +162,7 @@ describe("WatchHistory", () => {
       expect(getUserWatched).toHaveBeenCalledWith(7, {
         q: "",
         mediaType: "",
+        library: "",
         limit: 75,
       }),
     );
@@ -163,6 +175,7 @@ describe("WatchHistory", () => {
       expect(getUserWatched).toHaveBeenCalledWith(7, {
         q: "",
         mediaType: "show",
+        library: "",
         limit: 25,
       }),
     );
@@ -174,10 +187,27 @@ describe("WatchHistory", () => {
     expect(await screen.findByText(/3 of 8 episodes/)).toBeInTheDocument();
   });
 
+  it("draws each watch's own artwork, so a half-remembered title is recognisable", async () => {
+    // The rating key has to be the one the row's title came from. Before the payload carried it at
+    // all there was nothing to draw, and a list of 25 bare titles is the slowest possible way to
+    // answer "have they seen this?" — which is the only question this panel exists for.
+    const { container } = renderPanel();
+    await screen.findByText("Teacup");
+
+    // Queried out of the DOM rather than by role: the artwork is decorative (`alt=""`, the title is
+    // right beside it as text), so it has no img role to find it by.
+    expect(container.querySelector("img")).toHaveAttribute(
+      "src",
+      "/api/picks/90210/poster",
+    );
+  });
+
   it("says how complete the cached set is", async () => {
     renderPanel();
 
-    expect(await screen.findByText(/1284 titles synced/)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/1284 library copies synced/),
+    ).toBeInTheDocument();
     expect(screen.getByText(/last full sync/)).toBeInTheDocument();
   });
 
@@ -265,5 +295,252 @@ describe("WatchHistory", () => {
       await screen.findByText(/another tool is writing plex ratings/i),
     ).toBeInTheDocument();
     expect(screen.getByText(/ignores all 1455 of them/i)).toBeInTheDocument();
+  });
+});
+
+describe("the library filter", () => {
+  const twoLibraries = () =>
+    page({
+      items: [title({ libraries: ["4K TV", "TV Shows"] })],
+      libraries: [
+        lib("4K Movies", "movie"),
+        lib("4K TV", "show"),
+        lib("Movies", "movie"),
+        lib("TV Shows", "show"),
+      ],
+    });
+
+  it("names the libraries a title was found in, under its name", async () => {
+    // Two names is a title stored twice — the row this page used to render as two rows, each with
+    // its own Block button doing the same global thing.
+    getUserWatched.mockResolvedValue(twoLibraries());
+    renderPanel();
+
+    const row = (await screen.findByText("Teacup")).closest("li");
+    expect(
+      Array.from(row!.querySelectorAll("span[title]")).map((t) => t.textContent),
+    ).toEqual(["4K TV", "TV Shows"]);
+  });
+
+  it("shows one name, with no trailing separator, for a title in one library", async () => {
+    // On a server where the type HAS two libraries, a title in only one of them still names it —
+    // that is how you tell it apart from the duplicated rows around it.
+    getUserWatched.mockResolvedValue(
+      page({
+        items: [title({ media_type: "movie", libraries: ["Movies"] })],
+        libraries: [lib("4K Movies", "movie"), lib("Movies", "movie")],
+      }),
+    );
+    renderPanel();
+
+    expect(await screen.findByText("Movies")).toBeInTheDocument();
+    expect(screen.queryByText(/Movies ·/)).not.toBeInTheDocument();
+  });
+
+  it("names the library on every row, even where only one library exists", async () => {
+    // The approved design: the tag says which library a title lives in, always. An earlier build
+    // hid it wherever it "added nothing", which quietly removed the feature on the commonest server.
+    getUserWatched.mockResolvedValue(
+      page({
+        items: [title({ media_type: "movie", libraries: ["Movies"] })],
+        libraries: [lib("Movies", "movie"), lib("TV Shows", "show")],
+      }),
+    );
+    renderPanel();
+
+    expect(await screen.findByText("Movies")).toBeInTheDocument();
+  });
+
+  it("still names both libraries on a row that is genuinely in two", async () => {
+    // Even if nothing else on the server is duplicated, THIS row is — and that is the whole point.
+    getUserWatched.mockResolvedValue(
+      page({
+        items: [
+          title({ media_type: "movie", libraries: ["4K Movies", "Movies"] }),
+        ],
+        libraries: [lib("4K Movies", "movie"), lib("Movies", "movie")],
+      }),
+    );
+    renderPanel();
+
+    const row = (await screen.findByText("Teacup")).closest("li");
+    expect(
+      Array.from(row!.querySelectorAll("span[title]")).map((t) => t.textContent),
+    ).toEqual(["4K Movies", "Movies"]);
+  });
+
+  it("renders no tag at all for a watch cached before the name was recorded", async () => {
+    // Its name arrives on that person's next sync. Asserting on the ELEMENT rather than its text:
+    // an empty `libraries` renders an empty string either way, so a text assertion passes just as
+    // happily against a component that emits a blank tag beside every title. `span[title]` is what
+    // every other test in this block counts, so it cannot silently stop matching the markup.
+    getUserWatched.mockResolvedValue(
+      page({ items: [title({ libraries: [] })], libraries: [] }),
+    );
+    const { container } = renderPanel();
+    await screen.findByText("Teacup");
+
+    expect(container.querySelectorAll("li span[title]")).toHaveLength(0);
+  });
+
+  it("sends the chosen library to the server", async () => {
+    getUserWatched.mockResolvedValue(twoLibraries());
+    renderPanel();
+    await screen.findByText("Teacup");
+
+    await userEvent.selectOptions(
+      screen.getByLabelText(/filter by library/i),
+      "4K Movies",
+    );
+
+    await waitFor(() =>
+      expect(getUserWatched).toHaveBeenCalledWith(7, {
+        q: "",
+        mediaType: "",
+        library: "4K Movies",
+        limit: 25,
+      }),
+    );
+  });
+
+  it("offers every library the person watched in, not just the ones on screen", async () => {
+    // The list is unnarrowed by the current filter on purpose — narrowing it would empty the control
+    // that did the narrowing, stranding the person on one library.
+    getUserWatched.mockResolvedValue(twoLibraries());
+    renderPanel();
+
+    const select = await screen.findByLabelText(/filter by library/i);
+    expect(
+      Array.from(select.querySelectorAll("option")).map((o) => o.textContent),
+    ).toEqual(["All libraries", "4K Movies", "4K TV", "Movies", "TV Shows"]);
+  });
+
+  it("hides the filter on a server with one library", async () => {
+    // It could only ever say "All libraries".
+    getUserWatched.mockResolvedValue(
+      page({ libraries: [lib("TV Shows", "show")] }),
+    );
+    renderPanel();
+    await screen.findByText("Teacup");
+
+    expect(screen.queryByLabelText(/filter by library/i)).not.toBeInTheDocument();
+  });
+
+  it("hides the filter when every type has exactly one library", async () => {
+    // The common server, and the regression this rule exists for: libraries named "Movies" and
+    // "TV Shows" beside buttons named "Movies" and "Shows" is the same choice offered twice.
+    getUserWatched.mockResolvedValue(
+      page({ libraries: [lib("Movies", "movie"), lib("TV Shows", "show")] }),
+    );
+    renderPanel();
+    await screen.findByText("Teacup");
+
+    expect(screen.queryByLabelText(/filter by library/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the filter as soon as one type holds two libraries", async () => {
+    getUserWatched.mockResolvedValue(
+      page({
+        libraries: [
+          lib("4K Movies", "movie"),
+          lib("Movies", "movie"),
+          lib("TV Shows", "show"),
+        ],
+      }),
+    );
+    renderPanel();
+
+    const select = await screen.findByLabelText(/filter by library/i);
+    expect(
+      Array.from(select.querySelectorAll("option")).map((o) => o.textContent),
+    ).toEqual(["All libraries", "4K Movies", "Movies", "TV Shows"]);
+  });
+
+  it("offers only the selected type's libraries", async () => {
+    // "4K Movies" under a Shows filter can only ever return nothing.
+    getUserWatched.mockResolvedValue(
+      page({
+        libraries: [
+          lib("4K Movies", "movie"),
+          lib("Movies", "movie"),
+          lib("Anime", "show"),
+          lib("TV Shows", "show"),
+        ],
+      }),
+    );
+    renderPanel();
+    await screen.findByText("Teacup");
+
+    await userEvent.click(screen.getByRole("button", { name: "Shows" }));
+
+    const select = await screen.findByLabelText(/filter by library/i);
+    await waitFor(() =>
+      expect(
+        Array.from(select.querySelectorAll("option")).map((o) => o.textContent),
+      ).toEqual(["All libraries", "Anime", "TV Shows"]),
+    );
+  });
+
+  it("caps the dropdown width, whatever a library is called", async () => {
+    // A native <select> sizes to its WIDEST option, so one long library name blows out the toolbar:
+    // "4K HDR Remux Collection — Director's Cuts and Extended Editions" measured 470px and ran
+    // 212px off a 320px phone. jsdom does no layout, so this asserts the CAP is still declared —
+    // the measurement itself lives in the commit that added it.
+    getUserWatched.mockResolvedValue(
+      page({
+        libraries: [
+          lib("Movies", "movie"),
+          lib("4K HDR Remux Collection — Director's Cuts and Extended Editions", "movie"),
+        ],
+      }),
+    );
+    renderPanel();
+
+    const select = await screen.findByLabelText(/filter by library/i);
+    expect(select.className).toMatch(/max-w-/);
+    expect(select.className).toMatch(/truncate/);
+    expect(select.className).toMatch(/min-w-0/);
+  });
+
+  it("resets paging when the library changes", async () => {
+    getUserWatched.mockResolvedValue(page({ ...twoLibraries(), total: 100 }));
+    renderPanel();
+    await userEvent.click(
+      await screen.findByRole("button", { name: /show 50 more/i }),
+    );
+
+    await userEvent.selectOptions(
+      screen.getByLabelText(/filter by library/i),
+      "Movies",
+    );
+
+    await waitFor(() =>
+      expect(getUserWatched).toHaveBeenCalledWith(7, {
+        q: "",
+        mediaType: "",
+        library: "Movies",
+        limit: 25,
+      }),
+    );
+  });
+
+  it("explains an impossible type-and-library combination rather than looking broken", async () => {
+    getUserWatched.mockResolvedValue(
+      page({
+        items: [],
+        total: 0,
+        libraries: [lib("4K Movies", "movie"), lib("Movies", "movie")],
+      }),
+    );
+    renderPanel();
+    await userEvent.selectOptions(
+      await screen.findByLabelText(/filter by library/i),
+      "4K Movies",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Shows" }));
+
+    expect(
+      await screen.findByText("No shows watched in 4K Movies."),
+    ).toBeInTheDocument();
   });
 });

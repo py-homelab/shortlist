@@ -77,7 +77,11 @@ function report(over: Partial<EffectivenessReport> = {}): EffectivenessReport {
     // `overall` was absent entirely, though the fixture is cast to `EffectivenessReport`, which has
     // it. The card reads `overall.dropped`/`overall.bounced` to tell "nobody gave up" from "the only
     // give-ups were too short to list" — a distinction it cannot make against an undefined.
-    overall: { dropped: 0, bounced: 0 },
+    // A MATURED cohort. The card holds back its "nothing landed" warnings while `landing.rate` is
+    // null — too early to judge, which it then says itself — so without a rate here these tests would
+    // assert warnings the product deliberately withholds on a new install. `rate: 0` is a real
+    // measurement of zero; `null` is "we cannot say".
+    overall: { dropped: 0, bounced: 0, landing: { rate: 0, matured_days: 30 } },
     ...over,
   } as unknown as EffectivenessReport;
 }
@@ -410,6 +414,23 @@ describe("NeedsALook agrees with the Verdict card", () => {
     expect(
       screen.queryByText(/everyone who got a pick watched something/i),
     ).not.toBeInTheDocument();
+  });
+
+  it("says it is too early rather than that everyone watched something", async () => {
+    // `landing.rate === null` holds back the idle-people and empty-row warnings until a pick has had its
+    // full window. The card beside this one used to say "Not enough time yet"; it no longer does, so
+    // without saying so here the card reported an all-clear it had not checked.
+    getEngagement.mockResolvedValue({ ...ENGAGEMENT, people: [] });
+    renderPanel(
+      report({
+        coverage: { users_with_picks: 4, users_watched: 0, users_idle: 4 },
+        overall: { dropped: 0, bounced: 0, landing: { rate: null, matured_days: 30 } },
+      } as never),
+    );
+
+    expect(await screen.findByText(/too early to say who isn.t watching/i)).toBeInTheDocument();
+    expect(screen.getByText(/30 days/)).toBeInTheDocument();
+    expect(screen.queryByText(/everyone who got a pick watched something/i)).toBeNull();
   });
 
   it("still says everyone watched something when there were no give-ups at all", async () => {
