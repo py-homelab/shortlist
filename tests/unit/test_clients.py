@@ -1015,6 +1015,18 @@ class TestPlexClient:
             "sarah": OwnedRow("Shortlist_sarah", [571285, 571290], {"movie", "show"})
         }
 
+    def test_collections_titled_reads_the_server_not_the_runs_cache(self, mock_plex: PlexClient):
+        """It is asked only after Plex refused a rename, and the cache holds objects renamed earlier in the
+        same run under their OLD titles (plexapi's `editTitle` does not update them)."""
+        stale = MagicMock(ratingKey=7, title="Old Name")
+        fresh = MagicMock(ratingKey=7, title="New Name")
+        section = MagicMock(type="movie")
+        section.collections.side_effect = [[stale], [fresh]]
+        mock_plex._server.library.sections.return_value = [section]
+        mock_plex.find_owned_collections(section, "x")  # warms the cache with the stale object
+
+        assert [c.ratingKey for c in mock_plex.collections_titled("new name")] == [7]
+
     def test_section_collections_are_cached_within_a_run(self, mock_plex: PlexClient):
         # The section's collection list is otherwise re-pulled for every owned/find scan. Two reads
         # of the same section fetch it once.

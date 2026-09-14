@@ -25,6 +25,7 @@ from shortlist.engine.clients.plex_pms import TOP, log_title
 from shortlist.engine.clients.plextv import FilterWriteRefused
 from shortlist.engine.context import EngineContext, _emit
 from shortlist.engine.delivery import (
+    is_name_freeing_helper,
     render_row_name,
     resolve_row_template,
     row_marker,
@@ -1615,6 +1616,8 @@ def _promote_one(ctx: EngineContext, collection, spec: RowSpec | None, user_type
     (https://support.plex.tv/articles/manage-recommendations/). Routing a managed user through the
     owner flag would hide their row from them and put it on the owner's Home instead.
     """
+    if is_name_freeing_helper(collection.title):
+        return  # debris from a stopped run, not a row: the next sweep deletes it
     if spec is None:
         # No spec could be matched to this title. This is NOT a rare path — the title->spec map
         # misses routinely (the full-stack suite reaches it for every collection), so whatever this

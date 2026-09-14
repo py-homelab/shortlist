@@ -128,3 +128,14 @@ class TestRenamesMatchTheRecording:
 
         assert state.collections[row].title == "Wanted"
         assert state.collections[row].item_keys == items
+
+    def test_renaming_one_twin_leaves_the_other_twins_title(self, pms):
+        state, client = pms
+        movies = _create(client, state, state.section_id, "X")
+        shows = _create(client, state, state.show_section_id, "X")
+
+        assert _rename(client, state.section_id, movies, "Y").status_code == 200
+
+        assert state.collections[shows].title == "X"
+        assert _rename(client, state.show_section_id, shows, "Z").status_code == 200
+        assert state.collections[movies].title == "Y"

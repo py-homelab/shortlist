@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -30,6 +31,16 @@ DEFAULT_ROW_NAME = "✨ Picked for You"
 #: What `_rename_or_keep` did: the row has its new name, it kept its old one, or it has to be rebuilt to
 #: get the new one.
 RENAMED, KEPT, REBUILD = "renamed", "kept", "rebuild"
+
+#: The name a helper collection moves to once it has freed a row's name (`_reclaim_orphaned_name`). A
+#: helper still standing is debris from a stopped run: `sweep_broken_rows` deletes it and promotion skips it.
+FREED_NAME_PREFIX = "Shortlist freed name "
+_FREED_NAME = re.compile(rf"^{re.escape(FREED_NAME_PREFIX)}[0-9a-f]{{12}}$")
+
+
+def is_name_freeing_helper(title: str) -> bool:
+    """Is this collection a helper `_reclaim_orphaned_name` left behind (its marker aside)?"""
+    return isinstance(title, str) and bool(_FREED_NAME.match(strip_marker(title)))
 
 
 def _rename_or_keep(
@@ -64,6 +75,7 @@ def _rename_or_keep(
     """
     try:
         collection.editTitle(title)
+        collection.title = title  # plexapi leaves the object's title as it was; the run's cache keeps it
         return RENAMED
     except Exception as exc:  # plexapi raises BadRequest; the status is only in the message
         # `startswith`, NOT `"409" in`. plexapi formats the message as
@@ -111,11 +123,13 @@ def _reclaim_orphaned_name(
     the tag row away, so nothing has the name any more and the row's own rename goes through. The row
     keeps its ratingKey, items and every setting (measured on a real PMS: pms_collection_title_tags.json).
     Never used for a name a live collection has: the helper would share that collection's tag row, and
-    renaming the helper would rename it too.
+    renaming the helper would move that collection's tag with it.
 
-    The helper is labelled in the same write a new row gets, so it is hidden from everyone the row is,
-    and it is deleted in a `finally` (plex-safety rule 7). Its unique name stays behind as an orphan
-    nothing will ever ask for.
+    The helper gives the name up first, before anything slow: while it holds the row's exact title, a
+    process killed there would leave a collection the next run takes for the row itself. Then it is
+    labelled, as a new row is, so it is hidden from everyone the row is, and it is deleted in a `finally`
+    (plex-safety rule 7). A helper a killed run left behind carries `FREED_NAME_PREFIX`, which the next
+    run's sweep deletes. Its unique name stays behind as an orphan nothing will ever ask for.
     """
     if spare_item is None:
         _log_kept(
@@ -123,11 +137,14 @@ def _reclaim_orphaned_name(
         )
         return False
     helper = None
+    labelled = False
     try:
         helper = plex.create_collection(section, title, [spare_item])
+        helper.editTitle(f"{FREED_NAME_PREFIX}{uuid.uuid4().hex[:12]}{marker}")
         plex.stored_label(helper, label, extra=LABEL_PREFIX)
-        helper.editTitle(f"Shortlist freed name {uuid.uuid4().hex[:12]}{marker}")
+        labelled = True
         collection.editTitle(title)
+        collection.title = title  # plexapi leaves the object's title as it was; the run's cache keeps it
     except Exception as exc:
         why = f"a deleted collection left the name behind, and freeing it failed ({type(exc).__name__})"
         _log_kept(profile, collection, title, section, why)
@@ -139,11 +156,14 @@ def _reclaim_orphaned_name(
             except Exception as exc:
                 logger.error(
                     "{}: could not delete the helper collection (ratingKey {}) used to free a row name in '{}' "
-                    "({}). It carries their label, so no one else can see it. Delete it in Plex.",
+                    "({}). {} The next run's sweep deletes it.",
                     profile.username,
                     getattr(helper, "ratingKey", "?"),
                     section.title,
                     type(exc).__name__,
+                    "It carries their label, so no one else can see it."
+                    if labelled
+                    else "It has no label, so other people may see it until then.",
                 )
     logger.info(
         "{}: '{}' in '{}' was refused because a deleted collection had left the name behind; freed it and "
@@ -1892,13 +1912,15 @@ def sweep_broken_rows(
         marker = markers.get(slug)
         unhidable = not plex.matches_section(collection, section)
         shares_tag = marker is not None and not collection.title.endswith(marker)
-        if not unhidable and not shares_tag:
+        leftover_helper = is_name_freeing_helper(collection.title)
+        if not unhidable and not shares_tag and not leftover_helper:
             continue
-        reason = (
-            "it is the wrong type for that library, so no share filter can hide it and every user can see it"
-            if unhidable
-            else "it shares a collection tag with other users' rows, so it holds their picks too"
-        )
+        if unhidable:
+            reason = "it is the wrong type for that library, so no share filter can hide it and every user can see it"
+        elif shares_tag:
+            reason = "it shares a collection tag with other users' rows, so it holds their picks too"
+        else:
+            reason = "it is a helper a stopped run left behind while freeing a row's name"
         logger.warning(
             "{}{}: removing their row in '{}' — {}", "[dry-run] " if dry_run else "", slug, section.title, reason
         )

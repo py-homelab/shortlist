@@ -49,11 +49,13 @@ from tests.fakes.fake_plex import (
     FakeHistoryEntry,
     FakePlexState,
     FakeSection,
+    collection_tag,
     make_fake_plex,
     make_fake_plextv,
     movie_title,
     seed_state,
     show_title,
+    tag_name,
 )
 from tests.fakes.file_stores import FileSnapshotStore
 
@@ -1896,6 +1898,43 @@ def test_a_row_renamed_onto_its_twin_rows_name_in_another_library_is_rebuilt_und
     assert f"shortlist_{sarah.slug}" in [label.lower() for label in rebuilt.labels], "the rebuilt row is unlabelled"
     assert state.collections[show_key].title == "Buried Treasure" + marker, "the twin was renamed"
     assert state.collections[show_key].item_keys == show_items, "the twin's titles changed"
+    _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
+
+
+def test_two_libraries_renamed_onto_one_name_in_one_run_never_use_the_helper(fakes, tmp_path):
+    """Architecture review 2026-09-14 (HIGH). plexapi's `editTitle` leaves the object's title as it was, and
+    the run's collection cache keeps that object. So after the Movies row took the new name, the TV row's
+    refused rename looked the name up in the cache, saw the Movies row under its OLD title, found no holder
+    and freed the name with a helper — which took over the live Movies row's tag and renamed it away. The
+    holder must be read fresh, so the TV row is rebuilt as the Movies row's twin and nothing else moves."""
+    state, pms_url, _tmdb_app = fakes
+    sarah = UserProfile(username="sarah", plex_account_id=201, user_type=UserType.SHARED)
+    marker = row_marker(sarah.plex_account_id)
+    before = [
+        RowSpec(slug="gems", name_template="Hidden Gems", size=8, media="movie"),
+        RowSpec(slug="gems_tv", name_template="Buried Treasure", size=8, media="show"),
+    ]
+    assert engine_run(_renaming_ctx(state, pms_url, tmp_path, before), [sarah]).ok
+    (movie_key,) = _rows_of(state, sarah.plex_account_id, state.section_id)
+    (show_key,) = _rows_of(state, sarah.plex_account_id, state.show_section_id)
+
+    after = [
+        RowSpec(slug="gems", name_template="Same Name", size=8, media="movie"),
+        RowSpec(slug="gems_tv", name_template="Same Name", size=8, media="show"),
+    ]
+    ledger = {
+        (sarah.slug, "gems", str(state.section_id)): movie_key,
+        (sarah.slug, "gems_tv", str(state.show_section_id)): show_key,
+    }
+    report = engine_run(_renaming_ctx(state, pms_url, tmp_path, after, ledger), [sarah])
+
+    assert report.ok
+    movie_row = state.collections[movie_key]
+    assert movie_row.title == "Same Name" + marker
+    assert collection_tag(movie_row) == tag_name("Same Name" + marker), "a helper renamed the live Movies row's tag"
+    (tv_row,) = _rows_of(state, sarah.plex_account_id, state.show_section_id).values()
+    assert tv_row.title == "Same Name" + marker
+    assert not [c for c in state.collections.values() if "freed name" in c.title.lower()]
     _assert_breakdown_names_what_plex_holds(report, state, sarah.plex_account_id)
 
 

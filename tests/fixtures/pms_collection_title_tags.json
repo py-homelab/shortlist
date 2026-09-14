@@ -13,36 +13,85 @@
     "   own tag row in place, and answers 409 when ANY OTHER tag row already has that name: an orphan",
     "   from case 2, or a live collection in another library. After a rename succeeds, the old name is free.",
     "4. A create (POST /library/collections?title=..) is never refused on a name: it REUSES the tag row",
-    "   with that name, orphan or live. Two same-named collections in different libraries therefore share",
-    "   one tag; their memberships and deletions stay separate while their titles stay in step.",
+    "   with that name, orphan or live. Two same-named collections in different libraries (twins) therefore",
+    "   share one tag row. Their memberships and deletions stay separate. Renaming ONE twin renames that tag",
+    "   row and nothing else: the other twin keeps its title, the two stop agreeing with their tag, and",
+    "   deleting a twin whose title no longer matches its tag left its items tagged (a stale name in the",
+    "   items' Collections field). Plex does not refuse any of those renames.",
     "5. So an orphaned name can be reclaimed without touching the row: create a helper with that name",
     "   (it takes over the orphan), rename the helper to a unique name, rename the row, delete the helper.",
     "   The row keeps its ratingKey and items. This must NOT be done when the name belongs to a live",
-    "   collection in another library: the helper would share that collection's tag, and renaming the",
-    "   helper renames it too.",
+    "   collection in another library: the helper would share that collection's tag row, and renaming the",
+    "   helper would move the tag away from that collection's title.",
     "",
     "On SFLIX at the time: 4 of 5 refused renames targeted an orphan left by the pre-#119 rebuild, 1 the",
     "same person's live row in another library. 41 orphaned Shortlist tags in total."
   ],
-  "server": { "version": "1.43.3.10793", "recorded": "2026-09-14" },
+  "server": {
+    "version": "1.43.3.10793",
+    "recorded": "2026-09-14"
+  },
   "rename_conflict_response": {
     "status": 409,
     "body": "<html><head><title>Conflict</title></head><body><h1>409 Conflict</h1></body></html>",
     "plexapi_message_starts_with": "(409) conflict;"
   },
   "cases": [
-    { "case": "rename onto the name of a DELETED collection in the same library", "result": 409 },
-    { "case": "same, plain title with no emoji or marker", "result": 409 },
-    { "case": "CREATE with the name of a deleted collection", "result": "created" },
-    { "case": "rename onto a name that was never used", "result": "renamed" },
-    { "case": "rename onto the name another collection had BEFORE its own successful rename", "result": "renamed" },
-    { "case": "rename a TV collection onto the name of a LIVE Movies collection", "result": 409 },
-    { "case": "create a TV collection with the name of a live Movies collection", "result": "created" },
-    { "case": "twins (same name, two libraries): each holds only its own library's items", "result": "separate" },
-    { "case": "twins: delete one, the other keeps its title and items, and can still be renamed", "result": "unaffected" },
+    {
+      "case": "rename onto the name of a DELETED collection in the same library",
+      "result": 409
+    },
+    {
+      "case": "same, plain title with no emoji or marker",
+      "result": 409
+    },
+    {
+      "case": "CREATE with the name of a deleted collection",
+      "result": "created"
+    },
+    {
+      "case": "rename onto a name that was never used",
+      "result": "renamed"
+    },
+    {
+      "case": "rename onto the name another collection had BEFORE its own successful rename",
+      "result": "renamed"
+    },
+    {
+      "case": "rename a TV collection onto the name of a LIVE Movies collection",
+      "result": 409
+    },
+    {
+      "case": "create a TV collection with the name of a live Movies collection",
+      "result": "created"
+    },
+    {
+      "case": "twins (same name, two libraries): each holds only its own library's items",
+      "result": "separate"
+    },
+    {
+      "case": "twins: delete one, the other keeps its title and items, and can still be renamed",
+      "result": "unaffected"
+    },
     {
       "case": "orphaned name: create helper with it, rename helper away, rename row onto it, delete helper",
       "result": "row renamed, same ratingKey, same items"
+    },
+    {
+      "case": "twins: rename the Movies twin X->Y",
+      "result": "renamed; the TV twin's title stays X"
+    },
+    {
+      "case": "twins: then rename the TV twin X->Y (Y is the Movies twin's title)",
+      "result": "renamed"
+    },
+    {
+      "case": "twins: then rename the TV twin Y->Z, and the Movies twin Y->X",
+      "result": "both renamed; titles unaffected by each other"
+    },
+    {
+      "case": "twins renamed apart, then both deleted",
+      "result": "one item kept its tagging to the shared tag row"
     }
   ],
   "tags_table": {

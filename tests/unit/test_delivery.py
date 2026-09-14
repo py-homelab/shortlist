@@ -1139,6 +1139,27 @@ class TestSweepBrokenRows:
         assert deleted == {"mike": ["✨ Picked for You"]}
         plex.delete_owned_collection.assert_called_once_with(stranded, "shortlist")
 
+    def test_deletes_a_name_freeing_helper_a_killed_run_left_behind(self, engine_config: EngineConfig, movies, shows):
+        """`_reclaim_orphaned_name` deletes its helper in a `finally`, which a killed process never reaches.
+        Nothing else matches the helper to a row, so it would sit on that person's Home for good."""
+        marker = row_marker(4242)
+        helper = self._collection(movies, "Shortlist_mike", title=f"Shortlist freed name 0123456789ab{marker}")
+        plex = self._plex(movies, shows, helper)
+        plex.matches_section.return_value = True
+
+        deleted = sweep_broken_rows(plex, engine_config, markers={"mike": marker})
+
+        assert deleted == {"mike": [helper.title]}
+        plex.delete_owned_collection.assert_called_once_with(helper, "shortlist")
+
+    def test_a_row_someone_named_like_a_helper_is_left_alone(self, engine_config: EngineConfig, movies, shows):
+        marker = row_marker(4242)
+        row = self._collection(movies, "Shortlist_mike", title=f"Shortlist freed name of the week{marker}")
+        plex = self._plex(movies, shows, row)
+        plex.matches_section.return_value = True
+
+        assert sweep_broken_rows(plex, engine_config, markers={"mike": marker}) == {}
+
     def test_leaves_a_well_typed_row_alone(self, engine_config: EngineConfig, movies, shows):
         healthy = self._collection(movies, "Shortlist_mike")
         plex = self._plex(movies, shows, healthy)
@@ -2465,14 +2486,48 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         assert outcome == RENAMED
         plex.create_collection.assert_called_once_with(movies, target, ["an item of the row"])
         steps = [c[0] for c in order.mock_calls]
-        assert steps == ["row_rename", "label", "helper_rename", "row_rename", "delete"], steps
-        # Labelled with this person's label in the create's own write, as a new row is: hidden from
-        # everyone the row is hidden from for the moment it exists.
+        # The helper gives the name up BEFORE anything slow: while it holds the row's exact title, a process
+        # killed there would leave a labelled collection the next run takes for the row itself.
+        assert steps == ["row_rename", "helper_rename", "label", "row_rename", "delete"], steps
+        # Labelled with this person's label, as a new row is: hidden from everyone the row is hidden from.
         assert plex.stored_label.call_args == call(helper, "Shortlist_sarah", extra=LABEL_PREFIX)
+        assert collection.title == target, "the cached object must carry the name Plex now has"
         freed = helper.editTitle.call_args.args[0]
         assert freed != target and freed.endswith(marker), "the helper must move away under a name that is ours"
         assert collection.editTitle.call_args_list[-1] == call(target)
         plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
+
+    def test_a_rename_plex_accepts_updates_the_cached_title(self, movies):
+        """plexapi's `editTitle` does not, and the run's collection cache keeps the object: a later lookup
+        in the same run would see the old name (architecture review 2026-09-14)."""
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        collection = MagicMock()
+        collection.title = "Old"
+
+        self._rename(plex, collection, "New", profile, movies)
+
+        assert collection.title == "New"
+
+    def test_a_helper_that_could_not_be_deleted_is_not_claimed_hidden_when_its_label_failed(self, movies):
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+        helper = MagicMock(ratingKey=5555)
+        plex.create_collection.return_value = helper
+        plex.stored_label.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+        plex.delete_owned_collection.side_effect = BadRequest("(500) internal_server_error; http://pms/y")
+        from loguru import logger
+
+        seen: list[str] = []
+        sink = logger.add(seen.append, level="ERROR")
+        try:
+            self._rename(plex, self._refused_row(profile), "New", profile, movies)
+        finally:
+            logger.remove(sink)
+
+        assert "5555" in "".join(seen)
+        assert "no one else can see it" not in "".join(seen)
 
     def test_every_helper_moves_to_a_name_no_earlier_helper_left_behind(self, movies):
         """A freed name stays behind as an orphan, so reusing one would be refused the next time."""

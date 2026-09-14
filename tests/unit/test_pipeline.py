@@ -3181,6 +3181,20 @@ class TestPlacement:
             "recommended": False,
         }
 
+    def test_a_helper_a_stopped_run_left_behind_is_never_promoted(self, ctx: EngineContext):
+        """It carries the person's label and matches no row, so the no-spec fallback below would put it on
+        their Home every night until the sweep removes it."""
+        from shortlist.engine.delivery import row_marker
+        from shortlist.engine.models import UserType
+        from shortlist.engine.pipeline import _promote_one
+
+        helper = MagicMock()
+        helper.title = f"Shortlist freed name 0123456789ab{row_marker(7)}"
+        for user_type in (UserType.OWNER, UserType.SHARED, None):
+            _promote_one(ctx, helper, None, user_type)
+
+        ctx.plex.promote.assert_not_called()
+
     def test_the_no_spec_fallback_never_forces_a_row_onto_the_recommended_shelf(self, ctx: EngineContext):
         """A row whose title can't be mapped back to its spec takes the fallback, which used to
         default `recommended=True`.

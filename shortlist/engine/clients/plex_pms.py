@@ -823,11 +823,14 @@ class PlexClient:
         A collection's title is a row in Plex's server-wide `tags` table, compared `COLLATE NOCASE`
         (ASCII letters only), so a rename is refused while any other collection anywhere carries the
         name — not just one in the same library (tests/fixtures/pms_collection_title_tags.json).
+
+        Read from the server, never the run's cache: this is asked right after Plex refused a rename, and
+        the cache holds collections renamed earlier in the run under their old titles.
         """
         wanted = _tag_name(title)
         if self._sections_cache is None:
             self._sections_cache = self._server.library.sections()
-        return [c for s in self._sections_cache for c in self._section_collections(s) if _tag_name(c.title) == wanted]
+        return [c for s in self._sections_cache for c in s.collections() if _tag_name(c.title) == wanted]
 
     def find_owned_collections(self, section: LibrarySection, wanted_label: str) -> list[Collection]:
         """Every collection in this section carrying `wanted_label` (case-insensitive).
