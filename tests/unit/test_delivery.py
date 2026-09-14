@@ -2438,12 +2438,48 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         plex.collections_titled.assert_not_called()
         plex.create_collection.assert_not_called()
 
+    def test_a_name_something_in_this_library_holds_is_its_own_outcome(self, movies):
+        """So a caller can say "something there has that name" only when something does."""
+        from shortlist.engine.delivery import HELD
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = [self._held(99887, "New", movies.key)]
+
+        outcome, _ = self._rename(plex, self._refused_row(profile), "New", profile, movies)
+
+        assert outcome == HELD
+
+    def test_freeing_a_name_waits_when_a_caller_says_plex_is_busy(self, movies):
+        """A rename from the row editor runs beside the nightly run: its helper holding a name the run is
+        about to deliver would move that row's tag away from its title."""
+        from shortlist.engine.delivery import DEFERRED, rename_or_keep
+
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        profile = make_profile()
+        plex.collections_titled.return_value = []
+
+        outcome = rename_or_keep(
+            plex,
+            self._refused_row(profile),
+            "New",
+            profile,
+            movies,
+            label="Shortlist_sarah",
+            marker=row_marker(profile.plex_account_id),
+            spare_item="item",
+            may_free_name=lambda: False,
+        )
+
+        assert outcome == DEFERRED
+        plex.create_collection.assert_not_called()
+
     def test_the_conflict_warning_names_what_is_holding_the_title(self, movies):
         """A name another collection in THIS library really has is the one refusal nothing here can fix,
         and "a collection already has that title" is untriageable on its own. The ratingKey is what makes
         the squatter findable, because the title carries invisible marker characters.
         """
-        from shortlist.engine.delivery import KEPT
+        from shortlist.engine.delivery import HELD
 
         plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
         profile = make_profile()
@@ -2453,7 +2489,7 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
 
         outcome, text = self._rename(plex, collection, target, profile, movies)
 
-        assert outcome == KEPT
+        assert outcome == HELD
         assert "99887" in text, "the ratingKey is the only way to find it in Plex"
         assert "also a Shortlist row" in text
         plex.create_collection.assert_not_called()
@@ -2518,6 +2554,9 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         assert collection.title == target, "the cached object must carry the name Plex now has"
         freed = helper.editTitle.call_args.args[0]
         assert freed != target and freed.endswith(marker), "the helper must move away under a name that is ours"
+        # plexapi leaves the object's title as it was, and `delete_owned_collection` proves ownership by the
+        # marker on THAT title: a shared row's unmarked name would leave a helper whose label failed undeletable.
+        assert helper.title == freed
         assert collection.editTitle.call_args_list[-1] == call(target)
         plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
 
@@ -2582,6 +2621,40 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         assert outcome == KEPT
         plex.delete_owned_collection.assert_called_once_with(helper, LABEL_PREFIX)
         assert "freeing it failed" in text
+
+    def test_a_shared_rows_helper_whose_label_failed_is_still_deleted(self, movies):
+        """Review 2026-09-14 (HIGH). A shared row is renamed to an unmarked title, so the helper is created
+        unmarked; if its label write fails, only the marker on its freed name proves it is ours, and the real
+        `delete_owned_collection` reads that from the object's title."""
+        from shortlist.engine.delivery import KEPT
+
+        real = PlexClient.__new__(PlexClient)
+        real._collections_cache = {}
+        plex = _labelling_plex_mock(MagicMock(spec=PlexClient))
+        plex.collections_titled.return_value = []
+        plex.stored_label.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+        plex.delete_owned_collection.side_effect = lambda c, prefix: PlexClient.delete_owned_collection(real, c, prefix)
+        helper = MagicMock(ratingKey=5555, labels=[])
+        helper.title = "Popular on the server"  # what the create was given, unmarked
+        plex.create_collection.return_value = helper
+        profile = make_profile()
+        collection = self._refused_row(profile)
+
+        from shortlist.engine.delivery import rename_or_keep
+
+        outcome = rename_or_keep(
+            plex,
+            collection,
+            "Popular on the server",
+            profile,
+            movies,
+            label="Shortlist__shared_popular",
+            marker=row_marker(0),
+            spare_item="item",
+        )
+
+        assert outcome == KEPT
+        helper.delete.assert_called_once()
 
     def test_a_helper_that_was_never_created_is_not_deleted(self, movies):
         from shortlist.engine.delivery import KEPT

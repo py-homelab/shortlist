@@ -31,6 +31,10 @@ DEFAULT_ROW_NAME = "✨ Picked for You"
 #: What `rename_or_keep` did: the row has its new name, it kept its old one, or it has to be rebuilt to
 #: get the new one.
 RENAMED, KEPT, REBUILD = "renamed", "kept", "rebuild"
+#: KEPT because a collection in this very library has the name: the one refusal nothing here can fix.
+HELD = "held"
+#: The name could be freed, but the caller said not now (`may_free_name`): the row keeps its old name.
+DEFERRED = "deferred"
 
 #: The name a helper collection moves to once it has freed a row's name (`_reclaim_orphaned_name`). A
 #: helper still standing is debris from a stopped run: `sweep_broken_rows` deletes it and promotion skips it.
@@ -57,11 +61,14 @@ def rename_or_keep(
     marker: str,
     spare_item=None,
     read_spare_item: Callable[[], object | None] | None = None,
+    may_free_name: Callable[[], bool] | None = None,
 ) -> str:
     """Rename a row in place. Returns RENAMED, KEPT (Plex refused and nothing could fix it), or REBUILD.
 
     ``spare_item`` is one item of the row, to create a helper with; ``read_spare_item`` reads one only if a
-    helper turns out to be needed, for a caller that has not read the row's items.
+    helper turns out to be needed, for a caller that has not read the row's items. ``may_free_name`` is
+    asked right before a helper is created; False returns DEFERRED (a caller outside a run, while one is
+    writing). HELD is KEPT for the one reason worth telling a person: something in that library has the name.
 
     A collection's title is a row in Plex's server-wide `tags` table, and that row outlives the
     collection. A rename answers 409 while ANY other row has the name, and a create with the name is
@@ -103,7 +110,7 @@ def rename_or_keep(
         # The ratingKey is what makes it findable in Plex: the title carries invisible marker characters.
         owner = "also a Shortlist row" if has_marker(here[0].title) else "NOT a Shortlist row"
         _log_kept(profile, collection, title, section, f"ratingKey {here[0].ratingKey} here has it, {owner}")
-        return KEPT
+        return HELD
     if holders:
         logger.info(
             "{}: '{}' in '{}' takes the name their row in another library has (ratingKey {}). Plex only lets a "
@@ -114,6 +121,15 @@ def rename_or_keep(
             holders[0].ratingKey,
         )
         return REBUILD
+    if may_free_name is not None and not may_free_name():
+        logger.info(
+            "{}: '{}' in '{}' was refused because a deleted collection left the name behind; freeing it waits "
+            "for Plex to be free, so the row keeps its old name for now",
+            profile.username,
+            log_title(title),
+            section.title,
+        )
+        return DEFERRED
     if spare_item is None and read_spare_item is not None:
         try:
             spare_item = read_spare_item()
@@ -153,7 +169,11 @@ def _reclaim_orphaned_name(
     labelled = False
     try:
         helper = plex.create_collection(section, title, [spare_item])
-        helper.editTitle(f"{FREED_NAME_PREFIX}{uuid.uuid4().hex[:12]}{marker}")
+        freed = f"{FREED_NAME_PREFIX}{uuid.uuid4().hex[:12]}{marker}"
+        helper.editTitle(freed)
+        # plexapi leaves the object's title as it was, and `delete_owned_collection` proves ownership by the
+        # marker on it: a shared row's unmarked name would leave a helper whose label failed undeletable.
+        helper.title = freed
         plex.stored_label(helper, label, extra=LABEL_PREFIX)
         labelled = True
         collection.editTitle(title)
@@ -1658,7 +1678,7 @@ def _deliver_one(
             if rebuilt is not None:
                 return rebuilt
             outcome = KEPT
-        if outcome == KEPT:
+        if outcome in (KEPT, HELD):
             # The run page and the ledger say what Plex holds: the reconcile finds a `{top_seed}` row by
             # its recorded title, and "the run says X" must not be a name the row does not have.
             diff.collection_title = strip_marker(collection.title)

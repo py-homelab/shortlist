@@ -314,7 +314,10 @@ export function RowRenamePage() {
                   />
                 )}
                 {e.error ? (
-                  <span className="text-destructive-text">{e.error}</span>
+                  <span className="text-destructive-text">
+                    {e.display_name ? `${e.display_name}: ` : ""}
+                    {e.error}
+                  </span>
                 ) : (
                   <>
                     <span className="font-medium">

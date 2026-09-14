@@ -680,6 +680,12 @@ _DRAIN_LOCK = asyncio.Lock()
 _WRITER_LOCKS: dict[asyncio.AbstractEventLoop, asyncio.Lock] = {}
 
 
+def plex_writer_busy(state) -> bool:
+    """Is a run or a writer job writing to Plex right now? For work that runs OUTSIDE the lock (a rename from
+    the row editor) and must not create anything a run could mistake for a row while it delivers."""
+    return _plex_busy(state) or any(lock.locked() for lock in list(_WRITER_LOCKS.values()))
+
+
 def plex_writer_lock() -> asyncio.Lock:
     """The one-writer lock for Plex/plex.tv, held by writer JOBS **and by engine runs**.
 

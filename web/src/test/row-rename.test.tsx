@@ -58,8 +58,9 @@ describe("RowRenamePage — what each person's rename came to", () => {
         streamOf([
           {
             user: "sarah",
+            display_name: "Sarah",
             library: "Movies",
-            error: "Sarah: Plex refused 'New Name' in Movies because something else there already has that name.",
+            error: "Plex refused 'New Name' in Movies: something in that library already has that name.",
           },
           { user: "mike", display_name: "Mike", old: "Old Name", new: "New Name", libraries: ["Movies"] },
           { done: true, total: 1 },

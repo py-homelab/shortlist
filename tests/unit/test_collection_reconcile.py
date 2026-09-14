@@ -751,8 +751,53 @@ class TestReconcileRowRenameIter:
 
         (refused,) = [e for e in events if e.get("error")]
         assert refused["user"] == "sarah" and "already has" in refused["error"] and "(409)" not in refused["error"]
+        assert refused["display_name"] == "sarah" and not refused["error"].startswith("sarah")
         mikes.editTitle.assert_called_once_with("New Name" + row_marker(200))
         assert events[-1] == {"done": True, "total": 1}
+
+    def test_a_name_that_could_not_be_freed_is_not_blamed_on_something_holding_it(self, sessions):
+        """Review 2026-09-14: every KEPT said "something else there already has that name", including a
+        failed label write while freeing it, which sent the owner looking for a collection that did not exist."""
+        from plexapi.exceptions import BadRequest
+
+        _add_user(sessions, slug="sarah", account_id=100)
+        collection = self._refusing("Old Name" + row_marker(100))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies")]
+        plex.find_owned_collections.side_effect = lambda sec, label: [collection] if label == "shortlist_sarah" else []
+        plex.collections_titled.return_value = []
+        plex.create_collection.return_value = MagicMock(ratingKey=9)
+        plex.stored_label.side_effect = BadRequest("(500) internal_server_error; http://pms/x")
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="comedy", new_template="New Name", old_template="Old Name"
+            )
+        )
+
+        (refused,) = [e for e in events if e.get("error")]
+        assert "already has" not in refused["error"] and "next run" in refused["error"]
+
+    def test_a_name_is_not_freed_while_a_run_or_writer_job_is_writing(self, sessions, monkeypatch):
+        from shortlist.server.services import jobs
+
+        monkeypatch.setattr(jobs, "plex_writer_busy", lambda state: True)
+        _add_user(sessions, slug="sarah", account_id=100)
+        collection = self._refusing("Old Name" + row_marker(100))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies")]
+        plex.find_owned_collections.side_effect = lambda sec, label: [collection] if label == "shortlist_sarah" else []
+        plex.collections_titled.return_value = []
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="comedy", new_template="New Name", old_template="Old Name"
+            )
+        )
+
+        plex.create_collection.assert_not_called()
+        (pending,) = [e for e in events if e.get("user")]
+        assert pending["next_run"] is True
 
     def test_a_shared_rows_refused_rename_is_said_plainly(self, sessions):
         collection = self._refusing("Old Shared Name")

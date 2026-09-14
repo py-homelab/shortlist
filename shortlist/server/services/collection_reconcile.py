@@ -18,6 +18,8 @@ from loguru import logger
 
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import (
+    DEFERRED,
+    HELD,
     KEPT,
     REBUILD,
     remove_row_collections,
@@ -34,6 +36,7 @@ from shortlist.engine.models import LABEL_PREFIX, SHARED_LABEL_PREFIX, EngineCon
 from shortlist.engine.pipeline import identity_map
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Delivery, Run, User
 from shortlist.server.safe_mode import force_dry_run
+from shortlist.server.services import jobs
 from shortlist.server.services.audit import write_audit
 from shortlist.server.services.context_builder import ContextBuilder
 from shortlist.server.settings_store import SettingsStore
@@ -778,16 +781,17 @@ def reconcile_row_rename_iter(
                             # Names a helper only: ours by marker even if its label write fails.
                             marker=row_marker(0),
                             read_spare_item=lambda c=collection: next(iter(c.items()), None),
+                            may_free_name=lambda: not jobs.plex_writer_busy(state),
                         )
                         if not dry_run
                         else None
                     )
-                    if outcome == KEPT:
+                    if outcome in (KEPT, HELD):
                         yield {
                             "user": slug,
+                            "display_name": "Everyone",
                             "library": lib_name,
-                            "error": f"Plex refused '{new_display}' in {lib_name} because something else there "
-                            "already has that name, so the row keeps its old name there.",
+                            "error": _refusal(outcome, new_display, lib_name),
                         }
                         continue
                     event = {
@@ -797,7 +801,7 @@ def reconcile_row_rename_iter(
                         "new": new_display,
                         "libraries": [lib_name],
                     }
-                    if outcome == REBUILD:
+                    if outcome in (REBUILD, DEFERRED):
                         event["next_run"] = True
                     else:
                         total += 1
@@ -869,16 +873,17 @@ def reconcile_row_rename_iter(
                             label=label,
                             marker=marker,
                             read_spare_item=lambda c=collection: next(iter(c.items()), None),
+                            may_free_name=lambda: not jobs.plex_writer_busy(state),
                         )
                         if not dry_run
                         else None
                     )
-                    if outcome == KEPT:
+                    if outcome in (KEPT, HELD):
                         yield {
                             "user": udata["slug"],
+                            "display_name": profile.display_name,
                             "library": lib_name,
-                            "error": f"{profile.display_name}: Plex refused '{new_display}' in {lib_name} because "
-                            "something else there already has that name, so their row keeps its old name there.",
+                            "error": _refusal(outcome, new_display, lib_name),
                         }
                         continue
                     event = {
@@ -888,9 +893,10 @@ def reconcile_row_rename_iter(
                         "new": new_display,
                         "libraries": [lib_name],
                     }
-                    if outcome == REBUILD:
+                    if outcome in (REBUILD, DEFERRED):
                         # Plex lets only a new collection share a name their row in another library has, and a
-                        # rename has no titles to build one from: the next run rebuilds it under this name.
+                        # rename has no titles to build one from; or freeing the name waits for a run that is
+                        # writing. Either way the next run gives the row this name.
                         event["next_run"] = True
                     else:
                         total += 1
@@ -905,6 +911,19 @@ def reconcile_row_rename_iter(
                     logger.warning("{}: rename failed in {} ({})", udata["slug"], lib_name, message)
                     yield {"user": udata["slug"], "library": lib_name, "error": message}
     yield {"done": True, "total": total}
+
+
+def _refusal(outcome: str, name: str, library: str) -> str:
+    """Why a rename left the old name, in words that are true for this outcome."""
+    if outcome == HELD:
+        return (
+            f"Plex refused '{name}' in {library}: something in that library already has that name, so the row "
+            "keeps its old name there."
+        )
+    return (
+        f"Plex refused '{name}' in {library} and freeing the name failed, so the row keeps its old name there "
+        "for now. The next run tries again."
+    )
 
 
 async def run_row_rename_from_plex(
@@ -951,6 +970,10 @@ async def run_row_rename_from_plex(
         error = "; ".join(failures)
     write_audit(state, scope, "info", slug=slug, renames=entries, new_template=new_template, error=error)
     logger.info(
-        "{} '{}': renamed {} collection(s){}", scope, slug, len(entries), f" then FAILED: {error}" if error else ""
+        "{} '{}': renamed {} collection(s){}",
+        scope,
+        slug,
+        sum(1 for entry in entries if not entry.get("next_run")),
+        f" then FAILED: {error}" if error else "",
     )
     return entries, error
