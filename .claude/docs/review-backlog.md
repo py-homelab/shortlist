@@ -10,6 +10,22 @@ below is later work.
 
 ---
 
+## OPEN — v1.9.0 release review, three LOW (2026-09-14)
+
+The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. Deferred, none a leak:
+
+1. **Stale comment.** `shortlist/server/api/collections.py:1678` says the visibility handler compares
+   placements "against the state it last applied"; 0089 dropped `shown_state` and it recomputes.
+2. **`user.restore` omits `skip_unmatched`.** `shortlist/server/services/jobs.py:1505`. Un-pausing
+   someone on a row's scheduled day off, when one of their `{top_seed}` rows has neither a ledger key
+   nor a last-run title, puts that row back on their own Home until the next midnight pass. Other
+   accounts' excludes still hide it. Fix: pass `skip_unmatched` the way `_promote_phase` does.
+3. **0088's downgrade leaves `collections.shown_state`** after 0089's downgrade re-creates it. Nullable
+   and unread. Both migrations are frozen (`frozen_migrations.txt`), so any fix is a new migration or
+   nothing.
+
+---
+
 ## CLOSED — a person's first row was in the Collections tab until the merge (2026-09-13)
 
 Found auditing #119. A person with no row yet has no `label!=shortlist_<slug>` in anyone's share
