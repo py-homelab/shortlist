@@ -386,6 +386,40 @@ class TestSettingsValidation:
         assert r.status_code == 200
 
 
+class TestWebhookSettingsValidation:
+    """The webhook's event list and auth header are sent to a third party on every alert, so a value that
+    cannot work is refused at save rather than failing at 3am."""
+
+    def test_events_must_be_ones_shortlist_sends(self, client: TestClient):
+        ok = client.put("/api/settings", json={"values": {"notify.webhook.events": ["run.failed", "job.failed"]}})
+        assert ok.status_code == 200, ok.text
+        assert client.put("/api/settings", json={"values": {"notify.webhook.events": []}}).status_code == 200
+        for refused in (["run.exploded"], "run.failed", [1]):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.events": refused}})
+            assert resp.status_code == 422, f"{refused!r} was accepted"
+
+    def test_the_header_name_must_be_a_valid_http_header_name(self, client: TestClient):
+        for offered in ("Authorization", "X-Gotify-Key", "x-api-key"):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": offered}})
+            assert resp.status_code == 200, f"{offered}: {resp.text}"
+        for refused in ("", "X Gotify", "Auth:orization", "Bad\nName"):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": refused}})
+            assert resp.status_code == 422, f"{refused!r} was accepted"
+
+    def test_the_header_value_may_not_break_the_request(self, client: TestClient):
+        """A line break in a header value is a header-injection shape; httpx refuses it at send time."""
+        ok = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_value": "Bearer abc.def"}})
+        assert ok.status_code == 200, ok.text
+        assert client.get("/api/settings").json()["notify.webhook.auth_header_value"] == "•••••"
+        # h11's own rule: printable ASCII, whitespace only between words. Anything else fails every send
+        # at 3am, and its error quotes the value back in an escaped form an exact-match scrub misses.
+        for refused in ("Bearer abc\r\nX-Evil: 1", "abc\ndef", "key\t", " key", "key ", "kéy"):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_value": refused}})
+            assert resp.status_code == 422, f"{refused!r} was accepted"
+        # Empty is how the owner takes authentication off again.
+        assert client.put("/api/settings", json={"values": {"notify.webhook.auth_header_value": ""}}).status_code == 200
+
+
 class TestSettingsChangeAudit:
     """Every owner-made settings change leaves an auditable before/after (rule 10) — with the
     values of secrets never appearing in it, in either direction (rule 9)."""

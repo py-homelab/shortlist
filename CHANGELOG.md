@@ -6,6 +6,20 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added
+
+- **Choose what the webhook tells you, and give it a key.** The webhook sent one thing: a run
+  failing. In Settings → Notifications you now tick what to send — runs starting, finishing, partly
+  failing, failing or stopping; jobs starting, finishing or failing; someone able to see a row that
+  isn't theirs; titles waiting for your approval; and a new version being out. A failed run and a
+  privacy problem are ticked to begin with, so a webhook you already set up only gains the privacy
+  alert. Jobs that run every few minutes, like the privacy sync, only say when they fail, and no
+  message ever names anybody.
+
+  If your receiver needs a key (ntfy, Gotify, n8n), choose **Add authentication** and give a header
+  name and value. It is sent with every message, the test included, and stored encrypted. The switch
+  is now called **Send alerts to a webhook**.
+
 ### Fixed
 
 - **Un-pausing someone on a row's day off no longer puts that row back on their Home.** A row named

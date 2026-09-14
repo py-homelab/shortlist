@@ -111,11 +111,17 @@ DEFAULTS: dict[str, Any] = {
     # alert stays hidden but a new failure or a newer release surfaces again. Capped to the newest 100.
     "notifications.dismissed": [],
     # Send the bell's alerts to a webhook as well. Opt-in, off by default: an unasked-for outbound
-    # POST from a self-hosted tool is not a default anyone should inherit. Only ONE event goes out —
-    # a whole run failing — because that is the one an owner cannot see before their next login
-    # (services/notify.py). The address itself is a SECRET_KEY below: it is a bearer token in a URL.
+    # POST from a self-hosted tool is not a default anyone should inherit. The address itself is a
+    # SECRET_KEY below: it is a bearer token in a URL.
     "notify.webhook.enabled": False,
     "notify.webhook.url": "",
+    # Which events go out (services/notify.py EVENTS). The default is the two an owner cannot see
+    # before their next login: a whole run failing, and a live privacy exposure.
+    "notify.webhook.events": ["run.failed", "privacy.exposure"],
+    # An optional header sent with every POST, for receivers that authenticate (ntfy, Gotify, n8n).
+    # Sent only when the value is set; the value is a SECRET_KEY.
+    "notify.webhook.auth_header_name": "Authorization",
+    "notify.webhook.auth_header_value": "",
     # Which candidate sources feed recommendations (engine/candidates.py). More = wider recall.
     "candidates.sources": ["tmdb_similar", "tmdb_discover"],
     # Which backend the web-search (llm_web) source searches with. Exactly one, always:
@@ -278,6 +284,8 @@ SECRET_KEYS = {
     # channel — so it is encrypted at rest and redacted on read like any other credential, even
     # though it looks like a mere address.
     "notify.webhook.url",
+    # A bearer token or API key for the webhook's receiver.
+    "notify.webhook.auth_header_value",
 }
 
 # Keys stored server-side but NEVER returned by all_public() and never writable via the generic
@@ -304,6 +312,11 @@ PRIVATE_KEYS = {
     # Which release notes the owner has closed (`whats_new.py`). Only the dialog's own endpoint moves
     # it, and only forwards: a generic write could mark a release read before anyone saw it.
     "app.release_notes_seen",
+    # What the webhook sender remembers so it does not repeat itself (services/notify.py). A generic
+    # write could re-arm or silence an alert, so nothing but the sender moves them.
+    "notify.webhook.privacy_sent_at",
+    "notify.webhook.requests_seen",
+    "notify.webhook.update_sent",
 }
 
 # Dropped keys purged from the settings table on boot, so stale rows don't linger.

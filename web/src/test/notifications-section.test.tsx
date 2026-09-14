@@ -1,5 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { NotificationsSection } from "@/components/settings/notifications-section";
@@ -44,7 +50,7 @@ describe("NotificationsSection", () => {
   it("saves the switch and reveals the address field", async () => {
     renderSection({});
     fireEvent.click(
-      screen.getByRole("switch", { name: /Send failures to a webhook/i }),
+      screen.getByRole("switch", { name: /Send alerts to a webhook/i }),
     );
     await waitFor(() =>
       expect(putSettings).toHaveBeenCalledWith({
@@ -60,7 +66,7 @@ describe("NotificationsSection", () => {
     putSettings.mockRejectedValueOnce(new Error("nope"));
     renderSection({});
     const toggle = screen.getByRole("switch", {
-      name: /Send failures to a webhook/i,
+      name: /Send alerts to a webhook/i,
     });
     fireEvent.click(toggle);
     await waitFor(() =>
@@ -98,5 +104,104 @@ describe("NotificationsSection", () => {
     // just as happily if the button regressed to pinging the AI provider.
     await waitFor(() => expect(testConnection).toHaveBeenCalledWith("notify"));
     expect(await screen.findByText(/answered 204/i)).toBeTruthy();
+  });
+
+  describe("choosing what gets sent", () => {
+    const on = { "notify.webhook.enabled": true, "notify.webhook.url": "•••••" };
+
+    it("ticks the events the server says are switched on", () => {
+      renderSection({
+        ...on,
+        "notify.webhook.events": ["run.failed", "privacy.exposure"],
+      });
+      expect(
+        screen.getByRole("checkbox", { name: /A run failed/i }),
+      ).toHaveProperty("checked", true);
+      expect(
+        screen.getByRole("checkbox", { name: /Someone can see a row/i }),
+      ).toHaveProperty("checked", true);
+      expect(
+        screen.getByRole("checkbox", { name: /A run started/i }),
+      ).toHaveProperty("checked", false);
+    });
+
+    it("hides the list until notifications are on", () => {
+      renderSection({ "notify.webhook.events": ["run.failed"] });
+      expect(screen.queryByRole("checkbox", { name: /A run failed/i })).toBeNull();
+    });
+
+    it("saves the whole list when one event is ticked", async () => {
+      renderSection({ ...on, "notify.webhook.events": ["run.failed"] });
+      fireEvent.click(screen.getByRole("checkbox", { name: /A job failed/i }));
+      await waitFor(() =>
+        expect(putSettings).toHaveBeenCalledWith({
+          "notify.webhook.events": ["run.failed", "job.failed"],
+        }),
+      );
+    });
+
+    it("puts the tick back when the save fails", async () => {
+      putSettings.mockRejectedValueOnce(new Error("nope"));
+      renderSection({ ...on, "notify.webhook.events": ["run.failed"] });
+      const box = screen.getByRole("checkbox", { name: /A run failed/i });
+      fireEvent.click(box);
+      await waitFor(() =>
+        expect(screen.getByRole("alert").textContent).toMatch(/Couldn’t save/i),
+      );
+      expect(box).toHaveProperty("checked", true);
+    });
+
+    it("says routine jobs only report a failure", () => {
+      renderSection(on);
+      expect(screen.getByText(/privacy sync and playback credits/i)).toBeTruthy();
+    });
+  });
+
+  describe("authentication", () => {
+    const on = { "notify.webhook.enabled": true, "notify.webhook.url": "•••••" };
+
+    it("stays folded away until the owner asks for it", () => {
+      renderSection(on);
+      expect(screen.queryByLabelText(/Header name/i)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /Add authentication/i }));
+      expect(screen.getByLabelText(/Header name/i)).toHaveProperty(
+        "value",
+        "Authorization",
+      );
+      expect(screen.getByLabelText(/Header value/i)).toHaveProperty(
+        "type",
+        "password",
+      );
+    });
+
+    it("is already open, with the value as dots, when one is saved", () => {
+      renderSection({
+        ...on,
+        "notify.webhook.auth_header_name": "X-Gotify-Key",
+        "notify.webhook.auth_header_value": "•••••",
+      });
+      expect(screen.getByLabelText(/Header name/i)).toHaveProperty(
+        "value",
+        "X-Gotify-Key",
+      );
+      expect(screen.getByLabelText(/Header value/i)).toHaveProperty(
+        "value",
+        "•••••",
+      );
+    });
+
+    it("saves a header name as typed", async () => {
+      renderSection(on);
+      fireEvent.click(screen.getByRole("button", { name: /Add authentication/i }));
+      const name = screen.getByLabelText(/Header name/i);
+      fireEvent.change(name, { target: { value: "X-Api-Key" } });
+      const group = name.closest("div.rounded-lg") as HTMLElement;
+      fireEvent.click(within(group).getByRole("button", { name: /^Save$/i }));
+      await waitFor(() =>
+        expect(putSettings).toHaveBeenCalledWith({
+          "notify.webhook.auth_header_name": "X-Api-Key",
+        }),
+      );
+    });
   });
 });

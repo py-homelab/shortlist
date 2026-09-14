@@ -35,12 +35,26 @@ def _update_available(store: SettingsStore, current_version: str) -> dict | None
     update = check_for_update(current_version)
     if not update:
         return None
+    return update_alert(current_version, update["latest"], update["url"])
+
+
+def update_alert(current_version: str, latest: str, url: str) -> dict:
+    """A newer release exists. Shared by the bell and the webhook's `update.available`.
+
+    Args:
+        current_version: The running version.
+        latest: The newest published version.
+        url: The release page.
+
+    Returns:
+        A notification dict.
+    """
     return {
-        "id": f"update-{update['latest']}",
+        "id": f"update-{latest}",
         "severity": "info",
         "title": "Update available",
-        "body": f"v{current_version} → v{update['latest']}",
-        "action_url": update["url"],
+        "body": f"v{current_version} → v{latest}",
+        "action_url": url,
         "action_label": "View release",
         "dismissable": True,
     }
@@ -174,23 +188,193 @@ def run_failed_alert(run: Run) -> dict:
     }
 
 
+def run_partial_alert(run: Run) -> dict:
+    """The alert for a run that finished with some people failing. Shared by the bell and the webhook.
+
+    Args:
+        run: The run. Its `id` and `stats["users_error"]` are read.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    failed = (run.stats or {}).get("users_error", 0)
+    return {
+        "id": f"run-partial-{run.id}",
+        "severity": "warning",
+        "title": f"{failed} {'person' if failed == 1 else 'people'} failed in the last run",
+        "body": "Some people didn't rebuild in the most recent run. The rest finished fine.",
+        "action_url": f"/runs/{run.id}",
+        "action_label": "See the run",
+        "dismissable": True,
+    }
+
+
+def run_started_alert(run: Run) -> dict:
+    """A run began. Webhook only (`run.started`); the app shows a live run on its own.
+
+    Args:
+        run: The run. Only its `id` is read.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    return {
+        "id": f"run-started-{run.id}",
+        "severity": "info",
+        "title": "A run started",
+        "body": "Shortlist is rebuilding rows. Open the run to follow along.",
+        "action_url": f"/runs/{run.id}",
+        "action_label": "See the run",
+        "dismissable": True,
+    }
+
+
+def run_finished_alert(run: Run) -> dict:
+    """A run finished with nobody failing. Webhook only (`run.finished`).
+
+    Args:
+        run: The run. Its `id` and the `users_ok`/`titles_added` counters are read.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    stats = run.stats or {}
+    people, titles = int(stats.get("users_ok") or 0), int(stats.get("titles_added") or 0)
+    return {
+        "id": f"run-finished-{run.id}",
+        "severity": "info",
+        "title": "The last run finished",
+        "body": (
+            f"Rebuilt rows for {people} {'person' if people == 1 else 'people'} and added "
+            f"{titles} {'title' if titles == 1 else 'titles'}."
+        ),
+        "action_url": f"/runs/{run.id}",
+        "action_label": "See the run",
+        "dismissable": True,
+    }
+
+
+def run_stopped_alert(run: Run) -> dict:
+    """A run ended before it finished: stopped by the owner, or cut short by a restart (`run.stopped`).
+
+    Args:
+        run: The run. Only its `id` is read.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    return {
+        "id": f"run-stopped-{run.id}",
+        "severity": "warning",
+        "title": "A run stopped before it finished",
+        "body": "It was stopped, or Shortlist restarted part-way through. Open the run to see who it reached.",
+        "action_url": f"/runs/{run.id}",
+        "action_label": "See the run",
+        "dismissable": True,
+    }
+
+
+def job_alert(event: str, job_id: int, label: str) -> dict:
+    """A background job started, finished, or ran out of retries (`job.*`). Webhook only.
+
+    Names the job by its catalogue label and nothing else: a job's `detail` and `error` can name a
+    person ("Put 2 row(s) back for sarah"), so neither is ever part of this.
+
+    Args:
+        event: `job.started`, `job.finished` or `job.failed`.
+        job_id: The job.
+        label: The job kind's label from the jobs catalogue.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    verb, severity, body = {
+        "job.started": ("started", "info", "Open Jobs to follow it."),
+        "job.finished": ("finished", "info", "Open Jobs to see what it did."),
+        "job.failed": ("failed", "error", "It ran out of retries. Open Jobs to see why."),
+    }[event]
+    return {
+        "id": f"{event.replace('.', '-')}-{job_id}",
+        "severity": severity,
+        "title": f"Job {verb}: {label}",
+        "body": body,
+        "action_url": "/jobs",
+        "action_label": "Open Jobs",
+        "dismissable": True,
+    }
+
+
+def exposed_accounts(session: Session) -> set[str]:
+    """Every account the newest measurement says can see rows that aren't theirs.
+
+    The union of the three privacy findings a run records, each read from the newest run that measured
+    it, exactly as `_rows_we_cannot_hide`, `_filters_not_enforced` and `_filters_plex_cannot_read` read
+    them. For counting only: the names never leave the server.
+
+    Args:
+        session: A database session.
+
+    Returns:
+        Account names, possibly empty.
+    """
+    runs = session.query(Run).filter(Run.finished_at.isnot(None)).order_by(Run.finished_at.desc()).limit(50).all()
+    names: set[str] = set()
+    for key in ("unhideable_rows", "filters_not_enforced", "unreadable_filters"):
+        newest = next((r for r in runs if key in (r.stats or {})), None)
+        if newest is not None:
+            names.update((newest.stats or {}).get(key) or {})
+    return names
+
+
+def privacy_exposure_alert(accounts: int) -> dict:
+    """Accounts can see rows that aren't theirs (`privacy.exposure`). A count, never names (design §6).
+
+    Args:
+        accounts: How many accounts are exposed.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    return {
+        "id": "privacy-exposure",
+        "severity": "error",
+        "title": f"{accounts} {'account' if accounts == 1 else 'accounts'} can see rows that aren't theirs",
+        "body": "Open Shortlist to see who, and what to do about it.",
+        "action_url": "/sharing",
+        "action_label": "See sharing",
+        "dismissable": False,
+    }
+
+
+def requests_waiting_alert(waiting: int, new: int) -> dict:
+    """Titles are waiting for the owner's approval (`requests.waiting`).
+
+    Args:
+        waiting: How many wait now.
+        new: How many more than the last time this was sent.
+
+    Returns:
+        A notification dict that names no account.
+    """
+    return {
+        "id": f"requests-waiting-{waiting}",
+        "severity": "info",
+        "title": f"{waiting} {'title' if waiting == 1 else 'titles'} waiting for your approval",
+        "body": f"{new} new since the last message. Open Requests to send or reject them.",
+        "action_url": "/requests",
+        "action_label": "Open Requests",
+        "dismissable": True,
+    }
+
+
 def _last_run_problem(session: Session) -> dict | None:
     last = session.query(Run).filter(Run.status.in_(("ok", "error"))).order_by(Run.id.desc()).first()
     if last is None:
         return None
     if last.status == "error":
         return run_failed_alert(last)
-    failed = (last.stats or {}).get("users_error", 0)
-    if failed:
-        return {
-            "id": f"run-partial-{last.id}",
-            "severity": "warning",
-            "title": f"{failed} {'person' if failed == 1 else 'people'} failed in the last run",
-            "body": "Some people didn't rebuild in the most recent run. The rest finished fine.",
-            "action_url": f"/runs/{last.id}",
-            "action_label": "See the run",
-            "dismissable": True,
-        }
+    if (last.stats or {}).get("users_error", 0):
+        return run_partial_alert(last)
     return None
 
 

@@ -396,8 +396,8 @@ CATALOG: tuple[JobKind, ...] = (
         label="Send an alert to your webhook",
         description=(
             "Posts one of Shortlist's own alerts to the webhook address you saved in Settings, so a "
-            "run that fails at 3am reaches you without you having to open the app and look. The "
-            "message is the same one the bell shows, and it never names anybody."
+            "run that fails at 3am reaches you without you having to open the app and look. It sends "
+            "the events you ticked there, and it never names anybody."
             "\n\nIt keeps trying for about four and a half hours, because a chat service or an "
             "automation box can be down far longer than Plex ever is. If it still cannot get through, "
             "it gives up and the bell tells you a job failed — the one place that always works."
@@ -405,7 +405,7 @@ CATALOG: tuple[JobKind, ...] = (
         # Not manual: the payload IS the message, so a generic "run it" button would send an empty one.
         manual=False,
         writes_plex=False,  # an HTTP POST to the owner's own webhook; nothing on Plex is touched
-        trigger="Queued when a whole run fails, and when you press Send a test in Settings.",
+        trigger="Queued for each event you ticked in Settings → Notifications, and when you press Send a test.",
         backoff_s=NOTIFY_BACKOFF_S,
     ),
 )
@@ -656,7 +656,13 @@ def _finish(sessions, job_id: int, *, result: dict | None = None, error: str | N
             job.error = error
             logger.error("job {} ({}) gave up after {} attempts: {}", job.id, job.kind, job.attempts, error)
             add_audit(session, "job.failed", "error", job_id=job.id, kind=job.kind, error=error, attempts=job.attempts)
+        status = job.status
         session.commit()
+    # After the commit, so the webhook's own job is queued behind a settled row. A retry is not news.
+    if status in ("done", "failed"):
+        from shortlist.server.services import notify
+
+        notify.enqueue_job_event(sessions, job_id, "job.finished" if status == "done" else "job.failed")
 
 
 def _plex_busy(state) -> bool:
@@ -792,6 +798,10 @@ async def _execute(state, sessions, job_id: int, kind: str) -> None:
         if job is not None:
             job.started_at = datetime.now(UTC)  # it is running NOW, not when it was claimed
             session.commit()
+    if job is not None:
+        from shortlist.server.services import notify
+
+        notify.enqueue_job_event(sessions, job_id, "job.started")
     fn = _HANDLERS.get(kind)
     if fn is None:
         # The kind was removed in an upgrade while a job was queued. Nothing can run it.

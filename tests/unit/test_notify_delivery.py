@@ -131,7 +131,7 @@ class TestSecretsNeverEscape:
         configure(sessions, secrets)
         with respx.mock:
             respx.post(WEBHOOK).mock(side_effect=httpx.ConnectError(f"failed to connect to {WEBHOOK}"))
-            job_id = notify.enqueue_run_failure(sessions, _failed_run(sessions))
+            job_id = notify.enqueue_run_outcome(sessions, _failed_run(sessions))
             drain(state)
         job = job_row(sessions, job_id)
         assert job.error, "a send that could not connect must record why"
@@ -143,7 +143,7 @@ class TestSecretsNeverEscape:
         configure(sessions, secrets)
         with respx.mock:
             respx.post(WEBHOOK).mock(return_value=httpx.Response(401, text="invalid webhook token"))
-            job_id = notify.enqueue_run_failure(sessions, _failed_run(sessions))
+            job_id = notify.enqueue_run_outcome(sessions, _failed_run(sessions))
             drain(state)
         job = job_row(sessions, job_id)
         assert job.error and WEBHOOK not in job.error and "AbCdEf" not in job.error
@@ -169,6 +169,7 @@ class TestWebhookBody:
             "severity": "error",
             "title": "The last run failed",
             "message": "The most recent run ended in an error — open it to see what went wrong.",
+            "event": "",
             "path": "/runs/12",
             "sent_at": "2026-09-05T03:31:00+00:00",
             "content": "The last run failed\nThe most recent run ended in an error — open it to see what went wrong.",
@@ -206,6 +207,7 @@ class TestWebhookBody:
             "severity",
             "title",
             "message",
+            "event",
             "path",
             "sent_at",
             "content",
@@ -262,29 +264,29 @@ class TestRunFailureHook:
     def test_a_failed_run_queues_one_send_carrying_the_bell_s_own_wording(self, sessions, secrets):
         configure(sessions, secrets)
         run_id = _failed_run(sessions)
-        assert notify.enqueue_run_failure(sessions, run_id) is not None
+        assert notify.enqueue_run_outcome(sessions, run_id) is not None
         queued = notify_jobs(sessions)
         assert len(queued) == 1
         # The payload is the notification the in-app bell would show for this run — one wording, two
         # destinations. A second wording here is how a webhook message and the bell start disagreeing.
         with sessions() as session:
             expected = notifications.run_failed_alert(session.get(Run, run_id))
-        assert queued[0].payload["item"] == expected
+        assert queued[0].payload["item"] == expected | {"event": "run.failed"}
 
     def test_a_successful_run_queues_nothing(self, sessions, secrets):
         configure(sessions, secrets)
-        assert notify.enqueue_run_failure(sessions, _ok_run(sessions)) is None
+        assert notify.enqueue_run_outcome(sessions, _ok_run(sessions)) is None
         assert notify_jobs(sessions) == []
 
     def test_a_dry_run_queues_nothing(self, sessions, secrets):
         """A dry run is a preview somebody is watching. The alert exists for the failure nobody saw."""
         configure(sessions, secrets)
-        assert notify.enqueue_run_failure(sessions, _failed_run(sessions, dry_run=True)) is None
+        assert notify.enqueue_run_outcome(sessions, _failed_run(sessions, dry_run=True)) is None
         assert notify_jobs(sessions) == []
 
     def test_nothing_is_queued_while_the_webhook_is_off(self, sessions, secrets):
         configure(sessions, secrets, enabled=False)
-        assert notify.enqueue_run_failure(sessions, _failed_run(sessions)) is None
+        assert notify.enqueue_run_outcome(sessions, _failed_run(sessions)) is None
         assert notify_jobs(sessions) == []
 
     def test_it_never_raises_into_the_run(self, sessions, secrets, monkeypatch):
@@ -295,7 +297,7 @@ class TestRunFailureHook:
         """
         configure(sessions, secrets)
         monkeypatch.setattr(jobs, "enqueue", _raise)
-        assert notify.enqueue_run_failure(sessions, _failed_run(sessions)) is None
+        assert notify.enqueue_run_outcome(sessions, _failed_run(sessions)) is None
 
     def test_the_queued_job_is_read_only_and_never_manual(self):
         kind = jobs.BY_KIND["notify.send"]
@@ -315,7 +317,7 @@ class TestDeliveryThroughTheQueue:
         run_id = _failed_run(sessions)
         with respx.mock:
             route = respx.post(WEBHOOK).mock(return_value=httpx.Response(204))
-            job_id = notify.enqueue_run_failure(sessions, run_id)
+            job_id = notify.enqueue_run_outcome(sessions, run_id)
             drain(state)
         assert route.called
         sent = json.loads(route.calls.last.request.content)
@@ -330,7 +332,7 @@ class TestDeliveryThroughTheQueue:
         turned notifications off in the meantime has not had a failure — they have changed their mind.
         """
         configure(sessions, secrets)
-        job_id = notify.enqueue_run_failure(sessions, _failed_run(sessions))
+        job_id = notify.enqueue_run_outcome(sessions, _failed_run(sessions))
         configure(sessions, secrets, enabled=False)
         with respx.mock:
             route = respx.post(WEBHOOK).mock(return_value=httpx.Response(204))
@@ -353,7 +355,7 @@ class TestDeliveryThroughTheQueue:
         configure(sessions, secrets)
         with respx.mock:
             route = respx.post(WEBHOOK).mock(return_value=httpx.Response(500))
-            job_id = notify.enqueue_run_failure(sessions, _failed_run(sessions))
+            job_id = notify.enqueue_run_outcome(sessions, _failed_run(sessions))
             for _ in range(jobs.NOTIFY_ATTEMPTS + 1):
                 drain(state)
         job = job_row(sessions, job_id)

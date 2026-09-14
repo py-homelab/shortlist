@@ -335,6 +335,35 @@ class TestRunExecution:
         with sessions() as session:
             assert session.query(Job).filter(Job.kind == "notify.send").count() == 0
 
+    def test_a_run_announces_its_start_and_its_finish_when_the_owner_chose_them(self, sessions, tmp_path, monkeypatch):
+        """The wiring for `run.started` and `run.finished`, through the real `RunService`."""
+        service = RunService(sessions, EventBus(), tmp_path, SecretBox(tmp_path))
+        monkeypatch.setattr(service, "build_context", lambda **kw: _fake_ctx())
+        healthy = RunReport(
+            started_at=datetime.now(UTC),
+            finished_at=datetime.now(UTC),
+            dry_run=False,
+            users=[UserRunReport(username="sarah", slug="sarah", status="ok", diff=CollectionDiff(added=["Movie"]))],
+            unhideable_measured=True,
+        )
+        monkeypatch.setattr(run_service_mod, "engine_run", lambda ctx, profiles: healthy)
+        with sessions() as session:
+            store = SettingsStore(session)
+            store.set("notify.webhook.enabled", True)
+            store.set("notify.webhook.events", ["run.started", "run.finished"])
+
+        async def scenario():
+            run_id = await service.start_run(trigger="schedule", dry_run=False)
+            return await _wait_for_run(sessions, run_id)
+
+        run = asyncio.run(scenario())
+        with sessions() as session:
+            queued = session.query(Job).filter(Job.kind == "notify.send").order_by(Job.id).all()
+        assert [(j.payload["item"]["event"], j.payload["item"]["id"]) for j in queued] == [
+            ("run.started", f"run-started-{run.id}"),
+            ("run.finished", f"run-finished-{run.id}"),
+        ]
+
     def test_shortlist_dry_run_env_forces_dry_run(self, sessions, tmp_path, monkeypatch):
         """SHORTLIST_DRY_RUN forces even a non-dry 'Run now' to dry-run — the safety a demo/test
         instance pointed at a real server relies on (it can never write to Plex)."""

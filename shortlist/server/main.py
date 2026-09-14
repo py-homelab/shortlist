@@ -283,6 +283,12 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 logger.warning("aborted {} orphaned run(s) from a previous process", len(stale))
             session.commit()
         crashed_runs = len(stale)
+        if not restored:
+            from shortlist.server.services import notify
+
+            # `run.stopped`: a restart cut these short. Not after a restore — those are history.
+            for run in stale:
+                notify.enqueue_run_outcome(sessions, run.id)
 
         # Requeue jobs a previous process died inside. Handlers are idempotent (converge-to-desired,
         # never a delta), so replaying is safe — and losing the work is not: a disable cleanup lost to

@@ -230,3 +230,55 @@ slots on top without reworking this.
 4. **Email recipients** — one `to_addr` assumed since this is admin-only. Some owners forward to a
    co-admin; confirm.
 5. **What is v1.1** — job-failure + privacy-exposure detection, or email as second channel?
+
+## v1.1 — the owner picks the events, and the webhook can authenticate (2026-09-14)
+
+Owner decisions, taken in chat on 2026-09-14. They supersede §1's "notify externally only for
+failures and exposures": the owner asked for every event that makes sense, including started and
+finished, so the RULE moves into the owner's hands and the defaults keep today's quiet behaviour.
+
+**Events** (`notify.webhook.events`, a list; default `["run.failed", "privacy.exposure"]`):
+
+- `run.started`, `run.finished`, `run.partial` (finished, `users_error > 0`), `run.failed`,
+  `run.stopped` (aborted by the owner, or found orphaned at boot). Dry runs never send. A run
+  cancelled while still queued never started, so it sends nothing.
+- `job.started`, `job.finished`, `job.failed`. Failed means out of retries, never an attempt that
+  will be retried, and a retry does not send `job.started` again. Started/finished skip `routine`
+  kinds (one playback credit per play); failed never does. `privacy.sync` runs every 30 minutes but is
+  NOT routine, so it takes the Jobs page's own Recent rule: a scheduled pass never sends
+  `job.started`, and one whose result is `quiet` never sends `job.finished`. `notify.send` never reports on itself — a webhook that is
+  down would otherwise queue an alert about failing to send an alert, for ever. Titles use the
+  catalogue's `label`; the body never carries `Job.detail` or `Job.error`, which can name a person.
+- `privacy.exposure`: the newest measured `unhideable_rows` / `filters_not_enforced` /
+  `unreadable_filters` is non-empty. Counts only, never names (§6). Checked after every real run.
+  Re-sent at most once per 23h while it stays true (a day less an hour: the stamp is when a nightly run
+  ends, and a night that ends sooner must not skip to the next); when it clears, the clock resets, so a new
+  exposure alerts at once.
+- `requests.waiting`: after a real run, when more titles wait for approval than the last time this
+  sent. The count it last saw is stored and follows decreases too.
+- `update.available`: after a real run, once per newer version.
+
+The run-level checks (privacy, requests, update) run in an executor after the run is persisted —
+`check_for_update` can reach GitHub, and that must not block the event loop.
+
+**Wording** lives in `notifications.py` beside `run_failed_alert`, one builder per event, so the bell
+and the webhook still share one module for what is said. Every body names no account; the key-set test
+covers every event.
+
+**Body:** adds `event` (the id above, `"test"` for the button). Additive, so `version` stays 1.
+
+**Auth:** `notify.webhook.auth_header_name` (default `Authorization`) and
+`notify.webhook.auth_header_value` (SECRET_KEYS: Fernet at rest, redacted on read). Sent on every
+POST, the test included, only when the value is set. The name must be an RFC 7230 token and the value
+must be h11-valid — printable ASCII, whitespace only between words (422 at save). `scrub` removes the
+value from any error text, in its escaped bytes form too, as well as the URL.
+
+**State** the sender keeps for itself — `notify.webhook.privacy_sent_at`,
+`notify.webhook.requests_seen`, `notify.webhook.update_sent` — is in PRIVATE_KEYS: never public,
+never writable through the settings PUT.
+
+**No migration.** Settings rows fall back to DEFAULTS, so an install that already switched the webhook
+on keeps its run-failure alert and gains the privacy one.
+
+**UI:** the Notifications card gains an event checklist grouped Runs / Jobs / Privacy / Requests /
+Updates, and an optional "Authentication" pair under the address.

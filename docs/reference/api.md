@@ -254,15 +254,28 @@ GET  /api/notifications/whats-new -> {version, releases[{version, url, published
 ## Outgoing notifications
 
 ```
-Settings -> System -> Notifications, or `notify.webhook.enabled` / `notify.webhook.url`.
-     A whole run failing POSTs generic JSON {source, version, id, severity, title, message, path, sent_at},
-     plus `content` and `text` carrying "title\nmessage" — the fields Discord and Slack each require —
-     to one webhook. The gap being closed is that a run failing overnight was visible only to someone
-     who opened the app. Delivery reuses the existing job queue, so retry, backoff and the dead-letter
-     state are the ones already tested rather than a second mechanism.
+Settings -> System -> Notifications, or `notify.webhook.enabled` / `notify.webhook.url` /
+`notify.webhook.events` / `notify.webhook.auth_header_name` / `notify.webhook.auth_header_value`.
+     Each event in `notify.webhook.events` POSTs generic JSON
+     {source, version, id, severity, title, message, event, path, sent_at}, plus `content` and `text`
+     carrying "title\nmessage" — the fields Discord and Slack each require — to one webhook.
+     Events: run.started, run.finished, run.partial, run.failed, run.stopped, job.started,
+     job.finished, job.failed, privacy.exposure, requests.waiting, update.available ("test" for the
+     button). Default ["run.failed", "privacy.exposure"]; an unknown name is a 422.
+     Dry runs and dry-run jobs send nothing. job.started/job.finished skip routine jobs (watch.reconcile)
+     and retries, a scheduled privacy.sync never sends job.started, and one that changed nothing never
+     sends job.finished. job.failed means out of retries. notify.send never reports on itself.
+     privacy.exposure is a count of accounts, never names, repeated at most once a day while true.
+     requests.waiting is sent after a run when more titles wait than last time; update.available once
+     per version. No message carries a person's name, a job's detail, or a job's error.
+     Delivery reuses the existing job queue, so retry, backoff and the dead-letter state are the ones
+     already tested rather than a second mechanism.
      `notify.webhook.url` is a SECRET (a Discord or Slack webhook URL is a bearer token in a URL): Fernet
      at rest, redacted from `GET /api/settings`, and stripped of its path and query before any exception
      text reaches a log, a `Job.error`, the audit trail or the support bundle.
+     `notify.webhook.auth_header_value` is a SECRET too, sent as `<auth_header_name>: <value>` on every
+     POST when set, and removed from any error text. The name must be a valid header name (default
+     Authorization) and the value a single line, or the save is a 422.
      The "Send a test" button travels the exact same code path as a real 3am failure — same settings
      read, same body builder, same HTTP call — so a passing test cannot mean a broken channel.
 ```
