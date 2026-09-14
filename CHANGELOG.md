@@ -21,14 +21,6 @@ All notable changes to this project are documented here. This project follows
   name and value on the same card. It is sent with every message and stored encrypted; clear the name
   to stop sending it.
 
-### Changed
-
-- **Settings and the other form pages keep to a readable width on a wide screen.** Settings, Rows, a
-  row's editor, Jobs, Sharing and privacy, a person's page and Have an issue? used to stretch across
-  the whole screen, leaving their switches and buttons far from what they belong to. They now stop at
-  about 1000px. Pages built around tables — the Dashboard, Runs, Logs, Requests and Users — still use
-  the full width.
-
 ### Fixed
 
 - **Un-pausing someone on a row's day off no longer puts that row back on their Home.** A row named
