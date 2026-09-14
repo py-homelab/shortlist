@@ -28,7 +28,7 @@ from shortlist.engine.models import (
 DEFAULT_ROW_NAME = "✨ Picked for You"
 
 
-#: What `_rename_or_keep` did: the row has its new name, it kept its old one, or it has to be rebuilt to
+#: What `rename_or_keep` did: the row has its new name, it kept its old one, or it has to be rebuilt to
 #: get the new one.
 RENAMED, KEPT, REBUILD = "renamed", "kept", "rebuild"
 
@@ -46,7 +46,7 @@ def is_name_freeing_helper(title: str) -> bool:
     return isinstance(title, str) and bool(_FREED_NAME.match(strip_marker(title)))
 
 
-def _rename_or_keep(
+def rename_or_keep(
     plex: PlexClient,
     collection,
     title: str,
@@ -55,9 +55,13 @@ def _rename_or_keep(
     *,
     label: str,
     marker: str,
-    spare_item,
+    spare_item=None,
+    read_spare_item: Callable[[], object | None] | None = None,
 ) -> str:
     """Rename a row in place. Returns RENAMED, KEPT (Plex refused and nothing could fix it), or REBUILD.
+
+    ``spare_item`` is one item of the row, to create a helper with; ``read_spare_item`` reads one only if a
+    helper turns out to be needed, for a caller that has not read the row's items.
 
     A collection's title is a row in Plex's server-wide `tags` table, and that row outlives the
     collection. A rename answers 409 while ANY other row has the name, and a create with the name is
@@ -110,6 +114,12 @@ def _rename_or_keep(
             holders[0].ratingKey,
         )
         return REBUILD
+    if spare_item is None and read_spare_item is not None:
+        try:
+            spare_item = read_spare_item()
+        except Exception as exc:  # a failed read leaves the row as it is, never loses it
+            _log_kept(profile, collection, title, section, f"could not read the row's titles ({type(exc).__name__})")
+            return KEPT
     if _reclaim_orphaned_name(
         plex, collection, title, profile, section, label=label, marker=marker, spare_item=spare_item
     ):
@@ -1619,7 +1629,7 @@ def _deliver_one(
         return diff, label, collection
 
     if collection.title != title:
-        outcome = _rename_or_keep(
+        outcome = rename_or_keep(
             plex,
             collection,
             title,

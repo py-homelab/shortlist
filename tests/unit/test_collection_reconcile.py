@@ -674,6 +674,109 @@ class TestReconcileRowRenameIter:
         } in (events)
         assert events[-1] == {"done": True, "total": 1}
 
+    CONFLICT = "(409) conflict; http://pms:32400/library/sections/1/all?id=771&title.value=X&type=18"
+
+    def _refusing(self, title: str, *, then=None) -> MagicMock:
+        from plexapi.exceptions import BadRequest
+
+        collection = _collection(title)
+        collection.ratingKey = 771
+        collection.editTitle.side_effect = [BadRequest(self.CONFLICT), then]
+        collection.items.return_value = [MagicMock(ratingKey=5)]
+        return collection
+
+    def test_a_name_a_deleted_collection_left_behind_is_freed_and_the_rename_goes_through(self, sessions):
+        """The same refusal delivery handles (tests/fixtures/pms_collection_title_tags.json): renaming a row
+        back to a name it once had used to fail here with a raw 409 until the next run."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        collection = self._refusing("Old Name" + row_marker(100))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies")]
+        plex.find_owned_collections.side_effect = lambda sec, label: [collection] if label == "shortlist_sarah" else []
+        plex.collections_titled.return_value = []
+        plex.create_collection.return_value = MagicMock(ratingKey=9)
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="comedy", new_template="New Name", old_template="Old Name"
+            )
+        )
+
+        assert collection.editTitle.call_args_list[-1].args == ("New Name" + row_marker(100),)
+        assert plex.create_collection.call_args.args[2] == collection.items.return_value[:1]
+        assert not any(e.get("error") for e in events), events
+        assert events[-1] == {"done": True, "total": 1}
+
+    def test_a_name_their_row_in_another_library_has_is_left_for_the_next_run_and_says_so(self, sessions):
+        """Only a new collection can share that name, and a rename has no titles to build one from."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        collection = self._refusing("Old Name" + row_marker(100))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies", key="1")]
+        plex.find_owned_collections.side_effect = lambda sec, label: [collection] if label == "shortlist_sarah" else []
+        twin = MagicMock(ratingKey=42, title="New Name" + row_marker(100), librarySectionID="2")
+        plex.collections_titled.return_value = [twin]
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="comedy", new_template="New Name", old_template="Old Name"
+            )
+        )
+
+        (pending,) = [e for e in events if e.get("user")]
+        assert pending["next_run"] is True and pending["new"] == "New Name" and "error" not in pending
+        plex.create_collection.assert_not_called()
+        assert events[-1] == {"done": True, "total": 0}
+
+    def test_a_name_something_in_that_library_really_has_is_reported_and_the_others_still_rename(self, sessions):
+        _add_user(sessions, slug="sarah", account_id=100)
+        _add_user(sessions, slug="mike", account_id=200)
+        sarahs = self._refusing("Old Name" + row_marker(100))
+        mikes = _collection("Old Name" + row_marker(200))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies", key="1")]
+        plex.find_owned_collections.side_effect = lambda sec, label: {
+            "shortlist_sarah": [sarahs],
+            "shortlist_mike": [mikes],
+        }.get(label, [])
+        plex.collections_titled.side_effect = lambda title: (
+            [MagicMock(ratingKey=42, title=title, librarySectionID="1")] if title.endswith(row_marker(100)) else []
+        )
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="comedy", new_template="New Name", old_template="Old Name"
+            )
+        )
+
+        (refused,) = [e for e in events if e.get("error")]
+        assert refused["user"] == "sarah" and "already has" in refused["error"] and "(409)" not in refused["error"]
+        mikes.editTitle.assert_called_once_with("New Name" + row_marker(200))
+        assert events[-1] == {"done": True, "total": 1}
+
+    def test_a_shared_rows_refused_rename_is_said_plainly(self, sessions):
+        collection = self._refusing("Old Shared Name")
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies", key="1")]
+        plex.find_owned_collections.side_effect = lambda sec, label: (
+            [collection] if label.startswith("shortlist__shared_") else []
+        )
+        plex.collections_titled.side_effect = lambda title: [MagicMock(ratingKey=42, title=title, librarySectionID="1")]
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex),
+                slug="popular",
+                new_template="New Shared Name",
+                old_template="Old Shared Name",
+                build="shared",
+            )
+        )
+
+        (refused,) = [e for e in events if e.get("error")]
+        assert "already has that name" in refused["error"] and "(409)" not in refused["error"]
+        assert events[-1] == {"done": True, "total": 0}
+
     def test_does_not_touch_a_different_row_sharing_the_same_label(self, sessions):
         _add_user(sessions, slug="sarah", account_id=100)
         this_row = _collection("Old Name" + row_marker(100))

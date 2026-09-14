@@ -690,7 +690,7 @@ class TestDeliverRows:
     def test_a_non_400_failure_is_never_swallowed(self, engine_config, movies, shows):
         """Anchored on the leading token, not `"400" in`: plexapi puts the collection's own ratingKey
         in the message, so a substring test matches keys like 1400 or 40053. That exact mistake
-        swallowed 500s and 401s in `_rename_or_keep`."""
+        swallowed 500s and 401s in `rename_or_keep`."""
         plex = self._plex(movies, shows)
         profile = make_profile()
         existing = self._existing_with_stale(profile, 0)
@@ -2406,12 +2406,12 @@ class TestAConflictingRenameDoesNotTakeThePersonDown:
         return collection
 
     def _rename(self, plex, collection, target, profile, section, spare="spare"):
-        from shortlist.engine.delivery import _rename_or_keep
+        from shortlist.engine.delivery import rename_or_keep
 
         outcome: list[str] = []
         text = self._warnings(
             lambda: outcome.append(
-                _rename_or_keep(
+                rename_or_keep(
                     plex,
                     collection,
                     target,

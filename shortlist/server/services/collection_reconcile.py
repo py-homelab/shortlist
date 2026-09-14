@@ -18,7 +18,10 @@ from loguru import logger
 
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import (
+    KEPT,
+    REBUILD,
     remove_row_collections,
+    rename_or_keep,
     render_row_name,
     reset_row_posters,
     resolve_row_template,
@@ -762,17 +765,43 @@ def reconcile_row_rename_iter(
             for collection in ctx.plex.find_owned_collections(section, label):
                 if collection.title == new_display:
                     continue
+                old_title = collection.title
                 try:
-                    if not dry_run:
-                        collection.editTitle(new_display)
-                    total += 1
-                    yield {
+                    outcome = (
+                        rename_or_keep(
+                            ctx.plex,
+                            collection,
+                            new_display,
+                            _shared_profile(),
+                            section,
+                            label=label,
+                            # Names a helper only: ours by marker even if its label write fails.
+                            marker=row_marker(0),
+                            read_spare_item=lambda c=collection: next(iter(c.items()), None),
+                        )
+                        if not dry_run
+                        else None
+                    )
+                    if outcome == KEPT:
+                        yield {
+                            "user": slug,
+                            "library": lib_name,
+                            "error": f"Plex refused '{new_display}' in {lib_name} because something else there "
+                            "already has that name, so the row keeps its old name there.",
+                        }
+                        continue
+                    event = {
                         "user": slug,
                         "display_name": "Everyone",
-                        "old": collection.title,
+                        "old": old_title,
                         "new": new_display,
                         "libraries": [lib_name],
                     }
+                    if outcome == REBUILD:
+                        event["next_run"] = True
+                    else:
+                        total += 1
+                    yield event
                 except Exception as e:  # pragma: no cover - PMS failure shape
                     yield {"user": slug, "library": lib_name, "error": redact(str(e))}
         yield {"done": True, "total": total}
@@ -830,16 +859,42 @@ def reconcile_row_rename_iter(
                     # this is ITS collection, however well the old title matches.
                     continue
                 try:
-                    if not dry_run:
-                        collection.editTitle(new_with_marker)
-                    total += 1
-                    yield {
+                    outcome = (
+                        rename_or_keep(
+                            ctx.plex,
+                            collection,
+                            new_with_marker,
+                            profile,
+                            section,
+                            label=label,
+                            marker=marker,
+                            read_spare_item=lambda c=collection: next(iter(c.items()), None),
+                        )
+                        if not dry_run
+                        else None
+                    )
+                    if outcome == KEPT:
+                        yield {
+                            "user": udata["slug"],
+                            "library": lib_name,
+                            "error": f"{profile.display_name}: Plex refused '{new_display}' in {lib_name} because "
+                            "something else there already has that name, so their row keeps its old name there.",
+                        }
+                        continue
+                    event = {
                         "user": udata["slug"],
                         "display_name": profile.display_name,
                         "old": strip_marker(current_title),
                         "new": new_display,
                         "libraries": [lib_name],
                     }
+                    if outcome == REBUILD:
+                        # Plex lets only a new collection share a name their row in another library has, and a
+                        # rename has no titles to build one from: the next run rebuilds it under this name.
+                        event["next_run"] = True
+                    else:
+                        total += 1
+                    yield event
                 except Exception as e:
                     # Yielded, not just logged: one user's PMS failure must not stop the other users'
                     # renames, but it must still reach the audit and the SSE stream. Swallowing it

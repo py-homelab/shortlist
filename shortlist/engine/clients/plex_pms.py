@@ -323,7 +323,7 @@ def _is_transient_pms_error(error: BaseException) -> bool:
     Anchored on the LEADING token, never ``"500" in``: plexapi formats the message as
     ``f'({status}) {codename}; {url} {errtext}'`` and that url carries the collection's own
     ratingKey, so a substring test matches keys like 1500 or 45002 — the mistake that once swallowed
-    500s and 401s in ``delivery._rename_or_keep``.
+    500s and 401s in ``delivery.rename_or_keep``.
     """
     return str(error).startswith(_PMS_SERVER_ERROR_PREFIXES)
 
@@ -1339,7 +1339,7 @@ class PlexClient:
                 # Anchored on the leading token, never `"400" in`: plexapi formats the message as
                 # `f'({status}) {codename}; {url} {errtext}'` and that url carries the collection's
                 # own ratingKey, so a substring test matches keys like 1400 or 40053 — the mistake
-                # that once swallowed 500s and 401s in `delivery._rename_or_keep`.
+                # that once swallowed 500s and 401s in `delivery.rename_or_keep`.
                 if not str(exc).startswith("(400)"):
                     raise
                 # Raised from HERE, not inferred by the caller, so "the collection refuses items" can

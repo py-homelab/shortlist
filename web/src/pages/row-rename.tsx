@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Check, Loader2, Pen } from "lucide-react";
+import { Check, Clock, Loader2, Pen, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useParams } from "react-router";
 
@@ -20,8 +20,12 @@ interface RenameEvent {
   old?: string;
   new?: string;
   libraries?: string[];
+  library?: string;
+  /** Plex only lets a new collection share this name, so the row's next run rebuilds it under it. */
+  next_run?: boolean;
   done?: boolean;
   total?: number;
+  /** With `user`: that one person's collection could not be renamed, and the rest carry on. */
   error?: string;
 }
 
@@ -96,7 +100,9 @@ export function RowRenamePage() {
             .find((l) => l.startsWith("data: "));
           if (!dataLine) continue;
           const event: RenameEvent = JSON.parse(dataLine.slice(6));
-          if (event.error) {
+          // Only an error about the whole rename stops it. One person's refusal is theirs: the server
+          // carries on with everyone else, and stopping here hid every rename that followed it.
+          if (event.error && !event.user) {
             setError(event.error);
             setRunning(false);
             return;
@@ -136,7 +142,9 @@ export function RowRenamePage() {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
   }, [events]);
 
-  const renamed = events.filter((e) => e.user && !e.done);
+  const results = events.filter((e) => e.user && !e.done);
+  const refused = results.filter((e) => e.error);
+  const nextRun = results.filter((e) => !e.error && e.next_run);
   const doneEvent = events.find((e) => e.done);
 
   async function handleSubmit() {
@@ -242,7 +250,7 @@ export function RowRenamePage() {
 
       {running && (
         <ProgressBar
-          done={renamed.length}
+          done={results.length}
           total={undefined}
           label="Renaming collections"
         />
@@ -257,8 +265,13 @@ export function RowRenamePage() {
       {doneEvent && !error && (
         <div className="flex items-center gap-2 rounded-lg border bg-success/10 p-4 text-sm text-success">
           <Check className="h-4 w-4" aria-hidden="true" />
-          Done — renamed {doneEvent.total} collection
-          {doneEvent.total === 1 ? "" : "s"} on Plex.
+          <span>
+            Done — renamed {doneEvent.total} collection
+            {doneEvent.total === 1 ? "" : "s"} on Plex.
+            {nextRun.length > 0 &&
+              ` ${nextRun.length} take${nextRun.length === 1 ? "s" : ""} the new name at this row's next run.`}
+            {refused.length > 0 && ` ${refused.length} could not be renamed.`}
+          </span>
         </div>
       )}
 
@@ -266,37 +279,63 @@ export function RowRenamePage() {
         ref={logRef}
         className="max-h-[28rem] overflow-y-auto rounded-lg border bg-background"
       >
-        {renamed.length === 0 && running && (
+        {results.length === 0 && running && (
           <div className="flex items-center gap-2 p-4 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
             Starting rename...
           </div>
         )}
-        {renamed.length === 0 && !running && !error && (
+        {results.length === 0 && !running && !error && (
           <p className="p-4 text-sm text-muted-foreground">
             Nothing to rename — every collection already has the correct title.
           </p>
         )}
-        {renamed.map((e, i) => (
-          <div
-            key={i}
-            className="flex items-center gap-3 border-b px-4 py-2 text-sm last:border-b-0"
-          >
-            <Check
-              className="h-3.5 w-3.5 shrink-0 text-success"
-              aria-hidden="true"
-            />
-            <span className="font-medium">{e.display_name || e.user}</span>
-            <span className="text-muted-foreground">
-              {e.old} → {e.new}
-            </span>
-            {e.libraries && e.libraries.length > 0 && (
-              <Badge variant="secondary" className="ml-auto shrink-0">
-                {e.libraries.join(", ")}
-              </Badge>
-            )}
-          </div>
-        ))}
+        {results.length > 0 && (
+          <ul aria-label="Rename results">
+            {results.map((e, i) => (
+              <li
+                key={i}
+                className="flex items-center gap-3 border-b px-4 py-2 text-sm last:border-b-0"
+              >
+                {e.error ? (
+                  <X
+                    className="h-3.5 w-3.5 shrink-0 text-destructive-text"
+                    aria-hidden="true"
+                  />
+                ) : e.next_run ? (
+                  <Clock
+                    className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+                    aria-hidden="true"
+                  />
+                ) : (
+                  <Check
+                    className="h-3.5 w-3.5 shrink-0 text-success"
+                    aria-hidden="true"
+                  />
+                )}
+                {e.error ? (
+                  <span className="text-destructive-text">{e.error}</span>
+                ) : (
+                  <>
+                    <span className="font-medium">
+                      {e.display_name || e.user}
+                    </span>
+                    <span className="text-muted-foreground">
+                      {e.next_run
+                        ? `takes “${e.new}” at this row's next run`
+                        : `${e.old} → ${e.new}`}
+                    </span>
+                  </>
+                )}
+                {(e.libraries?.length || e.library) && (
+                  <Badge variant="secondary" className="ml-auto shrink-0">
+                    {e.libraries?.join(", ") || e.library}
+                  </Badge>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );
