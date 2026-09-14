@@ -1098,6 +1098,9 @@ def _privacy_sync(state, payload: dict) -> dict:
     _require_filters_merged(report, "reporting the filters as merged")
     _audit_hub_orderings(state, report, dry_run)
     swept = sum(len(titles) for key, titles in report.swept_rows.items() if not key.startswith(FREED_NAME_HELPER_KEY))
+    helpers_removed = sum(
+        len(titles) for key, titles in report.swept_rows.items() if key.startswith(FREED_NAME_HELPER_KEY)
+    )
     # The reason is carried through to the detail line so the Jobs page answers "why did this fire?"
     # — "someone was removed from a shared row" reads very differently from a nightly housekeeping
     # pass, and an operator seeing filters rewritten deserves to know which.
@@ -1107,6 +1110,10 @@ def _privacy_sync(state, payload: dict) -> dict:
         detail += f" after {reason}"
     if swept:
         detail += f"; swept {swept} unhidable row(s)"
+    # Not rows: collections a run that was stopped left behind while freeing a row's name. This job writes no
+    # run, so this line is the only record of deleting them (rule 10).
+    if helpers_removed:
+        detail += f"; removed {helpers_removed} leftover name-freeing helper collection(s)"
     # `privacy.sync` persists no run, so `report.left_alone_failures` has nowhere else to surface —
     # and this handler is the one the "leave their sharing alone" PATCH fires. Without this the toast
     # says the filters were merged while that account kept every exclude we promised to remove.
@@ -1155,6 +1162,7 @@ def _privacy_sync(state, payload: dict) -> dict:
     quiet = bool(payload.get("scheduled")) and not (
         reason
         or swept
+        or helpers_removed
         or report.filter_writes
         or report.converged
         or report.left_alone_failures

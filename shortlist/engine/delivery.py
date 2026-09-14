@@ -1899,6 +1899,9 @@ def sweep_broken_rows(
                 )
                 continue
             orphan_slug = slug_by_marker.get(collection.title[-64:]) or f"orphan:{marker_account(collection.title)}"
+            if is_name_freeing_helper(collection.title):
+                # Stopped between the helper's rename and its label: not a row of this person's either.
+                orphan_slug = f"{FREED_NAME_HELPER_KEY}{orphan_slug}"
             logger.warning(
                 "{}{}: removing an UNLABELLED orphan row in '{}' — no label, so no share filter can "
                 "hide it (visible to everyone)",

@@ -2269,6 +2269,7 @@ class TestAPrivacySyncSaysWhenItWasQuiet:
         [
             {"reason": "a person was switched off"},
             {"swept_rows": {"sarah": ["✨ Movies Picked for You"]}},
+            {"swept_rows": {"freed-name helper:sarah": ["Shortlist freed name 0123456789ab"]}},
             {"filter_writes": {100: {"username": "sarah", "fields": {"filterMovies": ("", "label!=Shortlist_mike")}}}},
             {"converged": ["sarah's row taken off your Home"]},
             {"left_alone_failures": {300: "mike: plex.tv refused the write"}},
@@ -2280,6 +2281,7 @@ class TestAPrivacySyncSaysWhenItWasQuiet:
         ids=[
             "caused by a change",
             "swept unhidable rows",
+            "removed a leftover helper",
             "wrote a filter",
             "converged",
             "could not leave an account alone",
@@ -2293,6 +2295,19 @@ class TestAPrivacySyncSaysWhenItWasQuiet:
         # `hub_orderings` has no row: this job switches shelf ordering off, so that list is always empty.
         payload = {**self.SCHEDULED, **({"reason": news.pop("reason")} if "reason" in news else {})}
         assert self._run(monkeypatch, sessions, payload, **news)["quiet"] is False
+
+    def test_a_leftover_helper_it_deleted_is_said_apart_from_rows(self, monkeypatch, sessions):
+        """This job writes no run, so its detail line is the only record of the delete (rule 10), and a helper
+        is not a row of anyone's."""
+        detail = self._run(
+            monkeypatch,
+            sessions,
+            self.SCHEDULED,
+            swept_rows={"freed-name helper:sarah": ["Shortlist freed name 0123456789ab"]},
+        )["detail"]
+
+        assert "removed 1 leftover name-freeing helper" in detail
+        assert "unhidable row" not in detail
 
     def test_a_warning_the_last_pass_already_gave_is_not_news_again(self, monkeypatch, sessions):
         """A kid profile Plex will not take a hide-list for is reported by EVERY pass. Counting it as news each

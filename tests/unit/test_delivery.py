@@ -1155,6 +1155,27 @@ class TestSweepBrokenRows:
         assert deleted == {f"{FREED_NAME_HELPER_KEY}mike": [helper.title]}
         plex.delete_owned_collection.assert_called_once_with(helper, "shortlist")
 
+    def test_an_unlabelled_helper_is_filed_as_a_helper_not_as_the_persons_row(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        """Killed between the helper's rename and its label write, it is swept as an unlabelled orphan."""
+        from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
+
+        marker = row_marker(4242)
+        helper = self._collection(movies, title=f"Shortlist freed name 0123456789ab{marker}")
+        healthy = self._collection(movies, "Shortlist_mike", title=f"✨ Picked for You{marker}")
+        plex = self._plex(movies, shows, helper, healthy)
+        plex.matches_section.return_value = True
+        plex.confirm_unlabelled.side_effect = lambda c, _prefix: c is helper
+
+        deleted = sweep_broken_rows(
+            plex,
+            engine_config.__class__(**{**engine_config.__dict__, "orphan_confirm_delay_s": 0}),
+            markers={"mike": marker},
+        )
+
+        assert deleted == {f"{FREED_NAME_HELPER_KEY}mike": [helper.title]}
+
     def test_a_row_someone_named_like_a_helper_is_left_alone(self, engine_config: EngineConfig, movies, shows):
         marker = row_marker(4242)
         row = self._collection(movies, "Shortlist_mike", title=f"Shortlist freed name of the week{marker}")
