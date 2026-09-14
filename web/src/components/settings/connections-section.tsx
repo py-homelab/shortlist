@@ -7,7 +7,7 @@ import {
   TmdbGlyph,
 } from "@/components/brand-glyphs";
 import { ConnectionCard } from "@/components/connection-card";
-import { settingString } from "@/lib/format";
+import { settingBool, settingString } from "@/lib/format";
 import { CURATOR_PROVIDERS, findProvider } from "@/lib/providers";
 import { useRuns } from "@/lib/queries";
 import { hasExa, hasExternalSearch, hasSearxng } from "@/lib/sources";
@@ -518,8 +518,8 @@ export function ConnectionsSection({ settings }: { settings: Settings }) {
           service="notify"
           title="Webhook"
           purpose="Where Shortlist sends its alerts: a Discord or Slack channel, ntfy, Gotify, Home Assistant, n8n, or anything else that accepts a webhook."
-          next="Choose what it sends under Notifications."
           settings={settings}
+          footnote={<WebhookNextStep settings={settings} />}
           summary={
             settingString(settings, "notify.webhook.url")
               ? settingString(settings, "notify.webhook.auth_header_value") &&
@@ -562,5 +562,31 @@ export function ConnectionsSection({ settings }: { settings: Settings }) {
         This product uses the TMDB API but is not endorsed or certified by TMDB.
       </p>
     </section>
+  );
+}
+
+/**
+ * Saving the address sends nothing by itself: the switch and the events are in Notifications, further
+ * down the page. Once an address is saved, say which of those states it is in and link straight there.
+ */
+function WebhookNextStep({ settings }: { settings: Settings }) {
+  if (!settingString(settings, "notify.webhook.url")) return null;
+  const events = settings["notify.webhook.events"];
+  const count = Array.isArray(events) ? events.length : 0;
+  const lead = !settingBool(settings, "notify.webhook.enabled")
+    ? "Not sending yet — turn it on and choose what to send in"
+    : count === 0
+      ? "Switched on, but nothing is ticked — choose what to send in"
+      : `Sends ${count} ${count === 1 ? "kind" : "kinds"} of alert — change them in`;
+  return (
+    <>
+      {lead}{" "}
+      <a
+        href="#notifications"
+        className="font-medium text-primary underline-offset-2 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Notifications →
+      </a>
+    </>
   );
 }

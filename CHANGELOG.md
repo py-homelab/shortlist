@@ -17,9 +17,10 @@ All notable changes to this project are documented here. This project follows
   or went wrong, and no message ever names anybody.
 
   The webhook's address has moved to a **Webhook** card in Settings → Connections, beside every other
-  service, with Send a test and Remove. If your receiver needs a key (ntfy, Gotify, n8n), add a header
-  name and value on the same card. It is sent with every message and stored encrypted; clear the name
-  to stop sending it.
+  service, with Send a test and Remove. Once an address is saved, the card says whether anything is
+  being sent yet and links to Notifications, where you turn it on and choose what it sends. If your
+  receiver needs a key (ntfy, Gotify, n8n), add a header name and value on the same card. It is sent
+  with every message and stored encrypted; clear the name to stop sending it.
 
 ### Fixed
 

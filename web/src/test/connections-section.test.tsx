@@ -89,6 +89,43 @@ describe("ConnectionsSection", () => {
       expect(within(card).getByText(/Clear the name to stop sending a header/i)).toBeInTheDocument();
     });
 
+    describe("the way on to Notifications", () => {
+      const address = { "notify.webhook.url": "•••••" };
+      const nextStep = () =>
+        within(screen.getByTestId("connection-notify")).queryByRole("link", {
+          name: /Notifications/i,
+        });
+
+      it("says nothing is sent yet while the switch is off", () => {
+        renderSection({ ...address, "notify.webhook.enabled": false });
+        const link = nextStep();
+        expect(link?.getAttribute("href")).toBe("#notifications");
+        expect(within(screen.getByTestId("connection-notify")).getByText(/Not sending yet/i)).toBeInTheDocument();
+      });
+
+      it("counts what it sends once it is on", () => {
+        renderSection({
+          ...address,
+          "notify.webhook.enabled": true,
+          "notify.webhook.events": ["run.failed", "privacy.exposure"],
+        });
+        expect(nextStep()?.getAttribute("href")).toBe("#notifications");
+        expect(within(screen.getByTestId("connection-notify")).getByText(/Sends 2 kinds of alert/i)).toBeInTheDocument();
+      });
+
+      it("says when it is on with nothing ticked", () => {
+        renderSection({ ...address, "notify.webhook.enabled": true, "notify.webhook.events": [] });
+        expect(within(screen.getByTestId("connection-notify")).getByText(/nothing is ticked/i)).toBeInTheDocument();
+      });
+
+      it("appears as soon as an address is saved, not before", () => {
+        const { refresh } = renderSection({});
+        expect(nextStep()).toBeNull();
+        refresh({ ...address });
+        expect(nextStep()).not.toBeNull();
+      });
+    });
+
     it("removes the address and the header together", async () => {
       renderSection(saved);
       const card = screen.getByTestId("connection-notify");

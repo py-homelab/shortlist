@@ -285,4 +285,6 @@ address, header name and header value in one form, with "Send a test" (never run
 a real message) and Remove, like every other service. A blank header name sends no header, which is
 how the owner takes one off without removing the webhook. The Notifications section keeps only the
 on/off switch and "What to send" (Runs / Jobs / Everything else), and points at the card when no
-address is saved.
+address is saved. The card points the other way once an address is saved — "Not sending yet", "Sends N
+kinds of alert" or "nothing is ticked", linking to Notifications — because saving an address alone
+sends nothing and the switch is further down the page.

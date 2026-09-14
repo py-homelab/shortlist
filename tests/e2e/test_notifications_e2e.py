@@ -8,6 +8,7 @@ the queue draining them, and every message that leaves naming nobody.
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -155,6 +156,11 @@ def test_the_webhook_is_set_up_and_removed_from_its_connection_card(page: Page, 
     card.get_by_label("Header value").fill("k3y-value")
     card.get_by_role("button", name="Save", exact=True).click()
     expect(card.get_by_text("Address and auth header saved")).to_be_visible()
+    # Saving sends nothing yet: the card says so and links to where it is switched on.
+    expect(card.get_by_text("Not sending yet", exact=False)).to_be_visible()
+    card.get_by_role("link", name="Notifications").click()
+    expect(page).to_have_url(re.compile(r"#notifications$"))
+    expect(page.get_by_role("switch", name="Send alerts to a webhook")).to_be_in_viewport()
     saved = app.api("GET", "/api/settings").json()
     assert saved["notify.webhook.url"] == "•••••"
     assert saved["notify.webhook.auth_header_name"] == "X-Api-Key"
