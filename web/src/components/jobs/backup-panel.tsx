@@ -58,7 +58,11 @@ export function BackupPanel() {
   });
   const cancelRestore = useMutation({
     mutationFn: api.cancelRestore,
-    onSuccess: refreshPending,
+    onSuccess: () => {
+      // Or the "Ready to restore" receipt from before comes back once the waiting notice goes.
+      restore.reset();
+      return refreshPending();
+    },
   });
   const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
   const waiting = pendingRestore.data?.pending ?? null;

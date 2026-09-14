@@ -99,4 +99,22 @@ describe("BackupPanel — a restore waiting for a restart", () => {
 
     expect(await screen.findByRole("status", { name: /restore waiting/i })).toBeInTheDocument();
   });
+
+  it("says nothing is ready after the waiting restore is cancelled", async () => {
+    getPendingRestore
+      .mockResolvedValueOnce({ pending: null })
+      .mockResolvedValueOnce({ pending: { backup: BACKUP.name, requested_at: "2026-09-14T00:00:00+00:00" } })
+      .mockResolvedValue({ pending: null });
+    restoreBackup.mockResolvedValue({ restored: BACKUP.name, message: "Ready to restore.", privacy_note: "Rows note." });
+    cancelRestore.mockResolvedValue({ pending: null });
+
+    renderPanel();
+    await userEvent.click(await screen.findByRole("button", { name: "Restore" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await userEvent.click(await screen.findByRole("button", { name: /cancel the restore/i }));
+
+    await waitFor(() => expect(screen.queryByRole("status", { name: /restore waiting/i })).not.toBeInTheDocument());
+    expect(screen.queryByText(/Ready to restore/)).not.toBeInTheDocument();
+    expect(screen.queryByText("Rows note.")).not.toBeInTheDocument();
+  });
 });

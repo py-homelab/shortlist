@@ -1140,6 +1140,8 @@ class TestSweepBrokenRows:
         plex.delete_owned_collection.assert_called_once_with(stranded, "shortlist")
 
     def test_deletes_a_name_freeing_helper_a_killed_run_left_behind(self, engine_config: EngineConfig, movies, shows):
+        from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
+
         """`_reclaim_orphaned_name` deletes its helper in a `finally`, which a killed process never reaches.
         Nothing else matches the helper to a row, so it would sit on that person's Home for good."""
         marker = row_marker(4242)
@@ -1149,7 +1151,8 @@ class TestSweepBrokenRows:
 
         deleted = sweep_broken_rows(plex, engine_config, markers={"mike": marker})
 
-        assert deleted == {"mike": [helper.title]}
+        # Not filed under "mike": that is their deleted ROWS, which the run page lists as theirs.
+        assert deleted == {f"{FREED_NAME_HELPER_KEY}mike": [helper.title]}
         plex.delete_owned_collection.assert_called_once_with(helper, "shortlist")
 
     def test_a_row_someone_named_like_a_helper_is_left_alone(self, engine_config: EngineConfig, movies, shows):

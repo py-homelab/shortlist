@@ -22,6 +22,7 @@ from sqlalchemy import and_, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
 from shortlist.engine.models import SHARED_SLUG_PREFIX
 from shortlist.engine.requests import QUEUE_REASON_PREFIXES
 from shortlist.server.db.models import (
@@ -1437,7 +1438,9 @@ def _emit_sweep_event(session: Session, run_id: int, report) -> None:
         dry_run=report.dry_run,
         reason="row was broken beyond repair-in-place — no share filter could hide it (wrong "
         "type for its library, or no shortlist label at all — an orphan from an interrupted "
-        "run), or it shared a collection tag with other users' rows and held their picks",
+        "run), or it shared a collection tag with other users' rows and held their picks. Keys "
+        "starting 'freed-name helper:' are not rows: a helper a stopped run left behind while "
+        "freeing a row's name",
         deleted=report.swept_rows,
     )
 
@@ -1666,7 +1669,9 @@ def _finalize_run(
         # Built nothing, but nothing went wrong — see RunUser.reason for which case it was.
         "users_skipped": skipped,
         "dry_run": report.dry_run,
-        "rows_swept": sum(len(titles) for titles in report.swept_rows.values()),
+        "rows_swept": sum(
+            len(titles) for key, titles in report.swept_rows.items() if not key.startswith(FREED_NAME_HELPER_KEY)
+        ),
         "shares_updated": len(report.filter_writes),
         "titles_added": titles_added,
         "titles_removed": titles_removed,

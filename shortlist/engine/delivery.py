@@ -35,6 +35,9 @@ RENAMED, KEPT, REBUILD = "renamed", "kept", "rebuild"
 #: The name a helper collection moves to once it has freed a row's name (`_reclaim_orphaned_name`). A
 #: helper still standing is debris from a stopped run: `sweep_broken_rows` deletes it and promotion skips it.
 FREED_NAME_PREFIX = "Shortlist freed name "
+#: `sweep_broken_rows` files a deleted helper under this prefix + the owner's slug, not the slug alone:
+#: that key lists a person's deleted ROWS, and a helper was never one.
+FREED_NAME_HELPER_KEY = "freed-name helper:"
 _FREED_NAME = re.compile(rf"^{re.escape(FREED_NAME_PREFIX)}[0-9a-f]{{12}}$")
 
 
@@ -1930,5 +1933,7 @@ def sweep_broken_rows(
         title = collection.title
         if not dry_run:
             plex.delete_owned_collection(collection, LABEL_PREFIX)
-        deleted.setdefault(slug, []).append(title)
+        deleted.setdefault(
+            f"{FREED_NAME_HELPER_KEY}{slug}" if leftover_helper and not (unhidable or shares_tag) else slug, []
+        ).append(title)
     return deleted

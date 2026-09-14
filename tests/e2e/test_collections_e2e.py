@@ -41,6 +41,18 @@ def _saved_row(page: Page, name: str):
     return page.get_by_text(name, exact=False).first
 
 
+def _edit_row(page: Page, name: str) -> None:
+    """Open THIS row's editor. `Edit.last` clicked whichever card rendered last — under load the list
+    from before the save, so the editor opened the default row instead (seen twice at load 27)."""
+    actions = (
+        page.locator("div")
+        .filter(has=page.get_by_role("link", name=f"Remove or delete {name}"))
+        .filter(has=page.get_by_role("button", name="Edit"))
+        .last
+    )
+    actions.get_by_role("button", name="Edit").click()
+
+
 def _open_rows(page: Page) -> None:
     page.goto("/rows")
     expect(page.get_by_role("heading", name="Rows", exact=True)).to_be_visible(timeout=LOAD)
@@ -86,7 +98,7 @@ def test_a_row_can_be_given_a_built_in_text_poster(page: Page, app: ShortlistApp
     expect(_saved_row(page, "Poster Row")).to_be_visible(timeout=LOAD)
 
     # Re-open it and choose a built-in text poster — this needs no AI provider, so it works on any setup.
-    page.get_by_role("button", name="Edit").last.click()
+    _edit_row(page, "Poster Row")
     expect(page.get_by_label("Name", exact=True)).to_have_value("Poster Row")
     # The poster sits in the open "How it looks on Plex" group, beside the name it belongs to.
     page.get_by_role("button", name="Text", exact=True).click()
@@ -110,7 +122,7 @@ def test_a_row_can_be_given_a_description_and_sort_title_prefix(page: Page, app:
     page.get_by_role("button", name="Add row").click()
     expect(_saved_row(page, "Sorted Row")).to_be_visible(timeout=LOAD)
 
-    page.get_by_role("button", name="Edit").last.click()
+    _edit_row(page, "Sorted Row")
     expect(page.get_by_label("Name", exact=True)).to_have_value("Sorted Row")
     page.get_by_label("Description", exact=True).fill("Picked for {user}")
     page.get_by_label("Sort title prefix").fill("!010_")

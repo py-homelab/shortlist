@@ -34,7 +34,7 @@ from loguru import logger
 from sqlalchemy import text
 
 from shortlist.engine.clients.http_retry import redact
-from shortlist.engine.delivery import row_marker
+from shortlist.engine.delivery import FREED_NAME_HELPER_KEY, row_marker
 from shortlist.engine.models import LABEL_PREFIX
 from shortlist.server.db.models import Job
 from shortlist.server.services.audit import add_audit, audit_restored_restrictions, write_audit
@@ -1097,7 +1097,7 @@ def _privacy_sync(state, payload: dict) -> dict:
     audit_restored_restrictions(state, report)
     _require_filters_merged(report, "reporting the filters as merged")
     _audit_hub_orderings(state, report, dry_run)
-    swept = sum(len(titles) for titles in report.swept_rows.values())
+    swept = sum(len(titles) for key, titles in report.swept_rows.items() if not key.startswith(FREED_NAME_HELPER_KEY))
     # The reason is carried through to the detail line so the Jobs page answers "why did this fire?"
     # — "someone was removed from a shared row" reads very differently from a nightly housekeeping
     # pass, and an operator seeing filters rewritten deserves to know which.

@@ -94,7 +94,10 @@ def _rotate(backup_dir: Path, max_keep: int) -> None:
         except OSError:
             return 0.0  # sorts last, so it is a rotation candidate; the unlink below tolerates it
 
-    backups = sorted(backup_dir.glob("shortlist_*.db"), key=_mtime, reverse=True)
+    # Never the backup a restore is waiting for: it would be gone by the restart that applies it.
+    waiting = pending_restore(backup_dir.parent)
+    keep = waiting["backup"] if waiting else None
+    backups = sorted((b for b in backup_dir.glob("shortlist_*.db") if b.name != keep), key=_mtime, reverse=True)
     for old in backups[max_keep:]:
         try:
             old.unlink()
@@ -242,6 +245,8 @@ def apply_pending_restore(config_dir: Path, now: datetime | None = None) -> dict
     """
     marker = config_dir / RESTORE_PENDING
     if not marker.exists():
+        # A boot killed inside the copy below had already removed the request, so nothing else would.
+        (config_dir / RESTORE_STAGING).unlink(missing_ok=True)
         return None
     try:
         queued = json.loads(marker.read_text())

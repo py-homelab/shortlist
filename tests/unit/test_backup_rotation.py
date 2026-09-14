@@ -123,3 +123,52 @@ class TestARestoreNeverOverwritesTheOnlyCopy:
         with sqlite3.connect(tmp_path / "shortlist.db") as con:
             tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         assert "only_in_the_live_db" not in tables, "the chosen backup did not replace the live database"
+
+
+class TestAWaitingRestoreKeepsItsBackup:
+    """A restore waits for the next restart, and backups keep being taken meanwhile (nightly, "Back up
+    now"). The rotation used to delete the oldest backup even when it was the one waiting to be restored,
+    so the restart found nothing to restore and the owner's restore point was gone (review 2026-09-14)."""
+
+    def _install(self, tmp_path: Path) -> Path:
+        from shortlist.server.db.session import make_engine, run_migrations
+
+        run_migrations(tmp_path)
+        make_engine(tmp_path).dispose()
+        chosen = backup_mod.take_backup(tmp_path, label="chosen")
+        assert chosen is not None
+        return chosen
+
+    def test_rotation_skips_the_backup_a_restore_is_waiting_for(self, tmp_path: Path):
+        import os
+
+        chosen = self._install(tmp_path)
+        os.utime(chosen, (1, 1))  # the oldest of all
+        _make_backups(tmp_path / "backups", 4)
+        assert backup_mod.request_restore(tmp_path, chosen.name, max_keep=3)
+
+        backup_mod._rotate(tmp_path / "backups", max_keep=3)
+
+        assert chosen.exists()
+        assert backup_mod.apply_pending_restore(tmp_path)["status"] == "restored"
+
+    def test_a_cancelled_restore_no_longer_protects_its_backup(self, tmp_path: Path):
+        import os
+
+        chosen = self._install(tmp_path)
+        os.utime(chosen, (1, 1))
+        _make_backups(tmp_path / "backups", 4)
+        backup_mod.request_restore(tmp_path, chosen.name, max_keep=3)
+        backup_mod.cancel_restore(tmp_path)
+
+        backup_mod._rotate(tmp_path / "backups", max_keep=3)
+
+        assert not chosen.exists()
+
+    def test_a_copy_left_by_a_boot_killed_mid_restore_is_removed_on_the_next(self, tmp_path: Path):
+        """The request is removed before the copy starts, so a boot killed inside it left a database-sized
+        `shortlist.db.restoring` in /config that nothing ever removed."""
+        (tmp_path / backup_mod.RESTORE_STAGING).write_bytes(b"half a database")
+
+        assert backup_mod.apply_pending_restore(tmp_path) is None
+        assert not (tmp_path / backup_mod.RESTORE_STAGING).exists()
