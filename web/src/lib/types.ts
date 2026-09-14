@@ -431,6 +431,8 @@ export type LogPage = Schemas["LogsOut"];
 export type SyncsInfo = Schemas["SyncsOut"];
 
 export type Backup = Schemas["BackupOut"];
+/** The restore waiting for the next start, if any (it is applied at boot, see `backups.apply_pending_restore`). */
+export type PendingRestore = Schemas["PendingRestoreOut"];
 
 export type VersionInfo = Schemas["VersionOut"];
 

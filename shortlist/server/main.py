@@ -81,6 +81,14 @@ def _instance_secret(config_dir: Path, name: str) -> str:
     return existing
 
 
+#: How a restore applied (or not) at boot is audited: `backups.apply_pending_restore`'s status -> (scope, level).
+_RESTORE_AUDIT = {
+    "restored": ("backup.restore", "warning"),
+    "failed": ("backup.restore_failed", "error"),
+    "expired": ("backup.restore_expired", "warning"),
+}
+
+
 # Baseline response headers. Deliberately NOT a locked-down CSP: Shortlist renders Plex avatars and
 # TMDB artwork from hosts that vary per install, and Vite's build emits inline styles — a strict
 # policy would blank the UI on somebody else's server, which is how security headers get switched off
@@ -219,13 +227,14 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             unreadable = store.undecryptable_secrets()
             store.seed_from_env(dict(os.environ))
             if restore is not None:
-                if restore["ok"]:
+                if restore["status"] == "restored":
                     whats_new.keep_closed(store, closed_notes)
-                # Audited in the database it produced, since the one it replaced is now a backup (rule 10).
+                # Audited in the database the boot ended up on: the restored one, or the one it kept (rule 10).
+                scope, level = _RESTORE_AUDIT[restore["status"]]
                 session.add(
                     Event(
-                        scope="backup.restore" if restore["ok"] else "backup.restore_failed",
-                        level="warning" if restore["ok"] else "error",
+                        scope=scope,
+                        level=level,
                         message={"backup": restore["backup"], "at": datetime.now(UTC).isoformat()},
                     )
                 )
@@ -262,7 +271,11 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             )
             stale = session.query(Run).filter(Run.status.in_(("queued", "running"))).all()
             booted_at = datetime.now(UTC)
-            unfinished = [plan for run in stale if (plan := missed_by_restart(session, run, booted_at))]
+            # Not after a restore: a run the BACKUP caught mid-flight is history, not a run this restart cut short.
+            restored = restore is not None and restore["status"] == "restored"
+            unfinished = (
+                [] if restored else [plan for run in stale if (plan := missed_by_restart(session, run, booted_at))]
+            )
             for run in stale:
                 run.status = "aborted"
                 run.finished_at = booted_at

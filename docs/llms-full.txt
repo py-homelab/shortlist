@@ -1952,7 +1952,9 @@ copies of each user's original Plex share filters that an uninstall restores fro
 
 Restoring one takes effect when you restart the container: Shortlist saves a copy of the current
 database and swaps the backup in as it starts, before anything else opens the database. Until that
-restart it keeps running on the database it has.
+restart it keeps running on the database it has, and Jobs → Backups says a restore is waiting, with a
+button to cancel it. A restore still waiting a day later is dropped rather than applied by whatever
+restarts the container next.
 
 Because a backup holds your rows' **audiences**, restoring one also restores who could see which
 rows at that moment. If you have narrowed a shared row's audience since the backup was taken,
@@ -2759,6 +2761,7 @@ POST /api/collections/{id}/poster/upload (multipart image) · GET/DELETE /api/co
 GET  /api/system/image-provider -> {capable, provider, reason} (can the AI provider generate poster images — drives the row editor's Generate gate)
 GET  /api/system/logs?level=&q=&limit= (parsed + redacted log lines) · GET /api/system/logs/download (all log files as a zip; credentials, addresses and this server's machine id removed — the live view above strips credentials only, since it renders on the owner's own screen where the address is what makes a line readable)
 GET  /api/system/libraries -> [{key, title, type}] (the server's Plex libraries, for the row editor)
+GET  /api/system/backups -> [{name, size_bytes, created_at}] · POST /api/system/backups -> {name, size_bytes} · POST /api/system/backups/restore {name} -> {restored, message, privacy_note} (QUEUES the restore; it is applied when the container next starts, before anything opens the database, after a pre-restore copy; one still waiting a day later is dropped) · GET /api/system/backups/restore -> {pending: {backup, requested_at} | null} · DELETE /api/system/backups/restore -> {pending: null} (cancels the waiting restore)
 GET  /api/system/jobs?kind=&limit=&before_id=&status=&exclude_routine= -> [{id, kind, payload, result, status, attempts, max_attempts, detail, error, created_at, started_at, finished_at}] (background maintenance history, newest first; `kind` narrows it to one job type, which is how the Jobs page shows a single job's own history; `status` narrows it to one of `queued`/`running`/`done`/`failed` and anything else is refused with 422 rather than ignored — the Jobs page's "N failed" badge counts every failed row in the table, so its list has to be able to reach past the newest page; `exclude_routine=true` drops the high-volume automatic kinds unless they FAILED — `watch.reconcile` alone is one job per playback stop, measured at 165 of the 197 jobs a 46-user server queued in a day, so it is what the header's activity feed passes and the Jobs page does not; runs have their own page)
 GET  /api/schedule -> {jobs[{kind, label, setting, cron, using_default, default_cron, optional, writes_plex, next_run}], rows[{cron, rows[], next_run}]} (everything on a timer, rows grouped by shared cron exactly as the scheduler groups them. One trigger builds all of them). `cron` is the EFFECTIVE one with defaults resolved; `default_cron` is the built-in it falls back to when nothing is stored, and `using_default` says whether that is what it is running on. Read-only: crons are still edited through PUT /api/settings and PATCH /api/collections, so each one is validated in exactly one place
 GET  /api/system/jobs/catalog -> [{kind, label, description, manual, trigger, scheduled, next_run, last, total, queued, running, failed}] (every job Shortlist can run, with its schedule, its tallies and its most recent run — the Jobs page renders straight from this, so labels can't drift from the handler registry)

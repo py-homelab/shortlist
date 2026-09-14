@@ -216,3 +216,21 @@ class TestAScheduledRunCutShortIsFinishedOnce:
         _boot(tmp_path)
 
         assert [call["collection_ids"] for call in started] == [[ids["rows"]["night_a"]]]
+
+    def test_restoring_a_backup_that_caught_a_run_mid_flight_starts_no_run(self, tmp_path: Path, started):
+        """A backup taken at 04:00 holds that night's run as `running`. Restoring it is not a restart
+        cutting that run short, and a real run must not start on the restored configuration by itself."""
+        from shortlist.server.services.backup import request_restore, take_backup
+
+        first = _boot(tmp_path)
+        self._seed(first)
+        backup = take_backup(tmp_path, label="manual")
+        with first.app.state.sessions() as session:
+            for run in session.query(Run).all():
+                run.status = "ok"
+            session.commit()
+        assert request_restore(tmp_path, backup.name)
+
+        _boot(tmp_path)
+
+        assert started == []

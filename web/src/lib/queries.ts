@@ -79,6 +79,7 @@ export const queryKeys = {
   version: ["version"] as const,
   imageProvider: ["image-provider"] as const,
   backups: ["backups"] as const,
+  pendingRestore: ["backups", "restore"] as const,
   // The base key ("jobs") covers every job-queue query for a broad "something changed" invalidation
   // (fired after every mutation — App.tsx); `jobsCatalog` is what the catalogue query itself uses.
   jobs: ["jobs"] as const,

@@ -3301,6 +3301,46 @@
         "title": "OwnedCollectionsOut",
         "type": "object"
       },
+      "PendingRestore": {
+        "additionalProperties": true,
+        "properties": {
+          "backup": {
+            "title": "Backup",
+            "type": "string"
+          },
+          "requested_at": {
+            "title": "Requested At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "backup",
+          "requested_at"
+        ],
+        "title": "PendingRestore",
+        "type": "object"
+      },
+      "PendingRestoreOut": {
+        "additionalProperties": true,
+        "description": "The restore waiting for a restart, if any.",
+        "properties": {
+          "pending": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PendingRestore"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "pending"
+        ],
+        "title": "PendingRestoreOut",
+        "type": "object"
+      },
       "PerRowOut": {
         "additionalProperties": true,
         "description": "One (row, library) line. A row targeting >1 library is one Plex collection per library.",
@@ -11284,8 +11324,48 @@
       }
     },
     "/api/system/backups/restore": {
+      "delete": {
+        "description": "Cancel the restore waiting for the next start. Nothing has been changed yet, so nothing is undone.",
+        "operationId": "cancel_restore_endpoint_api_system_backups_restore_delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingRestoreOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Cancel Restore Endpoint",
+        "tags": [
+          "system"
+        ]
+      },
+      "get": {
+        "description": "The restore waiting for the next start, so the owner can see it is still to come, or cancel it.",
+        "operationId": "pending_restore_endpoint_api_system_backups_restore_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingRestoreOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Pending Restore Endpoint",
+        "tags": [
+          "system"
+        ]
+      },
       "post": {
-        "description": "Queue a restore from a named backup. It is applied when the app next starts.\n\nNot applied here: the running app has the database open, and swapping the file under its pooled\nconnections let the shutdown checkpoint write the old database back over the restored one, so the\nrestart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the\npre-restore copy there (so it holds everything written until the restart), and audits it in the\ndatabase it restored.\n\nA restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a\ncopy taken before a shared row's audience was narrowed puts the wider audience back, and the\nshared-exclude prune \u2014 the only un-hiding path Shortlist has \u2014 then removes the `label!=` excludes\nthat were hiding that row. That is correct for the config being restored, and it is exactly the\nkind of change an operator does not expect from a button labelled \"restore\".\n\nSo it is stated, in the response, rather than left to be discovered on someone's Home screen.",
+        "description": "Queue a restore from a named backup. It is applied when the app next starts.\n\nNot applied here: the running app has the database open, and swapping the file under its pooled\nconnections let the shutdown checkpoint write the old database back over the restored one, so the\nrestart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the\npre-restore copy there (so it holds everything written until the restart), and audits it in the\ndatabase it restored. Until then it can be seen and cancelled (`GET`/`DELETE` below), and one left\nwaiting for over a day is not applied.\n\nA restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a\ncopy taken before a shared row's audience was narrowed puts the wider audience back, and the\nshared-exclude prune \u2014 the only un-hiding path Shortlist has \u2014 then removes the `label!=` excludes\nthat were hiding that row. That is correct for the config being restored, and it is exactly the\nkind of change an operator does not expect from a button labelled \"restore\".\n\nSo it is stated, in the response and in the audit trail (rule 10), rather than left to be\ndiscovered on someone's Home screen.",
         "operationId": "restore_backup_endpoint_api_system_backups_restore_post",
         "requestBody": {
           "content": {

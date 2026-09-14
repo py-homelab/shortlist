@@ -1136,3 +1136,119 @@ class TestARestoreIsAppliedByTheRestartItAsksFor:
 
         with self._boot(tmp_path) as client:
             assert self._get(client, "app.release_notes_seen") == "1.8.0"
+
+    @staticmethod
+    def _fill_backups(config_dir, count: int, *, first_value: str) -> list[str]:
+        """`count` backups, oldest first, the oldest holding `app.probe = first_value`."""
+        import os
+        import shutil
+        import time
+
+        from shortlist.server.services.backup import take_backup
+
+        oldest = take_backup(config_dir, label="manual")
+        names = [oldest.name]
+        base = time.time() - 10_000
+        os.utime(oldest, (base, base))
+        for i in range(1, count):
+            copy = oldest.with_name(f"shortlist_20260101_0000{i:02d}_filler.db")
+            shutil.copy2(oldest, copy)
+            os.utime(copy, (base + i, base + i))
+            names.append(copy.name)
+        assert first_value  # the value the oldest was taken with is set by the caller before this
+        return names
+
+    def test_restoring_the_oldest_backup_survives_the_copy_taken_first(self, tmp_path):
+        """Architecture review 2026-09-14. The pre-restore copy rotates the backups, and the one it rotates
+        out is the oldest: the very file being restored. The copy that followed raised, the boot failed,
+        and the owner's restore point was gone."""
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.probe", "the oldest backup")
+            names = self._fill_backups(tmp_path, 10, first_value="the oldest backup")
+            self._set(client, "app.probe", "current")
+            assert client.post("/api/system/backups/restore", json={"name": names[0]}).status_code == 200
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "the oldest backup"
+
+    def test_a_restore_keeps_the_owners_backup_limit(self, tmp_path):
+        from shortlist.server.services.backup import list_backups
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "backup.max_keep", 20)
+            self._set(client, "app.probe", "in the backup")
+            names = self._fill_backups(tmp_path, 12, first_value="in the backup")
+            client.post("/api/system/backups/restore", json={"name": names[-1]})
+
+        with self._boot(tmp_path):
+            pass
+        assert len(list_backups(tmp_path)) == 13, "a restore trimmed the backups to the default of 10"
+
+    def test_a_restore_that_fails_at_boot_leaves_the_database_alone_and_says_so(self, tmp_path):
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+        (tmp_path / "backups" / backup.name).chmod(0)
+        try:
+            with self._boot(tmp_path) as client:
+                assert self._get(client, "app.probe") == "written after it"
+                with client.app.state.sessions() as session:
+                    assert [e.scope for e in session.query(Event).filter(Event.scope.like("backup.restore%"))] == [
+                        "backup.restore_requested",
+                        "backup.restore_failed",
+                    ]
+        finally:
+            (tmp_path / "backups" / backup.name).chmod(0o644)
+        assert not (tmp_path / "shortlist.db.restoring").exists(), "a half-copied database was left behind"
+
+    def test_asking_for_a_restore_is_audited_before_the_restart(self, tmp_path):
+        from shortlist.server.db.models import Event
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            backup = take_backup(tmp_path, label="manual")
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+            with client.app.state.sessions() as session:
+                requested = session.query(Event).filter(Event.scope == "backup.restore_requested").one()
+                assert requested.message["backup"] == backup.name
+
+    def test_a_waiting_restore_can_be_seen_and_cancelled(self, tmp_path):
+        from shortlist.server.db.models import Event
+        from shortlist.server.services.backup import take_backup
+
+        with self._boot(tmp_path) as client:
+            self._set(client, "app.probe", "in the backup")
+            backup = take_backup(tmp_path, label="manual")
+            self._set(client, "app.probe", "current")
+            assert client.get("/api/system/backups/restore").json() == {"pending": None}
+            client.post("/api/system/backups/restore", json={"name": backup.name})
+
+            pending = client.get("/api/system/backups/restore").json()["pending"]
+            assert pending["backup"] == backup.name and pending["requested_at"]
+
+            assert client.delete("/api/system/backups/restore").status_code == 200
+            assert client.get("/api/system/backups/restore").json() == {"pending": None}
+            with client.app.state.sessions() as session:
+                assert session.query(Event).filter(Event.scope == "backup.restore_cancelled").count() == 1
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "current"
+
+    def test_a_restore_left_waiting_more_than_a_day_is_not_applied(self, tmp_path):
+        import json
+        from datetime import UTC, datetime, timedelta
+
+        from shortlist.server.db.models import Event
+
+        backup = self._backup_then_diverge(tmp_path)
+        marker = tmp_path / "restore-pending.json"
+        queued = json.loads(marker.read_text())
+        queued["requested_at"] = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
+        marker.write_text(json.dumps(queued))
+
+        with self._boot(tmp_path) as client:
+            assert self._get(client, "app.probe") == "written after it"
+            with client.app.state.sessions() as session:
+                expired = session.query(Event).filter(Event.scope == "backup.restore_expired").one()
+                assert expired.message["backup"] == backup.name
+        assert not marker.exists()

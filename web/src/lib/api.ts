@@ -13,6 +13,7 @@ import type {
   ArrOptions,
   SeerrOptions,
   Backup,
+  PendingRestore,
   BlockedSeed,
   DeletedRowHistory,
   EffectivenessReport,
@@ -755,6 +756,12 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ name }),
     }),
+
+  getPendingRestore: (): Promise<PendingRestore> =>
+    request("/api/system/backups/restore"),
+
+  cancelRestore: (): Promise<PendingRestore> =>
+    request("/api/system/backups/restore", { method: "DELETE" }),
 
   // --- Support Mode ---
   // The tools 403 until the mode is on; `supportStatus` is what the page uses to tell the two

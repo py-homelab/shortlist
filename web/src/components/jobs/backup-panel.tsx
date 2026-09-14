@@ -9,7 +9,7 @@ import { Segmented } from "@/components/segmented";
 import { Button } from "@/components/ui/button";
 import { api } from "@/lib/api";
 import { describeCron } from "@/lib/cron";
-import { formatSize, timeAgo } from "@/lib/format";
+import { formatDate, formatSize, timeAgo } from "@/lib/format";
 import { queryKeys, useSaveSettings, useSettings } from "@/lib/queries";
 
 const RETENTION_OPTIONS = ["5", "10", "20", "30"];
@@ -29,6 +29,12 @@ function describeBackupSchedule(cron: string): string {
   return first.toLowerCase() + description.slice(1);
 }
 
+/** When a waiting restore stops being applied: a day after it was asked for (`RESTORE_EXPIRES_AFTER`,
+ *  server/services/backup.py). */
+function restoreDeadline(requestedAt: string): string {
+  return new Date(new Date(requestedAt).getTime() + 24 * 60 * 60 * 1000).toISOString();
+}
+
 /** Backups: what's in one, where it lives, how often, how many to keep, and the restore list. */
 export function BackupPanel() {
   const queryClient = useQueryClient();
@@ -38,8 +44,24 @@ export function BackupPanel() {
     queryKey: queryKeys.backups,
     queryFn: api.getBackups,
   });
-  const restore = useMutation({ mutationFn: api.restoreBackup });
+  // A restore is applied when the container next starts, so until then it is a thing that is still to
+  // come: said here for as long as it waits, with a way to take it back.
+  const pendingRestore = useQuery({
+    queryKey: queryKeys.pendingRestore,
+    queryFn: api.getPendingRestore,
+  });
+  const refreshPending = () =>
+    queryClient.invalidateQueries({ queryKey: queryKeys.pendingRestore });
+  const restore = useMutation({
+    mutationFn: api.restoreBackup,
+    onSuccess: refreshPending,
+  });
+  const cancelRestore = useMutation({
+    mutationFn: api.cancelRestore,
+    onSuccess: refreshPending,
+  });
   const [confirmRestore, setConfirmRestore] = useState<string | null>(null);
+  const waiting = pendingRestore.data?.pending ?? null;
 
   const backupCron = ((settings.data ?? {})["backup.cron"] as string) ?? "";
   const backupMaxKeep =
@@ -103,7 +125,45 @@ export function BackupPanel() {
         </div>
       </div>
 
-      {restore.isSuccess && (
+      {waiting && (
+        <div
+          role="status"
+          aria-label="Restore waiting for a restart"
+          className="space-y-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-sm"
+        >
+          <p>
+            <span className="font-medium">Restore waiting.</span> Restart the
+            container to swap in{" "}
+            <span className="font-mono text-xs">
+              {waiting.backup.replace("shortlist_", "").replace(".db", "")}
+            </span>
+            ; a copy of the current database is saved first. Until then
+            Shortlist keeps running as it is, and if it has not restarted by{" "}
+            {formatDate(restoreDeadline(waiting.requested_at))} the restore is
+            dropped.
+          </p>
+          <p className="text-muted-foreground">
+            It also puts back who could see which rows at the time of the
+            backup, so check Rows before restarting.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            loading={cancelRestore.isPending}
+            onClick={() => cancelRestore.mutate()}
+          >
+            Cancel the restore
+          </Button>
+          {cancelRestore.isError && (
+            <MutationAlert
+              error={cancelRestore.error}
+              fallback="Couldn’t cancel the restore."
+            />
+          )}
+        </div>
+      )}
+
+      {restore.isSuccess && !waiting && (
         <div className="space-y-1.5">
           <p className="text-sm text-success">{restore.data.message}</p>
           {/* A restore is not a neutral rollback: the database decides who may see which rows, so

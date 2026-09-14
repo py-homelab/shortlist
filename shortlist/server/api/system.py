@@ -1039,7 +1039,8 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
     connections let the shutdown checkpoint write the old database back over the restored one, so the
     restart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the
     pre-restore copy there (so it holds everything written until the restart), and audits it in the
-    database it restored.
+    database it restored. Until then it can be seen and cancelled (`GET`/`DELETE` below), and one left
+    waiting for over a day is not applied.
 
     A restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a
     copy taken before a shared row's audience was narrowed puts the wider audience back, and the
@@ -1047,15 +1048,27 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
     that were hiding that row. That is correct for the config being restored, and it is exactly the
     kind of change an operator does not expect from a button labelled "restore".
 
-    So it is stated, in the response, rather than left to be discovered on someone's Home screen.
+    So it is stated, in the response and in the audit trail (rule 10), rather than left to be
+    discovered on someone's Home screen.
     """
     from shortlist.server.services.backup import request_restore
 
+    state = request.app.state
+    max_keep = _backup_limit(state)
     ok = await asyncio.get_running_loop().run_in_executor(
-        None, lambda: request_restore(request.app.state.config_dir, body.name)
+        None, lambda: request_restore(state.config_dir, body.name, max_keep=max_keep)
     )
     if not ok:
         raise HTTPException(status_code=404, detail="backup not found")
+    with state.sessions() as session:
+        session.add(
+            Event(
+                scope="backup.restore_requested",
+                level="warning",
+                message={"backup": body.name, "at": datetime.now(UTC).isoformat()},
+            )
+        )
+        session.commit()
     return {
         "restored": body.name,
         "message": (
@@ -1069,6 +1082,54 @@ async def restore_backup_endpoint(body: RestoreRequest, request: Request) -> dic
             "next run — check Rows before restarting."
         ),
     }
+
+
+class PendingRestore(PassthroughModel):
+    backup: str
+    requested_at: str
+
+
+class PendingRestoreOut(PassthroughModel):
+    """The restore waiting for a restart, if any."""
+
+    pending: PendingRestore | None
+
+
+@_authed.get("/backups/restore", response_model=PendingRestoreOut)
+async def pending_restore_endpoint(request: Request) -> dict:
+    """The restore waiting for the next start, so the owner can see it is still to come, or cancel it."""
+    from shortlist.server.services.backup import pending_restore
+
+    return {"pending": pending_restore(request.app.state.config_dir)}
+
+
+@_authed.delete("/backups/restore", response_model=PendingRestoreOut)
+async def cancel_restore_endpoint(request: Request) -> dict:
+    """Cancel the restore waiting for the next start. Nothing has been changed yet, so nothing is undone."""
+    from shortlist.server.services.backup import cancel_restore
+
+    state = request.app.state
+    cancelled = cancel_restore(state.config_dir)
+    if cancelled is not None:
+        with state.sessions() as session:
+            session.add(
+                Event(
+                    scope="backup.restore_cancelled",
+                    level="info",
+                    message={"backup": cancelled["backup"], "at": datetime.now(UTC).isoformat()},
+                )
+            )
+            session.commit()
+    return {"pending": None}
+
+
+def _backup_limit(state) -> int:
+    """The owner's backup limit, as the scheduled backup reads it, for the rotation a restore triggers."""
+    from shortlist.server.services.backup import DEFAULT_MAX_BACKUPS
+
+    with state.sessions() as session:
+        keep = SettingsStore(session).get("backup.max_keep")
+    return keep if isinstance(keep, int) and 1 <= keep <= 100 else DEFAULT_MAX_BACKUPS
 
 
 # Strong references to in-flight background drains. asyncio holds only a weak reference to a task,

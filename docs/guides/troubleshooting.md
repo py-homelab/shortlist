@@ -137,7 +137,9 @@ copies of each user's original Plex share filters that an uninstall restores fro
 
 Restoring one takes effect when you restart the container: Shortlist saves a copy of the current
 database and swaps the backup in as it starts, before anything else opens the database. Until that
-restart it keeps running on the database it has.
+restart it keeps running on the database it has, and Jobs → Backups says a restore is waiting, with a
+button to cancel it. A restore still waiting a day later is dropped rather than applied by whatever
+restarts the container next.
 
 Because a backup holds your rows' **audiences**, restoring one also restores who could see which
 rows at that moment. If you have narrowed a shared row's audience since the backup was taken,

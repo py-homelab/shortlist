@@ -1931,7 +1931,11 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /**
+         * Pending Restore Endpoint
+         * @description The restore waiting for the next start, so the owner can see it is still to come, or cancel it.
+         */
+        get: operations["pending_restore_endpoint_api_system_backups_restore_get"];
         put?: never;
         /**
          * Restore Backup Endpoint
@@ -1941,7 +1945,8 @@ export interface paths {
          *     connections let the shutdown checkpoint write the old database back over the restored one, so the
          *     restart this asks for undid the restore. `backups.apply_pending_restore` swaps it in at boot, takes the
          *     pre-restore copy there (so it holds everything written until the restart), and audits it in the
-         *     database it restored.
+         *     database it restored. Until then it can be seen and cancelled (`GET`/`DELETE` below), and one left
+         *     waiting for over a day is not applied.
          *
          *     A restore is not a neutral rollback: the database is what decides WHO MAY SEE WHAT. Restoring a
          *     copy taken before a shared row's audience was narrowed puts the wider audience back, and the
@@ -1949,10 +1954,15 @@ export interface paths {
          *     that were hiding that row. That is correct for the config being restored, and it is exactly the
          *     kind of change an operator does not expect from a button labelled "restore".
          *
-         *     So it is stated, in the response, rather than left to be discovered on someone's Home screen.
+         *     So it is stated, in the response and in the audit trail (rule 10), rather than left to be
+         *     discovered on someone's Home screen.
          */
         post: operations["restore_backup_endpoint_api_system_backups_restore_post"];
-        delete?: never;
+        /**
+         * Cancel Restore Endpoint
+         * @description Cancel the restore waiting for the next start. Nothing has been changed yet, so nothing is undone.
+         */
+        delete: operations["cancel_restore_endpoint_api_system_backups_restore_delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -4058,6 +4068,24 @@ export interface components {
             orphans: number;
             /** Total */
             total: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /** PendingRestore */
+        PendingRestore: {
+            /** Backup */
+            backup: string;
+            /** Requested At */
+            requested_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * PendingRestoreOut
+         * @description The restore waiting for a restart, if any.
+         */
+        PendingRestoreOut: {
+            pending: components["schemas"]["PendingRestore"] | null;
         } & {
             [key: string]: unknown;
         };
@@ -8488,6 +8516,26 @@ export interface operations {
             };
         };
     };
+    pending_restore_endpoint_api_system_backups_restore_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingRestoreOut"];
+                };
+            };
+        };
+    };
     restore_backup_endpoint_api_system_backups_restore_post: {
         parameters: {
             query?: never;
@@ -8517,6 +8565,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    cancel_restore_endpoint_api_system_backups_restore_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PendingRestoreOut"];
                 };
             };
         };
