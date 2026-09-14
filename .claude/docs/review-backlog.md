@@ -794,7 +794,16 @@ one caller in a module makes it deletable-by-accident along with that caller. An
 an exception message goes through it — check for the import surviving whenever a module's last
 `redact()` user is removed.
 
-## Delivery over-reports titles Plex silently dropped (open)
+## CLOSED — delivery over-reported titles Plex silently dropped
+
+**Fixed in `54299476` (2026-08-18), the same commit that wrote this entry; it was never marked closed.**
+`fetch_items` returns `(items, missing)` and every delivery path drops the missing keys from
+`diff.added` and `wanted_keys`. Coverage for each path, checked 2026-09-14 by removing the filters (both
+tests fail without them): create `TestTheDiffReportsWhatLandedNotWhatWasAsked`, in-place update
+`test_an_in_place_update_does_not_report_a_title_plex_dropped`, rebuild
+`test_a_rebuilt_row_does_not_report_a_title_plex_dropped`. `titles_added` is `sum(len(diff.added))`
+(`run_persistence.py`), so it follows. The original entry is kept below.
+
 
 **Found:** architecture review, 2026-08-18, while fixing the run-#17 delivery failure.
 
