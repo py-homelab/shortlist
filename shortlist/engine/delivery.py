@@ -7,10 +7,10 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import date
 
 from loguru import logger
 
+from shortlist.engine import placeholders
 from shortlist.engine.clients.plex_pms import CollectionRejectedItems, PlexClient, log_title
 from shortlist.engine.clients.poster import PosterArtist
 from shortlist.engine.models import (
@@ -21,11 +21,11 @@ from shortlist.engine.models import (
     MediaType,
     Pick,
     PosterSpec,
-    RowSeason,
     RowSpec,
     UserProfile,
     WrittenDetails,
 )
+from shortlist.engine.placeholders import fill_season, names_a_seed, needs_a_run, season_renderings, uses_season
 
 DEFAULT_ROW_NAME = "✨ Picked for You"
 
@@ -382,50 +382,16 @@ def seed_source(section_picks: list[Pick], row_picks: list[Pick]) -> list[Pick]:
     return section_picks if top_seed_of(section_picks) else row_picks
 
 
-#: A seasonal row's name placeholders (discussion #124). Filled from the row's season by
-#: `resolve_row_template`; one still standing afterwards means there was no season to fill it with.
-SEASON_PLACEHOLDERS = ("{season}", "{season_emoji}")
-
-
-def uses_season(text: str) -> bool:
-    """Whether a name, description or poster line depends on the row's season."""
-    return any(placeholder in text for placeholder in SEASON_PLACEHOLDERS)
-
-
-def catalogue_seasons() -> list[RowSeason]:
-    """Every season a row can follow, as a name-filling season (the anchor's year is irrelevant to a name)."""
-    from shortlist.engine.seasons import SEASONS
-
-    return [
-        RowSeason(slug=s.slug, name=s.name, emoji=s.emoji, anchor=date(2000, s.month, s.day)) for s in SEASONS.values()
-    ]
-
-
-def season_renderings(template: str) -> list[str]:
-    """``template`` once per catalogue season, for the checks that must see every title a seasonal row
-    can wear — out of season it keeps the last one, and no single night's spec can render that."""
-    if not uses_season(template):
-        return [template]
-    return [fill_season(template, season) for season in catalogue_seasons()]
-
-
-def fill_season(text: str, season: RowSeason | None) -> str:
-    """``text`` with the season placeholders filled, or untouched when there is no season to fill them."""
-    if season is None:
-        return text
-    return text.replace("{season_emoji}", season.emoji).replace("{season}", season.name)
-
-
 def _fill(template: str, profile: UserProfile, top_seed: str, library_name: str) -> str:
     """Substitute the placeholders and tidy the spacing. No fallbacks, no opinions."""
     rendered = (
-        template.replace("{top_seed}", top_seed)
-        .replace("{user}", profile.display_name)
-        .replace("{library_name}", library_name)
+        template.replace(placeholders.TOP_SEED, top_seed)
+        .replace(placeholders.USER, profile.display_name)
+        .replace(placeholders.LIBRARY_NAME, library_name)
     )
     # A {library_name} title with no (or a padding-adjacent) library leaves double spaces where the
     # placeholder was — collapse runs of whitespace so the human title reads clean either way.
-    return " ".join(rendered.split()) if "{library_name}" in template else rendered.strip()
+    return " ".join(rendered.split()) if placeholders.LIBRARY_NAME in template else rendered.strip()
 
 
 def render_row_name(
@@ -458,14 +424,14 @@ def render_row_name(
     top_seed = top_seed_of(picks)
     # A season placeholder still standing here had no season to fill it (`resolve_row_template` fills
     # them), so it is unfillable exactly as a `{top_seed}` with no seed is.
-    unfillable = ("{top_seed}" in template and not top_seed) or uses_season(template)
+    unfillable = (names_a_seed(template) and not top_seed) or uses_season(template)
     rendered = "" if unfillable else _fill(template, profile, top_seed, library_name)
     if rendered:
         return rendered
     # The row's own name could not be produced — a `{top_seed}` with nothing to name, or a template
     # that is blank once rendered. Fall back only to what the OPERATOR wrote, and only if that itself
     # can be rendered: a fallback that also needs a seed (or a season) is no fallback at all.
-    if fallback_name and "{top_seed}" not in fallback_name and not uses_season(fallback_name):
+    if fallback_name and not needs_a_run(fallback_name):
         return _fill(fallback_name, profile, "", library_name)
     return ""
 
@@ -558,12 +524,12 @@ def render_description(template: str, profile: UserProfile, picks: list[Pick], l
     would flatten a description typed over several lines.
     """
     top_seed = top_seed_of(picks)
-    if not template.strip() or ("{top_seed}" in template and not top_seed) or uses_season(template):
+    if not template.strip() or (names_a_seed(template) and not top_seed) or uses_season(template):
         return ""
     return (
-        template.replace("{top_seed}", top_seed)
-        .replace("{user}", profile.display_name)
-        .replace("{library_name}", library_name)
+        template.replace(placeholders.TOP_SEED, top_seed)
+        .replace(placeholders.USER, profile.display_name)
+        .replace(placeholders.LIBRARY_NAME, library_name)
         .strip()
     )
 
@@ -1095,7 +1061,7 @@ def remove_row(
         # survives a title which differs per person, which is exactly what a fallback creates.
         # A seasonal name is the same case from the other side: it renders tonight's season, and the
         # collection may still wear the last one it was built for.
-        unrenderable = not display or "{top_seed}" in template or uses_season(raw_template)
+        unrenderable = not display or names_a_seed(template) or uses_season(raw_template)
         if unrenderable and ledger_key is None:
             # This row has no title to match on — a `{top_seed}` template (which renders per person,
             # so no title computed here is anyone's) or one that renders blank. Per-person rows share

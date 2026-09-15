@@ -21,7 +21,7 @@ import shortlist.server.services.context_builder as context_builder
 from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.candidates import KNOWN_SOURCES
 from shortlist.engine.clients.http_retry import redact
-from shortlist.engine.delivery import target_sections, uses_season
+from shortlist.engine.delivery import target_sections
 from shortlist.engine.models import (
     LANGUAGE_MODES,
     MAX_REFRESH_DAYS,
@@ -36,6 +36,7 @@ from shortlist.engine.models import (
     row_monitor_or_inherit,
     slugify,
 )
+from shortlist.engine.placeholders import refusal
 from shortlist.engine.rows import row_shown_today
 from shortlist.server.api.row_changes import (
     POSTER_RESET,
@@ -172,16 +173,8 @@ class CollectionIn(StrictRequestModel):
         went quiet, and the row still was not built. The operator does exactly what the alert asks and
         is told it worked. That is issue #84's symptom re-entering through the field built to fix it.
         """
-        if value and "{top_seed}" in value:
-            raise ValueError(
-                "the fallback name is for people with nothing watched, so it can't use {top_seed} "
-                "either — there'd still be nothing to put in it. Use a name that stands on its own."
-            )
-        if value and uses_season(value):
-            raise ValueError(
-                "the fallback name stands in when the row's own name can't be filled in, so it can't use "
-                "{season} or {season_emoji}. Use a name that stands on its own."
-            )
+        if why := refusal(value, "fallback"):
+            raise ValueError(why)
         return value
 
     min_watchers: int = Field(default=2, ge=2)  # a public row must never be shaped by one person
@@ -919,12 +912,8 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
 def _reject_season_name_without_seasons(template: str, seasons: list[str]) -> None:
     """Refuse a name that uses the season on a row that follows none: it could never be filled in, so the
     row would never be built for anyone (discussion #124)."""
-    if uses_season(template or "") and not seasons:
-        raise HTTPException(
-            status_code=422,
-            detail="{season} and {season_emoji} only work on a row that follows seasons — pick its seasons, "
-            "or take them out of the name.",
-        )
+    if why := refusal(template or "", "row_name", row_has_seasons=bool(seasons)):
+        raise HTTPException(status_code=422, detail=why)
 
 
 def _reject_duplicate_name(

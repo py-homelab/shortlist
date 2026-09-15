@@ -1385,6 +1385,40 @@ class TestATitleAnotherRowBuildsUnderIsNeverThisRows:
 
         plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
 
+    def test_what_another_seasonal_row_was_delivered_as_is_claimed_in_that_library(self, sessions):
+        """The seasonal twin of the `{top_seed}` case above: a seasonal title cannot be predicted without the
+        season the collection last wore, so it is claimed from the ledger in the same way."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        worn = "Christmas picks"
+        with sessions() as session:
+            session.add(Collection(slug="friday", name="{season} picks", media="movie", seasons=["christmas"]))
+            session.add(Collection(slug="friday_tv", name="{season} picks", media="show", seasons=["christmas"]))
+            session.add(
+                Delivery(collection_slug="friday_tv", user_slug="sarah", library_key="2", rating_key=99, title=worn)
+            )
+            run = Run(trigger="manual", status="ok")
+            session.add(run)
+            session.flush()
+            user = session.query(User).filter_by(slug="sarah").one()
+            session.add(
+                RunUser(
+                    run_id=run.id,
+                    user_id=user.id,
+                    status="ok",
+                    breakdown=[{"row_slug": "friday", "row_title": worn, "library_key": "1"}],
+                )
+            )
+            session.commit()
+        plex, movies_c, shows_c = self._plex()
+        movies_c.title = shows_c.title = worn + self.MARK
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
+
     def test_a_static_rows_ledger_title_claims_nothing_since_a_rename_leaves_it_stale(self, sessions):
         """A rename edits Plex and writes no ledger entry, so a static row's recorded title can be one it
         no longer wears — and this row may have just been renamed onto it."""

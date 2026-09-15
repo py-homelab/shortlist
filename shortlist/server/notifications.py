@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from shortlist.engine.placeholders import names_a_seed
 from shortlist.server.db.models import Event, Run
 from shortlist.server.services.audit import RESTRICTION_RESTORED_SCOPE
 from shortlist.server.services.watch_stream import STREAM_DOWN_ALERT_MINUTES, STREAM_DOWN_SINCE_KEY
@@ -381,7 +382,7 @@ def _last_run_problem(session: Session) -> dict | None:
 def _usable_fallback(row) -> bool:
     """A fallback name that can actually produce a title — non-blank, and not itself needing a seed."""
     value = (row.fallback_name or "").strip()
-    return bool(value) and "{top_seed}" not in value
+    return bool(value) and not names_a_seed(value)
 
 
 def _row_display_name(name: str) -> str:
@@ -421,12 +422,12 @@ def _rows_with_no_name_for_newcomers(session: Session, store: SettingsStore) -> 
         for row in session.query(Collection).filter(Collection.enabled.is_(True), Collection.build == "per_person")
         # A fallback that itself needs a seed can never render, so it is no fallback — the API refuses
         # new ones, and this keeps the alert firing on databases that already hold one.
-        if "{top_seed}" in ((row.name_template or row.name) or "") and not _usable_fallback(row)
+        if names_a_seed((row.name_template or row.name) or "") and not _usable_fallback(row)
     ]
     # The DEFAULT row takes its title from the global setting, never its own column.
     global_name = store.get("row.name_template") or ""
     display: dict[str, str] = {row.slug: (row.name_template or row.name) for row in rows}
-    if "{top_seed}" in global_name:
+    if names_a_seed(global_name):
         for row in session.query(Collection).filter(Collection.enabled.is_(True), Collection.slug == DEFAULT_SLUG):
             if _usable_fallback(row):
                 continue

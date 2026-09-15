@@ -23,8 +23,6 @@ from shortlist.engine.delivery import (
     HELD,
     KEPT,
     REBUILD,
-    catalogue_seasons,
-    fill_season,
     is_name_freeing_helper,
     remove_row_collections,
     rename_or_keep,
@@ -33,10 +31,8 @@ from shortlist.engine.delivery import (
     resolve_row_template,
     row_marker,
     rows_can_share_a_library,
-    season_renderings,
     strip_marker,
     titles_other_rows_build,
-    uses_season,
 )
 from shortlist.engine.models import (
     LABEL_PREFIX,
@@ -48,6 +44,13 @@ from shortlist.engine.models import (
     UserType,
 )
 from shortlist.engine.pipeline import identity_map
+from shortlist.engine.placeholders import (
+    catalogue_seasons,
+    fill_season,
+    needs_a_run,
+    season_renderings,
+    uses_season,
+)
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Delivery, Run, User
 from shortlist.server.safe_mode import force_dry_run
 from shortlist.server.services import jobs
@@ -158,7 +161,7 @@ def _claimed_titles(ctx, udata: dict, other_rows: _OtherRows) -> set[tuple[str, 
         if spec.audience is not None and profile.plex_account_id not in spec.audience:
             continue
         template = resolve_row_template(spec, profile, config)
-        if "{top_seed}" in template or uses_season(template):
+        if needs_a_run(template):
             claimed |= other_rows.delivered.get((udata["slug"], spec.slug), set())
     return claimed
 
@@ -447,7 +450,7 @@ def _rendered_titles(ctx, udata: dict, template: str, slug: str) -> set[str]:
     """
     # A seasonal name is the same case: it renders tonight's season, and the collection may still wear the
     # last one it was built for (discussion #124).
-    if not template or "{top_seed}" in template or uses_season(template):
+    if not template or needs_a_run(template):
         return set()
     profile = _profile_of(udata)
     titles = {

@@ -22,9 +22,9 @@ from shortlist.engine.delivery import (
     render_row_name,
     resolve_row_template,
     row_marker,
-    uses_season,
 )
 from shortlist.engine.models import CollectionDiff, EngineConfig, MediaType, Pick, RowSeason, RowSpec, Seed, UserType
+from shortlist.engine.placeholders import uses_season
 from shortlist.engine.rows import effective_row_sources, row_recipe
 from tests.conftest import MemorySnapshotStore, fake_media_item, make_profile, make_watched, plextv_user
 
@@ -581,6 +581,35 @@ class TestWhatDecidesARebuild:
         halloween = seasonal_spec(season=HALLOWEEN)
         policy = self._policy(ctx, christmas)
         assert policy.pool_key(christmas) != policy.pool_key(halloween)
+
+
+class TestRequestsFromASeasonalRow:
+    def test_the_inbox_names_the_row_as_it_reads_in_its_season(self, ctx, monkeypatch):
+        """A request is labelled with the row that surfaced it. The label is filled by hand in
+        `_record_demand`, apart from the renderer, so it has to get the season filled too."""
+        from shortlist.engine.models import ArrTarget, RequestConfig, RequestReport
+
+        ctx.tmdb.suggestions.return_value = [
+            ({"id": 77, "title": "Not On This Server", "genre_ids": [28], "vote_average": 8.0}, 1.0),
+            ({"id": 20, "title": "Die Hard 2", "genre_ids": [28], "vote_average": 7.0}, 1.0),
+        ]
+        ctx.config.requests = RequestConfig(
+            enabled=True,
+            radarr=ArrTarget(url="http://radarr.test", api_key="k", quality_profile_id=1, root_folder="/m"),
+        )
+        ctx.config.rows = [seasonal_spec()]
+        captured = {}
+
+        def spy(cfg, tmdb, demand, *, dry_run, already_handled=None, **kw):
+            captured["demand"] = demand
+            return RequestReport()
+
+        monkeypatch.setattr(pipeline_mod.requests_mod, "request_missing", spy)
+
+        pipeline_mod.run(ctx, _people())
+
+        (row,) = captured["demand"]
+        assert [why.row for why in row.demand[(77, MediaType.MOVIE)].why][:1] == ["🎄 Christmas picks"]
 
 
 class TestCarryingASeasonalRowForward:

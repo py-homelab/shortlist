@@ -14,7 +14,6 @@ from pydantic import BaseModel
 
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.clients.search import EXA_SEARCH_TYPES
-from shortlist.engine.delivery import uses_season
 from shortlist.engine.models import (
     LANGUAGE_MODES,
     MAX_REFRESH_DAYS,
@@ -23,6 +22,7 @@ from shortlist.engine.models import (
     REQUEST_TARGETS,
     SONARR_MONITOR_MODES,
 )
+from shortlist.engine.placeholders import refusal
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Server
@@ -180,11 +180,7 @@ def _non_blank_row_template(value: object) -> str | None:
     """
     if not str(value or "").strip():
         return "cannot be empty — it is the title of your default row"
-    if uses_season(str(value)):
-        # The default row follows no season, so the placeholder could never be filled and the row would
-        # stop being built for everyone (discussion #124).
-        return "can't use {season} or {season_emoji} — only a seasonal row's own name can"
-    return None
+    return refusal(str(value), "global_name")
 
 
 def _one_of(*allowed: str):

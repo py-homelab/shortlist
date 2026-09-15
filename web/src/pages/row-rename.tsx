@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label";
 import { ProgressBar } from "@/components/ui/progress-bar";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, apiUrl } from "@/lib/api";
+import { TOP_SEED } from "@/lib/placeholders";
 import { useCollections } from "@/lib/queries";
 
 interface RenameEvent {
@@ -228,7 +229,7 @@ export function RowRenamePage() {
               Use {"{library_name}"} for the library, {"{user}"} for each
               person's name, {"{top_seed}"} for a title they recently watched.
             </p>
-            {newName.includes("{top_seed}") && (
+            {newName.includes(TOP_SEED) && (
               <p className="rounded-md bg-muted/60 p-3 text-xs text-muted-foreground">
                 A {"{top_seed}"} name promises the row is about one title. By
                 default the row is built from their 30 most recent watches, so

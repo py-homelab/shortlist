@@ -4,12 +4,8 @@ import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useSeasons } from "@/lib/queries";
-import {
-  isNightly,
-  seasonStatusLine,
-  seasonWindowLabel,
-  usesSeason,
-} from "@/lib/seasons";
+import { usesSeason } from "@/lib/placeholders";
+import { isNightly, seasonStatusLine, seasonWindowLabel } from "@/lib/seasons";
 import type { SeasonStatus } from "@/lib/types";
 
 /** The API's bounds (`seasons.MAX_LEAD_DAYS` / `MAX_AFTER_DAYS`), so the field never offers a value

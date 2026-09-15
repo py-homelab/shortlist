@@ -38,6 +38,7 @@ from sqlalchemy import text as sa_text
 
 import shortlist
 from shortlist.engine.models import SHARED_LABEL_PREFIX, EngineConfig, RowSpec
+from shortlist.engine.placeholders import names_a_seed
 from shortlist.engine.rows import effective_idle_hold_days
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
@@ -1037,7 +1038,7 @@ def _effective_cadence(collection, global_days: int, global_template: str) -> in
     template = (
         global_template if collection.slug == DEFAULT_SLUG else (collection.name_template or collection.name)
     ) or ""
-    if "{top_seed}" in template or int(collection.seed_window or 1) > 1:
+    if names_a_seed(template) or int(collection.seed_window or 1) > 1:
         return 1
     return max(0, collection.refresh_days if collection.refresh_days is not None else global_days)
 

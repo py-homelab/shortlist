@@ -1,7 +1,7 @@
 # Row types: base class + subclasses, or not? (2026-09-15)
 
-Status: **review complete.** Recommendation: keep one row shape. The owner asked for every bug in §5 to be fixed
-(done 2026-09-15). The placeholder module (§4) is not built and awaits a go/no-go.
+Status: **done.** Recommendation taken: keep one row shape. Every bug in §5 fixed (2026-09-15). The placeholder module
+(§4) built the same day as its own behaviour-preserving change — see §9.
 
 The question (owner, during discussion #124): seasonal rows touched 37 production files. Should rows be
 restructured as a shared base with one subclass per custom row type, so the next type lives in one place?
@@ -250,3 +250,28 @@ fallback. The plan makes a mistake there fail a test before it can reach Plex.
 - Go / no-go on §4 (the placeholder module) after #124 lands.
 - B3: one reporting contract when a seasonal list cannot be read — `ok` with a note, `skipped`, or `error`.
 - Whether X1–X4 are fixed now or logged to `review-backlog.md`.
+
+## 9. The placeholder module as built (2026-09-15)
+
+- `shortlist/engine/placeholders.py`: the token constants, `names_a_seed`, `uses_season`, `needs_a_run`,
+  `fill_season`, `catalogue_seasons`, `season_renderings`, and `refusal(text, field, row_has_seasons=)` —
+  the four API validators' messages, byte-identical. Every backend call site in §4.2 now asks it; no
+  hand-typed token remains in engine or server code outside that module.
+- `web/src/lib/placeholders.ts`: the token list with meanings, `usesSeason`, the exact-token regexes the
+  row card's chips use, and `fillPlaceholders` for both preview renderers; the editor's and rename page's
+  `{top_seed}` checks use its constant. Prose hints in Settings, the wizard and the rename page still name
+  the tokens in their own copy.
+- Deviations from §4.1: no `fill(...)` renderer and no `report_label` — `_fill`, `render_description`,
+  `_record_demand` and `_RowNamer.label` each keep their own whitespace and fallback rules, which differ on
+  purpose, and now spell the tokens through the constants. `forces_nightly` is `names_a_seed`.
+- Proof that behaviour did not change: the old code (`7b239900`) and the new were each run over 3,447
+  templates (every combination of up to three tokens and near-miss fragments, plus every name template on
+  the maintainer's server, read-only) through the renderers, resolvers, claims, title keys, rename pairs,
+  the four validators, cadence, alerts and report labels: outputs byte-identical. Breaking `needs_a_run`
+  made them differ, so the probe has teeth.
+- Mutation probes on the identity checks: `remove_row`'s season half, reconcile's ledger claim and its
+  rendered-titles guard each fail a test when broken. `remove_row`'s seed half failed NOTHING in the whole
+  suite — a pre-existing gap: a `{top_seed}` row with a fallback name could be removed by matching a sibling
+  titled like the fallback. Pinned now (`test_a_top_seed_rows_fallback_title_never_selects_a_collection`).
+  Promotion's `{top_seed}` filter is an equivalent mutant: such a template renders "" there and is skipped
+  by the next check anyway.

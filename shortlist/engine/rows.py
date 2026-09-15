@@ -19,7 +19,7 @@ from functools import cached_property
 from loguru import logger
 
 from shortlist.engine import candidates as candidates_mod
-from shortlist.engine import picker, ranking
+from shortlist.engine import picker, placeholders, ranking
 from shortlist.engine import requests as requests_mod
 from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.clients.mdblist import MdbListRateLimitError
@@ -53,6 +53,7 @@ from shortlist.engine.models import (
     WatchedItem,
     WrittenDetails,
 )
+from shortlist.engine.placeholders import names_a_seed
 
 
 def effective_row_sources(spec: RowSpec, default_sources: list[str]) -> tuple[str, ...]:
@@ -755,7 +756,7 @@ def _names_a_seed(spec: RowSpec, user: UserProfile, config: EngineConfig) -> boo
     `resolve_row_template` is the single source of truth for that precedence, and delivery renders
     the delivered title through it too — so this now asks the same question the title answers.
     """
-    return "{top_seed}" in resolve_row_template(spec, user, config)
+    return names_a_seed(resolve_row_template(spec, user, config))
 
 
 def _seed_moved(
@@ -2451,14 +2452,14 @@ def _record_demand(policy: RowPolicy, demand: requests_mod.RowDemand) -> None:
             # Provenance for the inbox: this row surfaced it for this user, seeded by the
             # strongest history title behind the candidate ("because you watched …").
             seed_title = c.top_seed.title if c.top_seed else ""
-            row_name = row_template.replace("{user}", user.display_name).replace(
-                "{top_seed}", seed_title or "your favourites"
+            row_name = row_template.replace(placeholders.USER, user.display_name).replace(
+                placeholders.TOP_SEED, seed_title or "your favourites"
             )
             # {library_name} renders as the library this title's media type lands in; blank (an
             # unknown media type) collapses the gap ("✨  Picked for You" -> "✨ Picked for You").
-            if "{library_name}" in row_name:
+            if placeholders.LIBRARY_NAME in row_name:
                 library_name = media_library.get(c.media_type, "")
-                row_name = " ".join(row_name.replace("{library_name}", library_name).split())
+                row_name = " ".join(row_name.replace(placeholders.LIBRARY_NAME, library_name).split())
             entry = RequestWhy(
                 user=user.username,
                 row=row_name,

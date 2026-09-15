@@ -5,7 +5,6 @@ import {
   seasonDate,
   seasonStatusLine,
   seasonWindowLabel,
-  usesSeason,
 } from "@/lib/seasons";
 
 const HALLOWEEN = { month: 10, day: 31 };
@@ -65,13 +64,6 @@ describe("seasonStatusLine", () => {
   });
 });
 
-describe("usesSeason", () => {
-  it("spots either placeholder", () => {
-    expect(usesSeason("{season} picks")).toBe(true);
-    expect(usesSeason("{season_emoji} picks")).toBe(true);
-    expect(usesSeason("{top_seed} picks")).toBe(false);
-  });
-});
 
 describe("isNightly", () => {
   it("is true only for a schedule that runs every day", () => {

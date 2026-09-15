@@ -2055,6 +2055,31 @@ class TestTheLedgerRemovesAnUnrenderableRow:
         # here, and reporting that would name a row the owner never had.
         assert diff.deleted == ["Because you watched The Bear"]
 
+    def test_a_top_seed_rows_fallback_title_never_selects_a_collection(self):
+        """With no picks a `{top_seed}` row renders its FALLBACK name, but a seeded person's collection wears
+        "Because you watched X". Matched on the fallback, removal would find nothing of this row's and could
+        delete a sibling row that happens to carry that title, so only the ledger may select one."""
+        from shortlist.engine.delivery import remove_row, row_marker
+        from shortlist.engine.models import CollectionDiff, EngineConfig, RowSpec, UserProfile, UserType
+
+        sibling = self._collection("Weekend picks" + row_marker(100), 777)
+        plex, sections, deleted = self._plex([sibling])
+
+        remove_row(
+            plex,
+            UserProfile(username="sarah", plex_account_id=100, user_type=UserType.SHARED, slug="sarah"),
+            EngineConfig(),
+            RowSpec(
+                slug="because", name_template="Because you watched {top_seed}", size=5, fallback_name="Weekend picks"
+            ),
+            dry_run=False,
+            diff=CollectionDiff(),
+            sections=sections,
+            delivered_keys={},
+        )
+
+        assert deleted == []
+
     def test_a_ledger_key_never_reaches_a_different_row(self):
         """Identity must select ONE object. The user's live default row shares this label and is the
         exact collection the title guard exists to protect."""

@@ -62,6 +62,7 @@ import {
   useSeasons,
   useSettings,
 } from "@/lib/queries";
+import { TOP_SEED } from "@/lib/placeholders";
 import type { RowTemplate } from "@/lib/row-templates";
 import {
   coldStartGlobal,
@@ -339,7 +340,7 @@ export function RowEditor({
   // what let someone skip a section rather than open it to find out they didn't need it.
   // Whether this row's TITLE claims a particular watch. Mirrors the engine's `_names_a_seed`, and
   // decides whether the cycle window is worth offering.
-  const namesASeed = (input.name_template || input.name).includes("{top_seed}");
+  const namesASeed = (input.name_template || input.name).includes(TOP_SEED);
   // Whether that name CONTRADICTS the seed budget — the case `seedAdvice` asks the owner to change,
   // as opposed to the one it simply confirms. Only the former is dressed as a warning: a
   // movies-and-TV row on one seed leaves a whole library with no row at all, which is the same order

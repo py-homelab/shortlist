@@ -10,13 +10,6 @@ import type { Season, SeasonStatus } from "@/lib/types";
  * window as dates in any year, for the editor to say "shows 1 Oct – 31 Oct".
  */
 
-/** The name placeholders only a seasonal row can fill — `SEASON_PLACEHOLDERS` in engine/delivery.py. */
-export const SEASON_TOKENS = ["{season}", "{season_emoji}"] as const;
-
-export function usesSeason(text: string): boolean {
-  return SEASON_TOKENS.some((token) => text.includes(token));
-}
-
 /** "31 Oct" (in the reader's own date order) for an ISO date, read as a calendar date, not an instant. */
 export function seasonDate(iso: string): string {
   return new Date(`${iso}T00:00:00Z`).toLocaleDateString(undefined, {

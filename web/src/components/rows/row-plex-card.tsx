@@ -1,6 +1,6 @@
 import { api } from "@/lib/api";
 import { renderRowName, sampleLibraryName } from "@/lib/format";
-import { usesSeason } from "@/lib/seasons";
+import { fillPlaceholders, LIBRARY_NAME, TOP_SEED, USER, usesSeason } from "@/lib/placeholders";
 import type { CollectionInput, Season } from "@/lib/types";
 
 /** The sample person and library every preview on this card is filled in for. */
@@ -16,13 +16,7 @@ function renderDescription(
   libraryName: string,
   season: { name: string; emoji: string } = { name: "Christmas", emoji: "🎄" },
 ): string {
-  return template
-    .replaceAll("{top_seed}", SAMPLE.topSeed)
-    .replaceAll("{user}", SAMPLE.user)
-    .replaceAll("{library_name}", libraryName)
-    .replaceAll("{season_emoji}", season.emoji)
-    .replaceAll("{season}", season.name)
-    .trim();
+  return fillPlaceholders(template, { ...SAMPLE, libraryName, season }).trim();
 }
 
 /** What varies about the name, in the words the caption uses — or null when nothing does. */
@@ -30,8 +24,8 @@ function nameCaption(input: CollectionInput, template: string): string | null {
   // A per-person row renders a different name for each person, from their own viewing; a SHARED
   // row is one collection everybody sees, so only {library_name} moves — telling someone their
   // shared row is named per person is simply untrue.
-  const perPerson = /\{(top_seed|user)\}/.test(template);
-  const perLibrary = template.includes("{library_name}");
+  const perPerson = template.includes(TOP_SEED) || template.includes(USER);
+  const perLibrary = template.includes(LIBRARY_NAME);
   if (usesSeason(template)) {
     return "Example only — the name follows the season the row is in.";
   }

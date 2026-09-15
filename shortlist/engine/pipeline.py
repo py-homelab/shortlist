@@ -50,6 +50,7 @@ from shortlist.engine.models import (
     UserRunReport,
     UserType,
 )
+from shortlist.engine.placeholders import names_a_seed
 from shortlist.engine.privacy import (
     RESTRICTED_FILTER_FIELDS,
     FilterParseError,
@@ -1437,7 +1438,7 @@ def promote_user_rows(
         (spec, template)
         for spec in effective_rows
         if (spec.audience is None or user.plex_account_id in spec.audience)
-        and "{top_seed}" not in (template := resolve_row_template(spec, user, ctx.config))
+        and not names_a_seed(template := resolve_row_template(spec, user, ctx.config))
     ]
     # Two passes, so a row's title in a library it BUILDS in always beats another row's leftover there.
     # First the libraries each row targets today; then EVERY library of its media type, because its
