@@ -1178,6 +1178,7 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             poster=body.poster.model_dump(),
             description=body.description,
             sort_title_prefix=body.sort_title_prefix,
+            **{column: getattr(body, column) for column in _REQUEST_COLUMNS},
         )
         session.add(collection)
         session.flush()
@@ -1187,6 +1188,29 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
     rebuild_schedule(request.app)  # a new row may carry a schedule — register its cron job now
     return result
 
+
+#: This row's own request floors and Arr target; null on any of them means inherit the global. Named once
+#: for create and edit alike: the create constructor listed columns by hand and missed every one of these.
+_REQUEST_COLUMNS = (
+    "req_min_rating",
+    "req_min_votes",
+    "req_min_demand",
+    "req_min_year",
+    "req_max_year",
+    "req_auto_send",
+    "req_auto_min_demand",
+    "req_auto_min_rating",
+    "req_max_per_row",
+    "req_radarr_quality_profile_id",
+    "req_radarr_root_folder",
+    "req_sonarr_quality_profile_id",
+    "req_sonarr_root_folder",
+    "req_sonarr_monitor",
+    "req_language_mode",
+    "req_preferred_languages",
+    "req_min_rating_other",
+    "req_auto_user_tag",
+)
 
 # Columns a PATCH may set directly, name (needs a dup check) and audience (needs shaping)
 # handled separately.
@@ -1217,25 +1241,7 @@ _PATCHABLE_COLUMNS = (
     "max_seeds",
     "cold_start",
     "seed_window",
-    # This row's own request floors and Arr target; null on any of them means inherit the global.
-    "req_min_rating",
-    "req_min_votes",
-    "req_min_demand",
-    "req_min_year",
-    "req_max_year",
-    "req_auto_send",
-    "req_auto_min_demand",
-    "req_auto_min_rating",
-    "req_max_per_row",
-    "req_radarr_quality_profile_id",
-    "req_radarr_root_folder",
-    "req_sonarr_quality_profile_id",
-    "req_sonarr_root_folder",
-    "req_sonarr_monitor",
-    "req_language_mode",
-    "req_preferred_languages",
-    "req_min_rating_other",
-    "req_auto_user_tag",
+    *_REQUEST_COLUMNS,
     "pick_order",
     "placement",
     "placement_friends",

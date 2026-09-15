@@ -3265,6 +3265,22 @@ def stored_setting(client: TestClient, key: str):
         return SettingsStore(session, client.app.state.secrets).get(key)
 
 
+class TestANewRowsRequestSettings:
+    def test_a_new_row_keeps_the_request_settings_it_was_created_with(self, client: TestClient):
+        """The editor offers a row's own request floors before the row is first saved, and the create
+        constructor set none of them: they were dropped without a word, and only an edit after saving stuck."""
+        body = {"name": "Picky", "req_min_rating": 7.5, "req_max_per_row": 2, "req_auto_send": False}
+
+        created = client.post("/api/collections", json=body).json()
+
+        assert (created["req_min_rating"], created["req_max_per_row"], created["req_auto_send"]) == (7.5, 2, False)
+        from shortlist.server.db.models import Collection
+
+        with client.app.state.sessions() as session:
+            row = session.get(Collection, created["id"])
+            assert (row.req_min_rating, row.req_max_per_row, row.req_auto_send) == (7.5, 2, False)
+
+
 class TestSeasonalRowsApi:
     """A row's seasons (discussion #124): stored, validated, and resolved on the SERVER's clock."""
 
