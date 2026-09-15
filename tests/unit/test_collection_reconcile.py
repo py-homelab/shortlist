@@ -827,7 +827,7 @@ class TestReconcileRowRenameIter:
         assert events[-1] == {"done": True, "total": 1}
 
     def test_a_shared_rows_refused_rename_is_said_plainly(self, sessions):
-        collection = self._refusing("Old Shared Name")
+        collection = self._refusing("Old Shared Name" + row_marker(0))
         plex = MagicMock(spec=PlexClient)
         plex.sections.return_value = [_section("Movies", key="1")]
         plex.find_owned_collections.side_effect = lambda sec, label: (
@@ -868,8 +868,11 @@ class TestReconcileRowRenameIter:
         this_row.editTitle.assert_called_once_with("New Name" + row_marker(100))
         other_row.editTitle.assert_not_called()
 
-    def test_shared_build_renames_by_label_alone_no_marker_no_title_match_needed(self, sessions):
-        collection = _collection("Old Shared Name")  # no marker: ONE collection server-wide
+    def test_shared_build_renames_by_label_alone_keeping_the_shared_marker(self, sessions):
+        """A shared row needs no old title (its label is its own), but it does carry a marker: delivery
+        writes `row_marker(0)` on it and finds it again only by the marked title, or by that marker. A
+        rename that dropped the marker left the next run unable to find it, so it built a second one."""
+        collection = _collection("Old Shared Name" + row_marker(0))
         plex = MagicMock(spec=PlexClient)
         plex.sections.return_value = [_section("Movies")]
         plex.find_owned_collections.side_effect = lambda sec, label: (
@@ -886,8 +889,133 @@ class TestReconcileRowRenameIter:
             )
         )
 
-        collection.editTitle.assert_called_once_with("New Shared Name")
+        collection.editTitle.assert_called_once_with("New Shared Name" + row_marker(0))
         assert events[-1] == {"done": True, "total": 1}
+
+    # ---- seasonal names (discussion #124) ----------------------------------------------------------
+
+    def _one_collection(self, sessions, title, label="shortlist_sarah"):
+        _add_user(sessions, slug="sarah", account_id=100)
+        collection = _collection(title)
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies")]
+        plex.find_owned_collections.side_effect = lambda sec, found_by: [collection] if found_by == label else []
+        return collection, plex
+
+    def test_a_seasonal_name_is_renamed_in_the_season_the_collection_wears(self, sessions):
+        """Without a season the templates render nothing, so the rename matched nothing and reported success
+        while Plex kept the old name until the next run."""
+        collection, plex = self._one_collection(sessions, "🎄 Christmas picks" + row_marker(100))
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex),
+                slug="seasonal",
+                new_template="{season} for {user}",
+                old_template="{season_emoji} {season} picks",
+            )
+        )
+
+        collection.editTitle.assert_called_once_with("Christmas for sarah" + row_marker(100))
+        assert events[-1] == {"done": True, "total": 1}
+
+    def test_out_of_season_it_keeps_the_season_it_last_wore(self, sessions):
+        collection, plex = self._one_collection(sessions, "🎃 Halloween picks" + row_marker(100))
+
+        list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex),
+                slug="seasonal",
+                new_template="{season} for {user}",
+                old_template="{season_emoji} {season} picks",
+            )
+        )
+
+        collection.editTitle.assert_called_once_with("Halloween for sarah" + row_marker(100))
+
+    def test_a_plain_name_becoming_seasonal_waits_for_the_run_that_knows_the_season(self, sessions):
+        """Nothing says which season a plain "Holiday picks" collection should become; guessing one could put
+        Valentine's Day on it in December."""
+        collection, plex = self._one_collection(sessions, "Holiday picks" + row_marker(100))
+
+        events = list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="seasonal", new_template="{season} picks", old_template="Holiday picks"
+            )
+        )
+
+        collection.editTitle.assert_not_called()
+        assert events == [{"done": True, "total": 0}]
+
+    def test_a_nickname_change_renames_a_seasonal_row_named_after_them(self, sessions):
+        collection, plex = self._one_collection(sessions, "Christmas for Sal" + row_marker(100))
+
+        list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex),
+                slug="seasonal",
+                new_template="{season} for {user}",
+                old_template="{season} for {user}",
+                old_display_names={"sarah": "Sal"},
+            )
+        )
+
+        collection.editTitle.assert_called_once_with("Christmas for sarah" + row_marker(100))
+
+    def test_a_shared_seasonal_row_is_renamed_in_the_season_it_wears(self, sessions):
+        collection, plex = self._one_collection(
+            sessions, "🎄 Christmas picks" + row_marker(0), label="shortlist__shared_seasonal"
+        )
+
+        list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex),
+                slug="seasonal",
+                new_template="{season} favourites",
+                old_template="{season_emoji} {season} picks",
+                build="shared",
+            )
+        )
+
+        collection.editTitle.assert_called_once_with("Christmas favourites" + row_marker(0))
+
+    def test_a_shared_rename_leaves_a_helper_and_an_unmarked_copy_alone(self, sessions):
+        """Everything under a shared row's label used to be renamed, in listing order: a helper a killed run left
+        behind, or the unmarked copy an older rename left, would take the row's new name first, the real row
+        would be refused, and the next run would adopt the copy."""
+        from shortlist.engine.delivery import FREED_NAME_PREFIX
+
+        helper = _collection(FREED_NAME_PREFIX + "0123456789ab" + row_marker(0))
+        unmarked_copy = _collection("Old Shared Name")
+        the_row = _collection("Old Shared Name" + row_marker(0))
+        plex = MagicMock(spec=PlexClient)
+        plex.sections.return_value = [_section("Movies")]
+        plex.find_owned_collections.side_effect = lambda sec, label: (
+            [helper, unmarked_copy, the_row] if label == "shortlist__shared_movienight" else []
+        )
+
+        list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="movienight", new_template="New Shared Name", build="shared"
+            )
+        )
+
+        helper.editTitle.assert_not_called()
+        unmarked_copy.editTitle.assert_not_called()
+        the_row.editTitle.assert_called_once_with("New Shared Name" + row_marker(0))
+
+    def test_a_lone_unmarked_shared_collection_is_still_renamed_and_given_its_marker(self, sessions):
+        """The copy an older rename stripped: with nothing marked beside it, it IS the row, and taking the marker
+        back is what lets the next run find it again."""
+        collection, plex = self._one_collection(sessions, "Old Shared Name", label="shortlist__shared_movienight")
+
+        list(
+            rec.reconcile_row_rename_iter(
+                _state(sessions, plex), slug="movienight", new_template="New Shared Name", build="shared"
+            )
+        )
+
+        collection.editTitle.assert_called_once_with("New Shared Name" + row_marker(0))
 
     def test_dry_run_reports_without_writing(self, sessions):
         _add_user(sessions, slug="sarah", account_id=100)
@@ -1257,6 +1385,40 @@ class TestATitleAnotherRowBuildsUnderIsNeverThisRows:
 
         plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
 
+    def test_what_another_seasonal_row_was_delivered_as_is_claimed_in_that_library(self, sessions):
+        """The seasonal twin of the `{top_seed}` case above: a seasonal title cannot be predicted without the
+        season the collection last wore, so it is claimed from the ledger in the same way."""
+        _add_user(sessions, slug="sarah", account_id=100)
+        worn = "Christmas picks"
+        with sessions() as session:
+            session.add(Collection(slug="friday", name="{season} picks", media="movie", seasons=["christmas"]))
+            session.add(Collection(slug="friday_tv", name="{season} picks", media="show", seasons=["christmas"]))
+            session.add(
+                Delivery(collection_slug="friday_tv", user_slug="sarah", library_key="2", rating_key=99, title=worn)
+            )
+            run = Run(trigger="manual", status="ok")
+            session.add(run)
+            session.flush()
+            user = session.query(User).filter_by(slug="sarah").one()
+            session.add(
+                RunUser(
+                    run_id=run.id,
+                    user_id=user.id,
+                    status="ok",
+                    breakdown=[{"row_slug": "friday", "row_title": worn, "library_key": "1"}],
+                )
+            )
+            session.commit()
+        plex, movies_c, shows_c = self._plex()
+        movies_c.title = shows_c.title = worn + self.MARK
+        removed: list[str] = []
+
+        rec._reconcile_row_removal(
+            _state(sessions, plex), slug="friday", build="per_person", dry_run=False, removed=removed
+        )
+
+        plex.delete_owned_collection.assert_called_once_with(movies_c, LABEL_PREFIX)
+
     def test_a_static_rows_ledger_title_claims_nothing_since_a_rename_leaves_it_stale(self, sessions):
         """A rename edits Plex and writes no ledger entry, so a static row's recorded title can be one it
         no longer wears — and this row may have just been renamed onto it."""
@@ -1332,3 +1494,36 @@ class TestATitleAnotherRowBuildsUnderIsNeverThisRows:
 
         movies_c.editTitle.assert_called_once_with("Saturday" + self.MARK)
         shows_c.editTitle.assert_not_called()
+
+
+class TestSeasonalTitlesOutsideARun:
+    """A seasonal row's collection wears whichever season it was last built for (discussion #124), so a
+    title rendered without a run is never its title: like a `{top_seed}` row, it is found by what the
+    ledger and the run history recorded."""
+
+    def test_its_template_renders_no_titles_to_match_on(self):
+        from types import SimpleNamespace
+
+        from shortlist.server.services import collection_reconcile as reconcile
+
+        ctx = SimpleNamespace(plex=SimpleNamespace(sections=lambda: [SimpleNamespace(title="Movies", key="1")]))
+        udata = {
+            "slug": "sarah",
+            "username": "sarah",
+            "nickname": "",
+            "plex_account_id": 100,
+            "user_type": "shared",
+            "prefs": {},
+        }
+        assert reconcile._rendered_titles(ctx, udata, "{season_emoji} {season} picks", "seasonal") == set()
+
+    def test_two_different_seasonal_names_have_different_title_keys(self):
+        from shortlist.server.services.collection_reconcile import title_key
+
+        assert title_key("{season} picks") != title_key("{season} for you")
+        assert title_key("{season} picks") != ""
+
+    def test_the_same_seasonal_name_has_the_same_title_key(self):
+        from shortlist.server.services.collection_reconcile import title_key
+
+        assert title_key("{season} picks") == title_key("{season} picks")

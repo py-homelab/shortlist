@@ -19,6 +19,12 @@ describe("provenanceLabel", () => {
     ).toBe("suggested by TMDB · close match");
   });
 
+  it("names the seasonal list without claiming a match strength it never measured", () => {
+    expect(provenanceLabel(pick({ sources: ["season"], affinity: 0.75 }))).toBe(
+      "suggested by Seasonal list",
+    );
+  });
+
   it("admits when a pick was only loosely related", () => {
     // The reported bug: The Sandman sat near the bottom of TMDB's list for a medical drama and was
     // presented exactly like a top match. Now it says so.

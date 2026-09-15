@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy.orm import Session
 
+from shortlist.engine import placeholders
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.clients.plextv import PlexTvClient
 from shortlist.engine.clients.tautulli import TautulliClient
@@ -111,7 +112,7 @@ async def rename_after_nickname(state, was_called: dict[str, str], *, holds_writ
             for c in session.query(Collection).filter_by(enabled=True, build="per_person").all()
         ]
     for slug, template in rows:
-        if "{user}" not in (template or ""):
+        if placeholders.USER not in (template or ""):
             continue  # this row's title doesn't mention them, so a name change can't have moved it
         await run_row_rename_from_plex(
             state,

@@ -93,6 +93,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/collections/seasons": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Seasons
+         * @description Every season a row can follow, in calendar order (discussion #124).
+         */
+        get: operations["list_seasons_api_collections_seasons_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/collections/{collection_id}": {
         parameters: {
             query?: never;
@@ -3176,6 +3196,23 @@ export interface components {
              */
             schedule: string;
             /**
+             * Season After Days
+             * @description How many days after each season's day the row stays up.
+             * @default 0
+             */
+            season_after_days: number;
+            /**
+             * Season Lead Days
+             * @description How many days before each season's day the row starts showing.
+             * @default 30
+             */
+            season_lead_days: number;
+            /**
+             * Seasons
+             * @description Seasons this row follows (see GET /api/collections/seasons). Empty means it is not seasonal.
+             */
+            seasons?: string[];
+            /**
              * Seed Window
              * @default 1
              */
@@ -3362,6 +3399,23 @@ export interface components {
             rewatch_cooldown_days: number;
             /** Schedule */
             schedule: string;
+            /**
+             * Season After Days
+             * @description How many days after each season's day the row stays up.
+             */
+            season_after_days: number;
+            /**
+             * Season Lead Days
+             * @description How many days before each season's day the row starts showing.
+             */
+            season_lead_days: number;
+            /** @description Where the row is in its calendar today; null for a row that follows no season. */
+            season_status: components["schemas"]["SeasonStatusOut"] | null;
+            /**
+             * Seasons
+             * @description Seasons this row follows, in calendar order. Empty means not seasonal.
+             */
+            seasons: string[];
             /** Seed Window */
             seed_window: number;
             /**
@@ -5145,6 +5199,54 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * SeasonOut
+         * @description A season a row can follow.
+         */
+        SeasonOut: {
+            /** Day */
+            day: number;
+            /** Description */
+            description: string;
+            /** Emoji */
+            emoji: string;
+            /** Month */
+            month: number;
+            /** Name */
+            name: string;
+            /** Slug */
+            slug: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * SeasonStatusOut
+         * @description Where a seasonal row is in its calendar today, judged on the SERVER's clock.
+         */
+        SeasonStatusOut: {
+            next: components["schemas"]["SeasonWindowOut"] | null;
+            showing: components["schemas"]["SeasonWindowOut"] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /**
+         * SeasonWindowOut
+         * @description One season's run for a row: which season, and the first and last days the row shows it.
+         */
+        SeasonWindowOut: {
+            /** Emoji */
+            emoji: string;
+            /** Ends */
+            ends: string;
+            /** Name */
+            name: string;
+            /** Slug */
+            slug: string;
+            /** Starts */
+            starts: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** SeenRelease */
         SeenRelease: {
             /** Version */
@@ -6229,6 +6331,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_seasons_api_collections_seasons_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeasonOut"][];
                 };
             };
         };

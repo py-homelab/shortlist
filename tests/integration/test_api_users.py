@@ -1372,6 +1372,14 @@ class TestAPerUserRowNameCannotFollowAWatch:
         assert ok.status_code < 300, ok.text
 
 
+class TestAPerUserRowNameCannotFollowASeason:
+    def test_a_season_override_is_refused(self, client: TestClient):
+        """The override names the default row, which follows no season — the name could never be filled."""
+        uid = client.get("/api/users").json()[0]["id"]
+        bad = client.patch(f"/api/users/{uid}", json={"prefs": {"row_name_tpl": "{season} for {user}"}})
+        assert bad.status_code == 422, bad.text
+
+
 class TestUserPickOutcomes:
     """`/api/users/{id}/outcomes` — what this person did with the picks they were given.
 

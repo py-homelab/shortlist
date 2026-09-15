@@ -10,19 +10,50 @@ below is later work.
 
 ---
 
-## OPEN — v1.9.0 release review, three LOW (2026-09-14)
+## OPEN — v1.9.1 release review, two LOW (2026-09-16)
 
-The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. Deferred, none a leak:
+The release-PR Architecture Review over `v1.9.0..dev` (PR #129) found no HIGH or MED. A third LOW, the
+CHANGELOG saying a seasonal row returns "without being rebuilt", was fixed before the tag.
 
-1. **Stale comment.** `shortlist/server/api/collections.py:1678` says the visibility handler compares
-   placements "against the state it last applied"; 0089 dropped `shown_state` and it recomputes.
-2. **`user.restore` omits `skip_unmatched`.** `shortlist/server/services/jobs.py:1505`. Un-pausing
-   someone on a row's scheduled day off, when one of their `{top_seed}` rows has neither a ledger key
-   nor a last-run title, puts that row back on their own Home until the next midnight pass. Other
-   accounts' excludes still hide it. Fix: pass `skip_unmatched` the way `_promote_phase` does.
-3. **0088's downgrade leaves `collections.shown_state`** after 0089's downgrade re-creates it. Nullable
-   and unread. Both migrations are frozen (`frozen_migrations.txt`), so any fix is a new migration or
-   nothing.
+- **The Jobs catalogue overstates seasonal rows.** `rows.visibility`'s description
+  (`shortlist/server/services/jobs.py:326-328`) says a hidden row "comes straight back without being built
+  again". True for a day schedule, not for a season: the recipe carries `season=<slug>@<anchor date>` and
+  `_reusable_prior` drops out-of-season titles, so each new season rebuilds the row the night before it
+  opens (`docs/guides/rows.md:148-150` already says so). Fix: scope "without being built again" to days off.
+- **Every seedless seasonal pick explains itself as "in genres you watch".** `reason_for`
+  (`shortlist/engine/picker.py:23`) uses that line for any seedless `season` candidate, but
+  `candidates.py` admits season titles with no genre overlap (fit is only a 0.5–1.0 weight), and a failed
+  genre lookup leaves the claim empty for every title. Fix: an always-true line ("Right for the season"),
+  or the genre wording only above the fit floor.
+
+---
+
+## OPEN — LOW: unmarked duplicates of a shared row (found 2026-09-15, discussion #124 review)
+
+Before 2026-09-15 a rename from the rename screen took a shared row's `row_marker(0)` off its title, so
+the next run could not find the collection and built a second, marked one beside it. Both carry the
+`shortlist__shared_<row>` label, so `promote_shared_row` keeps both on Home. Not a privacy problem.
+
+The rename no longer strips the marker, and it now leaves an unmarked copy alone when a marked one is in
+the same library (`collection_reconcile.reconcile_row_rename_iter`). What is left: servers that renamed
+a shared row before the fix may still hold the unmarked copy. Nothing deletes it while the row is live
+(the sweep skips it: the shared slug is not in its markers map); removing the row does, through
+`remove_row_collections`. Fix when it matters: delete an unmarked collection
+under a shared label when a marked sibling exists in the same library, with the usual confirm-twice guard.
+
+---
+
+## CLOSED — v1.9.0 release review, three LOW (2026-09-14)
+
+The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. All three LOWs fixed the
+same day:
+
+1. **Stale comment** in `api/collections.py` about the visibility handler keeping state — reworded.
+2. **`user.restore` omitted `skip_unmatched`**, so un-pausing someone on a row's day off could put an
+   unidentifiable `{top_seed}` row back on their Home. It now asks `pipeline.any_row_hidden_today`,
+   the same answer `_promote_phase` uses. Pinned by `TestRestoreAfterUnpause::test_an_unidentifiable_row_*`.
+3. **0088's downgrade left `collections.shown_state`** behind after 0089's downgrade re-created it.
+   It drops it again; recorded as a downgrade-only `amended:` line in `frozen_migrations.txt`.
 
 ---
 
@@ -796,7 +827,16 @@ one caller in a module makes it deletable-by-accident along with that caller. An
 an exception message goes through it — check for the import surviving whenever a module's last
 `redact()` user is removed.
 
-## Delivery over-reports titles Plex silently dropped (open)
+## CLOSED — delivery over-reported titles Plex silently dropped
+
+**Fixed in `54299476` (2026-08-18), the same commit that wrote this entry; it was never marked closed.**
+`fetch_items` returns `(items, missing)` and every delivery path drops the missing keys from
+`diff.added` and `wanted_keys`. Coverage for each path, checked 2026-09-14 by removing the filters (both
+tests fail without them): create `TestTheDiffReportsWhatLandedNotWhatWasAsked`, in-place update
+`test_an_in_place_update_does_not_report_a_title_plex_dropped`, rebuild
+`test_a_rebuilt_row_does_not_report_a_title_plex_dropped`. `titles_added` is `sum(len(diff.added))`
+(`run_persistence.py`), so it follows. The original entry is kept below.
+
 
 **Found:** architecture review, 2026-08-18, while fixing the run-#17 delivery failure.
 

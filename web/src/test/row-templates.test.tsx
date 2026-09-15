@@ -29,6 +29,23 @@ function renderGallery(onPick = vi.fn()) {
   return onPick;
 }
 
+describe("the Seasonal template", () => {
+  it("follows every season as a nightly films row named after the season", () => {
+    const seasonal = findRowTemplate("seasonal");
+    expect(seasonal).toBeDefined();
+    expect(seasonal!.values).toMatchObject({
+      name: "{season_emoji} {season} picks",
+      build: "per_person",
+      media: "movie",
+      seasons: ["valentines", "halloween", "christmas"],
+      season_lead_days: 30,
+      season_after_days: 0,
+      refresh_days: 1,
+      recency: 0,
+    });
+  });
+});
+
 describe("ROW_TEMPLATES", () => {
   it("only sets fields the row input actually has", () => {
     // A template that names a field the API doesn't accept would 422 on save with no clue why.
@@ -105,9 +122,11 @@ describe("ROW_TEMPLATES", () => {
   });
 
   it("puts a real variable in every title, and only ones the engine renders", () => {
-    // `render_row_name` (engine/delivery.py) substitutes EXACTLY these three. Anything else survives
-    // verbatim onto a Plex shelf — "🌱 New {genre} to try" would ship with the braces showing.
+    // `render_row_name` (engine/delivery.py) substitutes EXACTLY these. Anything else survives
+    // verbatim onto a Plex shelf — "🌱 New {genre} to try" would ship with the braces showing. The two
+    // season placeholders are filled on a seasonal row only, so a template using them must follow seasons.
     const SUPPORTED = ["{user}", "{library_name}", "{top_seed}"];
+    const SEASONAL = ["{season}", "{season_emoji}"];
 
     for (const template of ROW_TEMPLATES) {
       const title = template.values.name ?? "";
@@ -120,9 +139,11 @@ describe("ROW_TEMPLATES", () => {
         `${template.id} has no variable in its title`,
       ).toBeGreaterThan(0);
       for (const placeholder of used) {
-        expect(SUPPORTED, `${template.id} uses "${placeholder}"`).toContain(
-          placeholder,
-        );
+        const seasonal = (template.values.seasons ?? []).length > 0;
+        expect(
+          seasonal ? [...SUPPORTED, ...SEASONAL] : SUPPORTED,
+          `${template.id} uses "${placeholder}"`,
+        ).toContain(placeholder);
       }
     }
   });

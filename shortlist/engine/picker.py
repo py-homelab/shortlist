@@ -20,6 +20,7 @@ from shortlist.engine.models import Candidate, Pick
 # contradicted the provenance line shown right beneath it. The web line no longer says "AI" either:
 # with Exa the source runs with no AI provider at all, so claiming one on the row was untrue.
 _SEEDLESS_REASON = {
+    "season": "Right for the season, in genres you watch",
     "llm_web": "Recommended on the web right now",
     "tmdb_discover": "In genres you watch a lot",
     "cold_start": "Popular on this server",
@@ -28,7 +29,8 @@ _SEEDLESS_REASON = {
 # Explicit precedence for a candidate whose sources include MORE THAN ONE of the above (e.g. found by
 # both llm_web and tmdb_discover) — a plain `.items()` walk would pick whichever happened to be
 # inserted first in the dict literal, silently coupling the reason shown to the user to source order.
-_SEEDLESS_SOURCE_PRECEDENCE = ("history", "llm_web", "tmdb_discover", "cold_start")
+# `season` before the search sources: on a seasonal row, being right for the season is why a title is there.
+_SEEDLESS_SOURCE_PRECEDENCE = ("history", "season", "llm_web", "tmdb_discover", "cold_start")
 _SEEDLESS_REASON_DEFAULT = "Matched to your taste"
 
 

@@ -59,6 +59,7 @@ EXPECTED_IDS = {
     "popular-here",
     "movie-night",
     "more-tv",
+    "seasonal",
 }
 
 
@@ -105,6 +106,10 @@ def _spec(template_id: str, **overrides) -> RowSpec:
     """
     values = {k: v for k, v in TEMPLATES[template_id].items() if k != "name"}
     build = values.pop("build", "per_person")
+    # A season's window is the server's to resolve against its clock: it becomes `season` (and the
+    # placement) on the spec, never a field the engine reads.
+    values.pop("season_lead_days", None)
+    values.pop("season_after_days", None)
 
     unsupported = [k for k in values if not hasattr(RowSpec, k) and k not in RowSpec.__annotations__]
     assert not unsupported, f"{template_id}: the engine has no setting for {unsupported}"
@@ -405,6 +410,44 @@ class TestEveryTemplateDelivers:
         assert all(p.media_type is MediaType.MOVIE for p in picks), (
             f"a shows title reached a movies-only row: {[(p.tmdb_id, p.media_type) for p in picks]}"
         )
+
+    def test_seasonal_follows_three_seasons_a_month_ahead_and_holds_only_the_season(self, engine_ctx, mock_plextv):
+        """Claims: "Halloween, Christmas & Valentine's", "Shows a month before", "Changes nightly" — and the
+        blurb's promise that October's row is Halloween films, which only the season filter can keep."""
+        from datetime import date
+
+        import shortlist.engine.pipeline as pipeline_mod
+        from shortlist.engine import seasons
+        from shortlist.engine.delivery import render_row_name, resolve_row_template
+        from shortlist.engine.models import RowSeason
+        from shortlist.engine.rows import _is_refresh_night
+
+        values = TEMPLATES["seasonal"]
+        assert values["seasons"] == ["valentines", "halloween", "christmas"]
+        lead, after = values["season_lead_days"], values["season_after_days"]
+        assert seasons.shown_on(values["seasons"], lead, after, date(2026, 9, 30)) is None
+        assert seasons.shown_on(values["seasons"], lead, after, date(2026, 10, 1)).season.slug == "halloween"
+        spec = _spec("seasonal", season=RowSeason("halloween", "Halloween", "🎃", date(2026, 10, 31)))
+        assert all(_is_refresh_night(spec.slug, "sarah", day, spec.refresh_days) for day in range(1, 30))
+
+        engine_ctx.history_source.fetch.return_value = _mixed_history()
+        engine_ctx.tmdb.suggestions.return_value = _movies(10, 20)
+        # The Halloween list: 20 is one, 10 is not; 30 is a Halloween SHOW, which a films-only row skips.
+        engine_ctx.tmdb.discover_all.side_effect = lambda media, params: (
+            [{"id": 20, "title": "Movie 20", "genre_ids": [27]}]
+            if media is MediaType.MOVIE and "with_keywords" in params
+            else []
+        )
+        engine_ctx.config.rows = [spec]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        profile = make_profile("sarah", account_id=100)
+
+        report = pipeline_mod.run(engine_ctx, [profile])
+
+        picks = _picks_by_row(report)["seasonal"]
+        assert [p.tmdb_id for p in picks] == [20], "a film outside the season reached a seasonal row"
+        rendered = render_row_name(resolve_row_template(spec, profile, engine_ctx.config), profile, picks, "Movies")
+        assert rendered == "🎃 Halloween picks"
 
     def test_more_tv_to_watch_excludes_a_series_already_started(self, engine_ctx, mock_plextv):
         """Claims: "TV only" and "Never started" — the second is stricter than the normal filter, which

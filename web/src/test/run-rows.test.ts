@@ -220,6 +220,25 @@ describe("groupRunByRow", () => {
     );
   });
 
+  it("marks a row that sat out the run because it is out of season", () => {
+    // Between seasons a seasonal row builds nothing for anyone, on purpose. Listed only as "wasn't in
+    // this run" it reads like a row the run forgot.
+    const { groups, notInRun } = groupRunByRow(
+      run({
+        users: [
+          user({ slug: "a", rows_considered: { picked: "due", because: "out_of_season" } }),
+          user({ slug: "b", rows_considered: { picked: "due", because: "out_of_season" } }),
+        ],
+      }),
+      CONFIG_NAMES,
+    );
+
+    expect(groups.map((g) => g.slug)).toEqual(["picked"]);
+    expect(notInRun).toEqual([
+      { slug: "because", title: "🎯 Because you watched", outOfSeason: true },
+    ]);
+  });
+
   it("counts a failed person as failed, not built", () => {
     const { groups } = groupRunByRow(
       run({

@@ -137,6 +137,11 @@ class FakeCollection:
     promoted_recommended: bool = False
     promoted_own_home: bool = False
     promoted_shared_home: bool = False
+    #: The title the MANAGED hub carries. A real PMS sets it the first time the collection is promoted
+    #: and a rename does not touch it, while the collection and the served hub take the new title
+    #: (tests/fixtures/pms_managed_hub_renamed_collection.json). None until then: the manage listing
+    #: shows the collection's own title.
+    hub_title: str | None = None
     summary: str = ""
     summary_locked: bool = False
     # None -> derived from the title at creation, as Plex does. See `plex_sort_title` and
@@ -851,7 +856,7 @@ def _managed_hub_xml(parent: Element, section_id: int, collection: FakeCollectio
         parent,
         "Hub",
         identifier=f"custom.collection.{section_id}.{collection.rating_key}",
-        title=collection.title,
+        title=collection.hub_title or collection.title,
         deletable="1",
         promotedToRecommended=int(collection.promoted_recommended),
         promotedToOwnHome=int(collection.promoted_own_home),
@@ -1414,6 +1419,8 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
         return _xml(root)
 
     def _apply_hub_flags(collection: FakeCollection, query) -> None:
+        if collection.hub_title is None:
+            collection.hub_title = collection.title
         collection.promoted_recommended = query.get("promotedToRecommended") == "1"
         collection.promoted_own_home = query.get("promotedToOwnHome") == "1"
         collection.promoted_shared_home = query.get("promotedToSharedHome") == "1"

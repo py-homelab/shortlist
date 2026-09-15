@@ -134,6 +134,38 @@ export const ROW_TEMPLATES: RowTemplate[] = [
     },
   },
   {
+    id: "seasonal",
+    emoji: "🗓️",
+    title: "Seasonal",
+    // Films only: TMDB tags a few dozen seasonal SHOWS against thousands of films (13 Christmas shows
+    // on a 5,000-show library, measured for discussion #124), so a TV half would sit nearly empty.
+    blurb:
+      "Follows the calendar: Halloween films and horror in October, Christmas films in December, romance for Valentine's. Hidden between seasons.",
+    highlights: [
+      "Halloween, Christmas & Valentine's",
+      "Shows a month before",
+      "Changes nightly",
+    ],
+    values: {
+      name: "{season_emoji} {season} picks",
+      build: "per_person",
+      media: "movie",
+      size: 15,
+      seasons: ["valentines", "halloween", "christmas"],
+      season_lead_days: 30,
+      season_after_days: 0,
+      // Nightly, because "changes every day" is the refresh cadence: each night keeps the best
+      // two-thirds and swaps the rest from the season's titles.
+      refresh_days: 1,
+      // Release date ignored. Seasonal favourites are old: on a real server the Christmas films people
+      // watched had a median release year of 2008, and at a server's usual lean towards new releases a
+      // Christmas row filled with obscure 2025 TV movies instead of Home Alone and Klaus. Measured side
+      // by side, both seasons read better at 0 — and new releases still arrive through their similar
+      // titles.
+      recency: 0,
+    },
+  },
+  {
     id: "from-the-vault",
     emoji: "🕰️",
     title: "From the vault",

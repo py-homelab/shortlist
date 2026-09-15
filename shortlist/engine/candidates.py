@@ -807,8 +807,13 @@ def gather_candidates(
     web_search_cache: Cache | None = None,
     recent_count: int = _WEB_SEARCH_MAX_TITLES,
     stats: GatherStats | None = None,
+    season_items: dict[MediaType, list[dict]] | None = None,
 ) -> list[Candidate]:
     """Pool candidates from every enabled source, deduped by (tmdb_id, media_type).
+
+    ``season_items`` is a seasonal row's season, as the TMDB list items the server's libraries hold
+    (`seasons.SeasonTitles.in_library`). When given, they join the pool as the ``season`` source whatever
+    ``sources`` says — they are what the row is made of.
 
     ``curator``/``profile`` are only needed by the ``llm_web`` source and ``trakt`` by the Trakt
     source; the TMDB sources ignore them. ``search``/``web_search_mode`` drive the ``llm_web``
@@ -1021,6 +1026,49 @@ def gather_candidates(
         except Exception as e:
             failures["llm_web"] = f"{type(e).__name__}: {e}"
             logger.warning("llm_web source failed ({}); continuing with the other sources", type(e).__name__)
+
+    if season_items is not None:
+        season_skipped = ""
+        for media_type, items in season_items.items():
+            if not items:
+                continue
+            # Counted once it has titles to offer: a season with nothing here is no working source, so with
+            # every other source down the pool fails loudly below instead of passing as a quiet empty.
+            attempted.add("season")
+            try:
+                genres_for(media_type)
+            except Exception as e:
+                # Genre NAMES are what a person's excluded genres are checked against, so an unnamed title
+                # would slip past one. This kind of title sits the night out; the other kind still builds.
+                logger.warning(
+                    "season source: no {} genre list ({}); left out tonight", media_type.value, type(e).__name__
+                )
+                season_skipped = f"no {media_type.value} genre list ({type(e).__name__})"
+                continue
+            # No seed: these are in the pool because of the calendar, not because of a watch. What makes
+            # them PERSONAL is this weight — how far each title stays inside the genres this person
+            # watches most, the same 0.5..1.0 `genre_coherence` tmdb_similar already applies per seed.
+            # Ranked on rating alone, two people's 15-film Christmas rows overlapped 48% on a real
+            # server; with this weight, 13%.
+            try:
+                theirs = set(_dominant_genre_ids(tmdb, seeds, media_type))
+            except Exception as e:
+                # A failed lookup costs the weight, never the titles: unweighted is still the season.
+                logger.debug("season source: could not read seed genres ({})", type(e).__name__)
+                theirs = set()
+            returned = []
+            for item in items:
+                # Only a title the season alone found takes this weight. One a seeded source already
+                # measured keeps that measurement: raising it to the genre fit and then multiplying by
+                # its seed put a kids' animation watcher's weak match for a cannibal horror at the top
+                # of their Halloween row, measured on a real server.
+                already = (item["id"], media_type) in measured
+                fit = None if already else genre_coherence(theirs, item.get("genre_ids") or [])
+                add(item, media_type, "season", fit)
+                returned.append((int(item.get("id") or 0), item.get("title") or item.get("name") or ""))
+            _record_query("season", "the season's titles in your libraries", media_type.value, returned)
+        if season_skipped and not any("season" in candidate.sources for candidate in pool.values()):
+            failures["season"] = season_skipped
 
     # One source down is a degradation the other sources absorb. EVERY source down is not: we know
     # nothing about this person tonight, and returning an empty pool would report a cheerful "ok"

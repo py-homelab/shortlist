@@ -214,6 +214,8 @@ export function sourceRole(source: string): string {
       return "We asked Trakt for titles people who watched the same films also watched.";
     case "cold_start":
       return "With little history to go on, we pulled the highest-rated titles on this server.";
+    case "season":
+      return "We took the season's titles in your libraries and weighed each by how well it fits what they watch.";
     default:
       return "We gathered candidate titles from this source.";
   }
@@ -297,6 +299,8 @@ export function fateLabel(fate: TraceFate): string {
       return "lost the ranking cut";
     case "hidden_by_their_restrictions":
       return "hidden by their Plex restrictions";
+    case "not_in_season":
+      return "not a film for the season";
     case "not_returned":
       return "found by another source";
     default:

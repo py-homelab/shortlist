@@ -47,6 +47,17 @@ describe("the AI TOKENS tile", () => {
     expect(tile).not.toHaveTextContent("sent + received");
   });
 
+  it("does not repeat the total as a one-step breakdown", () => {
+    const tile = renderTokenTile({
+      llm_tokens: 360939,
+      llm_output_tokens: 90782,
+      llm_tokens_by_step: { llm_web: 360939 },
+    });
+
+    expect(tile).toHaveTextContent("270,157 in · 90,782 out");
+    expect(tile).not.toHaveTextContent("web search");
+  });
+
   it("shows only input and output when the run recorded the split but no steps", () => {
     const tile = renderTokenTile({ llm_tokens: 520088, llm_output_tokens: 20088 });
 

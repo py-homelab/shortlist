@@ -1,0 +1,162 @@
+{
+  "_source": "TMDB API v3 GET /discover/movie and /discover/tv, recorded 2026-09-15 off the live key. Params: with_keywords=3335|180193|232795|9694|182794 (the Halloween season), include_adult=false, sort_by=primary_release_date.asc (movie) / first_air_date.asc (tv). results trimmed to 2 per page and overview to 60 chars; every other field verbatim.",
+  "_measured": {
+    "pages_carry_total_pages_and_total_results": true,
+    "christmas_keyword_paged_by_popularity_desc_unique_ids": 3133,
+    "christmas_keyword_paged_by_primary_release_date_asc_unique_ids": 3370,
+    "christmas_keyword_total_results": 3370,
+    "page_above_500": "HTTP 400 (page 600 requested) — TMDB serves at most 500 pages",
+    "tv_results_sorted_by_first_air_date_asc": true,
+    "pipe_between_keyword_ids_is_OR": "with_keywords=a|b returns the union (676 here vs 619 for 3335 alone)"
+  },
+  "movie_page_1": {
+    "page": 1,
+    "total_pages": 34,
+    "total_results": 676,
+    "results": [
+      {
+        "adult": false,
+        "backdrop_path": null,
+        "genre_ids": [
+          9648,
+          35
+        ],
+        "id": 456045,
+        "title": "At the Sign of the Jack'O Lantern",
+        "original_language": "en",
+        "original_title": "At the Sign of the Jack'O Lantern",
+        "overview": "When Harlan Carr inherited his Uncle Ebenezer's \"Jack-O Lant…",
+        "popularity": 0.5689,
+        "poster_path": "/u7n2KmvREJWPvg6oQ8Es1T0G0rH.jpg",
+        "release_date": "1922-01-22",
+        "softcore": false,
+        "video": false,
+        "vote_average": 9.0,
+        "vote_count": 1
+      },
+      {
+        "adult": false,
+        "backdrop_path": null,
+        "genre_ids": [
+          35,
+          16,
+          14
+        ],
+        "id": 189823,
+        "title": "Felix the Cat Switches Witches",
+        "original_language": "en",
+        "original_title": "Felix the Cat Switches Witches",
+        "overview": "On Halloween, Felix is both victim and victor in mischievous…",
+        "popularity": 0.7053,
+        "poster_path": "/rjTvejz6C9nwVxFvNJylxQkZMI1.jpg",
+        "release_date": "1927-10-02",
+        "softcore": false,
+        "video": false,
+        "vote_average": 7.0,
+        "vote_count": 3
+      }
+    ]
+  },
+  "movie_last_page": {
+    "page": 34,
+    "total_pages": 34,
+    "total_results": 676,
+    "results": [
+      {
+        "adult": false,
+        "backdrop_path": "/3xo8LF0YMyz4E3XTKhWOJlxyJW1.jpg",
+        "genre_ids": [
+          10749,
+          27,
+          18
+        ],
+        "id": 1436917,
+        "title": "Frenchy",
+        "original_language": "en",
+        "original_title": "Frenchy",
+        "overview": "Bethany and Sam are friends with a brewing romance that is l…",
+        "popularity": 0.5523,
+        "poster_path": "/uNRi1tm6jdDNucGAduBD88r59a.jpg",
+        "release_date": "",
+        "softcore": false,
+        "video": false,
+        "vote_average": 0.0,
+        "vote_count": 0
+      },
+      {
+        "adult": false,
+        "backdrop_path": null,
+        "genre_ids": [
+          10749
+        ],
+        "id": 1397794,
+        "title": "CRUSHED",
+        "original_language": "en",
+        "original_title": "CRUSHED",
+        "overview": "Corey throws an overly crowded Halloween party, but when ove…",
+        "popularity": 1.4839,
+        "poster_path": "/jAnEeHRByTBNiOHLggET1IFy1PK.jpg",
+        "release_date": "",
+        "softcore": false,
+        "video": false,
+        "vote_average": 0.0,
+        "vote_count": 0
+      }
+    ]
+  },
+  "tv_page_1": {
+    "page": 1,
+    "total_pages": 1,
+    "total_results": 17,
+    "results": [
+      {
+        "adult": false,
+        "backdrop_path": null,
+        "genre_ids": [
+          10759,
+          10751,
+          10765
+        ],
+        "id": 46391,
+        "origin_country": [
+          "GB"
+        ],
+        "original_language": "en",
+        "original_name": "Johnny and the Dead",
+        "overview": "Not many people can see the dead (not many would want to). 1…",
+        "popularity": 1.5493,
+        "poster_path": "/di2wxez18I5nFieUrbRz3tUWdrf.jpg",
+        "first_air_date": "1995-04-04",
+        "softcore": false,
+        "name": "Johnny and the Dead",
+        "vote_average": 6.333,
+        "vote_count": 3
+      },
+      {
+        "adult": false,
+        "backdrop_path": "/cxwVDVEkIrIDoXdHtrO50RFxfs.jpg",
+        "genre_ids": [
+          10751,
+          16,
+          10765,
+          35,
+          10762
+        ],
+        "id": 14165,
+        "origin_country": [
+          "CA"
+        ],
+        "original_language": "en",
+        "original_name": "Ruby Gloom",
+        "overview": "Ruby Gloom is a Canadian children's show that revolves aroun…",
+        "popularity": 11.0949,
+        "poster_path": "/tnUpRoi4Z9BYthmjM9CCRwPR5vN.jpg",
+        "first_air_date": "2006-10-13",
+        "softcore": false,
+        "name": "Ruby Gloom",
+        "vote_average": 7.154,
+        "vote_count": 13
+      }
+    ]
+  }
+}

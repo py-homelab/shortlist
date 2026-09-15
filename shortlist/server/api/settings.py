@@ -22,6 +22,7 @@ from shortlist.engine.models import (
     REQUEST_TARGETS,
     SONARR_MONITOR_MODES,
 )
+from shortlist.engine.placeholders import refusal
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Server
@@ -177,7 +178,9 @@ def _non_blank_row_template(value: object) -> str | None:
     in every library instead. Either way nothing refused it, which made the failure this guard exists
     to prevent reachable in two ordinary requests.
     """
-    return None if str(value or "").strip() else "cannot be empty — it is the title of your default row"
+    if not str(value or "").strip():
+        return "cannot be empty — it is the title of your default row"
+    return refusal(str(value), "global_name")
 
 
 def _one_of(*allowed: str):
@@ -257,7 +260,42 @@ def _known_sources(value: object) -> str | None:
 
 # Values the UI already constrains — but the API accepted anything, so a bad value from any other
 # client reached the engine (`row.size: "abc"` crashed every run and 500'd two endpoints).
+def _notify_events(value: object) -> str | None:
+    from shortlist.server.services.notify import EVENTS
+
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        return "must be a list of event names"
+    unknown = [v for v in value if v not in EVENTS]
+    return f"unknown event(s) {unknown}; valid: {list(EVENTS)}" if unknown else None
+
+
+#: RFC 7230 `token`: the characters an HTTP header name may contain.
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+
+
+def _header_name(value: object) -> str | None:
+    # Blank means "send no header", and is how the owner stops sending one without removing the webhook.
+    if not isinstance(value, str) or (value and not _HEADER_NAME.fullmatch(value)):
+        return "must be a header name such as Authorization or X-Api-Key (letters, digits and dashes)"
+    return None
+
+
+#: h11's own rule for a header value: printable ASCII, with spaces or tabs only between words.
+_HEADER_VALUE = re.compile(r"[\x21-\x7e]+(?:[ \t]+[\x21-\x7e]+)*")
+
+
+def _header_value(value: object) -> str | None:
+    # Anything h11 refuses fails every send at 3am, and its error quotes the value back in an escaped form.
+    # Empty clears it. The redacted placeholder is left to the write loop, which keeps the stored value.
+    if isinstance(value, str) and (value in ("", REDACTED_PLACEHOLDER) or _HEADER_VALUE.fullmatch(value)):
+        return None
+    return "must be printable text with no leading or trailing spaces, e.g. Bearer abc123"
+
+
 VALIDATORS = {
+    "notify.webhook.events": _notify_events,
+    "notify.webhook.auth_header_name": _header_name,
+    "notify.webhook.auth_header_value": _header_value,
     # `candidates_pre_rank` is derived from this ceiling (2x), so the pool always clears the largest
     # legal row — it used to be a flat 40 restated here, which met the ceiling and left no headroom.
     "row.size": _bounded_int(MIN_ROW_SIZE, MAX_ROW_SIZE),
@@ -358,7 +396,7 @@ _FETCHED_URL_KEYS = (
     "curator.ollama_url",
     "curator.openai_base_url",
     "searxng.url",  # fetched by the Test button and by the llm_web source on every run
-    # POSTed to by `notify.send` on every failed run, and by the Send-a-test button. Being an
+    # POSTed to by `notify.send` for every event the owner chose, and by the Send-a-test button. Being an
     # outbound alert rather than an integration does not change what it is: a URL the server fetches
     # because the owner typed it.
     "notify.webhook.url",

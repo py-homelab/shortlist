@@ -28,6 +28,12 @@ class TestSettingsValidation:
         assert client.put("/api/settings", json={"values": {"plextv.throttle_s": -1}}).status_code == 422
         assert client.put("/api/settings", json={"values": {"plextv.throttle_s": 61}}).status_code == 422
 
+    def test_the_default_row_title_cannot_use_a_season(self, client: TestClient):
+        """It titles the default row, which follows no season, so `{season}` would never be filled and the
+        row would stop being built for everyone (discussion #124)."""
+        resp = client.put("/api/settings", json={"values": {"row.name_template": "{season_emoji} {season} picks"}})
+        assert resp.status_code == 422, resp.text
+
     def test_the_sonarr_monitor_mode_accepts_only_the_modes_shortlist_offers(self, client: TestClient):
         # Sonarr 400s the whole add on a monitor value it doesn't know, so a typo saved here would
         # surface a fortnight later as shows that never arrived — with nothing on screen to explain it.
@@ -384,6 +390,42 @@ class TestSettingsValidation:
             json={"values": {"row.size": 15, "requests.min_rating": 7.5, "requests.max_per_run": 5}},
         )
         assert r.status_code == 200
+
+
+class TestWebhookSettingsValidation:
+    """The webhook's event list and auth header are sent to a third party on every alert, so a value that
+    cannot work is refused at save rather than failing at 3am."""
+
+    def test_events_must_be_ones_shortlist_sends(self, client: TestClient):
+        ok = client.put("/api/settings", json={"values": {"notify.webhook.events": ["run.failed", "job.failed"]}})
+        assert ok.status_code == 200, ok.text
+        assert client.put("/api/settings", json={"values": {"notify.webhook.events": []}}).status_code == 200
+        for refused in (["run.exploded"], "run.failed", [1]):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.events": refused}})
+            assert resp.status_code == 422, f"{refused!r} was accepted"
+
+    def test_the_header_name_must_be_a_valid_http_header_name(self, client: TestClient):
+        for offered in ("Authorization", "X-Gotify-Key", "x-api-key"):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": offered}})
+            assert resp.status_code == 200, f"{offered}: {resp.text}"
+        # Blank is allowed: it is how the owner stops sending a header without removing the webhook.
+        assert client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": ""}}).status_code == 200
+        for refused in ("X Gotify", "Auth:orization", "Bad\nName"):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_name": refused}})
+            assert resp.status_code == 422, f"{refused!r} was accepted"
+
+    def test_the_header_value_may_not_break_the_request(self, client: TestClient):
+        """A line break in a header value is a header-injection shape; httpx refuses it at send time."""
+        ok = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_value": "Bearer abc.def"}})
+        assert ok.status_code == 200, ok.text
+        assert client.get("/api/settings").json()["notify.webhook.auth_header_value"] == "•••••"
+        # h11's own rule: printable ASCII, whitespace only between words. Anything else fails every send
+        # at 3am, and its error quotes the value back in an escaped form an exact-match scrub misses.
+        for refused in ("Bearer abc\r\nX-Evil: 1", "abc\ndef", "key\t", " key", "key ", "kéy"):
+            resp = client.put("/api/settings", json={"values": {"notify.webhook.auth_header_value": refused}})
+            assert resp.status_code == 422, f"{refused!r} was accepted"
+        # Empty is how the owner takes authentication off again.
+        assert client.put("/api/settings", json={"values": {"notify.webhook.auth_header_value": ""}}).status_code == 200
 
 
 class TestSettingsChangeAudit:

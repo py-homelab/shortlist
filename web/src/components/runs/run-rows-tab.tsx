@@ -36,6 +36,7 @@ const DECISION_LABEL: Record<string, string> = {
   muted: "muted for them",
   not_in_audience: "not in the audience",
   not_due: "not due",
+  out_of_season: "out of season",
 };
 
 /** "+7 −7 · kept 8" for one library's delivery. */
@@ -400,7 +401,14 @@ export function RunRowsTab({
               : `${notInRun.length} rows weren’t in this run`}
           </span>
           {showSkipped ? (
-            <span>— {notInRun.map((row) => row.title).join(", ")}</span>
+            <span>
+              —{" "}
+              {notInRun
+                .map((row) =>
+                  row.outOfSeason ? `${row.title} (out of season)` : row.title,
+                )
+                .join(", ")}
+            </span>
           ) : (
             <button
               type="button"

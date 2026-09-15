@@ -99,11 +99,14 @@ const STEP_LABELS: Record<string, string> = {
   llm_library: "library scan",
 };
 
-/** ["final picks 12,340", "web search 4,100"] for a by-step token map, largest first, zeros dropped. */
+/** ["final picks 12,340", "web search 4,100"] for a by-step token map, largest first, zeros dropped.
+ *  Empty when fewer than two steps used tokens: one step IS the total, and web search has been the
+ *  only AI step since final picks moved into code (2026-07-23), so every newer run would repeat it. */
 export function tokenSteps(byStep?: Record<string, number>): string[] {
   if (!byStep) return [];
-  return Object.entries(byStep)
-    .filter(([, n]) => n > 0)
+  const used = Object.entries(byStep).filter(([, n]) => n > 0);
+  if (used.length < 2) return [];
+  return used
     .sort((a, b) => b[1] - a[1])
     .map(([step, n]) => `${STEP_LABELS[step] ?? step} ${n.toLocaleString()}`);
 }

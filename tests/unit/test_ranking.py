@@ -103,6 +103,31 @@ class TestPreRank:
         pool = [make_candidate(i, f"m{i}", rating=float(i)) for i in range(1, 6)]
         assert len(pre_rank(pool, keep=3)) == 3
 
+    def test_the_order_it_returns_after_a_cut_still_weighs_genre_avoidance(self):
+        """The cut honoured the dial and the final sort dropped it, so a pool larger than the cut came back
+        in base-score order — and `diversify_by_seed`, which builds the row best-first, put an avoided
+        genre back on top. Without a cut the same three titles came back in the dialled order."""
+        avoided = make_candidate(1, "Avoided", rating=9.0, genre_penalty=-0.5)
+        liked = make_candidate(2, "Liked", rating=8.0)
+        third = make_candidate(3, "Third", rating=5.0)
+        fourth = make_candidate(4, "Fourth", rating=1.0)
+
+        uncut = pre_rank([avoided, liked, third], keep=3, genre_avoidance=1.0)
+        cut = pre_rank([avoided, liked, third, fourth], keep=3, genre_avoidance=1.0)
+
+        assert [c.title for c in uncut] == ["Liked", "Avoided", "Third"]
+        assert [c.title for c in cut] == ["Liked", "Avoided", "Third"]
+
+    def test_the_order_it_returns_after_a_cut_still_weighs_franchise(self):
+        other = make_candidate(1, "Other", rating=9.0)
+        sequel = make_candidate(2, "Sequel", rating=8.0, in_seed_franchise=True)
+        filler = [make_candidate(i, f"f{i}", rating=1.0) for i in (3, 4)]
+
+        cut = pre_rank([other, sequel, *filler], keep=3, franchise=1.0)
+        uncut = pre_rank([other, sequel, filler[0]], keep=3, franchise=1.0)
+
+        assert [c.title for c in cut][:2] == [c.title for c in uncut][:2]
+
 
 NOW = 2026  # every recency test states the year explicitly — the engine never reads a wall clock
 
@@ -130,6 +155,20 @@ class TestRecencyFactor:
         """The slider stretches the curve rather than clipping it — 50% means 16 years to half, so
         the control has usable range instead of being a soft on/off."""
         assert recency_factor(NOW - int(RECENCY_HALF_LIFE_YEARS) * 2, NOW, 0.5) == pytest.approx(0.5)
+
+    def test_recency_curve_matches_the_engine(self):
+        """The slider's strip draws this curve from `web/src/lib/constants.ts`; `recency.test.ts` pins the web
+        side to these exact numbers. Named by the comment on `RECENCY_HALF_LIFE_YEARS`, and missing until now,
+        so a change on this side alone went unnoticed by both suites."""
+        import re
+        from pathlib import Path
+
+        web = (Path(__file__).parents[2] / "web" / "src" / "lib" / "constants.ts").read_text()
+        (web_half_life,) = re.findall(r"export const RECENCY_HALF_LIFE_YEARS = ([\d.]+);", web)
+        assert float(web_half_life) == RECENCY_HALF_LIFE_YEARS
+        assert recency_factor(NOW - 10, NOW, 1.0) == pytest.approx(0.42044820762685725, abs=1e-12)
+        assert recency_factor(NOW - 20, NOW, 1.0) == pytest.approx(0.1767766952966369, abs=1e-12)
+        assert recency_factor(NOW - 20, NOW, 0.5) == pytest.approx(0.42044820762685725, abs=1e-12)
 
     def test_a_title_with_no_release_year_is_neutral(self):
         """Same convention as the unrated-gets-5.0 prior: a missing signal must not be read as a bad

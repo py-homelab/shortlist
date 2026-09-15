@@ -892,6 +892,46 @@ class TestRestoreAfterUnpause:
         # fallback's "show it on their Home".
         assert [kwargs for _t, kwargs in promoted] == [{"shared": False, "home": False, "recommended": True}]
 
+    def test_an_unidentifiable_row_is_left_alone_when_a_row_is_hidden_today(self, sessions):
+        """Un-pausing someone on a row's day off. A `{top_seed}` collection with no ledger key and no
+        recorded title matches no row, and the no-spec fallback would put it on their Home on the very
+        day its schedule hides it. `_promote_phase` and `rows.visibility` both leave such a collection
+        alone whenever a row is hidden today; the restore has to agree with them."""
+        promoted: list = []
+        merged: list = []
+        self._add_user(sessions)
+        hidden_today = replace(
+            self.ROW, name_template="Because you watched {top_seed}", placement="off", placement_friends="off"
+        )
+        state = self._state(sessions, promoted=promoted, merged=merged, rows=[hidden_today])
+        ctx = state.run_service.build_context(dry_run=False)
+        ctx.plex.find_owned_collections(None, "shortlist_sarah")[0].title = "Because you watched Dune" + row_marker(
+            555000100
+        )
+
+        jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
+
+        assert promoted == []
+
+    def test_an_unidentifiable_row_is_still_shown_when_no_row_is_hidden_today(self, sessions):
+        """The other cell. With nothing scheduled off, the fallback showing the row is the safe direction:
+        leaving it alone would make an un-paused person's row silently stay missing."""
+        promoted: list = []
+        merged: list = []
+        self._add_user(sessions)
+        # `placement="both"`: `ROW`'s owner copy is `off`, which counts as a row placed nowhere.
+        row = replace(self.ROW, name_template="Because you watched {top_seed}", placement="both")
+        state = self._state(sessions, promoted=promoted, merged=merged, rows=[row])
+        ctx = state.run_service.build_context(dry_run=False)
+        ctx.plex.find_owned_collections(None, "shortlist_sarah")[0].title = "Because you watched Dune" + row_marker(
+            555000100
+        )
+
+        jobs._HANDLERS["user.restore"](state, {"slug": "sarah"})
+
+        # The no-spec fallback for a shared account: their own Home, never the owner's shelf.
+        assert [kwargs for _t, kwargs in promoted] == [{"shared": True, "home": False, "recommended": False}]
+
     def test_the_ledger_wins_over_a_stale_recorded_title(self, sessions):
         """Both sources can disagree — a title recorded before a rename, against a ratingKey that
         cannot go stale. Identity has to win, or a renamed row is placed by whatever it used to be."""
@@ -1849,6 +1889,7 @@ class TestScheduledRowVisibility:
         run_service = SimpleNamespace(
             build_context=lambda dry_run, plex_only=False: ctx,
             enabled_profiles=lambda session, user_ids=None: builder.enabled_profiles(session, user_ids),
+            builder=builder,
         )
         return SimpleNamespace(sessions=sessions, run_service=run_service, secrets=secrets)
 
@@ -1893,6 +1934,103 @@ class TestScheduledRowVisibility:
 
     def _promotes(self, calls):
         return [c for c in calls if c[0] == "promote"]
+
+    # ---- seasonal rows (discussion #124) ----------------------------------------------------
+
+    def _seed_seasonal(self, sessions, monkeypatch, *, today: datetime):
+        import shortlist.server.services.context_builder as cb
+        from shortlist.server.db.models import Collection, User
+
+        monkeypatch.setattr(cb, "local_now", lambda: today)
+        with sessions() as session:
+            session.query(Collection).delete()
+            session.add(User(plex_account_id=self.ACCOUNT, username="sarah", slug="sarah", enabled=True, prefs={}))
+            session.add(Collection(slug="seasonal", name="seasonal", enabled=True, seasons=["halloween"]))
+            session.commit()
+
+    def test_a_seasonal_row_on_an_ordinary_night_of_its_season_makes_no_work(self, sessions, monkeypatch):
+        """A server whose only scheduled row is seasonal should pay for a converge on the handful of nights
+        a season opens or closes — not all 365."""
+        self._seed_seasonal(sessions, monkeypatch, today=datetime(2026, 10, 15, 0, 0))
+        state = self._state(sessions, calls=[], rows=[self.ON])
+        state.run_service.build_context = lambda dry_run, plex_only=False: (_ for _ in ()).throw(
+            AssertionError("no season opened or closed tonight")
+        )
+
+        assert jobs._HANDLERS["rows.visibility"](state, {})["changed"] == []
+
+    def test_the_night_a_season_closes_the_row_is_converged(self, sessions, monkeypatch):
+        calls: list = []
+        self._seed_seasonal(sessions, monkeypatch, today=datetime(2026, 11, 1, 0, 0))
+        state = self._state(sessions, calls=calls, rows=[self.OFF])
+
+        result = jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert result["changed"] == ["seasonal"]
+        assert ("merge", []) in calls
+
+    def test_the_night_a_season_closes_its_collection_comes_off_every_surface(self, sessions, monkeypatch):
+        """The one place an out-of-season row is sure to be hidden when its own cron does not run that night:
+        runs scoped to other rows leave it alone. Specs come from the real ContextBuilder, so the row is
+        `off` because the season closed, not because a test said so."""
+        from shortlist.server.db.models import Collection, Delivery
+
+        calls: list = []
+        self._seed_seasonal(sessions, monkeypatch, today=datetime(2026, 11, 1, 0, 0))
+        with sessions() as session:
+            row = session.query(Collection).filter_by(slug="seasonal").one()
+            row.name_template, row.placement, row.placement_friends = "{season_emoji} {season} picks", "both", "both"
+            session.add(
+                Delivery(collection_slug="seasonal", user_slug="sarah", library_key="1", rating_key=4242, title="x")
+            )
+            session.commit()
+        state = self._state(
+            sessions,
+            calls=calls,
+            rows=[],
+            collections=[("🎃 Halloween picks" + row_marker(self.ACCOUNT), 4242, "shortlist_sarah")],
+        )
+        with sessions() as session:
+            specs = state.run_service.builder._build_rows(session, SettingsStore(session, state.secrets))
+        state.run_service.build_context(False).config.rows[:] = specs
+
+        jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert calls[0] == ("merge", calls[0][1])
+        assert self._promotes(calls) == [
+            (
+                "promote",
+                "🎃 Halloween picks" + row_marker(self.ACCOUNT),
+                {"shared": False, "home": False, "recommended": False},
+            )
+        ]
+
+    def test_a_turnover_a_failed_pass_missed_is_still_converged_the_following_nights(self, sessions, monkeypatch):
+        """Halloween closed on 1 Nov. If that night's pass failed and its retry ran past the next midnight, a
+        gate asking only about yesterday would drop the row and leave it up all of November."""
+        calls: list = []
+        self._seed_seasonal(sessions, monkeypatch, today=datetime(2026, 11, 4, 0, 0))
+        state = self._state(sessions, calls=calls, rows=[self.OFF])
+
+        assert jobs._HANDLERS["rows.visibility"](state, {})["changed"] == ["seasonal"]
+
+    def test_a_week_after_a_turnover_the_row_makes_no_work(self, sessions, monkeypatch):
+        self._seed_seasonal(sessions, monkeypatch, today=datetime(2026, 11, 9, 0, 0))
+        state = self._state(sessions, calls=[], rows=[self.OFF])
+        state.run_service.build_context = lambda dry_run, plex_only=False: (_ for _ in ()).throw(
+            AssertionError("the turnover was more than a week ago")
+        )
+
+        assert jobs._HANDLERS["rows.visibility"](state, {})["changed"] == []
+
+    def test_the_night_a_season_opens_the_row_is_converged(self, sessions, monkeypatch):
+        calls: list = []
+        self._seed_seasonal(sessions, monkeypatch, today=datetime(2026, 10, 1, 0, 0))
+        state = self._state(sessions, calls=calls, rows=[self.ON])
+
+        result = jobs._HANDLERS["rows.visibility"](state, {})
+
+        assert result["changed"] == ["seasonal"]
 
     # ---- the cheap night ------------------------------------------------------------------
 

@@ -20,6 +20,7 @@ from loguru import logger
 
 import shortlist.engine.rows as rows
 from shortlist.engine import requests as requests_mod
+from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.clients.plex_pms import TOP, log_title
 from shortlist.engine.clients.plextv import FilterWriteRefused
@@ -35,7 +36,9 @@ from shortlist.engine.delivery import (
 from shortlist.engine.models import (
     LABEL_PREFIX,
     SHARED_LABEL_PREFIX,
+    SHARED_SLUG_PREFIX,
     CollectionDiff,
+    EngineConfig,
     HubAnchor,
     MediaType,
     OwnedRow,
@@ -47,6 +50,7 @@ from shortlist.engine.models import (
     UserRunReport,
     UserType,
 )
+from shortlist.engine.placeholders import names_a_seed
 from shortlist.engine.privacy import (
     RESTRICTED_FILTER_FIELDS,
     FilterParseError,
@@ -143,6 +147,8 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
     # _collection_order_phase): each (collection, ranked_keys) delivery records here, so the expensive
     # one-move-per-item ordering never runs inside the serial delivery write-lock and can't stall it.
     order_work: list[tuple] = []
+
+    _load_season_titles(ctx, users, library_index)
 
     # Deliver every per-person and shared row UNPROMOTED — nothing is on anyone's Home yet.
     to_promote, shared_to_promote = _deliver_phase(
@@ -370,6 +376,48 @@ def _build_indexes(
     return seed_index, library_index
 
 
+def _load_season_titles(
+    ctx: EngineContext, users: list[UserProfile], library_index: dict[MediaType, dict[int, int]]
+) -> None:
+    """Read, once for the whole run, every season a seasonal row builds for tonight (discussion #124).
+
+    Only seasons a row in this run's scope actually builds — never an out-of-season row's — and only when
+    there is someone to build for: a no-user run (every privacy sync) reads no list at all. A season
+    that cannot be read is recorded, not raised: the rows that need it keep what they have, as a row
+    whose sources are all down does, and every other row still builds.
+    """
+    if not users:
+        return
+    wanted = {
+        spec.season.slug: spec.season
+        for spec in ctx.config.rows
+        if spec.season is not None and ctx.config.should_build(spec)
+    }
+    for slug, season in wanted.items():
+        catalogued = seasons_mod.SEASONS.get(slug)
+        if catalogued is None:
+            ctx.season_failures[slug] = "it is not a season this version knows"
+            continue
+        try:
+            ctx.season_titles[slug] = seasons_mod.load_titles(ctx.tmdb, catalogued, library_index)
+        except Exception as e:
+            ctx.season_failures[slug] = f"{type(e).__name__}: {e}"
+            logger.warning(
+                "the {} list could not be read from TMDB ({}) — seasonal rows keep what they have tonight",
+                season.name,
+                type(e).__name__,
+            )
+            continue
+        titles = ctx.season_titles[slug]
+        logger.info(
+            "{} list: {} films and {} shows, {} of them in your libraries",
+            season.name,
+            len(titles.ids[MediaType.MOVIE]),
+            len(titles.ids[MediaType.SHOW]),
+            sum(len(items) for items in titles.in_library.values()),
+        )
+
+
 def _sweep_phase(ctx: EngineContext, report: RunReport) -> bool:
     """Delete every row on the server that Plex cannot hide. Returns False (run aborts) on failure.
 
@@ -411,8 +459,12 @@ def _deliver_phase(
     report: RunReport,
     demand: requests_mod.RowDemand | None,
     order_work: list[tuple],
-) -> tuple[list[UserProfile], list[tuple[RowSpec, UserProfile]]]:
-    """Deliver every per-person and shared row, all UNPROMOTED. Returns the promotion candidates."""
+) -> tuple[list[UserProfile], list[tuple[RowSpec, UserProfile | None]]]:
+    """Deliver every per-person and shared row, all UNPROMOTED. Returns the promotion candidates.
+
+    A shared candidate carries no profile when its row was not built because it is out of season: it is
+    promoted only so its `off` placement applies.
+    """
     to_promote: list[UserProfile] = []
     # Whose rows were on the server before this run. Anyone else who ends up with a stored label got their
     # FIRST row tonight, and nobody's share filter excludes it yet. Until one does, that row is listed in
@@ -529,14 +581,23 @@ def _deliver_phase(
 
     # Shared "popular on this server" rows: built once from aggregate history, delivered UNPROMOTED
     # like the per-person rows so promotion still happens only after the filters are merged.
-    shared_to_promote: list[tuple[RowSpec, UserProfile]] = []
+    shared_to_promote: list[tuple[RowSpec, UserProfile | None]] = []
     # A cancelled run stops here too — no new shared rows once the user asked to stop. Nor does a
     # run scoped to particular people: their overlap is not "popular on this server", and publishing
     # it to everyone would let a hand-picked subset shape a public row. Shared rows rebuild on the
     # next full run, exactly like a row that's out of scope for a per-row scheduled run.
     build_shared = bool(users) and not ctx.cancelled() and not ctx.config.users_scoped
     shared_specs = [s for s in ctx.config.shared_rows() if ctx.config.should_build(s)] if build_shared else []
+    # Out of season (discussion #124): nothing is built, but the collection is promoted with its `off`
+    # placement so the row that was on screen in season comes off every surface. Whatever this run's
+    # scope: it only clears that one collection's flags (shelf order is `_order_phase`'s, which never
+    # reads this list), so unlike a per-person candidate it re-places nothing else, and it backs up the
+    # midnight pass on the nights after that pass stops looking.
+    if users and not ctx.cancelled():
+        shared_to_promote.extend((spec, None) for spec in ctx.config.shared_rows() if spec.dormant)
     for spec in shared_specs:
+        if spec.dormant:
+            continue
         _shared_report, agg = rows._run_shared(
             ctx, spec, users, seed_index, library_index, stored_labels, report, order_work
         )
@@ -1195,7 +1256,7 @@ def identity_map(keys: dict[tuple[str, str, str], int]) -> dict[str, dict[int, s
 def _promote_phase(
     ctx: EngineContext,
     to_promote: list[UserProfile],
-    shared_to_promote: list[tuple[RowSpec, UserProfile]],
+    shared_to_promote: list[tuple[RowSpec, UserProfile | None]],
     filters_ok: bool,
     report: RunReport,
 ) -> set[int]:
@@ -1216,9 +1277,7 @@ def _promote_phase(
     # no-spec fallback shows what it cannot identify, which would undo the midnight schedule for the
     # rest of the day. So the run stops guessing exactly when guessing could over-show, and keeps the
     # fallback on every server that schedules nothing (where guessing is what stops rows vanishing).
-    any_row_hidden_today = any(
-        spec.placement == "off" or spec._effective_friends_placement == "off" for spec in ctx.config.per_person_rows()
-    )
+    hidden_today = any_row_hidden_today(ctx.config)
     for position, user in enumerate(to_promote, start=1):
         _emit(ctx, "Shortlist", "promoting", {"done": position, "total": len(to_promote)})
         user_report = next((r for r in report.users if r.slug == user.slug), None)
@@ -1250,7 +1309,7 @@ def _promote_phase(
                 user_report.placement_titles if user_report else {},
                 placement_keys=ledger.get(user.slug, {}),
                 into=promoted,
-                skip_unmatched=any_row_hidden_today,
+                skip_unmatched=hidden_today,
             )
         except Exception as e:
             if user_report is not None:
@@ -1259,8 +1318,8 @@ def _promote_phase(
             logger.exception("{}: promote failed", user.username)
 
     # Promote the shared rows too — public, so everyone with library access sees them.
-    for spec, agg in shared_to_promote if not ctx.config.dry_run and filters_ok else []:
-        shared_report = next((r for r in report.users if r.slug == agg.slug), None)
+    for spec, _agg in shared_to_promote if not ctx.config.dry_run and filters_ok else []:
+        shared_report = next((r for r in report.users if r.slug == f"{SHARED_SLUG_PREFIX}_{spec.slug}"), None)
         try:
             promote_shared_row(ctx, spec, into=promoted)
         except Exception as e:
@@ -1300,6 +1359,24 @@ def promote_shared_row(ctx: EngineContext, spec: RowSpec, *, into: set[int]) -> 
             into.add(int(collection.ratingKey))
 
 
+def any_row_hidden_today(config: EngineConfig) -> bool:
+    """Whether any per-person row is placed nowhere today — by its schedule, out of season, or switched off.
+
+    Every promotion that cannot identify a collection needs this answer: while some row is hidden, an
+    unidentifiable collection might BE that row, so it is left alone rather than shown.
+
+    Args:
+        config: The run's engine config, with today's day schedule already resolved into placements.
+
+    Returns:
+        True when at least one per-person row is `off` for its owner or for everyone else.
+    """
+    return any(
+        spec.dormant or spec.placement == "off" or spec._effective_friends_placement == "off"
+        for spec in config.per_person_rows()
+    )
+
+
 def promote_user_rows(
     ctx: EngineContext,
     user: UserProfile,
@@ -1326,8 +1403,10 @@ def promote_user_rows(
 
     With neither, a static-titled row still matches via the rendered-title fallback below, and only a
     ``{top_seed}`` row with no ledger entry falls to ``_promote_one``'s no-spec branch — which shows it
-    on its own audience's Home. Right direction for a restore (the row was visible before the pause),
-    but not the row's configured placement, which is why the ledger is consulted first.
+    on its own audience's Home, not at the row's configured placement, which is why the ledger is
+    consulted first. Unless ``skip_unmatched``: then it is left exactly as it is. ``_promote_phase`` and
+    ``user.restore`` set it whenever a row is hidden today (``any_row_hidden_today``), because the
+    unidentified collection might be that row; ``rows.visibility`` always sets it.
 
     Returns the ratingKeys touched, and writes them into ``into`` as it goes when given one — so a
     caller that catches a mid-loop PMS failure still knows which collections were already set. Raises
@@ -1349,7 +1428,9 @@ def promote_user_rows(
     # a STATIC-titled row's title is stable, so map it to its spec by that title — otherwise
     # _promote_one would fall to the everywhere-visible default and yank a "Library only" row onto Home
     # for this one run. Dynamic ({top_seed}) titles can't be predicted without picks, so those keep the
-    # safe hide-everywhere fallback. resolve_row_template is the shared source of truth for the template
+    # safe hide-everywhere fallback. A seasonal row renders tonight's season here, so in season it maps
+    # like a static row; out of season its template cannot render and it is skipped (the ledger, or
+    # `skip_unmatched`, decides it). resolve_row_template is the shared source of truth for the template
     # precedence delivery also uses — they must not drift.
     marker = row_marker(user.plex_account_id)
     sections = ctx.plex.sections()
@@ -1357,7 +1438,7 @@ def promote_user_rows(
         (spec, template)
         for spec in effective_rows
         if (spec.audience is None or user.plex_account_id in spec.audience)
-        and "{top_seed}" not in (template := resolve_row_template(spec, user, ctx.config))
+        and not names_a_seed(template := resolve_row_template(spec, user, ctx.config))
     ]
     # Two passes, so a row's title in a library it BUILDS in always beats another row's leftover there.
     # First the libraries each row targets today; then EVERY library of its media type, because its
@@ -1438,8 +1519,8 @@ def promote_user_rows(
                 # marker characters, and a warning meant to make a collection FINDABLE cannot be a
                 # line nobody can match by eye.
                 logger.warning(
-                    "{}: no row matched it, so its surfaces are left as they are — a day schedule "
-                    "cannot be applied to it until its delivery record is rebuilt",
+                    "{}: no row matched it, so its surfaces are left as they are — neither a day schedule "
+                    "nor an un-pause can apply to it until its delivery record is rebuilt",
                     log_title(collection.title),
                 )
                 continue
@@ -1618,6 +1699,11 @@ def _promote_one(ctx: EngineContext, collection, spec: RowSpec | None, user_type
     """
     if is_name_freeing_helper(collection.title):
         return  # debris from a stopped run, not a row: the next sweep deletes it
+    if spec is not None and spec.dormant:
+        # Out of season is off, whatever the placement says. The server resolves it that way, but the
+        # engine promotes people and shared rows ONLY to hide dormant rows, so it does not rely on that.
+        ctx.plex.promote(collection, shared=False, home=False, recommended=False)
+        return
     if spec is None:
         # No spec could be matched to this title. This is NOT a rare path — the title->spec map
         # misses routinely (the full-stack suite reaches it for every collection), so whatever this

@@ -84,6 +84,13 @@ describe("tokenStepBreakdown", () => {
   it("returns '' for undefined — the single shape both callers (parens or not) build on", () => {
     expect(tokenStepBreakdown(undefined)).toBe("");
   });
+
+  // Web search has been the only AI step since final picks moved into code, so a run from then on
+  // always records one step, and "360,939 · web search 360,939" just says the total twice.
+  it("returns '' when only one step used any tokens", () => {
+    expect(tokenStepBreakdown({ llm_web: 360939 })).toBe("");
+    expect(tokenStepBreakdown({ llm_web: 360939, curate: 0 })).toBe("");
+  });
 });
 
 describe("webSearchSummary", () => {

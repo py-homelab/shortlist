@@ -10,6 +10,7 @@ from dataclasses import replace
 
 from loguru import logger
 
+from shortlist.engine import placeholders
 from shortlist.engine.clients.plex_pms import CollectionRejectedItems, PlexClient, log_title
 from shortlist.engine.clients.poster import PosterArtist
 from shortlist.engine.models import (
@@ -24,6 +25,7 @@ from shortlist.engine.models import (
     UserProfile,
     WrittenDetails,
 )
+from shortlist.engine.placeholders import fill_season, names_a_seed, needs_a_run, season_renderings, uses_season
 
 DEFAULT_ROW_NAME = "✨ Picked for You"
 
@@ -383,13 +385,13 @@ def seed_source(section_picks: list[Pick], row_picks: list[Pick]) -> list[Pick]:
 def _fill(template: str, profile: UserProfile, top_seed: str, library_name: str) -> str:
     """Substitute the placeholders and tidy the spacing. No fallbacks, no opinions."""
     rendered = (
-        template.replace("{top_seed}", top_seed)
-        .replace("{user}", profile.display_name)
-        .replace("{library_name}", library_name)
+        template.replace(placeholders.TOP_SEED, top_seed)
+        .replace(placeholders.USER, profile.display_name)
+        .replace(placeholders.LIBRARY_NAME, library_name)
     )
     # A {library_name} title with no (or a padding-adjacent) library leaves double spaces where the
     # placeholder was — collapse runs of whitespace so the human title reads clean either way.
-    return " ".join(rendered.split()) if "{library_name}" in template else rendered.strip()
+    return " ".join(rendered.split()) if placeholders.LIBRARY_NAME in template else rendered.strip()
 
 
 def render_row_name(
@@ -420,16 +422,29 @@ def render_row_name(
     row titles simply never did.
     """
     top_seed = top_seed_of(picks)
-    unfillable = "{top_seed}" in template and not top_seed
+    # A season placeholder still standing here had no season to fill it (`resolve_row_template` fills
+    # them), so it is unfillable exactly as a `{top_seed}` with no seed is.
+    unfillable = (names_a_seed(template) and not top_seed) or uses_season(template)
     rendered = "" if unfillable else _fill(template, profile, top_seed, library_name)
     if rendered:
         return rendered
     # The row's own name could not be produced — a `{top_seed}` with nothing to name, or a template
     # that is blank once rendered. Fall back only to what the OPERATOR wrote, and only if that itself
-    # can be rendered: a fallback that also needs a seed is no fallback at all.
-    if fallback_name and "{top_seed}" not in fallback_name:
+    # can be rendered: a fallback that also needs a seed (or a season) is no fallback at all.
+    if fallback_name and not needs_a_run(fallback_name):
         return _fill(fallback_name, profile, "", library_name)
     return ""
+
+
+def season_poster(spec: RowSpec) -> PosterSpec | None:
+    """The row's poster with its season filled into the text lines; None when the row has no poster."""
+    if spec.poster is None or spec.season is None:
+        return spec.poster
+    return replace(
+        spec.poster,
+        title=fill_season(spec.poster.title, spec.season),
+        subtitle=fill_season(spec.poster.subtitle, spec.season),
+    )
 
 
 def render_poster_text(field_value: str, profile: UserProfile, picks: list[Pick], library_name: str) -> str:
@@ -509,12 +524,12 @@ def render_description(template: str, profile: UserProfile, picks: list[Pick], l
     would flatten a description typed over several lines.
     """
     top_seed = top_seed_of(picks)
-    if not template.strip() or ("{top_seed}" in template and not top_seed):
+    if not template.strip() or (names_a_seed(template) and not top_seed) or uses_season(template):
         return ""
     return (
-        template.replace("{top_seed}", top_seed)
-        .replace("{user}", profile.display_name)
-        .replace("{library_name}", library_name)
+        template.replace(placeholders.TOP_SEED, top_seed)
+        .replace(placeholders.USER, profile.display_name)
+        .replace(placeholders.LIBRARY_NAME, library_name)
         .strip()
     )
 
@@ -573,7 +588,7 @@ def apply_row_details(
         return written, {}
     try:
         wanted = {
-            "summary": render_description(spec.description, profile, picks, library_name),
+            "summary": render_description(fill_season(spec.description, spec.season), profile, picks, library_name),
             "titleSort": f"{prefix}{display}" if prefix else "",
         }
         clearing = collection is not None and (
@@ -631,6 +646,15 @@ def resolve_row_template(spec: RowSpec, profile: UserProfile, config: EngineConf
     delivered collection's title from the same resolution to find the row it just wrote; if a caller
     resolved the template differently, promote would look for a title delivery never created and the
     row's placement/privacy promotion would silently no-op (plex-safety: a row could stay unhidden).
+    """
+    return fill_season(raw_row_template(spec, profile, config), spec.season)
+
+
+def raw_row_template(spec: RowSpec, profile: UserProfile, config: EngineConfig) -> str:
+    """The template `resolve_row_template` starts from, before the row's season is filled in.
+
+    For the question "can this row's title be predicted at all": a seasonal row's collection wears
+    whichever season it was last built for, which need not be tonight's.
     """
     return spec.name_template or (profile.row_name_template or config.row_name_template)
 
@@ -701,17 +725,20 @@ def titles_other_rows_build(
             continue
         if other.audience is not None and profile.plex_account_id not in other.audience:
             continue  # builds nothing for this person, so no title of theirs can be its collection
-        template = resolve_row_template(other, profile, config)
+        # A seasonal row claims the title of EVERY season, not only tonight's: its collection wears
+        # whichever season it was last built for. Claiming more only ever removes less.
+        templates = season_renderings(raw_row_template(other, profile, config))
         for section in target_sections(sections, other):
-            display = render_row_name(
-                template,
-                profile,
-                [],
-                library_name=getattr(section, "title", "") or "",
-                fallback_name=other.fallback_name,
-            )
-            if display:
-                claimed.add((str(section.key), display))
+            for template in templates:
+                display = render_row_name(
+                    template,
+                    profile,
+                    [],
+                    library_name=getattr(section, "title", "") or "",
+                    fallback_name=other.fallback_name,
+                )
+                if display:
+                    claimed.add((str(section.key), display))
     return claimed
 
 
@@ -848,7 +875,7 @@ def deliver_rows(
             # DIFFERENT library must never be allowed to match here.
             delivered_key=(delivered_keys or {}).get(str(section.key)),
             dry_run=dry_run,
-            poster=spec.poster if spec else None,
+            poster=season_poster(spec) if spec else None,
             artist=poster_artist,
             order_work=order_work,
             on_write=on_write,
@@ -1006,6 +1033,7 @@ def remove_row(
     wanted_label = spec.label or f"{LABEL_PREFIX}_{profile.slug}"
     marker = row_marker(0) if spec.shared else row_marker(profile.plex_account_id)
     template = resolve_row_template(spec, profile, config)
+    raw_template = raw_row_template(spec, profile, config)
 
     # Look in every library, not just the row's current targets: if its library_keys changed, an
     # earlier copy may linger in a library it no longer targets, and a muted row must leave them all.
@@ -1031,7 +1059,9 @@ def remove_row(
         # or cold-skipped row silently stops being removed) or finds a SIBLING row that happens to
         # be titled the fallback and deletes that instead. The ledger key is the only handle that
         # survives a title which differs per person, which is exactly what a fallback creates.
-        unrenderable = not display or "{top_seed}" in template
+        # A seasonal name is the same case from the other side: it renders tonight's season, and the
+        # collection may still wear the last one it was built for.
+        unrenderable = not display or names_a_seed(template) or uses_season(raw_template)
         if unrenderable and ledger_key is None:
             # This row has no title to match on — a `{top_seed}` template (which renders per person,
             # so no title computed here is anyone's) or one that renders blank. Per-person rows share

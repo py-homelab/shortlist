@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session
 from starlette.responses import JSONResponse, StreamingResponse
 
 import shortlist.server.services.context_builder as context_builder
+from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.candidates import KNOWN_SOURCES
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import target_sections
@@ -34,7 +36,8 @@ from shortlist.engine.models import (
     row_monitor_or_inherit,
     slugify,
 )
-from shortlist.engine.rows import row_is_shown
+from shortlist.engine.placeholders import refusal
+from shortlist.engine.rows import row_shown_today
 from shortlist.server.api.row_changes import (
     POSTER_RESET,
     PRIVACY_SYNC,
@@ -45,7 +48,7 @@ from shortlist.server.api.row_changes import (
     RowChange,
     plan_row_changes,
 )
-from shortlist.server.api.schemas import PassthroughModel
+from shortlist.server.api.schemas import PassthroughModel, StrictRequestModel
 from shortlist.server.auth import require_owner
 from shortlist.server.db.models import (
     DEFAULT_SLUG,
@@ -143,7 +146,7 @@ class PosterIn(BaseModel):
     style: str = Field(default="", max_length=400)
 
 
-class CollectionIn(BaseModel):
+class CollectionIn(StrictRequestModel):
     name: str = Field(min_length=1, max_length=255)
     build: str = _closed_set(BUILDS, "per_person", "Who the row is built for: one per person, or one shared row.")
     audience: str = _closed_set(AUDIENCES, "everyone", "Everyone, or the subset named by audience_user_ids.")
@@ -170,11 +173,8 @@ class CollectionIn(BaseModel):
         went quiet, and the row still was not built. The operator does exactly what the alert asks and
         is told it worked. That is issue #84's symptom re-entering through the field built to fix it.
         """
-        if value and "{top_seed}" in value:
-            raise ValueError(
-                "the fallback name is for people with nothing watched, so it can't use {top_seed} "
-                "either — there'd still be nothing to put in it. Use a name that stands on its own."
-            )
+        if why := refusal(value, "fallback"):
+            raise ValueError(why)
         return value
 
     min_watchers: int = Field(default=2, ge=2)  # a public row must never be shaped by one person
@@ -292,10 +292,35 @@ class CollectionIn(BaseModel):
         (`01 `) is part of how it sorts."""
         return value if value.strip() else ""
 
+    # The seasons this row follows (discussion #124); [] -> not seasonal. Out of season the row is hidden,
+    # and it shows from `season_lead_days` before each season's day to `season_after_days` after it.
+    seasons: list[str] = Field(
+        default_factory=list,
+        description="Seasons this row follows (see GET /api/collections/seasons). Empty means it is not seasonal.",
+    )
+    season_lead_days: int = Field(
+        default=30,
+        ge=0,
+        le=seasons_mod.MAX_LEAD_DAYS,
+        description="How many days before each season's day the row starts showing.",
+    )
+    season_after_days: int = Field(
+        default=0,
+        ge=0,
+        le=seasons_mod.MAX_AFTER_DAYS,
+        description="How many days after each season's day the row stays up.",
+    )
+
     @field_validator("show_days")
     @classmethod
     def _check_show_days(cls, days: list[int]) -> list[int]:
         return _normalise_show_days(days)
+
+    @field_validator("seasons")
+    @classmethod
+    def _check_seasons(cls, slugs: list[str]) -> list[str]:
+        """Known seasons only, de-duplicated and in calendar order, so equal choices compare equal."""
+        return seasons_mod.normalise_slugs(slugs)
 
 
 class HubAnchorOut(PassthroughModel):
@@ -335,6 +360,37 @@ class PlanEntryOut(PassthroughModel):
     only_user_ids: list[int]
     #: WHICH libraries a RECONCILE is limited to (Plex section keys); empty means every library.
     in_sections: list[str]
+
+
+class SeasonWindowOut(PassthroughModel):
+    """One season's run for a row: which season, and the first and last days the row shows it."""
+
+    slug: str
+    name: str
+    emoji: str
+    starts: str  # ISO date, on the server's clock
+    ends: str
+
+
+class SeasonStatusOut(PassthroughModel):
+    """Where a seasonal row is in its calendar today, judged on the SERVER's clock."""
+
+    #: The season it shows today, or null between seasons (the row is hidden).
+    showing: SeasonWindowOut | None
+    #: The next season to start after today, or null when it follows none.
+    next: SeasonWindowOut | None
+
+
+class SeasonOut(PassthroughModel):
+    """A season a row can follow."""
+
+    slug: str
+    name: str
+    emoji: str
+    month: int
+    day: int
+    #: What the row holds in this season, in plain English.
+    description: str
 
 
 class CollectionOut(PassthroughModel):
@@ -435,6 +491,12 @@ class CollectionOut(PassthroughModel):
             "Whether this row is on its surfaces today, judged on the SERVER's clock — which is the "
             "clock the midnight schedule and Plex follow, not the viewer's."
         )
+    )
+    seasons: list[str] = Field(description="Seasons this row follows, in calendar order. Empty means not seasonal.")
+    season_lead_days: int = Field(description="How many days before each season's day the row starts showing.")
+    season_after_days: int = Field(description="How many days after each season's day the row stays up.")
+    season_status: SeasonStatusOut | None = Field(
+        description="Where the row is in its calendar today; null for a row that follows no season."
     )
     pin_top: bool
     hub_anchor: dict[str, HubAnchorOut]  # keyed by Plex section key, so the KEYS vary by library
@@ -722,7 +784,34 @@ def _poster_view(session, collection: Collection) -> dict:
     }
 
 
+def _season_window_view(window: seasons_mod.SeasonWindow | None) -> dict | None:
+    if window is None:
+        return None
+    return {
+        "slug": window.season.slug,
+        "name": window.season.name,
+        "emoji": window.season.emoji,
+        "starts": window.starts.isoformat(),
+        "ends": window.ends.isoformat(),
+    }
+
+
+def _season_status(collection: Collection, now: datetime) -> dict | None:
+    """Which season a seasonal row shows today and which comes next, on the server's clock; None if not seasonal."""
+    if not collection.seasons:
+        return None
+    args = (list(collection.seasons), collection.season_lead_days, collection.season_after_days, now.date())
+    showing = seasons_mod.shown_on(*args)
+    if showing is not None:
+        # Its last day on screen, which is not its window's end when a following season takes over first.
+        showing = replace(showing, ends=seasons_mod.last_shown_day(*args))
+    return {"showing": _season_window_view(showing), "next": _season_window_view(seasons_mod.next_after(*args))}
+
+
 def _serialize(session, collection: Collection, now: datetime | None = None) -> dict:
+    # One clock read for everything this row reports about today: the badge and the season status must
+    # describe the same day, even for a response built across midnight.
+    now = now or context_builder.local_now()
     audience_ids = [
         row.user_id for row in session.query(CollectionAudience).filter_by(collection_id=collection.id).all()
     ]
@@ -801,13 +890,30 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
         # Resolved HERE, on the server's clock — the same one the midnight job and Plex follow. A
         # badge computed in the browser reads the admin's timezone, which can disagree with what
         # Plex is actually showing for as long as the offset lasts.
-        "shown_today": row_is_shown(collection.show_days, now or context_builder.local_now()),
+        "shown_today": row_shown_today(
+            collection.show_days,
+            collection.seasons,
+            collection.season_lead_days,
+            collection.season_after_days,
+            now,
+        ),
+        "seasons": list(collection.seasons or []),
+        "season_lead_days": collection.season_lead_days,
+        "season_after_days": collection.season_after_days,
+        "season_status": _season_status(collection, now),
         "placement_friends": collection.placement_friends or "both",
         "pin_top": bool(collection.pin_top),
         "hub_anchor": collection.hub_anchor or {},
         "library_keys": [str(k) for k in (collection.library_keys or [])],
         "poster": _poster_view(session, collection),
     }
+
+
+def _reject_season_name_without_seasons(template: str, seasons: list[str]) -> None:
+    """Refuse a name that uses the season on a row that follows none: it could never be filled in, so the
+    row would never be built for anyone (discussion #124)."""
+    if why := refusal(template or "", "row_name", row_has_seasons=bool(seasons)):
+        raise HTTPException(status_code=422, detail=why)
 
 
 def _reject_duplicate_name(
@@ -980,6 +1086,22 @@ async def list_collections(request: Request) -> list[dict]:
         return [_serialize(session, c, now) for c in collections]
 
 
+@router.get("/seasons", response_model=list[SeasonOut])
+async def list_seasons() -> list[dict]:
+    """Every season a row can follow, in calendar order (discussion #124)."""
+    return [
+        {
+            "slug": season.slug,
+            "name": season.name,
+            "emoji": season.emoji,
+            "month": season.month,
+            "day": season.day,
+            "description": season.description,
+        }
+        for season in seasons_mod.SEASONS.values()
+    ]
+
+
 @router.post("", status_code=201, response_model=CollectionOut)
 async def create_collection(body: CollectionIn, request: Request) -> dict:
     # `CollectionIn` is the body model for PATCH as well, which is where `dry_run` belongs — but that
@@ -989,6 +1111,7 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
     if body.dry_run:
         raise HTTPException(status_code=422, detail="dry_run is only supported on PATCH and DELETE")
     _validate(body)
+    _reject_season_name_without_seasons(body.name_template or body.name, body.seasons)
     with request.app.state.sessions() as session:
         # The template this row will actually be titled from, not the bare name — a POST may set both.
         _reject_duplicate_name(
@@ -1034,6 +1157,9 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             pick_order=body.pick_order,
             placement=body.placement,
             show_days=body.show_days,
+            seasons=body.seasons,
+            season_lead_days=body.season_lead_days,
+            season_after_days=body.season_after_days,
             placement_friends=body.placement_friends,
             pin_top=body.pin_top,
             hub_anchor={k: v.model_dump() for k, v in body.hub_anchor.items()},
@@ -1041,6 +1167,7 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             poster=body.poster.model_dump(),
             description=body.description,
             sort_title_prefix=body.sort_title_prefix,
+            **{column: getattr(body, column) for column in _REQUEST_COLUMNS},
         )
         session.add(collection)
         session.flush()
@@ -1050,6 +1177,29 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
     rebuild_schedule(request.app)  # a new row may carry a schedule — register its cron job now
     return result
 
+
+#: This row's own request floors and Arr target; null on any of them means inherit the global. Named once
+#: for create and edit alike: the create constructor listed columns by hand and missed every one of these.
+_REQUEST_COLUMNS = (
+    "req_min_rating",
+    "req_min_votes",
+    "req_min_demand",
+    "req_min_year",
+    "req_max_year",
+    "req_auto_send",
+    "req_auto_min_demand",
+    "req_auto_min_rating",
+    "req_max_per_row",
+    "req_radarr_quality_profile_id",
+    "req_radarr_root_folder",
+    "req_sonarr_quality_profile_id",
+    "req_sonarr_root_folder",
+    "req_sonarr_monitor",
+    "req_language_mode",
+    "req_preferred_languages",
+    "req_min_rating_other",
+    "req_auto_user_tag",
+)
 
 # Columns a PATCH may set directly, name (needs a dup check) and audience (needs shaping)
 # handled separately.
@@ -1080,29 +1230,14 @@ _PATCHABLE_COLUMNS = (
     "max_seeds",
     "cold_start",
     "seed_window",
-    # This row's own request floors and Arr target; null on any of them means inherit the global.
-    "req_min_rating",
-    "req_min_votes",
-    "req_min_demand",
-    "req_min_year",
-    "req_max_year",
-    "req_auto_send",
-    "req_auto_min_demand",
-    "req_auto_min_rating",
-    "req_max_per_row",
-    "req_radarr_quality_profile_id",
-    "req_radarr_root_folder",
-    "req_sonarr_quality_profile_id",
-    "req_sonarr_root_folder",
-    "req_sonarr_monitor",
-    "req_language_mode",
-    "req_preferred_languages",
-    "req_min_rating_other",
-    "req_auto_user_tag",
+    *_REQUEST_COLUMNS,
     "pick_order",
     "placement",
     "placement_friends",
     "show_days",
+    "seasons",
+    "season_lead_days",
+    "season_after_days",
     "pin_top",
     "library_keys",
 )
@@ -1283,6 +1418,23 @@ async def update_collection(collection_id: int, body: CollectionIn, request: Req
         _validate_anchor_rows(session, body, editing_slug=collection.slug)
         before = _snapshot(session, collection)
         is_default = collection.slug == DEFAULT_SLUG
+        if is_default:
+            # The default row is everyone's everyday row and its title is the global template, which every
+            # person's row renders: it follows no season, so it can neither take one nor wear its name.
+            if "seasons" in sent and body.seasons:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The default row can't follow seasons — add a new row from the Seasonal template.",
+                )
+            if "name" in sent:
+                _reject_season_name_without_seasons(body.name, [])
+        elif sent & {"name", "name_template", "seasons"}:
+            # Merged, like the title checks below: a PATCH that sends only the seasons, or only the name,
+            # is judged against what the row will be once it lands.
+            _reject_season_name_without_seasons(
+                _merged_template(collection, body, sent),
+                body.seasons if "seasons" in sent else list(collection.seasons or []),
+            )
         # A rename only matters for a NON-default per-person row (the default row's title follows the
         # global Settings template, not this column). The old effective template is what the
         # collections on Plex are titled with right now — delivery renders from `name_template or name`.
@@ -1505,6 +1657,11 @@ def _snapshot(session, collection: Collection) -> dict:
         "audience": audience,
         "poster_mode": (collection.poster or {}).get("mode") or "",
         "show_days": tuple(collection.show_days or []),
+        "calendar": (
+            tuple(collection.seasons or []),
+            collection.season_lead_days,
+            collection.season_after_days,
+        ),
     }
 
 
@@ -1560,6 +1717,11 @@ def _projected_snapshot(session, collection: Collection, body: CollectionIn, sen
         "audience": audience,
         "poster_mode": (body.poster.mode or "") if "poster" in sent else before["poster_mode"],
         "show_days": tuple(body.show_days) if "show_days" in sent else before["show_days"],
+        "calendar": (
+            tuple(body.seasons) if "seasons" in sent else before["calendar"][0],
+            body.season_lead_days if "season_lead_days" in sent else before["calendar"][1],
+            body.season_after_days if "season_after_days" in sent else before["calendar"][2],
+        ),
     }
 
 
@@ -1590,6 +1752,8 @@ def _row_change(
         poster_mode_after=after["poster_mode"],
         days_before=before["show_days"],
         days_after=after["show_days"],
+        calendar_before=before["calendar"],
+        calendar_after=after["calendar"],
         defer_rename=defer_rename,
     )
 
@@ -1674,9 +1838,9 @@ async def _apply_plan(state, plan: list[PlannedWork], *, slug: str, build: str) 
         elif work.kind == POSTER_RESET:
             await reconcile.run_poster_reset(state, slug=slug, build=build, scope=work.scope)
         elif work.kind == VISIBILITY:
-            # Server-wide converge rather than a targeted write: the handler compares every row's
-            # resolved placement against the state it last applied, so it settles this row AND any
-            # other whose day turned over while Plex was unreachable. Durable, so an outage right now
+            # Server-wide converge rather than a targeted write: the handler recomputes today's answer
+            # for every scheduled row and keeps no state, so it settles this row AND any other whose
+            # day turned over while Plex was unreachable. Durable, so an outage right now
             # is retried rather than lost.
             # Names the row: when its days are CLEARED and no other row on the server carries a
             # schedule, the job's gate would otherwise see nothing to do and skip the very pass that
@@ -1830,6 +1994,9 @@ async def rename_collection_stream(collection_id: int, body: RenameRequest, requ
             # endpoint documents standalone use one line up, and an API client taking that route
             # could hand two rows one title, or overwrite the global template, with nothing to stop
             # it. Checked BEFORE either write, so a refusal renames nothing here or on Plex.
+            _reject_season_name_without_seasons(
+                new_template, [] if slug == DEFAULT_SLUG else list(collection.seasons or [])
+            )
             _reject_duplicate_name(
                 session,
                 request.app.state.secrets,

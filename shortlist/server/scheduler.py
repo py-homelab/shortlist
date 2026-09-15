@@ -342,11 +342,12 @@ def _register_row_visibility(scheduler: AsyncIOScheduler, app) -> None:
     stay up until 03:30 Tuesday, and a row that rebuilds weekly for days. This tick is therefore the
     mechanism, not a tidy-up behind one.
 
-    Free on a server where no row narrows its days, which is every server until somebody uses the
-    feature: the handler answers that from one query and returns before building a Plex client. Where
-    a row IS scheduled, the pass costs a privacy sync (`engine_run` with no users) plus one ~5ms hub
-    visibility write per collection — it holds no state, so it simply reapplies today's answer every
-    night, and anything it cannot do is done by the next one.
+    Free on a server where no row narrows its days and no seasonal row has opened or closed a season in
+    the last week, which is every server until somebody uses either: the handler answers that from one
+    query and returns before building a Plex client. Where a row IS scheduled, the pass costs a privacy
+    sync (`engine_run` with no users) plus one ~5ms hub visibility write per collection — it holds no
+    state, so it simply reapplies today's answer every night, and anything it cannot do is done by the
+    next one.
     """
     cron = _resolve_cron(app, "rows.visibility_cron", DEFAULT_CRONS["rows.visibility_cron"])
 

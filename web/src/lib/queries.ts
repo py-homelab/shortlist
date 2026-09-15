@@ -71,6 +71,7 @@ export const queryKeys = {
   deletedRows: ["report", "deleted-rows"] as const,
   schedule: ["schedule"] as const,
   libraries: ["libraries"] as const,
+  seasons: ["seasons"] as const,
   libraryCollections: (key: string) => ["library-collections", key] as const,
   ownedCollections: ["owned-collections"] as const,
   notifications: ["notifications"] as const,
@@ -499,6 +500,17 @@ export function useCuratorModels(
     enabled,
     staleTime: 60_000,
     retry: false,
+  });
+}
+
+/** The season catalogue. It only changes with the app, so it is never refetched; `enabled` lets a
+ *  component that shows seasons only on a seasonal row avoid asking for them on every other row. */
+export function useSeasons(enabled = true) {
+  return useQuery({
+    queryKey: queryKeys.seasons,
+    queryFn: () => api.getSeasons(),
+    staleTime: Infinity,
+    enabled,
   });
 }
 

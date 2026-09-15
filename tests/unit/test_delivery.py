@@ -654,6 +654,43 @@ class TestDeliverRows:
         # The ledger's handle must follow the NEW collection, or the next run addresses the deleted one.
         assert diff.rating_key is not None
 
+    def test_an_in_place_update_does_not_report_a_title_plex_dropped(self, engine_config, movies, shows):
+        """plex-safety rule 10, update path. Movie 2 was deleted from Plex after it was picked, so the batch
+        read omits it: the row must neither ask Plex to hold it nor report it added, because
+        `titles_added` is the sum of `diff.added`."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 1)
+        stale = existing.items.return_value
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        alive = MagicMock(ratingKey=1001)
+        plex.fetch_items.return_value = ([alive], [1002])
+
+        diff, _ = deliver_rows(plex, profile, picks(), engine_config)
+
+        plex.create_collection.assert_not_called()
+        plex.set_items.assert_called_once_with(existing, stale, [alive], [1001])
+        assert diff.added == ["Movie 1"]
+        assert diff.removed == ["Stale 0"]
+
+    def test_a_rebuilt_row_does_not_report_a_title_plex_dropped(self, engine_config, movies, shows):
+        """plex-safety rule 10, rebuild path: a row Plex refuses every item for is recreated, and the
+        recreated row holds only what Plex still has."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        existing = self._existing_with_stale(profile, 0)
+        existing.items.return_value = []
+        existing.childCount = 0
+        plex.find_owned_collections.side_effect = lambda section, label: [existing] if section is movies else []
+        plex.set_items.side_effect = CollectionRejectedItems("(400) bad_request; .../collections/9/items")
+        plex.fetch_items.return_value = ([MagicMock(ratingKey=1001)], [1002])
+
+        diff, _ = deliver_rows(plex, profile, picks(), engine_config)
+
+        plex.delete_owned_collection.assert_called_once()
+        assert plex.create_collection.call_args.args[2] == [plex.fetch_items.return_value[0][0]]
+        assert diff.added == ["Movie 1"]
+
     def test_a_row_plex_says_has_items_is_never_deleted_on_an_empty_read(self, engine_config, movies, shows):
         """plex-safety rule 4: an empty read never authorises a delete.
 
@@ -2017,6 +2054,31 @@ class TestTheLedgerRemovesAnUnrenderableRow:
         # The COLLECTION's own title, not the computed one — the computed name is the bare default
         # here, and reporting that would name a row the owner never had.
         assert diff.deleted == ["Because you watched The Bear"]
+
+    def test_a_top_seed_rows_fallback_title_never_selects_a_collection(self):
+        """With no picks a `{top_seed}` row renders its FALLBACK name, but a seeded person's collection wears
+        "Because you watched X". Matched on the fallback, removal would find nothing of this row's and could
+        delete a sibling row that happens to carry that title, so only the ledger may select one."""
+        from shortlist.engine.delivery import remove_row, row_marker
+        from shortlist.engine.models import CollectionDiff, EngineConfig, RowSpec, UserProfile, UserType
+
+        sibling = self._collection("Weekend picks" + row_marker(100), 777)
+        plex, sections, deleted = self._plex([sibling])
+
+        remove_row(
+            plex,
+            UserProfile(username="sarah", plex_account_id=100, user_type=UserType.SHARED, slug="sarah"),
+            EngineConfig(),
+            RowSpec(
+                slug="because", name_template="Because you watched {top_seed}", size=5, fallback_name="Weekend picks"
+            ),
+            dry_run=False,
+            diff=CollectionDiff(),
+            sections=sections,
+            delivered_keys={},
+        )
+
+        assert deleted == []
 
     def test_a_ledger_key_never_reaches_a_different_row(self):
         """Identity must select ONE object. The user's live default row shares this label and is the

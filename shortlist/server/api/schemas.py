@@ -16,7 +16,10 @@ Never declare a response model on a bare ``BaseModel``. `tests/unit/test_respons
 if one appears, because this is not a rule to rely on remembering.
 
 Request models are the opposite case and must NOT inherit this — rejecting an unknown field on the
-way IN is how a typo in a client becomes a 422 instead of a silently ignored setting.
+way IN is how a typo in a client becomes a 422 instead of a silently ignored setting. A plain
+``BaseModel`` does not do that either (Pydantic ignores unknown fields by default), so a request body
+inherits :class:`StrictRequestModel`. The row body (`CollectionIn`) does; older request bodies still
+sit on a bare ``BaseModel`` and ignore what they do not declare.
 """
 
 from __future__ import annotations
@@ -28,3 +31,9 @@ class PassthroughModel(BaseModel):
     """Base for every response model: documents the payload without filtering it (see module doc)."""
 
     model_config = ConfigDict(extra="allow")
+
+
+class StrictRequestModel(BaseModel):
+    """Base for a request body: an unknown field is a 422, not a setting that silently never took."""
+
+    model_config = ConfigDict(extra="forbid")

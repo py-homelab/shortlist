@@ -14,6 +14,7 @@ import os
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -139,6 +140,89 @@ def is_collection_hub(hub) -> bool:
     is the old bug back, never a placement that works being refused.
     """
     return str(getattr(hub, "identifier", "") or "").startswith(_COLLECTION_HUB_PREFIX)
+
+
+def hub_rating_key(hub) -> int | None:
+    """The ratingKey a collection's managed hub names in its identifier, or None if it names none.
+
+    Every identifier shape recorded off a real PMS ends in the ratingKey — `custom.collection.1.683081`
+    (`/hubs/sections/<key>/manage`), `custom.collection.1.527794.527794` and `custom.collection.571285`
+    (`/hubs`) — so the last segment is read, and nothing else about the format is assumed.
+
+    This, and never the hub's title, is what ties a hub to its collection. The manage listing keeps
+    the title a collection had when it was promoted, so after an in-place rename the two disagree
+    (`pms_managed_hub_renamed_collection.json`) while the identifier still names the right row.
+    """
+    identifier = str(getattr(hub, "identifier", "") or "")
+    if not is_collection_hub(hub):
+        return None
+    last = identifier.rsplit(".", 1)[-1]
+    return int(last) if last.isdigit() else None
+
+
+def displaced_rows(current: list[str], wanted: list[str], ours: set[str]) -> list[str]:
+    """The hubs of ours that were out of place before a pass, in wanted order.
+
+    ``current`` and ``wanted`` hold the same hubs. A bottom-build re-sends every one of them, so what it
+    wrote says nothing about what was wrong; this does. A row of ours counts when either:
+
+    - it is not among the hubs that already stand in the wanted relative order (the longest run the
+      two orders share). A new row Plex appended at the bottom is one of these; the rows around it
+      are not, or every insertion would name its neighbours too.
+    - a hub that is NOT ours sits directly above it where the arrangement wants something else. That
+      is the fight `_shelf_contention` looks for: another tool slides its hub in under the anchor,
+      and our first row is the one that lost its place. The shared-order test alone would blame the
+      intruder and name nothing of ours.
+    - it heads a block (the arrangement puts a foreign hub directly above it) and the nearest foreign
+      hub above it has changed. Another tool moved the row's anchor to BELOW it: the hub directly
+      above the row is still ours and the shared-order test drops the anchor, so neither check above
+      names anything, and a fight that repeats every half hour would never reach the alert.
+    """
+    position = {ident: n for n, ident in enumerate(current)}
+    sequence = [position[ident] for ident in wanted]
+    # Longest increasing run of current positions, read in wanted order, with back-pointers.
+    tails: list[int] = []
+    tail_at: list[int] = []
+    parent = [-1] * len(sequence)
+    for k, value in enumerate(sequence):
+        j = bisect_left(tails, value)
+        if j == len(tails):
+            tails.append(value)
+            tail_at.append(k)
+        else:
+            tails[j] = value
+            tail_at[j] = k
+        parent[k] = tail_at[j - 1] if j else -1
+    kept: set[str] = set()
+    k = tail_at[-1] if tail_at else -1
+    while k != -1:
+        kept.add(wanted[k])
+        k = parent[k]
+    above_now = dict(pairwise(reversed(current)))
+    above_wanted = dict(pairwise(reversed(wanted)))
+    foreign_above_now = _nearest_foreign_above(current, ours)
+    foreign_above_wanted = _nearest_foreign_above(wanted, ours)
+
+    def out_of_place(ident: str) -> bool:
+        if ident not in kept:
+            return True
+        if above_now.get(ident) != above_wanted.get(ident) and above_now.get(ident) not in ours:
+            return True
+        return above_wanted.get(ident) not in ours and foreign_above_now[ident] != foreign_above_wanted[ident]
+
+    return [ident for ident in wanted if ident in ours and out_of_place(ident)]
+
+
+def _nearest_foreign_above(order: list[str], ours: set[str]) -> dict[str, str | None]:
+    """For each hub of ours, the closest hub above it that is not ours (None at the top)."""
+    nearest: dict[str, str | None] = {}
+    last: str | None = None
+    for ident in order:
+        if ident in ours:
+            nearest[ident] = last
+        else:
+            last = ident
+    return nearest
 
 
 #: The sequence entries that name a POSITION rather than a block of our rows. Every `("rows", …)`
@@ -1099,11 +1183,29 @@ class PlexClient:
         settled shelf costs one read.
         """
         prefix = f"{label_prefix}_".lower()
-        key_by_title = {
-            c.title: c.ratingKey
+        owned = [
+            c
             for c in self._section_collections(section)
             if has_shortlist_marker(c.title) or any(label.tag.lower().startswith(prefix) for label in c.labels)
-        }
+        ]
+        key_by_title = {c.title: c.ratingKey for c in owned}
+        owned_keys = {c.ratingKey for c in owned}
+        title_by_key = {c.ratingKey: c.title for c in owned}
+
+        def key_of(hub) -> int | None:
+            """The ratingKey of OUR collection behind this hub, or None when the hub is not ours.
+
+            By identifier. The manage listing keeps a collection's title from when it was promoted, so
+            matching by title made every row renamed in place — a `{top_seed}` row, most nights — read
+            as another tool's hub: the pass found the shelf out of order, rebuilt all of it, and
+            reported every row as put back (SFLIX, 2026-09-16). Title is only the fallback for an
+            identifier that names no ratingKey at all.
+            """
+            rating_key = hub_rating_key(hub)
+            if rating_key is None:
+                return key_by_title.get(getattr(hub, "title", "") or "")
+            return rating_key if rating_key in owned_keys else None
+
         #: The anchors this pass actually placed against. Built inside the attempt loop from the
         #: anchors that RESOLVED, because naming a refused one here put it in the "we arranged the
         #: shelf" record as well as in its own "could not place" record.
@@ -1121,11 +1223,10 @@ class PlexClient:
             idents = [h.identifier for h in order]
             by_ident = {h.identifier: h for h in order}
             title_of = {h.identifier: (getattr(h, "title", "") or "") for h in order}
-            ours_here = {
-                h.identifier
-                for h in order
-                if is_collection_hub(h) and key_by_title.get(title_of[h.identifier]) in ours_keys and is_promoted(h)
-            }
+            key_by_ident = {h.identifier: key_of(h) for h in order if is_collection_hub(h)}
+            #: Our rows named as they are NOW, for the audit — the manage listing's title can be stale.
+            row_title = {ident: title_by_key.get(key) or title_of[ident] for ident, key in key_by_ident.items()}
+            ours_here = {h.identifier for h in order if key_by_ident.get(h.identifier) in ours_keys and is_promoted(h)}
 
             #: Our rows, grouped as the sequence asks and each group in its CURRENT shelf order — the
             #: order inside a row is one collection per person and nobody sees anyone else's, so
@@ -1134,9 +1235,7 @@ class PlexClient:
             for n, (kind, value) in enumerate(sequence):
                 if kind == "rows":
                     blocks[n] = [
-                        h.identifier
-                        for h in order
-                        if is_collection_hub(h) and key_by_title.get(title_of[h.identifier]) in value and is_promoted(h)
+                        h.identifier for h in order if key_by_ident.get(h.identifier) in value and is_promoted(h)
                     ]
 
             # Every named anchor has to actually be on the shelf. A collection promoted nowhere names
@@ -1239,7 +1338,8 @@ class PlexClient:
             # to rewrite anything. Comparing the whole list made every pass find a difference it could
             # never fix and rewrite the shelf for ever.
             in_play = set(wanted)
-            if [i for i in idents if i in in_play] == wanted:
+            current = [i for i in idents if i in in_play]
+            if current == wanted:
                 if not writes:
                     return {
                         "anchor": audit_anchor,
@@ -1273,7 +1373,7 @@ class PlexClient:
                     # `spliced`, not `ours_here` — the same accounting the real pass uses. Keyed on
                     # ownership, the preview credited a row whose anchor was REFUSED as one it would
                     # move, next to a record saying it could not be placed.
-                    "moved": [title_of[i] for i in wanted if i in spliced],
+                    "moved": [row_title[i] for i in displaced_rows(current, wanted, spliced)],
                     # The preview must state what a real pass would WRITE, backbone included — an
                     # owner told to trust it should not be shown a smaller number than the truth.
                     "repositioned": sum(1 for n, i in enumerate(wanted) if not (n == 0 and i == idents[-1])),
@@ -1281,6 +1381,13 @@ class PlexClient:
                     "dry_run": True,
                     "refused": refused,
                 }
+
+            if not writes:
+                # Judged once, on the shelf as we found it. A retry starts from our own half-finished
+                # moves, and rows displaced by those are not evidence of anything. `spliced`, not
+                # `ours_here`: a row whose anchor was REFUSED rides along in the backbone, and the feed
+                # must not say "we moved Row A" beside "we could not place Row A".
+                moved = {ident: row_title[ident] for ident in displaced_rows(current, wanted, spliced)}
 
             # Bottom-build: each hub in turn to the END of the shelf, which is the one insert with
             # room to spare. `tail` tracks the hub currently last so the model never re-reads.
@@ -1290,11 +1397,6 @@ class PlexClient:
                     continue
                 by_ident[ident].reload().move(after=by_ident[tail])
                 writes += 1
-                if ident in spliced:
-                    # `spliced`, not `ours_here`: a row of ours whose anchor was REFUSED rides along
-                    # in the backbone, and counting it here made the feed say "we moved Row A" beside
-                    # "we could not place Row A". `moved` means rows we put where the owner asked.
-                    moved[ident] = title_of[ident]
                 tail = ident
 
         logger.warning(

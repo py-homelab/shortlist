@@ -26,6 +26,7 @@ from shortlist.engine.curator import Curator
 from shortlist.engine.history import HistorySource
 from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport, WrittenDetails
 from shortlist.engine.privacy import SnapshotStore
+from shortlist.engine.seasons import SeasonTitles
 
 
 @dataclass
@@ -103,6 +104,11 @@ class EngineContext:
     # section listing; it costs no extra request. Empty when genre avoidance is off, so nothing is
     # computed for an owner who never asked for it.
     library_genre_counts: Counter[str] = field(default_factory=Counter)
+    # Seasonal rows (discussion #124): each season a row builds for tonight, read from TMDB once for the
+    # whole run (`pipeline._load_season_titles`), and why any that could not be read failed. A row whose
+    # season is missing here keeps what it has — the same as a row whose every source is down.
+    season_titles: dict[str, SeasonTitles] = field(default_factory=dict)
+    season_failures: dict[str, str] = field(default_factory=dict)
     # plex account id -> the slug Shortlist assigned that account, for EVERY user it knows (not just
     # tonight's). This is how "whose row is this?" is answered. It cannot be answered from a name:
     # people rename themselves, and two display names can slugify to the same string — either

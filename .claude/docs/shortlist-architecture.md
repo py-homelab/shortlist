@@ -66,6 +66,8 @@ shortlist/
 │   │   │   ├── base.py           # curate(profile, candidates, k) -> [Pick]; strict JSON schema; validates output ⊆ input
 │   │   │   ├── anthropic.py · openai.py · google.py · ollama.py · null.py (heuristic+template reasons)
 │   │   ├── delivery.py           # collection upsert, custom sort, label, poster, visibility promote
+│   │   ├── placeholders.py       # row-name placeholders ({user}, {top_seed}, {season}…) and what each call site asks of them
+│   │   ├── seasons.py            # seasonal rows: the season catalogue, show/build windows, TMDB season lists
 │   │   ├── privacy.py            # filter parse/merge/serialize, snapshot, diff, throttled apply
 │   │   ├── acquire.py            # Radarr/Sonarr/Seerr, capped
 │   │   ├── posters.py            # PIL branded collection posters (3 templates)

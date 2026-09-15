@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import String, case, cast, func, literal, or_
 from sqlalchemy.orm import Session
 
+from shortlist.engine import placeholders
 from shortlist.engine.models import DEFAULT_ROW_TEMPLATE
 from shortlist.server.db.models import (
     DEFAULT_SLUG,
@@ -478,7 +479,9 @@ class _RowNamer:
         template = self.template(slug)
         if template is None:
             return slug
-        name = _PLACEHOLDER.sub(lambda m: library if m.group(0) == "{library_name}" else "\u2026", template)
+        # A seasonal row's name follows the calendar and a report spans it, so it reads as what it is.
+        template = template.replace(placeholders.SEASON_EMOJI, "").replace(placeholders.SEASON, "Seasonal")
+        name = _PLACEHOLDER.sub(lambda m: library if m.group(0) == placeholders.LIBRARY_NAME else "\u2026", template)
         # Collapse the space the placeholder left behind, so it reads "watched…" not "watched …".
         name = " ".join(name.split()).replace(" \u2026", "\u2026")
         # A template that is NOTHING but a per-person placeholder — `{top_seed}` alone, which

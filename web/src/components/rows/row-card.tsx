@@ -1,3 +1,4 @@
+import { PLACEHOLDER_EXACT, PLACEHOLDER_SPLIT } from "@/lib/placeholders";
 import {
   Image as ImageIcon,
   ListChecks,
@@ -16,6 +17,7 @@ import { api } from "@/lib/api";
 import { audienceSummary, rowOverrides } from "@/lib/collections";
 import { DEFAULT_ROW_SLUG } from "@/lib/constants";
 import { settingString } from "@/lib/format";
+import { seasonStatusLine } from "@/lib/seasons";
 import { useLibraries, useSettings } from "@/lib/queries";
 import type { Collection, User } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -29,28 +31,19 @@ import { cn } from "@/lib/utils";
  * two names, so there is no single name to show. Marking the variable as a variable is the honest
  * version, and it costs one chip.
  */
-// EXACTLY the tokens the engine substitutes (`delivery.py`), matched case-sensitively — not
-// `\{[a-z_]+\}`. The name field is free text and nothing validates a token whitelist, so a loose
-// pattern would dress "Best of {genre}" or "{Library_Name} Picks" up as a resolved placeholder
-// while Plex receives the literal braces in the collection title on every home screen. Anything
-// outside this set must stay plain text: the whole point is to stop a template reading as a failed
-// substitution, and hiding a typo does the exact opposite.
-const ROW_NAME_TOKEN_SPLIT = /(\{(?:user|top_seed|library_name)\})/;
-const ROW_NAME_TOKEN = /^\{(?:user|top_seed|library_name)\}$/;
-
 /** Whether this name renders any chips, so a caller can explain what a chip IS only when one is on
- *  screen. Shares the pattern above rather than re-deriving the token list, which is the whole
- *  reason that pattern is written out so carefully. */
+ *  screen. Exact tokens only (`lib/placeholders.ts`): anything else must stay plain text, since hiding a
+ *  typo like "{Library_Name}" as a chip would dress up braces Plex will print. */
 export function hasRowNameToken(name: string): boolean {
-  return ROW_NAME_TOKEN_SPLIT.test(name);
+  return PLACEHOLDER_SPLIT.test(name);
 }
 
 function RowCardName({ name }: { name: string }) {
-  const parts = name.split(ROW_NAME_TOKEN_SPLIT);
+  const parts = name.split(PLACEHOLDER_SPLIT);
   return (
     <span className="font-medium">
       {parts.map((part, i) =>
-        ROW_NAME_TOKEN.test(part) ? (
+        PLACEHOLDER_EXACT.test(part) ? (
           <span
             key={i}
             className="mx-0.5 rounded bg-muted px-1 py-0.5 text-xs font-normal text-muted-foreground"
@@ -155,6 +148,14 @@ export function RowCard({
                 from Plex today is indistinguishable from a broken one — and "my row disappeared" is
                 the support question the schedule creates. Only rendered for a row that HAS a
                 schedule, so the ordinary row is unchanged. */}
+            {/* A seasonal row says which season it is in, or when it comes back — "my row vanished" is
+                the same question a day schedule creates, answered with the date. The server resolves
+                it, on the clock Plex follows. */}
+            {(collection.seasons ?? []).length > 0 && seasonStatusLine(collection.season_status) && (
+              <Badge variant={collection.season_status?.showing ? "secondary" : "outline"}>
+                {seasonStatusLine(collection.season_status)}
+              </Badge>
+            )}
             {(collection.show_days ?? []).length > 0 &&
               (collection.shown_today ? (
                 <Badge variant="secondary">Showing today</Badge>

@@ -258,7 +258,9 @@ def pre_rank(
                 break
         if not progressed:  # every queue is exhausted
             break
-    return sorted(picked, key=lambda c: _sort_key(c, recency, year_now))
+    # Every dial again, as the cut used: `diversify_by_seed` builds the row from this order best-first, so
+    # sorting on the base score here undid genre avoidance, franchise and cast for any pool over `keep`.
+    return sorted(picked, key=lambda c: _sort_key(c, recency, year_now, genre_avoidance, franchise, cast))
 
 
 def diversify_by_seed(candidates: list[Candidate], keep: int) -> list[Candidate]:

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.models import DEFAULT_ROW_TEMPLATE
+from shortlist.engine.placeholders import refusal
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.api.serializers import UserOut, UserPickOut, pick_dict, user_dict
 from shortlist.server.auth import require_owner
@@ -74,12 +75,8 @@ class UserPrefs(BaseModel):
         alert reads rows, not user prefs. So the honest answer is to refuse it and point at the field
         that has a fallback beside it.
         """
-        if value and "{top_seed}" in value:
-            raise ValueError(
-                "a per-person row name can't use {top_seed} — it needs a fallback name for people "
-                "with nothing watched yet, and that lives on the row, not the person. Set it on the "
-                "row instead."
-            )
+        if value and (why := refusal(value, "person_name")):
+            raise ValueError(why)
         return value
 
 

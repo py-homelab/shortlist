@@ -38,6 +38,8 @@ export type ConnectionField =
       // on the same card so it knows whose models to list.
       kind: "text" | "password" | "model";
       placeholder?: string;
+      /** One line under the input, for what the field is for or how to undo it. */
+      hint?: string;
       showIf?: (values: Record<string, string>) => boolean;
       /** Optional "Get a key ↗" link shown by the field. A function receives the current field
           values so a provider-specific URL can be chosen (e.g. the AI curator's key link). */
@@ -88,6 +90,7 @@ export function ConnectionCard({
   fields,
   summary,
   footnote,
+  testLabel = "Test",
 }: {
   service: TestableService;
   /** False for a service whose probe is too expensive to run unasked. The dot then stays amber
@@ -119,6 +122,8 @@ export function ConnectionCard({
   summary: string;
   /** Optional extra line shown under the card when idle — e.g. recent usage the owner should see. */
   footnote?: ReactNode;
+  /** Wording for the test button, where the test is not a silent ping: the webhook's posts a message. */
+  testLabel?: string;
 }) {
   const test = useMutation({ mutationFn: () => api.testConnection(service) });
   const save = useSaveSettings();
@@ -313,7 +318,7 @@ export function ConnectionCard({
                   disabled={!configured}
                 >
                   {!test.isPending && <PlugZap aria-hidden="true" />}
-                  Test
+                  {testLabel}
                 </Button>
                 {configured && (
                   <Button
@@ -438,6 +443,9 @@ export function ConnectionCard({
                         }))
                       }
                     />
+                  )}
+                  {field.kind !== "select" && field.hint && (
+                    <p className="text-xs text-muted-foreground">{field.hint}</p>
                   )}
                 </div>
               );

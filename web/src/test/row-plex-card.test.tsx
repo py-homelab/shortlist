@@ -29,6 +29,26 @@ describe("RowPlexCard", () => {
     expect(screen.getByText(/each person gets their own name/i)).toBeInTheDocument();
   });
 
+  it("fills the season into the description as it does the name", () => {
+    render(
+      <RowPlexCard
+        input={input({ name_template: "{season} picks", description: "{season_emoji} {season} favourites", seasons: ["halloween"] })}
+        collectionId={null}
+        hasImage={false}
+        sampleSeason={{ slug: "halloween", name: "Halloween", emoji: "🎃", month: 10, day: 31, description: "" }}
+      />,
+    );
+
+    expect(screen.getByText("🎃 Halloween favourites")).toBeInTheDocument();
+  });
+
+  it("says a seasonal name follows the season rather than the person", () => {
+    render(<RowPlexCard input={input({ name_template: "{season} for {user}" })} collectionId={null} hasImage={false} />);
+
+    expect(screen.getByText(/the name follows the season/i)).toBeInTheDocument();
+    expect(screen.queryByText(/each person gets their own name/i)).not.toBeInTheDocument();
+  });
+
   it("says Plex keeps its own artwork when the row sets no poster", () => {
     render(<RowPlexCard input={input()} collectionId={1} hasImage />);
 

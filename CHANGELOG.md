@@ -6,6 +6,72 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-09-16
+
+### Added
+
+- **Seasonal rows that follow the calendar.** A row can follow seasons — Valentine's Day, Halloween,
+  Christmas. In season it holds that season's films from your library, ranked for each person; between
+  seasons it is hidden but kept, and the night before its next season it is rebuilt for that season
+  while still hidden, so it appears on the day already filled. Pick the
+  seasons on the row, and how many days before and after each one it shows (30 before and none after,
+  to begin with). Start from the new **Seasonal** template. The row's name can use `{season}` and
+  `{season_emoji}`, and follows the season it is in (#124).
+
+- **Choose what the webhook tells you, and give it a key.** The webhook sent one thing: a run
+  failing. In Settings → Notifications you now tick what to send — runs starting, finishing, partly
+  failing, failing or stopping; jobs starting, finishing or failing; someone able to see a row that
+  isn't theirs; titles waiting for your approval; and a new version being out. A failed run and a
+  privacy problem are ticked to begin with, so a webhook you already set up only gains the privacy
+  alert. Jobs that run every few minutes, like the privacy sync, only speak up when something changed
+  or went wrong, and no message ever names anybody.
+
+  The webhook's address has moved to a **Webhook** card in Settings → Connections, beside every other
+  service, with Send a test and Remove. Once an address is saved, the card says whether anything is
+  being sent yet and links to Notifications, where you turn it on and choose what it sends. If your
+  receiver needs a key (ntfy, Gotify, n8n), add a header name and value on the same card. It is sent
+  with every message and stored encrypted; clear the name to stop sending it.
+
+### Changed
+
+- **The API refuses a row setting it does not know.** A misspelt field sent to create or edit a row
+  (`POST`/`PATCH /api/collections`) used to be ignored and the row saved as if nothing were wrong. It is
+  now answered with an error naming the field. The Shortlist app itself is unaffected; this only
+  matters if you script against the API.
+
+### Fixed
+
+- **Renamed rows stay where you put them, and "Something else is reordering your shelf" stops
+  blaming other tools for it.** When a row changed its name overnight — a "Because you watched…" row
+  picking a new title — Plex kept showing Shortlist the old name in its shelf list, so Shortlist
+  stopped recognising the row as its own and could leave it out of place. Most nights the whole
+  shelf was also rebuilt and every row was counted as
+  "put back", which set off the alert after three runs in a day even with Agregarr told to leave
+  Shortlist's rows alone. Rows are now recognised by Plex's id for them rather than by name, and the
+  alert only counts rows that were actually out of place.
+
+- **A new row keeps the request settings you gave it.** The row editor lets you set a row's own
+  request floors and Radarr/Sonarr target before you first save it, but those were dropped on create
+  and only stuck once you edited the row again.
+
+- **"Avoid these genres" holds at the front of a row.** When a row had more candidates than it could
+  keep, the kept titles were re-sorted without the genre, franchise and cast dials, so an avoided genre
+  could still lead the row.
+
+- **Renaming a shared row no longer builds a second copy of it.** The rename dropped the row's
+  invisible marker, so the next run did not recognise the renamed row and built it again.
+
+- **The row editor stops asking which watch a shared row follows.** A shared row follows nobody's
+  watches, but a leftover setting from before it was shared still brought the question back.
+
+- **The run's AI token tile stops repeating its total.** Web search is the only AI step now, so the
+  "breakdown" was just the total again; it shows only when more than one step used tokens.
+
+- **Un-pausing someone on a row's day off no longer puts that row back on their Home.** A row named
+  after a title they watched could reappear for the rest of the day when Shortlist couldn't tell which
+  row it was, even though its schedule said to hide it that day. It is now left hidden, as the nightly
+  run already did.
+
 ## [1.9.0] - 2026-09-14
 
 ### Added

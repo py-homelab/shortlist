@@ -25,6 +25,7 @@ from pathlib import Path
 from loguru import logger
 from sqlalchemy.orm import Session, sessionmaker
 
+import shortlist
 from shortlist.engine.context import EngineContext
 from shortlist.engine.pipeline import run as engine_run
 from shortlist.server.db.models import Collection, Run, RunUser, User
@@ -304,6 +305,7 @@ class RunService:
                 # Inside the try so a failure here (e.g. reading users) still marks the run errored
                 # AND runs the finally that frees the cancel Event — never leaves a run stuck "running".
                 self._mark_started(run_id)
+                notify.enqueue_run_started(self._sessions, run_id)
                 with self._sessions() as session:
                     run = session.get(Run, run_id)
                     profiles = self.enabled_profiles(session, user_ids)
@@ -393,15 +395,17 @@ class RunService:
                             type(e).__name__,
                         )
                 status = "aborted" if aborted else ("ok" if report.ok else "error")
-                if status == "error":
-                    notify.enqueue_run_failure(self._sessions, run_id)
+                notify.enqueue_run_outcome(self._sessions, run_id)
+                # In an executor: the update check can reach GitHub (3s timeout, cached for 6h).
+                await loop.run_in_executor(None, notify.after_run, self._sessions, run_id, shortlist.__version__)
             except Exception as e:
                 logger.exception("run {} failed", run_id)
                 self._mark_run_error(run_id, {"error": f"{type(e).__name__}: {e}"})
                 # Both ways a run reaches `error` get the alert, and they are genuinely two paths: the
                 # engine returning a not-ok report, and it raising. Hooking only the tidy one would
                 # stay silent for exactly the failures worth waking up for.
-                notify.enqueue_run_failure(self._sessions, run_id)
+                notify.enqueue_run_outcome(self._sessions, run_id)
+                await loop.run_in_executor(None, notify.after_run, self._sessions, run_id, shortlist.__version__)
                 self._bus.publish(
                     "run.finished", {"run_id": run_id, "status": "error", "error": f"{type(e).__name__}: {e}"}
                 )

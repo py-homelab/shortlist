@@ -61,10 +61,18 @@ Use one route or the other, not both. [Set it up →](/guides/requests/)
 | Service       | What it does                                                                    |
 | ------------- | -------------------------------------------------------------------------------- |
 | **Tautulli**  | Optional. Only used for friendlier display names — Shortlist reads watch history from Plex directly |
-| **A webhook** | Optional. Posts JSON to a URL you choose when a run fails, so an overnight failure isn't silent |
+| **A webhook** | Optional. Posts JSON to a URL you choose when something you picked happens, so an overnight failure isn't silent |
 
-The webhook is a generic JSON POST, so it works with Discord, Slack, Home Assistant, n8n or anything
-that accepts one.
+The webhook is a JSON POST that works with Discord, Slack, Home Assistant, n8n or anything that
+accepts one. Add its address on the **Webhook** card in Settings → Connections, then turn it on and
+tick what to send in Settings → Notifications: runs starting, finishing or failing, jobs starting,
+finishing or failing, someone able to see a row that isn't theirs, titles waiting for your approval,
+and new versions. A failed run and a privacy problem are ticked to begin with. No message names
+anybody.
+
+If your receiver needs a key (ntfy, Gotify, n8n's header auth), give a header name and value on the
+same card. It is sent with every message, the test included. Clear the header name to stop sending it,
+or remove the card to take the address and the header off together.
 
 ## What Shortlist does not work with
 

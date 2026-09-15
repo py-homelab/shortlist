@@ -15,6 +15,7 @@ import {
   RowSortPrefixField,
 } from "@/components/rows/row-plex-details-field";
 import { RowScheduleField } from "@/components/rows/row-schedule-field";
+import { RowSeasonsField } from "@/components/rows/row-seasons-field";
 import { RowShowDaysField } from "@/components/rows/row-show-days-field";
 import { showDaysSummary } from "@/lib/show-days";
 import { RowDestructiveActions } from "@/components/rows/row-destructive-actions";
@@ -58,8 +59,10 @@ import {
   useLibraries,
   useSaveCollection,
   useSaveSettings,
+  useSeasons,
   useSettings,
 } from "@/lib/queries";
+import { TOP_SEED } from "@/lib/placeholders";
 import type { RowTemplate } from "@/lib/row-templates";
 import {
   coldStartGlobal,
@@ -337,7 +340,7 @@ export function RowEditor({
   // what let someone skip a section rather than open it to find out they didn't need it.
   // Whether this row's TITLE claims a particular watch. Mirrors the engine's `_names_a_seed`, and
   // decides whether the cycle window is worth offering.
-  const namesASeed = (input.name_template || input.name).includes("{top_seed}");
+  const namesASeed = (input.name_template || input.name).includes(TOP_SEED);
   // Whether that name CONTRADICTS the seed budget — the case `seedAdvice` asks the owner to change,
   // as opposed to the one it simply confirms. Only the former is dressed as a warning: a
   // movies-and-TV row on one seed leaves a whole library with no row at all, which is the same order
@@ -395,6 +398,12 @@ export function RowEditor({
   // have no meaning on it — and `_shared_row` ignores them regardless. Hidden rather than shown and
   // ignored, following `request_tag`, which has always been hidden here for the same reason.
   const isSharedRow = input.build === "shared";
+  const isSeasonal = input.seasons.length > 0;
+  // Only asked for once the row follows seasons — an ordinary row's previews never mention one.
+  const seasonCatalogue = useSeasons(isSeasonal);
+  const chosenSeasons = (seasonCatalogue.data ?? []).filter((season) =>
+    input.seasons.includes(season.slug),
+  );
   const requestSummary = input.request_tag
     ? `Tagged “${input.request_tag}”`
     : "No tag";
@@ -581,7 +590,7 @@ export function RowEditor({
                       {/* The same placeholder list a new row's name box shows. Renaming is where a
                           name is actually typed for an existing row, and without it the box read as
                           plain text — nothing said {user} or {library_name} would work here. */}
-                      <TemplateVarsHint />
+                      <TemplateVarsHint seasonal={isSeasonal} />
                       {renamePending ? (
                         <p role="status" className="text-sm text-warning">
                           Not applied yet &mdash; press <strong>Rename</strong> to
@@ -606,7 +615,7 @@ export function RowEditor({
                       {/* Just the list of placeholders here. What the name BECOMES is shown in the
                         preview panel, which is always on screen — printing it twice made the field's
                         own help longer without answering anything the panel didn't. */}
-                      <TemplateVarsHint />
+                      <TemplateVarsHint seasonal={isSeasonal} />
                     </>
                   )}
                 </div>
@@ -660,12 +669,14 @@ export function RowEditor({
                   onChange={(poster) => set({ poster })}
                   collectionId={collection?.id ?? null}
                   hasImage={collection?.poster?.has_image ?? false}
+                  seasonal={isSeasonal}
                 />
               </div>
               <RowPlexCard
                 input={input}
                 collectionId={collection?.id ?? null}
                 hasImage={collection?.poster?.has_image ?? false}
+                sampleSeason={chosenSeasons[0]}
               />
             </div>
           </SettingsGroup>
@@ -740,6 +751,35 @@ export function RowEditor({
             )}
           </SettingsGroup>
 
+          {/* The default row's title is the global template, which follows no season; the server refuses it. */}
+          {!isDefault && (
+            <SettingsGroup
+              title="Seasons"
+              description="A row that follows the calendar: which seasons, and how early and late each one shows."
+              summary={isSeasonal ? `${input.seasons.length} season${input.seasons.length === 1 ? "" : "s"}` : "Not seasonal"}
+            >
+              <RowSeasonsField
+                value={{
+                  seasons: input.seasons,
+                  season_lead_days: input.season_lead_days,
+                  season_after_days: input.season_after_days,
+                }}
+                onChange={set}
+                schedule={input.schedule}
+                name={input.name_template || input.name}
+                // Only while the form still matches what is saved: the status describes the SAVED row.
+                status={
+                  collection &&
+                  JSON.stringify(collection.seasons ?? []) === JSON.stringify(input.seasons) &&
+                  collection.season_lead_days === input.season_lead_days &&
+                  collection.season_after_days === input.season_after_days
+                    ? (collection.season_status ?? null)
+                    : null
+                }
+              />
+            </SettingsGroup>
+          )}
+
           <SettingsGroup
             title="What goes in it"
             description="Where titles come from, how many, and in what order."
@@ -775,10 +815,21 @@ export function RowEditor({
                 below, and pick its libraries above.
               </p>
             ) : (
-              <RowSourcesField
-                value={input.candidate_sources}
-                onChange={(candidate_sources) => set({ candidate_sources })}
-              />
+              <>
+                <RowSourcesField
+                  value={input.candidate_sources}
+                  onChange={(candidate_sources) => set({ candidate_sources })}
+                />
+                {/* The engine drops it on a seasonal row (`effective_row_sources`): its searches are
+                    per watched title, not seasonal, so nearly all it found would be filtered out. */}
+                {isSeasonal && (
+                  <p className="text-sm text-muted-foreground">
+                    AI web search isn’t used on a seasonal row — it searches from what
+                    they watched, not the season, so almost everything it found would
+                    be thrown away. The season’s own titles are added instead.
+                  </p>
+                )}
+              </>
             )}
 
             {!isDefault && (
@@ -1143,7 +1194,7 @@ export function RowEditor({
 
             {/* Only for a row that builds from one or two watches. Above that it is blending a whole
                 history and "which watch does it follow" has no answer, so asking would be noise. */}
-            {(input.max_seeds ?? 0) > 0 && (input.max_seeds ?? 0) <= 2 && (
+            {!isSharedRow && (input.max_seeds ?? 0) > 0 && (input.max_seeds ?? 0) <= 2 && (
               <div className="space-y-3 border-t pt-4">
                 <p className="text-sm font-medium">Which watch it follows</p>
                 <p className="text-sm text-muted-foreground">
@@ -1402,6 +1453,7 @@ export function RowEditor({
             followsAWatch={followsAWatch}
             globalRefreshDays={refreshDaysGlobalValue(settings.data)}
             globalWatchedPct={watchedPctGlobalValue(settings.data)}
+            seasons={chosenSeasons}
           />
         </aside>
       </div>

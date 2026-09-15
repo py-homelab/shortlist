@@ -202,6 +202,10 @@ describe("small formatters", () => {
     expect(formatDuration(22.5 * 60 * 1000)).toBe("22m 30s");
   });
 
+  it("renderRowName fills the season placeholders with a sample season", () => {
+    expect(renderRowName("{season_emoji} {season} picks")).toBe("🎄 Christmas picks");
+  });
+
   it("renderRowName substitutes every {top_seed}", () => {
     expect(renderRowName("Because you watched {top_seed}", "Fargo")).toBe(
       "Because you watched Fargo",

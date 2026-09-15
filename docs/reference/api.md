@@ -167,7 +167,7 @@ GET  /api/picks/{rating_key}/poster -> image bytes
      `rating_key` and only one of the four construction sites carries a `poster_path`, so the PMS is the
      only source that covers all of them — no new column, no migration, no backfill gap. Owner-gated,
      and it refuses any thumb path that is not on this server.
-GET/POST /api/collections · PATCH/DELETE /api/collections/{id} (incl. `request_tag`, `candidate_sources`, `library_keys`, `max_seeds` — how many watched titles the row is built from (1–100; null inherits the engine default of 30), `recency` — how much a title's release date counts when ranking it for this row (0.0–1.0; null inherits the global `recommendations.recency`), `cold_start` — what the row does for someone below `recommendations.min_history` (`popular` | `skip`; null inherits the global `recommendations.cold_start`), `fallback_name` — what to call this row for someone whose name cannot be filled in, i.e. a `{top_seed}` row for a person with nothing watched. `""` (the default) means there is no such name and the row is simply not built for them — Shortlist never invents one, and a value containing `{top_seed}` is refused because it could not be filled in either, `seed_window` — how many recent watches a one-title row cycles between, one per run (1–20, default 1 = always their most recent; no global to inherit), `pick_order` — how the delivered collection is ordered (`best` | `rating` | `newest` | `shuffle` | `new_first` — titles that arrived this run lead | `rotate` — the front advances by one title a day, default `best`), `show_days` — which days the row appears, as ISO weekdays 1=Mon..7=Sun (`[]` = every day; values outside 1-7 are refused, and the list is stored sorted and de-duplicated). The response also carries read-only `shown_today`, resolved on the SERVER's clock so a UI badge cannot disagree with what Plex is showing, `hub_anchor` — per-row shelf-placement override, and `poster` — custom row artwork {mode: ""|upload|generate, title, subtitle, style})
+GET /api/collections/seasons (the seasons a row can follow: `slug`, `name`, `emoji`, `month`, `day`, `description`) · GET/POST /api/collections · PATCH/DELETE /api/collections/{id} (incl. `request_tag`, `candidate_sources`, `library_keys`, `max_seeds` — how many watched titles the row is built from (1–100; null inherits the engine default of 30), `recency` — how much a title's release date counts when ranking it for this row (0.0–1.0; null inherits the global `recommendations.recency`), `cold_start` — what the row does for someone below `recommendations.min_history` (`popular` | `skip`; null inherits the global `recommendations.cold_start`), `fallback_name` — what to call this row for someone whose name cannot be filled in, i.e. a `{top_seed}` row for a person with nothing watched. `""` (the default) means there is no such name and the row is simply not built for them — Shortlist never invents one, and a value containing `{top_seed}` is refused because it could not be filled in either, `seed_window` — how many recent watches a one-title row cycles between, one per run (1–20, default 1 = always their most recent; no global to inherit), `pick_order` — how the delivered collection is ordered (`best` | `rating` | `newest` | `shuffle` | `new_first` — titles that arrived this run lead | `rotate` — the front advances by one title a day, default `best`), `show_days` — which days the row appears, as ISO weekdays 1=Mon..7=Sun (`[]` = every day; values outside 1-7 are refused, and the list is stored sorted and de-duplicated), `seasons` — the seasons a seasonal row follows (`valentines` | `halloween` | `christmas`; `[]` = not seasonal; stored de-duplicated in calendar order, unknown slugs refused), `season_lead_days` (0–90, default 30) and `season_after_days` (0–30, default 0) — how many days before and after each season's day the row shows. A name using `{season}`/`{season_emoji}` is refused on a row with no seasons. The response also carries read-only `shown_today`, resolved on the SERVER's clock so a UI badge cannot disagree with what Plex is showing — it is false outside a seasonal row's seasons — and `season_status` (`{showing, next}`, each `{slug, name, emoji, starts, ends}` or null; null for a row with no seasons), `hub_anchor` — per-row shelf-placement override, and `poster` — custom row artwork {mode: ""|upload|generate, title, subtitle, style}. A top-level field the row body does not declare is refused with 422 rather than ignored, so a misspelt setting cannot save as a no-op (fields inside `poster` and `hub_anchor` are not yet checked this way))
 GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first_delivered_at, matured_days, matured, per_library} (has this row actually landed? `matured` is null until picks are old enough to judge — a pick counts as a hit only if watched while the row was still showing it, so a newer row is reported as "too early" rather than scored 0%)
      `finished` accompanies every `watched` here too, including per library. A row spanning Movies and TV can land the same share in
      both and finish almost none of the TV — that gap is the panel's most useful line, and it is invisible in `watched` alone.
@@ -254,15 +254,30 @@ GET  /api/notifications/whats-new -> {version, releases[{version, url, published
 ## Outgoing notifications
 
 ```
-Settings -> System -> Notifications, or `notify.webhook.enabled` / `notify.webhook.url`.
-     A whole run failing POSTs generic JSON {source, version, id, severity, title, message, path, sent_at},
-     plus `content` and `text` carrying "title\nmessage" — the fields Discord and Slack each require —
-     to one webhook. The gap being closed is that a run failing overnight was visible only to someone
-     who opened the app. Delivery reuses the existing job queue, so retry, backoff and the dead-letter
-     state are the ones already tested rather than a second mechanism.
+Settings -> Connections -> Webhook (`notify.webhook.url` / `notify.webhook.auth_header_name` /
+`notify.webhook.auth_header_value`) and Settings -> Notifications (`notify.webhook.enabled` /
+`notify.webhook.events`).
+     Each event in `notify.webhook.events` POSTs generic JSON
+     {source, version, id, severity, title, message, event, path, sent_at}, plus `content` and `text`
+     carrying "title\nmessage" — the fields Discord and Slack each require — to one webhook.
+     Events: run.started, run.finished, run.partial, run.failed, run.stopped, job.started,
+     job.finished, job.failed, privacy.exposure, requests.waiting, update.available ("test" for the
+     button). Default ["run.failed", "privacy.exposure"]; an unknown name is a 422.
+     Dry runs and dry-run jobs send nothing. job.started/job.finished skip routine jobs (watch.reconcile)
+     and retries, a scheduled privacy.sync never sends job.started, and one that changed nothing never
+     sends job.finished. job.failed means out of retries. notify.send never reports on itself.
+     privacy.exposure is a count of accounts, never names, repeated at most once a day while true.
+     requests.waiting is sent after a run when more titles wait than last time; update.available once
+     per version. No message carries a person's name, a job's detail, or a job's error.
+     Delivery reuses the existing job queue, so retry, backoff and the dead-letter state are the ones
+     already tested rather than a second mechanism.
      `notify.webhook.url` is a SECRET (a Discord or Slack webhook URL is a bearer token in a URL): Fernet
      at rest, redacted from `GET /api/settings`, and stripped of its path and query before any exception
      text reaches a log, a `Job.error`, the audit trail or the support bundle.
+     `notify.webhook.auth_header_value` is a SECRET too, sent as `<auth_header_name>: <value>` on every
+     POST when both it and the name are set, and removed from any error text. The name must be a valid
+     header name or blank (default Authorization; blank sends no header) and the value printable text
+     with no leading or trailing spaces, or the save is a 422.
      The "Send a test" button travels the exact same code path as a real 3am failure — same settings
      read, same body builder, same HTTP call — so a passing test cannot mean a broken channel.
 ```

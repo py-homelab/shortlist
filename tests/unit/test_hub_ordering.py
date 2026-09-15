@@ -15,6 +15,10 @@ subsequent move is accepted and dropped (measured on a real server, 2026-09-11).
 
 from itertools import pairwise
 
+import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
+
 from shortlist.engine.clients.plex_pms import PlexClient
 
 _UNSET = "UNSET"  # sentinel: move() was never called on this hub
@@ -195,6 +199,24 @@ def test_is_collection_hub_accepts_every_identifier_shape_a_real_pms_has_produce
     # Built-ins are a different family and must never be judged.
     for ident in ("home.television.recentlyadded", "movie.recentlyadded", "home.movies.toprated", ""):
         assert not is_collection_hub(FakeHub("x", "", collection=False, identifier=ident)), ident
+
+
+@pytest.mark.parametrize(
+    ("identifier", "expected"),
+    [
+        ("custom.collection.1.683081", 683081),  # pms_managed_hubs.xml.txt — the listing place_rows reads
+        ("custom.collection.1.527794.527794", 527794),  # pms_hubs_shared_account.json — /hubs, doubled
+        ("custom.collection.571285", 571285),  # pms_hubs_home.json — /hubs, no section id
+        ("custom.collection.2.p1", None),  # no ratingKey at all: the title fallback's case
+        ("movie.recentlyadded", None),  # a built-in is never a collection
+    ],
+)
+def test_hub_rating_key_reads_every_recorded_identifier_shape(identifier, expected):
+    from types import SimpleNamespace
+
+    from shortlist.engine.clients.plex_pms import hub_rating_key
+
+    assert hub_rating_key(SimpleNamespace(identifier=identifier)) == expected
 
 
 def _hub_identifiers(node) -> list[str]:
@@ -586,6 +608,228 @@ class FloatShelf(FakeSection):
     def gaps(self) -> list[float]:
         values = sorted(self.order.values())
         return [b - a for a, b in pairwise(values)]
+
+
+class TestRenamedRow:
+    """A row renamed in place is still ours on the shelf.
+
+    `GET /hubs/sections/<key>/manage` keeps the title a collection had when it was PROMOTED. The
+    collection itself, and the hub viewers are served, both carry the new title
+    (`pms_managed_hub_renamed_collection.json`, recorded on PMS 1.43.4). A `{top_seed}` row is renamed
+    most nights, so matching hubs to collections by title made every such row read as someone else's.
+    Each run then saw the shelf out of order, rebuilt all of it, and reported every row as put back.
+    Three runs in a day and the bell blamed Agregarr (measured on SFLIX, 2026-09-16: 15 of 93 rows
+    renamed in one library).
+    """
+
+    @staticmethod
+    def _recorded():
+        import json
+        from pathlib import Path
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "pms_managed_hub_renamed_collection.json"
+        return json.loads(fixture.read_text(encoding="utf-8"))
+
+    def test_a_renamed_row_already_in_place_is_left_alone_when_the_manage_title_is_stale(self):
+        recorded = self._recorded()
+        stale, current = recorded["manage_hub"]["title"], recorded["collection"]["title"]
+        assert stale != current, "precondition: the capture shows the manage listing lagging a rename"
+        rating_key = int(recorded["collection"]["ratingKey"])
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        # One row, three people: the renamed copy sits in the middle of its own block, as on SFLIX.
+        mike = FakeHub("Because you watched Up", "b1", identifier="custom.collection.2.11")
+        renamed = FakeHub(stale, "renamed", identifier=recorded["manage_hub"]["identifier"])
+        amy = FakeHub("Because you watched Heat", "b2", identifier="custom.collection.2.12")
+        kometa = FakeHub("Kometa Genre", "k", identifier="custom.collection.2.90")
+        section = FakeSection([anchor, mike, renamed, amy, kometa])
+        client = _client(
+            [
+                FakeColl("Because you watched Up", ["shortlist_mike"], 11),
+                FakeColl(current, ["shortlist_sarah"], rating_key),
+                FakeColl("Because you watched Heat", ["shortlist_amy"], 12),
+                FakeColl("Kometa Genre", ["kometa"], 90),
+            ]
+        )
+
+        result = client.place_rows(
+            section, label_prefix="shortlist", sequence=[("anchor", "Recently Added"), ("rows", {11, rating_key, 12})]
+        )
+
+        assert result["skipped"] is True, result
+        assert result["reason"] == "already in place"
+        assert [h.moves for h in (anchor, mike, renamed, amy, kometa)] == [0, 0, 0, 0, 0]
+
+    def test_a_renamed_row_out_of_place_is_placed_with_its_block_and_audited_by_its_current_title(self):
+        recorded = self._recorded()
+        stale, current = recorded["manage_hub"]["title"], recorded["collection"]["title"]
+        rating_key = int(recorded["collection"]["ratingKey"])
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        kometa = FakeHub("Kometa Genre", "k", identifier="custom.collection.2.90")
+        renamed = FakeHub(stale, "renamed", identifier=recorded["manage_hub"]["identifier"])
+        section = FakeSection([anchor, kometa, renamed])
+        client = _client([FakeColl(current, ["shortlist_sarah"], rating_key), FakeColl("Kometa Genre", ["kometa"], 90)])
+
+        result = client.place_rows(
+            section, label_prefix="shortlist", sequence=[("anchor", "Recently Added"), ("rows", {rating_key})]
+        )
+
+        assert result["verified"] is True
+        assert [h.identifier for h in section.managedHubs()] == [
+            "movie.recentlyadded",
+            recorded["manage_hub"]["identifier"],
+            "custom.collection.2.90",
+        ]
+        assert result["moved"] == [current]
+
+    def test_a_hub_whose_identifier_names_a_collection_that_is_not_ours_is_never_claimed_by_title(self):
+        """The identifier decides, whichever way it points. A foreign hub whose stale title happens to
+        match one of our collections must not be pulled into our block — position is the one thing
+        rule 4 lets us change on a foreign hub, and only to seat our rows among them."""
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        ours = FakeHub("Picked Sarah", "p1", identifier="custom.collection.2.11")
+        lookalike = FakeHub("Picked Sarah", "x", identifier="custom.collection.2.90")
+        section = FakeSection([anchor, ours, lookalike])
+        client = _client([FakeColl("Picked Sarah", ["shortlist_sarah"], 11), FakeColl("Other", ["kometa"], 90)])
+
+        result = client.place_rows(
+            section, label_prefix="shortlist", sequence=[("anchor", "Recently Added"), ("rows", {11})]
+        )
+
+        assert result["skipped"] is True, result
+        assert lookalike.moves == 0
+
+
+class TestMovedNamesTheRowsThatWereOutOfPlace:
+    """`moved` is the evidence `_shelf_contention` counts, so it names only rows that had to be put back.
+
+    A bottom-build re-sends EVERY hub, and `moved` used to name every row it re-sent. So one new row,
+    or one hub another tool slid in, reported all ~80 rows as put back, and any three passes in a day
+    crossed the "same row three times" line. On SFLIX one of the three passes behind the 2026-09-16
+    alert was the owner creating a test row.
+    """
+
+    @staticmethod
+    def _rows(n: int) -> tuple[list[FakeHub], list[FakeColl]]:
+        hubs = [FakeHub(f"Picked {i}", f"p{i}", identifier=f"custom.collection.2.{10 + i}") for i in range(n)]
+        colls = [FakeColl(f"Picked {i}", [f"shortlist_u{i}"], 10 + i) for i in range(n)]
+        return hubs, colls
+
+    def test_a_new_row_appended_at_the_bottom_is_the_only_row_moved(self):
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        rows, colls = self._rows(3)
+        kometa = FakeHub("Kometa Genre", "k", identifier="custom.collection.2.90")
+        new = FakeHub("Picked new", "new", identifier="custom.collection.2.50")
+        section = FakeSection([anchor, *rows, kometa, new])
+        client = _client(
+            [*colls, FakeColl("Picked new", ["shortlist_new"], 50), FakeColl("Kometa Genre", ["kometa"], 90)]
+        )
+
+        result = client.place_rows(
+            section, label_prefix="shortlist", sequence=[("anchor", "Recently Added"), ("rows", {10, 11, 12, 50})]
+        )
+
+        assert result["verified"] is True
+        assert section.titles() == ["Recently Added", "Picked 0", "Picked 1", "Picked 2", "Picked new", "Kometa Genre"]
+        assert result["moved"] == ["Picked new"]
+        assert result["repositioned"] > 1  # the bottom-build still re-sent the rest; it just wasn't putting them back
+
+    def test_a_foreign_hub_slid_in_under_the_anchor_names_the_row_it_displaced(self):
+        """The fight the alert exists for: another tool inserts its hub between the anchor and our rows.
+        The first row is the one that lost its place, and it is named on every pass that repairs it."""
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        rows, colls = self._rows(3)
+        intruder = FakeHub("Trending", "t", identifier="custom.collection.2.91")
+        section = FakeSection([anchor, intruder, *rows])
+        client = _client([*colls, FakeColl("Trending", ["agregarr"], 91)])
+
+        result = client.place_rows(
+            section, label_prefix="shortlist", sequence=[("anchor", "Recently Added"), ("rows", {10, 11, 12})]
+        )
+
+        assert section.titles() == ["Recently Added", "Picked 0", "Picked 1", "Picked 2", "Trending"]
+        assert result["moved"] == ["Picked 0"]
+
+    def test_a_preview_names_the_same_rows_a_real_pass_would(self):
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        rows, colls = self._rows(3)
+        new = FakeHub("Picked new", "new", identifier="custom.collection.2.50")
+        section = FakeSection([anchor, *rows, new, FakeHub("Kometa Genre", "k", identifier="custom.collection.2.90")])
+        section._hubs.append(section._hubs.pop(4))  # the new row below Kometa, where Plex appends it
+        client = _client(
+            [*colls, FakeColl("Picked new", ["shortlist_new"], 50), FakeColl("Kometa Genre", ["kometa"], 90)]
+        )
+
+        preview = client.place_rows(
+            section,
+            label_prefix="shortlist",
+            sequence=[("anchor", "Recently Added"), ("rows", {10, 11, 12, 50})],
+            dry_run=True,
+        )
+
+        assert preview["moved"] == ["Picked new"]
+
+    def test_a_row_whose_anchor_was_moved_below_it_is_named_even_with_our_row_above_it(self):
+        """Another tool moves Trending, the anchor of Picked 1, below it. The hub directly above
+        Picked 1 is still one of ours, and the shared-order test keeps our rows and blames Trending, so
+        neither check named anything: the pass repaired the shelf with `moved == []`, and a tool doing
+        this every half hour would never have tripped the alert (Architecture Review, 2026-09-16)."""
+        anchor = FakeHub("Recently Added", "movie.recentlyadded", collection=False)
+        rows, colls = self._rows(2)
+        trending = FakeHub("Trending", "t", identifier="custom.collection.2.91")
+        kometa = FakeHub("Kometa Genre", "k", identifier="custom.collection.2.90")
+        section = FakeSection([anchor, rows[0], rows[1], trending, kometa])
+        client = _client([*colls, FakeColl("Trending", ["agregarr"], 91), FakeColl("Kometa Genre", ["kometa"], 90)])
+
+        result = client.place_rows(
+            section,
+            label_prefix="shortlist",
+            sequence=[("anchor", "Recently Added"), ("rows", {10}), ("anchor", "Trending"), ("rows", {11})],
+        )
+
+        assert section.titles() == ["Recently Added", "Picked 0", "Trending", "Picked 1", "Kometa Genre"]
+        assert result["moved"] == ["Picked 1"]
+
+
+def _nearest_foreign_above(order: list[str], ours: set[str]) -> dict[str, str | None]:
+    above: dict[str, str | None] = {}
+    last = None
+    for ident in order:
+        if ident in ours:
+            above[ident] = last
+        else:
+            last = ident
+    return above
+
+
+@settings(max_examples=2000)  # the silent shape is ~1 shelf in 170; the default 100 rarely meets it
+@given(st.data())
+def test_displaced_rows_names_a_row_whenever_the_shelf_moved_one_against_the_arrangement(data):
+    """`current` keeps the foreign hubs in the order `wanted` has them, which `place_rows` guarantees:
+    its backbone IS the current order. Within that, our rows can be anywhere on either side."""
+    from shortlist.engine.clients.plex_pms import displaced_rows
+
+    foreign = [f"f{i}" for i in range(data.draw(st.integers(1, 5)))]
+    ours_list = [f"o{i}" for i in range(data.draw(st.integers(1, 5)))]
+    ours = set(ours_list)
+
+    def splice(order: list[str]) -> list[str]:
+        out = list(foreign)
+        for ident in order:
+            out.insert(data.draw(st.integers(0, len(out))), ident)
+        return out
+
+    wanted = splice(ours_list)
+    current = splice(data.draw(st.permutations(ours_list)))
+
+    named = displaced_rows(current, wanted, ours)
+
+    assert set(named) <= ours
+    assert named == [i for i in wanted if i in set(named)]
+    assert displaced_rows(wanted, wanted, ours) == []
+    moved_among_ours = [i for i in current if i in ours] != [i for i in wanted if i in ours]
+    moved_against_backbone = _nearest_foreign_above(current, ours) != _nearest_foreign_above(wanted, ours)
+    if moved_among_ours or moved_against_backbone:
+        assert named, (current, wanted)
 
 
 class TestFloatHealth:

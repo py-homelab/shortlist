@@ -1,3 +1,5 @@
+import { fillPlaceholders, LIBRARY_NAME } from "@/lib/placeholders";
+
 /** "6h ago" style relative time for ISO timestamps; plain English on edge cases. `now` lets a caller
  *  that already ticks a clock (a live run's row) share it, so its labels can't disagree. */
 export function timeAgo(iso: string | null, now: number = Date.now()): string {
@@ -267,15 +269,14 @@ export function renderRowName(
   topSeed = "Fargo",
   user = "Sarah",
   libraryName = "Movies",
+  season: { name: string; emoji: string } = { name: "Christmas", emoji: "🎄" },
 ): string {
   // Fill EVERY placeholder with a sample value so the "on Plex this looks like" preview shows what
-  // {user}/{top_seed}/{library_name} actually become — leaving any literal made the field look broken.
-  const rendered = template
-    .replaceAll("{top_seed}", topSeed)
-    .replaceAll("{user}", user)
-    .replaceAll("{library_name}", libraryName);
+  // {user}/{top_seed}/{library_name}/{season} actually become — leaving any literal made the field
+  // look broken.
+  const rendered = fillPlaceholders(template, { topSeed, user, libraryName, season });
   // A {library_name} title collapses its gap when the sample is empty, matching the backend renderer.
-  return template.includes("{library_name}")
+  return template.includes(LIBRARY_NAME)
     ? rendered.replace(/\s+/g, " ").trim()
     : rendered;
 }

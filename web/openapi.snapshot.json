@@ -568,6 +568,7 @@
         "type": "object"
       },
       "CollectionIn": {
+        "additionalProperties": false,
         "properties": {
           "audience": {
             "default": "everyone",
@@ -1061,6 +1062,30 @@
             "maxLength": 64,
             "title": "Schedule",
             "type": "string"
+          },
+          "season_after_days": {
+            "default": 0,
+            "description": "How many days after each season's day the row stays up.",
+            "maximum": 30.0,
+            "minimum": 0.0,
+            "title": "Season After Days",
+            "type": "integer"
+          },
+          "season_lead_days": {
+            "default": 30,
+            "description": "How many days before each season's day the row starts showing.",
+            "maximum": 90.0,
+            "minimum": 0.0,
+            "title": "Season Lead Days",
+            "type": "integer"
+          },
+          "seasons": {
+            "description": "Seasons this row follows (see GET /api/collections/seasons). Empty means it is not seasonal.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Seasons",
+            "type": "array"
           },
           "seed_window": {
             "default": 1,
@@ -1606,6 +1631,35 @@
             "title": "Schedule",
             "type": "string"
           },
+          "season_after_days": {
+            "description": "How many days after each season's day the row stays up.",
+            "title": "Season After Days",
+            "type": "integer"
+          },
+          "season_lead_days": {
+            "description": "How many days before each season's day the row starts showing.",
+            "title": "Season Lead Days",
+            "type": "integer"
+          },
+          "season_status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SeasonStatusOut"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the row is in its calendar today; null for a row that follows no season."
+          },
+          "seasons": {
+            "description": "Seasons this row follows, in calendar order. Empty means not seasonal.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Seasons",
+            "type": "array"
+          },
           "seed_window": {
             "title": "Seed Window",
             "type": "integer"
@@ -1708,6 +1762,10 @@
           "placement_friends",
           "show_days",
           "shown_today",
+          "seasons",
+          "season_lead_days",
+          "season_after_days",
+          "season_status",
           "pin_top",
           "hub_anchor",
           "library_keys",
@@ -5803,6 +5861,113 @@
         "title": "ScheduleRowsOut",
         "type": "object"
       },
+      "SeasonOut": {
+        "additionalProperties": true,
+        "description": "A season a row can follow.",
+        "properties": {
+          "day": {
+            "title": "Day",
+            "type": "integer"
+          },
+          "description": {
+            "title": "Description",
+            "type": "string"
+          },
+          "emoji": {
+            "title": "Emoji",
+            "type": "string"
+          },
+          "month": {
+            "title": "Month",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "emoji",
+          "month",
+          "day",
+          "description"
+        ],
+        "title": "SeasonOut",
+        "type": "object"
+      },
+      "SeasonStatusOut": {
+        "additionalProperties": true,
+        "description": "Where a seasonal row is in its calendar today, judged on the SERVER's clock.",
+        "properties": {
+          "next": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SeasonWindowOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "showing": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SeasonWindowOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "showing",
+          "next"
+        ],
+        "title": "SeasonStatusOut",
+        "type": "object"
+      },
+      "SeasonWindowOut": {
+        "additionalProperties": true,
+        "description": "One season's run for a row: which season, and the first and last days the row shows it.",
+        "properties": {
+          "emoji": {
+            "title": "Emoji",
+            "type": "string"
+          },
+          "ends": {
+            "title": "Ends",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "starts": {
+            "title": "Starts",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "emoji",
+          "starts",
+          "ends"
+        ],
+        "title": "SeasonWindowOut",
+        "type": "object"
+      },
       "SeenRelease": {
         "properties": {
           "version": {
@@ -8079,7 +8244,7 @@
   },
   "info": {
     "title": "Shortlist",
-    "version": "1.9.0"
+    "version": "1.9.1"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -8248,6 +8413,32 @@
           }
         },
         "summary": "Create Collection",
+        "tags": [
+          "collections"
+        ]
+      }
+    },
+    "/api/collections/seasons": {
+      "get": {
+        "description": "Every season a row can follow, in calendar order (discussion #124).",
+        "operationId": "list_seasons_api_collections_seasons_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SeasonOut"
+                  },
+                  "title": "Response List Seasons Api Collections Seasons Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Seasons",
         "tags": [
           "collections"
         ]

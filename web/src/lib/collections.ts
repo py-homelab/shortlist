@@ -73,6 +73,11 @@ export function blankInput(): CollectionInput {
     placement: "both",
     placement_friends: "both",
     show_days: [],
+    // Not seasonal: [] is every row's value unless it follows the calendar. The day counts mirror the
+    // API defaults, so a row made seasonal in the editor starts where the server would.
+    seasons: [],
+    season_lead_days: 30,
+    season_after_days: 0,
     pin_top: false,
     hub_anchor: {},
     poster: { mode: "", title: "", subtitle: "", style: "" },
@@ -135,6 +140,9 @@ export function toInput(collection: Collection): CollectionInput {
     placement: collection.placement ?? "both",
     placement_friends: collection.placement_friends ?? "both",
     show_days: collection.show_days ?? [],
+    seasons: collection.seasons ?? [],
+    season_lead_days: collection.season_lead_days ?? 30,
+    season_after_days: collection.season_after_days ?? 0,
     pin_top: collection.pin_top ?? false,
     hub_anchor: collection.hub_anchor ?? {},
     poster: {

@@ -6,7 +6,7 @@ import re
 import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import StrEnum
 
 
@@ -372,6 +372,20 @@ class PosterSpec:
     style: str = ""  # generate mode: art-style guidance
 
 
+@dataclass(frozen=True)
+class RowSeason:
+    """The season a seasonal row builds for on this run (discussion #124), resolved by the server.
+
+    ``anchor`` is that year's day of the season (25 Dec 2026), which is what tells two Christmases apart:
+    a new one rebuilds the row rather than carrying last year's picks forward.
+    """
+
+    slug: str
+    name: str
+    emoji: str
+    anchor: date
+
+
 @dataclass
 class RowSpec:
     """One curated-row definition the engine delivers, built by the adapter from a Collection row.
@@ -539,6 +553,17 @@ class RowSpec:
     # which is `hub_anchors`. "" -> the sort title is left alone. Always prefix + the CURRENT name, so
     # a renamed or `{top_seed}` row goes on sorting under the prefix.
     sort_title_prefix: str = ""
+    # The seasons this row follows, in calendar order (discussion #124). [] -> not a seasonal row.
+    seasons: list[str] = field(default_factory=list)
+    # The season it builds for on this run, resolved by the server from today's date (the engine reads no
+    # clock). None on a seasonal row means it is between seasons: DORMANT — not gathered, not built, and
+    # its collection kept hidden until its next season.
+    season: RowSeason | None = None
+
+    @property
+    def dormant(self) -> bool:
+        """A seasonal row with no season tonight: kept hidden and untouched until its next one."""
+        return bool(self.seasons) and self.season is None
 
     @property
     def _effective_friends_placement(self) -> str:
@@ -1378,7 +1403,7 @@ class UserRunReport:
     # {} when tracing produced nothing (a skipped/cold user). Persisted on RunUser.trace.
     trace: dict = field(default_factory=dict)
     # Every per-person row and what this run decided about it FOR THIS PERSON, as
-    # ``{row_slug: "due" | "not_due" | "muted" | "not_in_audience"}``.
+    # ``{row_slug: "due" | "not_due" | "muted" | "not_in_audience" | "out_of_season"}``.
     #
     # `reason` says why somebody built nothing as one sentence for the whole person, which cannot be
     # attributed to a row — so a rows-first view had no way to put a skipped person under the rows

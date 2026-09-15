@@ -8,8 +8,8 @@ nav_order: 2
 ## Starting from a template
 
 **Rows → Add a row** opens a gallery rather than a blank form: _Picked for You_, _Because you
-watched…_, _Happy to see again_, _Fresh finds_, _From the vault_, _Popular on this server_, _Movie
-night_, _More TV to watch_, and _Start from scratch_. Each tile names the two or three settings it
+watched…_, _Happy to see again_, _Fresh finds_, _Seasonal_, _From the vault_, _Popular on this
+server_, _Movie night_, _More TV to watch_, and _Start from scratch_. Each tile names the two or three settings it
 changes, so picking one also shows you which knobs matter. Nothing is locked in. Every field is
 editable afterwards, and the template is not stored on the row.
 
@@ -29,6 +29,9 @@ the row is built:
   unaffected.
 - `{top_seed}` — the title that most drove their recommendations. `Because you watched {top_seed}`
   becomes "Because you watched The Bear".
+- `{season}` and `{season_emoji}` — on a [seasonal row](#seasonal-rows) only, the season it's in and
+  its emoji. `{season_emoji} {season} picks` becomes "🎃 Halloween picks" in October and "🎄 Christmas
+  picks" in December. A row that follows no season can't use them, and Shortlist refuses the save.
 
 Two rows can have the same name as long as they never build in the same library — a movies-only
 row and a TV-only row can both be called "Picked for You". Two rows that could land in one library
@@ -114,6 +117,62 @@ What stays out: anything they finished in the last **30 days** (change it with *
 finished in the last**, or set 0 to allow everything), titles they rated low (again, only when Plex
 ratings are on), and genres you excluded for them. Someone with too little history still gets their
 finished titles first, with the server's top-rated titles filling any room left.
+
+## Seasonal rows
+
+A seasonal row follows the calendar. In October it holds Halloween films and horror, in December
+Christmas films, and before Valentine's Day romance. Between seasons it is hidden. Start from the
+_Seasonal_ template, or turn on **Row editor → Seasons → Follow the calendar** on any row.
+
+**The seasons**
+
+| Season          | Its day | What the row holds                                                                          |
+| --------------- | ------- | ------------------------------------------------------------------------------------------- |
+| Valentine's Day | 14 Feb  | Films TMDB tags for Valentine's Day, and romance                                            |
+| Halloween       | 31 Oct  | Films TMDB tags for Halloween (not dramas and romances merely set on the night), and horror |
+| Christmas       | 25 Dec  | Films TMDB tags for Christmas: Home Alone and Klaus, and also Die Hard                      |
+
+Tick the ones the row follows. **Start showing (days before)** (0–90, default 30) and **Keep it up
+(days after)** (0–30, default 0) set each season's window: with the defaults, Halloween shows 1–31
+October and Christmas 25 November – 25 December. When two windows overlap, the season coming up next
+wins. Weekdays under **Where people see it** narrow a season further.
+
+**What goes in it.** The season's films that are on your server, ranked for each person: films close to
+what they watch lead the row, and the rest are weighed by how well their genres fit that person's
+viewing. So someone who watches thrillers gets Violent Night and Die Hard before a Christmas romance, and
+a family that watches animation gets Casper and Hocus Pocus rather than slasher films. The row changes
+every night it rebuilds (the template sets nightly), keeping the strongest two-thirds. The template
+also ignores release dates, because seasonal favourites are mostly old: on a real server the Christmas
+films people actually watched had a median release year of 2008.
+
+**Between seasons** the row is taken off every Plex screen but kept, so it comes straight back — the
+same way a row's days off work. On the night before a season opens, the nightly run builds the row
+for that season while it is still hidden, and it appears at midnight on the season's first day.
+Leaving a season hides it at midnight too. A row whose schedule isn't nightly can't do this on time,
+and the editor says so.
+
+**Films only, by default.** TMDB tags few shows for a season (on a 5,000-show library, 13 for Christmas
+and 2 for Halloween). A seasonal row that also covers TV keeps last season's TV collection up through any
+season with nothing to put in it, so the template leaves TV out.
+
+**Per person or shared.** A shared seasonal row is the season's films that the most people on your
+server have watched, with the same watched-by-at-least floor as any shared row.
+
+Two things behave differently on a seasonal row:
+
+- **AI web search is skipped.** It searches from what someone watched, not from the season, so almost
+  everything it proposed would be thrown away after you'd paid for it.
+- **People without enough watch history** get the season's best-rated films on your server, not the
+  server's overall top-rated.
+
+The default row can't follow seasons: its name is the one every person's everyday row uses. Add a
+seasonal row beside it instead.
+
+Shortlist reads each season's list from TMDB once a run (a few hundred requests the first time, then
+cached for a week), and only while a seasonal row is in, or about to start, its season. On a night the
+list can't be read, the row keeps what it has, like a row whose sources are all down: the run names it,
+and marks a person as failed only if every row they had to build that night was left with nothing to
+build from.
 
 ## People without enough watch history
 

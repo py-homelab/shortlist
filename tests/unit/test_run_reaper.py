@@ -103,6 +103,34 @@ def test_a_clean_boot_queues_nothing(tmp_path: Path):
         assert session.query(Job).count() == 0
 
 
+@pytest.mark.parametrize(("stale_status", "announced"), [("running", True), ("queued", False)])
+def test_a_run_a_restart_cut_short_is_announced_as_stopped_if_it_had_started(
+    tmp_path: Path, stale_status: str, announced: bool
+):
+    """`run.stopped` covers a restart as well as the Stop button. A run still queued never started, so
+    there is nothing to say it stopped."""
+    from shortlist.server.db.models import Job
+    from shortlist.server.settings_store import SettingsStore
+
+    first = _boot(tmp_path)
+    with first.app.state.sessions() as session:
+        store = SettingsStore(session)
+        store.set("notify.webhook.enabled", True)
+        store.set("notify.webhook.events", ["run.stopped"])
+        run = Run(status=stale_status, started_at=datetime.now(UTC), trigger="manual")
+        if stale_status == "running":
+            run.began_at = datetime.now(UTC)
+        session.add(run)
+        session.commit()
+        run_id = run.id
+
+    second = _boot(tmp_path)
+
+    with second.app.state.sessions() as session:
+        items = [j.payload["item"] for j in session.query(Job).filter(Job.kind == "notify.send")]
+    assert [(i["event"], i["id"]) for i in items] == ([("run.stopped", f"run-stopped-{run_id}")] if announced else [])
+
+
 class TestAScheduledRunCutShortIsFinishedOnce:
     """A scheduled run a restart cut short rebuilds only the people it never reached, once (owner decision
     2026-09-14). On SFLIX Watchtower replaced the container at 04:30 while the 03:30 run was half way,

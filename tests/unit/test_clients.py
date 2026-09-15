@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
@@ -509,6 +510,106 @@ class TestTmdbClient:
         assert params.get("with_genres") == "18,28"
         assert params.get("sort_by") == "popularity.desc"
         assert params.get("vote_count.gte") == "200"
+
+    @respx.mock
+    def test_discover_all_reads_every_page_in_a_stable_order(self):
+        """A season's list is read to the end. Paged by popularity it silently loses ~7% of titles, because
+        popularity moves between page reads; by release date it returns them all
+        (tests/fixtures/tmdb_discover_paged.json)."""
+        recorded = json.loads((FIXTURES / "tmdb_discover_paged.json").read_text())
+        pages = {1: recorded["movie_page_1"], 34: recorded["movie_last_page"]}
+        blank = {"page": 0, "total_pages": 34, "total_results": 676, "results": []}
+
+        def serve(request):
+            page = int(request.url.params["page"])
+            return httpx.Response(200, json=pages.get(page, {**blank, "page": page}))
+
+        route = respx.get("https://api.themoviedb.org/3/discover/movie").mock(side_effect=serve)
+        titles = TmdbClient("k").discover_all(MediaType.MOVIE, {"with_keywords": "3335|180193"})
+
+        assert sorted(int(call.request.url.params["page"]) for call in route.calls) == list(range(1, 35))
+        params = route.calls.last.request.url.params
+        assert params["sort_by"] == "primary_release_date.asc"
+        assert params["include_adult"] == "false"
+        assert params["with_keywords"] == "3335|180193"
+        expected = [r["id"] for r in recorded["movie_page_1"]["results"] + recorded["movie_last_page"]["results"]]
+        assert sorted(t["id"] for t in titles) == sorted(expected)
+
+    @respx.mock
+    def test_discover_all_sorts_shows_by_first_air_date(self):
+        """TV has no release date to sort on; an unknown sort key is silently ignored rather than refused."""
+        recorded = json.loads((FIXTURES / "tmdb_discover_paged.json").read_text())
+        route = respx.get("https://api.themoviedb.org/3/discover/tv").mock(
+            return_value=httpx.Response(200, json=recorded["tv_page_1"])
+        )
+        TmdbClient("k").discover_all(MediaType.SHOW, {"with_keywords": "3335"})
+        assert route.calls.last.request.url.params["sort_by"] == "first_air_date.asc"
+
+    @respx.mock
+    def test_discover_all_stops_at_page_500(self):
+        """TMDB answers HTTP 400 for a page past 500, so asking for one would fail the whole list."""
+        route = respx.get("https://api.themoviedb.org/3/discover/movie").mock(
+            return_value=httpx.Response(200, json={"page": 1, "total_pages": 800, "results": []})
+        )
+        TmdbClient("k").discover_all(MediaType.MOVIE, {"with_genres": "27"})
+        requested = [int(call.request.url.params["page"]) for call in route.calls]
+        assert max(requested) == 500 and len(requested) == 500
+
+    @respx.mock
+    def test_discover_all_is_cached_as_one_entry_and_read_back_without_a_call(self):
+        """One entry, not one per page: pages cached at different moments would expire at different moments
+        and be re-read against a list that has shifted since — the drift the stable sort exists to avoid."""
+        route = respx.get("https://api.themoviedb.org/3/discover/movie").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "page": 1,
+                    "total_pages": 2,
+                    "results": [{"id": 7, "title": "A", "genre_ids": [27], "vote_average": 6.1, "overview": "x" * 500}],
+                },
+            )
+        )
+        cache = _MemoryCache()
+        first = TmdbClient("k", cache=cache).discover_all(MediaType.MOVIE, {"with_genres": "27"})
+        calls = len(route.calls)
+        second = TmdbClient("k", cache=cache).discover_all(MediaType.MOVIE, {"with_genres": "27"})
+
+        assert len(route.calls) == calls
+        assert len(cache.store) == 1
+        assert second == first
+        # Only what a candidate is built from is kept: a Christmas list is ~3,700 titles, and overviews
+        # alone would make it megabytes.
+        assert first == [{"id": 7, "title": "A", "genre_ids": [27], "vote_average": 6.1}]
+
+    @respx.mock
+    def test_discover_all_raises_rather_than_returning_part_of_a_list(self):
+        """A list missing a page would quietly drop titles from someone's season — and be cached for a week."""
+
+        def serve(request):
+            if request.url.params["page"] == "2":
+                return httpx.Response(500)
+            return httpx.Response(200, json={"page": 1, "total_pages": 2, "results": [{"id": 1}]})
+
+        respx.get("https://api.themoviedb.org/3/discover/movie").mock(side_effect=serve)
+        cache = _MemoryCache()
+        with pytest.raises(RuntimeError, match="HTTP 500"):
+            TmdbClient("k", cache=cache).discover_all(MediaType.MOVIE, {"with_genres": "27"})
+        assert cache.store == {}
+
+    @respx.mock
+    def test_discover_all_refuses_a_page_that_came_back_empty_handed(self, caplog):
+        """A 404 on one page reads as {} — which, taken as an empty page, would cache a short list for a week."""
+
+        def serve(request):
+            if request.url.params["page"] == "2":
+                return httpx.Response(404)
+            return httpx.Response(200, json={"page": 1, "total_pages": 2, "results": [{"id": 1}]})
+
+        respx.get("https://api.themoviedb.org/3/discover/movie").mock(side_effect=serve)
+        cache = _MemoryCache()
+        with pytest.raises(RuntimeError, match="page 2"):
+            TmdbClient("k", cache=cache).discover_all(MediaType.MOVIE, {"with_genres": "27"})
+        assert cache.store == {}
 
     @respx.mock
     def test_discover_with_no_genres_makes_no_call(self):
