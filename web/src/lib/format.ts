@@ -267,13 +267,17 @@ export function renderRowName(
   topSeed = "Fargo",
   user = "Sarah",
   libraryName = "Movies",
+  season: { name: string; emoji: string } = { name: "Christmas", emoji: "🎄" },
 ): string {
   // Fill EVERY placeholder with a sample value so the "on Plex this looks like" preview shows what
-  // {user}/{top_seed}/{library_name} actually become — leaving any literal made the field look broken.
+  // {user}/{top_seed}/{library_name}/{season} actually become — leaving any literal made the field
+  // look broken.
   const rendered = template
     .replaceAll("{top_seed}", topSeed)
     .replaceAll("{user}", user)
-    .replaceAll("{library_name}", libraryName);
+    .replaceAll("{library_name}", libraryName)
+    .replaceAll("{season_emoji}", season.emoji)
+    .replaceAll("{season}", season.name);
   // A {library_name} title collapses its gap when the sample is empty, matching the backend renderer.
   return template.includes("{library_name}")
     ? rendered.replace(/\s+/g, " ").trim()

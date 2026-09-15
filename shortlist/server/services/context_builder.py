@@ -15,6 +15,7 @@ from loguru import logger
 from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, sessionmaker
 
+from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.clients.mdblist import MdbListClient
 from shortlist.engine.clients.plex_pms import PlexClient
 from shortlist.engine.clients.plextv import PlexTvClient
@@ -51,7 +52,7 @@ from shortlist.engine.models import (
     row_languages_or_inherit,
     row_monitor_or_inherit,
 )
-from shortlist.engine.rows import row_is_shown
+from shortlist.engine.rows import row_shown_today
 from shortlist.server.db.adapters import DbCache, DbSnapshotStore
 from shortlist.server.db.models import (
     DEFAULT_SLUG,
@@ -1099,7 +1100,21 @@ class ContextBuilder:
             # understands. `off` is Shortlist's existing "show this row nowhere" state, so a
             # scheduled row rides the tested promote path instead of a hiding mechanism of its own —
             # and the engine never has to look at a clock.
-            shown = row_is_shown(collection.show_days, now)
+            #
+            # Seasons (discussion #124) resolve the same way: a seasonal row is `off` outside its seasons,
+            # and its spec carries the season it builds for tonight — the one it shows, or on the night
+            # before a season opens, that season, so it is built while still hidden. None between
+            # seasons is what makes the row dormant.
+            shown = row_shown_today(
+                collection.show_days, collection.seasons, collection.season_lead_days, collection.season_after_days, now
+            )
+            season = (
+                seasons_mod.row_season_on(
+                    list(collection.seasons), collection.season_lead_days, collection.season_after_days, now.date()
+                )
+                if collection.seasons
+                else None
+            )
             specs.append(
                 RowSpec(
                     slug=collection.slug,
@@ -1140,6 +1155,8 @@ class ContextBuilder:
                     request_overrides=row_request_overrides(collection),
                     description=collection.description or "",
                     sort_title_prefix=collection.sort_title_prefix or "",
+                    seasons=list(collection.seasons or []),
+                    season=season,
                 )
             )
         return specs

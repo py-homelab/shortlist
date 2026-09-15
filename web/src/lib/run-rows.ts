@@ -11,7 +11,12 @@ import type {
  *  `due` is intent, not outcome — it says the run meant to build the row, and the person's own
  *  `status` says what became of it. A run recorded before this existed has none of these, which is
  *  `null` here and must read as "not recorded", never as "no rows were considered". */
-export type RowDecision = "due" | "not_due" | "muted" | "not_in_audience";
+export type RowDecision =
+  | "due"
+  | "not_due"
+  | "muted"
+  | "not_in_audience"
+  | "out_of_season";
 
 export type RunRowPerson = {
   decision: RowDecision | null;
@@ -66,8 +71,9 @@ export type RunRowGroup = {
 export type RunRowsView = {
   /** Rows this run BUILT (or meant to). */
   groups: RunRowGroup[];
-  /** Rows that exist but were not part of this run — a scoped run's unselected rows. */
-  notInRun: { slug: string; title: string }[];
+  /** Rows that exist but were not part of this run — a scoped run's unselected rows, or a seasonal row
+   *  between seasons (`outOfSeason`, present only when true). */
+  notInRun: { slug: string; title: string; outOfSeason?: true }[];
 };
 
 const DECISIONS = new Set<string>([
@@ -75,6 +81,7 @@ const DECISIONS = new Set<string>([
   "not_due",
   "muted",
   "not_in_audience",
+  "out_of_season",
 ]);
 
 function asDecision(value: unknown): RowDecision | null {
@@ -122,11 +129,13 @@ export function groupRunByRow(
   // this row") look like it had touched rows the operator never selected.
   const ran = new Set<string>();
   const considered = new Set<string>();
+  const outOfSeason = new Set<string>();
   const delivered = new Map<string, string>();
   for (const user of run.users) {
     for (const [slug, decision] of Object.entries(user.rows_considered ?? {})) {
       considered.add(slug);
       if (decision === "due") ran.add(slug);
+      if (decision === "out_of_season") outOfSeason.add(slug);
     }
     for (const entry of user.breakdown ?? []) {
       if (!entry.row_slug) continue;
@@ -288,7 +297,11 @@ export function groupRunByRow(
 
   const notInRun = [...considered]
     .filter((slug) => !ran.has(slug))
-    .map((slug) => ({ slug, title: nameFor(slug) }))
+    .map((slug) => ({
+      slug,
+      title: nameFor(slug),
+      ...(outOfSeason.has(slug) ? { outOfSeason: true as const } : {}),
+    }))
     .sort((a, b) => a.title.localeCompare(b.title));
 
   const byTitle = (a: RunRowGroup, b: RunRowGroup) =>

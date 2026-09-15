@@ -244,6 +244,11 @@ class Collection(Base):
     # REBUILDS, this is when people can SEE it. A row can rebuild nightly and show on Fridays.
     # There is no way to spell "never" — `enabled` already means that.
     show_days: Mapped[list] = mapped_column(JSON, default=list, nullable=False, server_default="[]")
+    # The seasons this row follows (discussion #124), as `engine/seasons.py` slugs in calendar order.
+    # [] -> not a seasonal row. The two day counts are how early and how late it shows each season.
+    seasons: Mapped[list] = mapped_column(JSON, default=list, nullable=False, server_default="[]")
+    season_lead_days: Mapped[int] = mapped_column(Integer, default=30, nullable=False, server_default="30")
+    season_after_days: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
     # Pin the row to the TOP of its library's Recommended shelf (server-wide order, not per-user).
     pin_top: Mapped[bool] = mapped_column(Boolean, default=False)
     # Per-library override of where THIS row sits in the Recommended shelf: {sectionKey: {anchor, before}}.
@@ -410,7 +415,7 @@ class RunUser(Base):
     # UI can show "exactly what happened for this person". {} on legacy rows and skipped/cold users.
     trace: Mapped[dict] = mapped_column(JSON, default=dict)
     # What this run decided about each per-person row FOR THIS PERSON:
-    # {row_slug: "due" | "not_due" | "muted" | "not_in_audience"}. `reason` is one sentence about the
+    # {row_slug: "due" | "not_due" | "muted" | "not_in_audience" | "out_of_season"}. `reason` is one sentence about the
     # PERSON and cannot be attributed to a row, so without this a rows-first view had nowhere to put
     # a skipped user — and on a run where nothing was due, that is everybody. {} on legacy rows and
     # on a cold-start skip, which never reaches the decision; the UI must render that as "not

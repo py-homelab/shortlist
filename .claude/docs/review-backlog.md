@@ -10,6 +10,21 @@ below is later work.
 
 ---
 
+## OPEN — LOW: unmarked duplicates of a shared row (found 2026-09-15, discussion #124 review)
+
+Before 2026-09-15 a rename from the rename screen took a shared row's `row_marker(0)` off its title, so
+the next run could not find the collection and built a second, marked one beside it. Both carry the
+`shortlist__shared_<row>` label, so `promote_shared_row` keeps both on Home. Not a privacy problem.
+
+The rename no longer strips the marker, and it now leaves an unmarked copy alone when a marked one is in
+the same library (`collection_reconcile.reconcile_row_rename_iter`). What is left: servers that renamed
+a shared row before the fix may still hold the unmarked copy. Nothing deletes it while the row is live
+(the sweep skips it: the shared slug is not in its markers map); removing the row does, through
+`remove_row_collections`. Fix when it matters: delete an unmarked collection
+under a shared label when a marked sibling exists in the same library, with the usual confirm-twice guard.
+
+---
+
 ## CLOSED — v1.9.0 release review, three LOW (2026-09-14)
 
 The release-PR Architecture Review over `v1.8.0..dev` found no HIGH or MED. All three LOWs fixed the

@@ -9,8 +9,6 @@ import { api, apiErrorMessage } from "@/lib/api";
 import { useImageProvider } from "@/lib/queries";
 import type { PosterInput } from "@/lib/types";
 
-const PLACEHOLDER_HINT = <TemplateVarsHint />;
-
 /**
  * The row editor's "Poster" section: leave Plex's own artwork alone, upload an image, or generate one
  * from text with the AI provider. The image upload/preview act on a saved row, so for a brand-new row
@@ -21,11 +19,14 @@ export function PosterField({
   onChange,
   collectionId,
   hasImage,
+  seasonal = false,
 }: {
   value: PosterInput;
   onChange: (poster: PosterInput) => void;
   collectionId: number | null;
   hasImage: boolean;
+  /** The row follows seasons, so its poster text may carry the season too. */
+  seasonal?: boolean;
 }) {
   const provider = useImageProvider();
   const fileRef = useRef<HTMLInputElement>(null);
@@ -201,7 +202,7 @@ export function PosterField({
               onChange={(event) => set({ subtitle: event.target.value })}
             />
           </div>
-          {PLACEHOLDER_HINT}
+          <TemplateVarsHint seasonal={seasonal} />
           <div className="space-y-2">
             <Label htmlFor="poster-style">Art style</Label>
             <Input

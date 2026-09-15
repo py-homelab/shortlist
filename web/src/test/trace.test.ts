@@ -293,10 +293,12 @@ describe("plain-English trace helpers", () => {
     expect(fateLabel("hidden_by_their_restrictions")).toBe(
       "hidden by their Plex restrictions",
     );
+    expect(fateLabel("not_in_season")).toBe("not a film for the season");
   });
 
   it("sourceRole describes each source's real query shape", () => {
     expect(sourceRole("tmdb_discover")).toMatch(/genres they watch most/);
+    expect(sourceRole("season")).toMatch(/season's titles in your libraries/);
     expect(sourceRole("cold_start")).toMatch(/highest-rated titles/);
     expect(sourceRole("unknown_source")).toMatch(/gathered candidate titles/);
   });

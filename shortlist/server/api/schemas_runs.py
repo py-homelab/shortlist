@@ -69,7 +69,7 @@ class RunUserOut(PassthroughModel):
     breakdown: list[dict[str, Any]]
     has_trace: bool
     #: What this run decided about each per-person row FOR THIS PERSON:
-    #: `{row_slug: "due" | "not_due" | "muted" | "not_in_audience"}`. `reason` explains the person in
+    #: `{row_slug: "due" | "not_due" | "muted" | "not_in_audience" | "out_of_season"}`. `reason` explains the person in
     #: one sentence and cannot be attributed to a row, so this is what lets a rows-first view place
     #: somebody under the rows they were skipped for. `{}` on a run recorded before it existed —
     #: which the UI must render as "not recorded", never as "no rows were considered".

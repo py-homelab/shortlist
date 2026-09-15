@@ -56,6 +56,9 @@ class RowChange:
         poster_mode_after: ...and after.
         days_before: The ISO weekdays the row appeared on, before (() = every day).
         days_after: ...and after.
+        calendar_before: The row's seasons, lead days and days after, before (``((), 30, 0)`` when it
+            follows no season — any equal pair means the edit left them alone).
+        calendar_after: ...and after.
         defer_rename: The caller is going to stream the rename itself, so plan no rename here.
     """
 
@@ -76,6 +79,8 @@ class RowChange:
     poster_mode_after: str
     days_before: tuple[int, ...] = ()
     days_after: tuple[int, ...] = ()
+    calendar_before: tuple = ()
+    calendar_after: tuple = ()
     defer_rename: bool = False
 
 
@@ -185,5 +190,9 @@ def plan_row_changes(change: RowChange, stranded_sections: Callable[[], set[str]
     # happened — excludes are computed from what is really left on the server.
     if change.enabled_after and tuple(change.days_before) != tuple(change.days_after):
         plan.append(PlannedWork(kind=VISIBILITY, scope=f"the days row '{change.slug}' appears on changed"))
+    # The same for a row's seasons (discussion #124): make a row seasonal in September and it has to come
+    # off people's Home now. One pass however many of the two changed.
+    elif change.enabled_after and tuple(change.calendar_before) != tuple(change.calendar_after):
+        plan.append(PlannedWork(kind=VISIBILITY, scope=f"the seasons row '{change.slug}' follows changed"))
 
     return plan

@@ -1,6 +1,7 @@
 import { api } from "@/lib/api";
 import { renderRowName, sampleLibraryName } from "@/lib/format";
-import type { CollectionInput } from "@/lib/types";
+import { usesSeason } from "@/lib/seasons";
+import type { CollectionInput, Season } from "@/lib/types";
 
 /** The sample person and library every preview on this card is filled in for. */
 const SAMPLE = { topSeed: "Fargo", user: "Sarah" } as const;
@@ -10,11 +11,17 @@ const SAMPLE = { topSeed: "Fargo", user: "Sarah" } as const;
  * collapses whitespace around `{library_name}`, which is right for a one-line title and would
  * flatten a description typed over several lines — the engine's `render_description` keeps them too.
  */
-function renderDescription(template: string, libraryName: string): string {
+function renderDescription(
+  template: string,
+  libraryName: string,
+  season: { name: string; emoji: string } = { name: "Christmas", emoji: "🎄" },
+): string {
   return template
     .replaceAll("{top_seed}", SAMPLE.topSeed)
     .replaceAll("{user}", SAMPLE.user)
     .replaceAll("{library_name}", libraryName)
+    .replaceAll("{season_emoji}", season.emoji)
+    .replaceAll("{season}", season.name)
     .trim();
 }
 
@@ -25,6 +32,9 @@ function nameCaption(input: CollectionInput, template: string): string | null {
   // shared row is named per person is simply untrue.
   const perPerson = /\{(top_seed|user)\}/.test(template);
   const perLibrary = template.includes("{library_name}");
+  if (usesSeason(template)) {
+    return "Example only — the name follows the season the row is in.";
+  }
   if (input.build !== "shared" && perPerson) {
     return "Example only — each person gets their own name here, from their own viewing.";
   }
@@ -48,17 +58,20 @@ export function RowPlexCard({
   input,
   collectionId,
   hasImage,
+  sampleSeason,
 }: {
   input: CollectionInput;
   collectionId: number | null;
   hasImage: boolean;
+  /** The first season the row follows, to fill `{season}` with a real one; undefined uses a sample. */
+  sampleSeason?: Season;
 }) {
   const template = input.name_template || input.name;
   const sampleLibrary = sampleLibraryName(input.media);
   const shown =
-    renderRowName(template, SAMPLE.topSeed, SAMPLE.user, sampleLibrary) ||
+    renderRowName(template, SAMPLE.topSeed, SAMPLE.user, sampleLibrary, sampleSeason) ||
     "Picked for You";
-  const description = renderDescription(input.description, sampleLibrary);
+  const description = renderDescription(input.description, sampleLibrary, sampleSeason);
   const caption = nameCaption(input, template);
   const mode = input.poster.mode;
   const posterTitle = renderRowName(
@@ -66,12 +79,14 @@ export function RowPlexCard({
     SAMPLE.topSeed,
     SAMPLE.user,
     sampleLibrary,
+    sampleSeason,
   );
   const posterSubtitle = renderRowName(
     input.poster.subtitle,
     SAMPLE.topSeed,
     SAMPLE.user,
     sampleLibrary,
+    sampleSeason,
   );
 
   return (

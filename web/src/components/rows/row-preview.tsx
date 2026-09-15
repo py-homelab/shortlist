@@ -3,7 +3,13 @@ import type { ReactNode } from "react";
 import { effectiveSources } from "@/components/rows/row-sources-field";
 import { showDaysSummary } from "@/lib/show-days";
 import { sourceShortLabel } from "@/lib/sources";
-import type { CollectionInput, PlexLibrary, Settings, User } from "@/lib/types";
+import type {
+  CollectionInput,
+  PlexLibrary,
+  Season,
+  Settings,
+  User,
+} from "@/lib/types";
 
 /** How often the row swaps titles, in words, from the day count the engine reads.
  *
@@ -122,6 +128,11 @@ const ORDER_WORDS: Record<string, string> = {
   rotate: "Taking turns at the front",
 };
 
+/** "1 day", "30 days". */
+function daysLabel(days: number): string {
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
 function Fact({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="flex gap-3 py-2 text-sm">
@@ -156,7 +167,10 @@ export function RowPreview({
   followsAWatch,
   globalRefreshDays,
   globalWatchedPct,
+  seasons = [],
 }: {
+  /** The season catalogue, to name the seasons the row follows; empty while it loads. */
+  seasons?: Season[];
   input: CollectionInput;
   users: User[];
   libraries: PlexLibrary[];
@@ -166,7 +180,14 @@ export function RowPreview({
   globalRefreshDays: number | null;
   globalWatchedPct: number | null;
 }) {
-  const sources = effectiveSources(input.candidate_sources, settings);
+  const sources = effectiveSources(input.candidate_sources, settings).filter(
+    // A seasonal row never runs AI web search (`effective_row_sources`), so the panel must not list it.
+    (source) => input.seasons.length === 0 || source !== "llm_web",
+  );
+  const seasonNames = seasons
+    .filter((season) => input.seasons.includes(season.slug))
+    .map((season) => `${season.emoji} ${season.name}`)
+    .join(", ");
   const builtFrom = builtFromLine(input);
   const isSharedRow = input.build === "shared";
 
@@ -216,11 +237,13 @@ export function RowPreview({
             />
             <Fact
               label="Found via"
-              value={
-                sources.length
-                  ? sources.map(sourceShortLabel).join(", ")
-                  : "The global default sources"
-              }
+              value={[
+                // A seasonal row's own titles come first: they are what the row is made of.
+                ...(input.seasons.length > 0 ? ["Seasonal list"] : []),
+                ...(sources.length
+                  ? sources.map(sourceShortLabel)
+                  : ["The global default sources"]),
+              ].join(", ")}
             />
           </>
         )}
@@ -228,6 +251,14 @@ export function RowPreview({
           label="Updates"
           value={updateFrequency(input, followsAWatch, globalRefreshDays)}
         />
+        {input.seasons.length > 0 && (
+          <Fact
+            label="Seasons"
+            value={`${seasonNames || `${input.seasons.length} seasons`} — ${daysLabel(input.season_lead_days)} before to ${
+              input.season_after_days > 0 ? `${daysLabel(input.season_after_days)} after` : "the day itself"
+            }, hidden between seasons`}
+          />
+        )}
         <Fact label="Appears on" value={whereItShows(input)} />
         {/* Only for a row that actually narrows its days. Without this the panel says "Home and the
             library" and stops, which is true but not the whole answer for a row people only see on

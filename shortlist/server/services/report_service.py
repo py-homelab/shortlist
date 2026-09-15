@@ -478,6 +478,8 @@ class _RowNamer:
         template = self.template(slug)
         if template is None:
             return slug
+        # A seasonal row's name follows the calendar and a report spans it, so it reads as what it is.
+        template = template.replace("{season_emoji}", "").replace("{season}", "Seasonal")
         name = _PLACEHOLDER.sub(lambda m: library if m.group(0) == "{library_name}" else "\u2026", template)
         # Collapse the space the placeholder left behind, so it reads "watched…" not "watched …".
         name = " ".join(name.split()).replace(" \u2026", "\u2026")

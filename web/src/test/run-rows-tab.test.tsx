@@ -123,6 +123,19 @@ describe("RunRowsTab", () => {
     expect(screen.getByText(/1 row wasn.t in this run/i)).toBeInTheDocument();
   });
 
+  it("says which of the rows left out of the run were out of season", async () => {
+    const detail = run();
+    detail.users = detail.users.map((u) => ({
+      ...u,
+      rows_considered: { ...u.rows_considered, because: "out_of_season" },
+    }));
+    renderTab(detail);
+
+    await userEvent.click(screen.getByRole("button", { name: "Show" }));
+
+    expect(screen.getByText(/Because you watched \(out of season\)/)).toBeInTheDocument();
+  });
+
   it("names a multi-library row once, with its libraries beside it", () => {
     // Movies looked like it never ran because the row took its name from whichever delivered title
     // arrived last. The row has ONE name; the libraries are their own field.

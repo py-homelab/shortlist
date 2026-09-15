@@ -24,6 +24,7 @@ vi.mock("@/lib/api", () => ({
 function renderField(
   poster: Partial<PosterInput>,
   collectionId: number | null = 1,
+  seasonal = false,
 ) {
   const value: PosterInput = {
     mode: "",
@@ -42,6 +43,7 @@ function renderField(
         onChange={() => {}}
         collectionId={collectionId}
         hasImage={false}
+        seasonal={seasonal}
       />
     </QueryClientProvider>,
   );
@@ -61,6 +63,18 @@ describe("PosterField", () => {
     expect(screen.getByLabelText("Title text")).toBeInTheDocument();
     expect(screen.getByLabelText("Art style")).toBeInTheDocument();
     expect(screen.queryByText("no images here")).not.toBeInTheDocument();
+  });
+
+  it("lists the season placeholders beside a seasonal row's poster text", () => {
+    // The poster's text is filled with the season just as the name is, so a hint that leaves them out
+    // hides the one thing a seasonal poster most wants to say.
+    renderField({ mode: "text" }, 1, true);
+    expect(screen.getByText("{season}")).toBeInTheDocument();
+  });
+
+  it("does not offer the season placeholders on an ordinary row's poster", () => {
+    renderField({ mode: "text" });
+    expect(screen.queryByText("{season}")).toBeNull();
   });
 
   it("tells a brand-new row to save first before uploading", () => {

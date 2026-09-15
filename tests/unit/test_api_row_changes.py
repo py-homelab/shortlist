@@ -215,6 +215,28 @@ class TestOrdering:
         assert kinds == [RECONCILE, RECONCILE, PRIVACY_SYNC, RENAME, POSTER_RESET]
 
 
+class TestSeasonsChange:
+    """Changing a row's seasons, or how early or late it shows them, changes whether it is on Plex today."""
+
+    def test_changing_the_calendar_owes_plex_a_visibility_pass(self):
+        plan = plan_row_changes(
+            make_change(calendar_before=((), 30, 0), calendar_after=(("christmas",), 30, 0)), never_called
+        )
+        assert [w.kind for w in plan] == [VISIBILITY]
+
+    def test_changing_only_the_lead_owes_one_too(self):
+        plan = plan_row_changes(
+            make_change(calendar_before=(("christmas",), 30, 0), calendar_after=(("christmas",), 60, 0)), never_called
+        )
+        assert [w.kind for w in plan] == [VISIBILITY]
+
+    def test_leaving_the_calendar_alone_owes_nothing(self):
+        plan = plan_row_changes(
+            make_change(calendar_before=(("christmas",), 30, 0), calendar_after=(("christmas",), 30, 0)), never_called
+        )
+        assert [w.kind for w in plan] == []
+
+
 class TestShowDaysChange:
     """Changing which days a row appears is a Plex write, not a config change (issue #102).
 

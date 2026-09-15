@@ -6,6 +6,11 @@ const VARIABLES = [
   { token: "{top_seed}", meaning: "a title they recently watched" },
 ] as const;
 
+const SEASON_VARIABLES = [
+  { token: "{season}", meaning: "the season it’s in (Christmas)" },
+  { token: "{season_emoji}", meaning: "that season’s emoji (🎄)" },
+] as const;
+
 /**
  * The three placeholders a row name or poster text can carry — `render_row_name` in
  * engine/delivery.py is the substituting side, and this list must stay in step with it.
@@ -13,13 +18,16 @@ const VARIABLES = [
  * Shown wherever one of those fields is edited. Without it the fields look like plain text boxes,
  * so nobody discovers that a per-person row can say each person's own name.
  */
-export function TemplateVarsHint() {
+export function TemplateVarsHint({ seasonal = false }: { seasonal?: boolean }) {
+  // The season placeholders only mean something on a row that follows seasons. Anywhere else a name using
+  // them is refused, and poster text renders them blank, so offering them there offers nothing.
+  const variables = seasonal ? [...VARIABLES, ...SEASON_VARIABLES] : VARIABLES;
   return (
     <p className="text-sm text-muted-foreground">
       Use{" "}
-      {VARIABLES.map((v, i) => (
+      {variables.map((v, i) => (
         <span key={v.token}>
-          {i > 0 ? (i === VARIABLES.length - 1 ? ", or " : ", ") : ""}
+          {i > 0 ? (i === variables.length - 1 ? ", or " : ", ") : ""}
           <span className="font-mono">{v.token}</span> for {v.meaning}
         </span>
       ))}

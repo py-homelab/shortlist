@@ -128,6 +128,9 @@ export type CollectionBody = Partial<CollectionInput> & {
  *  `hub_anchor` needs no override: its dynamic keys are Plex section keys, which the schema already
  *  expresses as an index signature, and its VALUES are modelled (`HubAnchorOut`). */
 export type Collection = Schemas["CollectionOut"];
+/** A season a row can follow (GET /api/collections/seasons), and where a seasonal row is today. */
+export type Season = Schemas["SeasonOut"];
+export type SeasonStatus = Schemas["SeasonStatusOut"];
 export type RowEffectiveness = Schemas["RowEffectivenessOut"];
 
 /** A Plex library on the server (GET /api/system/libraries). */
@@ -857,6 +860,7 @@ export type TraceFate =
   | "excluded_genre"
   | "lost_ranking_cutoff"
   | "hidden_by_their_restrictions"
+  | "not_in_season"
   | "not_returned";
 
 /** The services POST /api/settings/test/{service} accepts (a path parameter typed `str`). */

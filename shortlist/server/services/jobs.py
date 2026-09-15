@@ -323,15 +323,15 @@ CATALOG: tuple[JobKind, ...] = (
         kind="rows.visibility",
         label="Show and hide rows for today",
         description=(
-            "Puts each row on the Plex shelves its own day schedule asks for. A row on its day off is "
-            "hidden, not deleted — it keeps its titles, so it comes straight back on its next day "
-            "without being built again. Everybody's privacy filters are re-merged before anything is "
-            "shown, and if that fails nothing appears."
+            "Puts each row on the Plex shelves its own day schedule and seasons ask for. A row on its day "
+            "off, or between its seasons, is hidden, not deleted — it keeps its titles, so it comes "
+            "straight back without being built again. Everybody's privacy filters are re-merged before "
+            "anything is shown, and if that fails nothing appears."
         ),
         manual=True,
         schedule_job_id="rows-visibility",
         schedule_setting="rows.visibility_cron",
-        trigger="Runs at midnight, and whenever you change which days a row appears on.",
+        trigger="Runs at midnight, and whenever you change which days or seasons a row appears in.",
     ),
     JobKind(
         kind="user.restore",
@@ -1721,6 +1721,13 @@ def _watching_account_undo(state, payload: dict, job_id: int | None = None) -> d
     return out
 
 
+#: How many nights after a seasonal row's turnover the midnight pass keeps converging it. One would be
+#: enough if every pass succeeded that night; a failed pass whose retry lands after the next midnight, one
+#: deferred behind a run, or one skipped under `paused_all` would otherwise never be redone. Stateless:
+#: each night is the same pure comparison, a week back.
+_SEASON_TURNOVER_LOOKBACK_DAYS = 7
+
+
 @handler("rows.visibility")
 def _rows_visibility(state, payload: dict) -> dict:
     """Make Plex match today's row day-schedules ("When it appears", issue #102).
@@ -1729,13 +1736,17 @@ def _rows_visibility(state, payload: dict) -> dict:
     Home until 03:30 Tuesday, and a weekly-rebuilding row for days. This is what makes a day schedule
     mean anything, and it is why the schedule is a MIDNIGHT job rather than a flag a run reads.
 
-    **This handler keeps no state of its own.** Today's answer is ``row_is_shown(show_days, now)`` —
-    schedule plus calendar, nothing else — so there is nothing to cache, nothing to keep in sync, and
-    no ordering rule about when to record it. An earlier version cached the last-applied answer per
-    row to skip work, and that cache produced two bugs by itself: it recorded rows as converged under
-    ``paused_all``, and again for a collection the pass had SKIPPED. Both left a row visible on a day
-    its schedule said to hide it, permanently, because the cache then agreed that there was nothing to
-    do. Recomputing is simpler AND self-healing — whatever one pass cannot do, the next one does.
+    **This handler keeps no state of its own.** Today's answer is
+    ``row_shown_today(show_days, seasons, lead, after, now)`` — schedule, seasons and calendar, nothing
+    else — so there is nothing to cache, nothing to keep in sync, and no ordering rule about when to
+    record it. An earlier version cached the last-applied answer per row to skip work, and that cache
+    produced two bugs by itself: it recorded rows as converged under ``paused_all``, and again for a
+    collection the pass had SKIPPED. Both left a row visible on a day its schedule said to hide it,
+    permanently, because the cache then agreed that there was nothing to do. Recomputing is simpler AND
+    self-healing — whatever one pass cannot do, the next one does. A seasonal row with no day schedule is
+    in the gate only for ``_SEASON_TURNOVER_LOOKBACK_DAYS`` nights after its shown-state changed, so for
+    those rows "the next one" is any pass within that week; after it, the promotion of each run that
+    covers the row keeps it right.
 
     **The gate comes first, before anything is built.** ``build_context`` constructs a PMS client (an
     HTTP fetch), plex.tv, TMDB and the curator, so deciding whether there is work AFTER it would make
@@ -1759,7 +1770,7 @@ def _rows_visibility(state, payload: dict) -> dict:
     """
     from shortlist.engine.pipeline import identity_map, promote_shared_row, promote_user_rows
     from shortlist.engine.pipeline import run as engine_run
-    from shortlist.engine.rows import row_is_shown
+    from shortlist.engine.rows import row_shown_today
     from shortlist.server.db.models import Collection, Delivery
     from shortlist.server.services.context_builder import local_now
 
@@ -1768,11 +1779,22 @@ def _rows_visibility(state, payload: dict) -> dict:
 
     # --- the gate: pure DB, no clients, no network -----------------------------------------
     with state.sessions() as session:
-        scheduled = {
-            row.slug: row_is_shown(row.show_days, now)
-            for row in session.query(Collection).filter_by(enabled=True)
-            if row.show_days
-        }
+        scheduled: dict[str, bool] = {}
+        for row in session.query(Collection).filter_by(enabled=True):
+            calendar = (row.seasons, row.season_lead_days, row.season_after_days)
+            shown = row_shown_today(row.show_days, *calendar, now)
+            # A seasonal row with no day schedule takes a pass only in the week after a season opens or
+            # closes for it (discussion #124) — stateless, since each earlier day's answer is the same pure
+            # call — so a server whose only scheduled row is seasonal converges a few weeks a year, not
+            # every night. Between those weeks, the runs that cover the row keep it right.
+            if row.show_days or (
+                row.seasons
+                and any(
+                    shown != row_shown_today(row.show_days, *calendar, now - timedelta(days=back))
+                    for back in range(1, _SEASON_TURNOVER_LOOKBACK_DAYS + 1)
+                )
+            ):
+                scheduled[row.slug] = shown
         paused_all = bool(SettingsStore(session, state.secrets).get("paused_all"))
 
     # `payload["row"]` is set when the ROW EDITOR queued this because a row's days changed. It is what

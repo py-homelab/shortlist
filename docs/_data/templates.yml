@@ -6,7 +6,7 @@
 # to match this site's house style. If a template is added, renamed or removed in
 # row-templates.ts, change it here too.
 #
-# `shared: true` marks the one row everybody sees. The other seven are built per
+# `shared: true` marks the one row everybody sees. The other eight are built per
 # person, which is the whole point of the app and worth showing rather than telling.
 
 - emoji: "✨"
@@ -24,6 +24,10 @@
 - emoji: "🌱"
   title: Fresh finds
   blurb: Rebuilds every night, nothing they've seen. For people who want something new each evening.
+
+- emoji: "🗓️"
+  title: Seasonal
+  blurb: "Follows the calendar: Halloween films and horror in October, Christmas films in December, romance for Valentine's. Hidden between seasons."
 
 - emoji: "🕰️"
   title: From the vault

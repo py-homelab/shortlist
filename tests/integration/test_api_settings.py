@@ -28,6 +28,12 @@ class TestSettingsValidation:
         assert client.put("/api/settings", json={"values": {"plextv.throttle_s": -1}}).status_code == 422
         assert client.put("/api/settings", json={"values": {"plextv.throttle_s": 61}}).status_code == 422
 
+    def test_the_default_row_title_cannot_use_a_season(self, client: TestClient):
+        """It titles the default row, which follows no season, so `{season}` would never be filled and the
+        row would stop being built for everyone (discussion #124)."""
+        resp = client.put("/api/settings", json={"values": {"row.name_template": "{season_emoji} {season} picks"}})
+        assert resp.status_code == 422, resp.text
+
     def test_the_sonarr_monitor_mode_accepts_only_the_modes_shortlist_offers(self, client: TestClient):
         # Sonarr 400s the whole add on a monitor value it doesn't know, so a typo saved here would
         # surface a fortnight later as shows that never arrived — with nothing on screen to explain it.

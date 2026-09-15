@@ -20,6 +20,7 @@ import type {
   EngagementReport,
   OwnedCollectionsAudit,
   PlexLibrary,
+  Season,
   ConnectionTestResult,
   LinkRequest,
   PinCreated,
@@ -512,6 +513,9 @@ export const api = {
 
   /** The server's Plex libraries, for the Rows editor's per-row delivery-target picker. */
   getLibraries: (): Promise<PlexLibrary[]> => request("/api/system/libraries"),
+
+  /** Every season a row can follow, in calendar order (discussion #124). */
+  getSeasons: (): Promise<Season[]> => request("/api/collections/seasons"),
 
   /** The running app version + update check (for the footer + update banner). */
   getVersion: (): Promise<VersionInfo> => request("/api/system/version"),

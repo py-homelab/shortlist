@@ -1479,6 +1479,45 @@ class TestRowDescriptionAndSortPrefix0091:
         assert not ({"summary_written", "title_sort_written"} & set(self._columns(tmp_path, "deliveries")))
 
 
+class TestSeasonalRows0092:
+    """0092 adds a row's seasons (discussion #124). [] is "not a seasonal row", so every existing row comes
+    out of the upgrade exactly as it went in — shown every day it was shown before."""
+
+    @staticmethod
+    def _columns(config_dir: Path) -> dict[str, tuple[bool, str | None]]:
+        """column -> (NOT NULL, default)."""
+        con = sqlite3.connect(config_dir / "shortlist.db")
+        try:
+            return {r[1]: (bool(r[3]), r[4]) for r in con.execute("PRAGMA table_info(collections)")}
+        finally:
+            con.close()
+
+    def test_every_existing_row_is_not_seasonal(self, tmp_path: Path):
+        run_migrations(tmp_path)
+        columns = self._columns(tmp_path)
+        assert columns["seasons"] == (True, "'[]'")
+        assert columns["season_lead_days"] == (True, "'30'")
+        assert columns["season_after_days"] == (True, "'0'")
+        con = sqlite3.connect(tmp_path / "shortlist.db")
+        try:
+            seeded = con.execute("SELECT seasons, season_lead_days, season_after_days FROM collections").fetchall()
+        finally:
+            con.close()
+        assert seeded, "expected the seeded default row"
+        assert set(seeded) == {("[]", 30, 0)}
+
+    def test_running_it_again_over_an_already_migrated_database_is_a_no_op(self, tmp_path: Path):
+        run_migrations(tmp_path)
+        command.stamp(_alembic(tmp_path), "0091")
+        run_migrations(tmp_path)
+        assert "seasons" in self._columns(tmp_path)
+
+    def test_the_downgrade_removes_them_again(self, tmp_path: Path):
+        run_migrations(tmp_path)
+        command.downgrade(_alembic(tmp_path), "0091")
+        assert not ({"seasons", "season_lead_days", "season_after_days"} & set(self._columns(tmp_path)))
+
+
 class TestRowShowDaysDowngrade0088:
     """0089's downgrade re-creates `shown_state` for any install that had it, and 0088's downgrade has to
     take it out again, or a database downgraded past 0088 keeps a column no revision below it defines."""

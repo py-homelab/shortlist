@@ -904,6 +904,10 @@ class TestRowNamerLabel:
         """A row named "…" names nothing. The ellipsis shows a name was shortened; it is not a name."""
         assert self.label(tmp_path, "{top_seed}") == "Picked for You"
 
+    def test_a_seasonal_row_reads_as_seasonal(self, tmp_path):
+        """A report spans seasons, so no one season names the row — but two ellipses in a row name nothing."""
+        assert self.label(tmp_path, "{season_emoji} {season} picks") == "Seasonal picks"
+
     def test_several_placeholders_all_render(self, tmp_path):
         assert self.label(tmp_path, "{library_name}: because you watched {top_seed}") == (
             "Movies: because you watched…"

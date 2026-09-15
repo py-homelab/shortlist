@@ -32,6 +32,12 @@ vi.mock("@/lib/api", async (importOriginal) => {
         updateCollection(id, body),
       getSettings: () => Promise.resolve(settingsData.current),
       getLibraries: () => Promise.resolve([]),
+      getSeasons: () =>
+        Promise.resolve([
+          { slug: "valentines", name: "Valentine's Day", emoji: "💘", month: 2, day: 14, description: "Valentine's films and romance" },
+          { slug: "halloween", name: "Halloween", emoji: "🎃", month: 10, day: 31, description: "Halloween films and horror" },
+          { slug: "christmas", name: "Christmas", emoji: "🎄", month: 12, day: 25, description: "Christmas films" },
+        ]),
       getImageProvider: () =>
         Promise.resolve({ capable: false, provider: "", reason: "" }),
       startRun: (body: unknown) => startRun(body),
@@ -94,6 +100,10 @@ function row(patch: Partial<Collection> = {}): Collection {
     placement_friends: "both",
     show_days: [],
     shown_today: true,
+    seasons: [],
+    season_lead_days: 30,
+    season_after_days: 0,
+    season_status: null,
     pin_top: false,
     hub_anchor: {},
     poster: { mode: "", title: "", subtitle: "", style: "", has_image: false },
@@ -1368,6 +1378,8 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
   const GROUPS = [
     "How it looks on Plex",
     "Who gets it",
+    // Before "What goes in it", because following a season decides what goes in it (discussion #124).
+    "Seasons",
     "What goes in it",
     "When it updates",
     "Where people see it",
@@ -1394,7 +1406,7 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
     expect(groupNamed("Requests")).not.toHaveAttribute("open");
   });
 
-  it("asks its questions in order: how it looks, who gets it, what's in it, when it updates, where it shows", () => {
+  it("asks its questions in order: how it looks, who gets it, its seasons, what's in it, when it updates, where it shows", () => {
     renderEditor(row());
 
     const titles = Array.from(
@@ -1930,6 +1942,69 @@ describe("RowEditor — which days a row appears", () => {
       "aria-pressed",
       "true",
     );
+  });
+});
+
+describe("RowEditor — seasons", () => {
+  beforeEach(() => {
+    updateCollection.mockClear();
+  });
+
+  it("round-trips the seasons and their days into the PATCH body", async () => {
+    renderEditor(row({ name: "{season} picks", seasons: ["christmas"] }));
+
+    await userEvent.click(await screen.findByRole("checkbox", { name: /Halloween/ }));
+    await userEvent.click(screen.getByRole("button", { name: /Save changes/i }));
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    const body = updateCollection.mock.calls.at(0)?.[1] as Collection;
+    expect(body.seasons).toEqual(["halloween", "christmas"]);
+    expect(body.season_lead_days).toBe(30);
+  });
+
+  it("tells the owner AI web search sits out on a seasonal row", () => {
+    // The engine drops it there, so a sources control that still offers it without a word would
+    // promise searches the row never makes.
+    renderEditor(row({ seasons: ["christmas"] }));
+
+    expect(screen.getByText(/AI web search isn.t used on a seasonal row/i)).toBeInTheDocument();
+  });
+
+  it("says nothing about seasons on an ordinary row's sources", () => {
+    renderEditor(row());
+
+    expect(screen.queryByText(/AI web search isn.t used on a seasonal row/i)).toBeNull();
+  });
+
+  it("does not offer seasons on the default row", () => {
+    // Its title is the global template every person's row renders, which follows no season; the server
+    // refuses seasons there, so the group would only offer a save that fails.
+    renderEditor(row({ slug: "picked", name: "✨ {library_name} Picked for You" }));
+
+    expect(screen.queryByRole("checkbox", { name: /Halloween/ })).toBeNull();
+    expect(screen.queryByText("Not seasonal")).toBeNull();
+  });
+
+  it("names the seasons in the summary panel", async () => {
+    renderEditor(row({ seasons: ["halloween", "christmas"] }));
+
+    const panel = within(document.querySelector("dl") as HTMLElement);
+    expect(panel.getByText("Seasons")).toBeInTheDocument();
+    expect(await panel.findByText(/🎃 Halloween, 🎄 Christmas/)).toBeInTheDocument();
+    // The season's own titles are the row's first source, and the panel must say so.
+    expect(panel.getByText(/^Seasonal list/)).toBeInTheDocument();
+  });
+
+  it("gives both ends of each season's window in the summary panel", async () => {
+    renderEditor(row({ seasons: ["christmas"], season_lead_days: 30, season_after_days: 7 }));
+    const panel = within(document.querySelector("dl") as HTMLElement);
+    expect(await panel.findByText(/30 days before to 7 days after/)).toBeInTheDocument();
+  });
+
+  it("says a season with no days after ends on its day", async () => {
+    renderEditor(row({ seasons: ["christmas"], season_lead_days: 1, season_after_days: 0 }));
+    const panel = within(document.querySelector("dl") as HTMLElement);
+    expect(await panel.findByText(/1 day before to the day itself/)).toBeInTheDocument();
   });
 });
 

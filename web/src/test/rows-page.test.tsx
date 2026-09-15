@@ -80,6 +80,10 @@ const SUBSET_ROW: Collection = {
   placement_friends: "both",
   show_days: [],
   shown_today: true,
+  seasons: [],
+  season_lead_days: 30,
+  season_after_days: 0,
+  season_status: null,
   pin_top: false,
   hub_anchor: {},
   poster: { mode: "", title: "", subtitle: "", style: "", has_image: false },
@@ -210,6 +214,45 @@ describe("RowsPage — the day-schedule badge", () => {
     renderPage();
 
     expect(await screen.findByText("Showing today")).toBeInTheDocument();
+  });
+
+  it("names the season a seasonal row is showing, and until when", async () => {
+    listCollections.mockResolvedValue([
+      {
+        ...SUBSET_ROW,
+        show_days: [],
+        shown_today: true,
+        seasons: ["halloween", "christmas"],
+        season_status: {
+          showing: { slug: "halloween", name: "Halloween", emoji: "🎃", starts: "2026-10-01", ends: "2026-10-31" },
+          next: { slug: "christmas", name: "Christmas", emoji: "🎄", starts: "2026-11-25", ends: "2026-12-25" },
+        },
+      },
+    ]);
+    renderPage();
+
+    expect(await screen.findByText(/Showing 🎃 Halloween until/)).toBeInTheDocument();
+    expect(screen.queryByText("Showing today")).toBeNull();
+  });
+
+  it("says a seasonal row is hidden until its next season", async () => {
+    // Out of season the row is simply gone from Plex, which is the "my row disappeared" question
+    // all over again — the badge answers it with the date it comes back.
+    listCollections.mockResolvedValue([
+      {
+        ...SUBSET_ROW,
+        show_days: [],
+        shown_today: false,
+        seasons: ["christmas"],
+        season_status: {
+          showing: null,
+          next: { slug: "christmas", name: "Christmas", emoji: "🎄", starts: "2026-11-25", ends: "2026-12-25" },
+        },
+      },
+    ]);
+    renderPage();
+
+    expect(await screen.findByText(/Hidden until 🎄 Christmas starts on/)).toBeInTheDocument();
   });
 
   it("says Hidden today for a scheduled row that is off", async () => {

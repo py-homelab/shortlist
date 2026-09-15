@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import date
 
 from loguru import logger
 
@@ -22,6 +23,9 @@ from shortlist.engine.delivery import (
     HELD,
     KEPT,
     REBUILD,
+    catalogue_seasons,
+    fill_season,
+    is_name_freeing_helper,
     remove_row_collections,
     rename_or_keep,
     render_row_name,
@@ -29,10 +33,20 @@ from shortlist.engine.delivery import (
     resolve_row_template,
     row_marker,
     rows_can_share_a_library,
+    season_renderings,
     strip_marker,
     titles_other_rows_build,
+    uses_season,
 )
-from shortlist.engine.models import LABEL_PREFIX, SHARED_LABEL_PREFIX, EngineConfig, RowSpec, UserProfile, UserType
+from shortlist.engine.models import (
+    LABEL_PREFIX,
+    SHARED_LABEL_PREFIX,
+    EngineConfig,
+    RowSeason,
+    RowSpec,
+    UserProfile,
+    UserType,
+)
 from shortlist.engine.pipeline import identity_map
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Delivery, Run, User
 from shortlist.server.safe_mode import force_dry_run
@@ -143,7 +157,8 @@ def _claimed_titles(ctx, udata: dict, other_rows: _OtherRows) -> set[tuple[str, 
     for spec in other_rows.specs:
         if spec.audience is not None and profile.plex_account_id not in spec.audience:
             continue
-        if "{top_seed}" in resolve_row_template(spec, profile, config):
+        template = resolve_row_template(spec, profile, config)
+        if "{top_seed}" in template or uses_season(template):
             claimed |= other_rows.delivered.get((udata["slug"], spec.slug), set())
     return claimed
 
@@ -159,6 +174,10 @@ _PROBE_LIBRARY = "\x00library\x00"
 #: Stub whose only job is to let `render_row_name` resolve `{user}`. A non-empty username stops a
 #: "{user}" template collapsing to empty — same stub `context_builder._retired_rows` uses.
 _PROBE_PROFILE = UserProfile(username="_probe_", plex_account_id=0, user_type=UserType.SHARED)
+
+#: A season no real one is called, for `title_key`, for the same reason as `_PROBE_LIBRARY`: left
+#: unfilled, every name using `{season}` renders to "" and every seasonal row would clash with every other.
+_PROBE_SEASON = RowSeason(slug="_probe_", name="\x00season\x00", emoji="\x00emoji\x00", anchor=date(2000, 1, 1))
 
 
 def title_key(template: str) -> str:
@@ -179,7 +198,17 @@ def title_key(template: str) -> str:
     templates that differ only OUTSIDE the placeholder and happen to agree in one library
     ("{library_name} Picks" vs "Movies Picks"), which would need the real library names.
     """
-    return render_row_name(template or "", _PROBE_PROFILE, [], library_name=_PROBE_LIBRARY).casefold()
+    probe = fill_season(template or "", _PROBE_SEASON)
+    return render_row_name(probe, _PROBE_PROFILE, [], library_name=_PROBE_LIBRARY).casefold()
+
+
+def title_keys(template: str) -> set[str]:
+    """Every key ``template`` can collide on: `title_key` itself, plus, for a seasonal name, the title it
+    renders to in each season. In December `{season} picks` IS "Christmas picks", so a plain row with that
+    name would share its collection. Every catalogue season rather than only the row's own: refusing a
+    few names too many is recoverable, one collection for two rows is not."""
+    keys = {title_key(template)} | {title_key(rendering) for rendering in season_renderings(template or "")}
+    return {key for key in keys if key}
 
 
 def _title_keys(session, collection: Collection, secrets) -> set[str]:
@@ -189,10 +218,7 @@ def _title_keys(session, collection: Collection, secrets) -> set[str]:
     dropped — a `{top_seed}` row with no fallback renders to nothing for a person with no watch, and
     "no title" cannot clash with "no title": neither row is built for them.
     """
-    keys = {
-        title_key(row_template(session, collection.slug, secrets)),
-        title_key(collection.fallback_name or ""),
-    }
+    keys = title_keys(row_template(session, collection.slug, secrets)) | {title_key(collection.fallback_name or "")}
     return {k for k in keys if k}
 
 
@@ -271,7 +297,7 @@ def rows_titled_from(
     check.
     """
     # Both of the incoming row's possible titles, for the same reason `_title_keys` collects both.
-    wanted_keys = {k for k in (title_key(template), title_key(fallback_name)) if k}
+    wanted_keys = title_keys(template) | {k for k in (title_key(fallback_name),) if k}
     # An unrenderable template has no title to collide on. Since issue #84 that includes every
     # `{top_seed}` template, which renders to "" without picks — an improvement: they all used to
     # render the same substitute name and so were refused against each other and against any row
@@ -419,7 +445,9 @@ def _rendered_titles(ctx, udata: dict, template: str, slug: str) -> set[str]:
     bare default title, which would match EVERY row rather than this one. Those fall back to the
     recorded titles — the same split `_promote_phase` makes for the same reason.
     """
-    if not template or "{top_seed}" in template:
+    # A seasonal name is the same case: it renders tonight's season, and the collection may still wear the
+    # last one it was built for (discussion #124).
+    if not template or "{top_seed}" in template or uses_season(template):
         return set()
     profile = _profile_of(udata)
     titles = {
@@ -765,21 +793,42 @@ def reconcile_row_rename_iter(
         # a success message for work that never happened, while the collection on Plex kept its old
         # title and the database said otherwise.
         label = f"{SHARED_LABEL_PREFIX}{slug}"
+        seasonal = uses_season(new_template) or uses_season(old_template or "")
         for section in ctx.plex.sections():
             lib_name = getattr(section, "title", "") or ""
-            new_display = render_row_name(new_template, _shared_profile(), [], library_name=lib_name)
-            if not new_display:  # unnameable — see render_row_name
+            # The label alone identifies a shared row's collection, so a plain name needs no old title. A
+            # seasonal one does: it is the only way to know which season the collection wears.
+            renamed = (
+                _renamed_titles(old_template or "", new_template, _shared_profile(), _shared_profile(), lib_name)
+                if seasonal
+                else None
+            )
+            new_display = (
+                "" if seasonal else render_row_name(new_template, _shared_profile(), [], library_name=lib_name)
+            )
+            if not seasonal and not new_display:  # unnameable — see render_row_name
                 continue
-            for collection in ctx.plex.find_owned_collections(section, label):
-                if collection.title == new_display:
+            owned = [c for c in ctx.plex.find_owned_collections(section, label) if not is_name_freeing_helper(c.title)]
+            # A shared row wears `row_marker(0)`, as delivery writes it (`deliver_rows`), and delivery finds it
+            # again only by that marked title or by the marker. When a marked one is here, it is the row, and an
+            # unmarked collection under the same label is a copy an older rename left: renamed first, it would
+            # take the name and the next run would adopt it. A lone unmarked one IS the row, and gets its marker back.
+            if any(c.title.endswith(row_marker(0)) for c in owned):
+                owned = [c for c in owned if c.title.endswith(row_marker(0))]
+            for collection in owned:
+                old_title = strip_marker(collection.title)
+                if renamed is not None:
+                    if old_title not in renamed:
+                        continue
+                    new_display = renamed[old_title]
+                if collection.title == new_display + row_marker(0):
                     continue
-                old_title = collection.title
                 try:
                     outcome = (
                         rename_or_keep(
                             ctx.plex,
                             collection,
-                            new_display,
+                            new_display + row_marker(0),
                             _shared_profile(),
                             section,
                             label=label,
@@ -830,13 +879,6 @@ def reconcile_row_rename_iter(
         claimed = _claimed_titles(ctx, udata, other_rows)
         for section in ctx.plex.sections():
             lib_name = getattr(section, "title", "") or ""
-            new_display = render_row_name(effective_template, profile, [], library_name=lib_name)
-            if not new_display:  # unnameable — see render_row_name
-                continue
-            new_with_marker = new_display + marker
-            old_display = (
-                render_row_name(effective_old, old_profile, [], library_name=lib_name) if effective_old else None
-            )
             # MANDATORY scoping. Every one of a person's rows shares the single label
             # `shortlist_<slug>`, so without the old title there is nothing distinguishing this row's
             # collection from their others — and renaming "whatever we find" would retitle a DIFFERENT
@@ -848,20 +890,26 @@ def reconcile_row_rename_iter(
             # falsy, which both `RenameRequest.old_template`'s default and the PATCH's
             # `old_template or ""` produce. Skip instead: renaming nothing is recoverable, renaming
             # the wrong row is not.
-            if not old_display:
+            if not effective_old:
                 logger.warning(
                     "rename: skipping {} — no previous title to match on, so this row's collections "
                     "cannot be told apart from their other rows'",
                     udata["slug"],
                 )
                 continue
+            renamed = _renamed_titles(effective_old, effective_template, old_profile, profile, lib_name)
+            if not renamed:  # unnameable — see render_row_name and `_renamed_titles`
+                continue
             for collection in ctx.plex.find_owned_collections(section, label):
                 current_title = collection.title
-                if current_title == new_with_marker:
-                    continue
                 # Scope to THIS row: only rename collections whose stripped title matches what this
                 # row USED to render as.
-                if strip_marker(current_title) != old_display:
+                old_display = strip_marker(current_title)
+                new_display = renamed.get(old_display)
+                if new_display is None:
+                    continue
+                new_with_marker = new_display + marker
+                if current_title == new_with_marker:
                     continue
                 if (str(section.key), old_display) in claimed:
                     # Another of this person's rows builds here under that very title (issue #121), so
@@ -916,6 +964,27 @@ def reconcile_row_rename_iter(
                     logger.warning("{}: rename failed in {} ({})", udata["slug"], lib_name, message)
                     yield {"user": udata["slug"], "library": lib_name, "error": message}
     yield {"done": True, "total": total}
+
+
+def _renamed_titles(
+    old_template: str, new_template: str, old_profile: UserProfile, profile: UserProfile, library_name: str
+) -> dict[str, str]:
+    """{title the row may be wearing -> the title it takes}, for one library.
+
+    One pair for a plain name. A seasonal name (discussion #124) renders only with a season, and a row keeps
+    the title of the season it was last built for — out of season too — so it is one pair per catalogue
+    season, old and new filled with the SAME season. A plain name becoming seasonal gets no pair: nothing
+    says which season the collection should take, and guessing could put Valentine's Day on it in December.
+    The next run names it.
+    """
+    seasons = catalogue_seasons() if uses_season(old_template) else [None]
+    pairs: dict[str, str] = {}
+    for season in seasons:
+        old = render_row_name(fill_season(old_template, season), old_profile, [], library_name=library_name)
+        new = render_row_name(fill_season(new_template, season), profile, [], library_name=library_name)
+        if old and new:
+            pairs.setdefault(old, new)
+    return pairs
 
 
 def _refusal(outcome: str, name: str, library: str) -> str:

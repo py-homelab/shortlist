@@ -16,6 +16,7 @@ import { api } from "@/lib/api";
 import { audienceSummary, rowOverrides } from "@/lib/collections";
 import { DEFAULT_ROW_SLUG } from "@/lib/constants";
 import { settingString } from "@/lib/format";
+import { seasonStatusLine } from "@/lib/seasons";
 import { useLibraries, useSettings } from "@/lib/queries";
 import type { Collection, User } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -35,8 +36,9 @@ import { cn } from "@/lib/utils";
 // while Plex receives the literal braces in the collection title on every home screen. Anything
 // outside this set must stay plain text: the whole point is to stop a template reading as a failed
 // substitution, and hiding a typo does the exact opposite.
-const ROW_NAME_TOKEN_SPLIT = /(\{(?:user|top_seed|library_name)\})/;
-const ROW_NAME_TOKEN = /^\{(?:user|top_seed|library_name)\}$/;
+const ROW_NAME_TOKEN_SPLIT =
+  /(\{(?:user|top_seed|library_name|season|season_emoji)\})/;
+const ROW_NAME_TOKEN = /^\{(?:user|top_seed|library_name|season|season_emoji)\}$/;
 
 /** Whether this name renders any chips, so a caller can explain what a chip IS only when one is on
  *  screen. Shares the pattern above rather than re-deriving the token list, which is the whole
@@ -155,6 +157,14 @@ export function RowCard({
                 from Plex today is indistinguishable from a broken one — and "my row disappeared" is
                 the support question the schedule creates. Only rendered for a row that HAS a
                 schedule, so the ordinary row is unchanged. */}
+            {/* A seasonal row says which season it is in, or when it comes back — "my row vanished" is
+                the same question a day schedule creates, answered with the date. The server resolves
+                it, on the clock Plex follows. */}
+            {(collection.seasons ?? []).length > 0 && seasonStatusLine(collection.season_status) && (
+              <Badge variant={collection.season_status?.showing ? "secondary" : "outline"}>
+                {seasonStatusLine(collection.season_status)}
+              </Badge>
+            )}
             {(collection.show_days ?? []).length > 0 &&
               (collection.shown_today ? (
                 <Badge variant="secondary">Showing today</Badge>

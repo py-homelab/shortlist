@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Protocol
 from urllib.parse import urlencode
 
@@ -13,6 +14,28 @@ from shortlist.engine.models import MediaType
 
 API = "https://api.themoviedb.org/3"
 CACHE_TTL_S = 7 * 24 * 3600  # design: (tmdb_id, endpoint) cached 7 days
+#: The vote floor for a whole-genre discover query. A genre holds tens of thousands of titles; this keeps
+#: to ones enough people have rated for a score to mean something.
+DISCOVER_MIN_VOTES = 200
+#: TMDB serves at most this many pages of a list: page 501 answers HTTP 400
+#: (tests/fixtures/tmdb_discover_paged.json).
+MAX_DISCOVER_PAGES = 500
+#: Pages of one list read at once. Each read is its own `httpx.request`, so they share no client state.
+_LIST_PAGE_WORKERS = 4
+#: What `discover_all` keeps of each title: the fields `candidates.gather_candidates` builds a candidate
+#: from. A Christmas list is ~3,700 titles, and overviews alone would make its cache entry megabytes.
+_LIST_FIELDS = (
+    "id",
+    "title",
+    "name",
+    "release_date",
+    "first_air_date",
+    "genre_ids",
+    "vote_average",
+    "vote_count",
+    "poster_path",
+    "original_language",
+)
 
 
 class Cache(Protocol):
@@ -52,23 +75,26 @@ class TmdbClient:
         if cached := self._cache.get(cache_key):
             logger.trace("tmdb cache hit · {}", path)
             return json.loads(cached)
+        data = self._fetch(path, extra)
+        # Cache the miss too (like trakt.py's `related()` deliberately does): without this, a title TMDB
+        # doesn't have is re-fetched every run for every user who has it as a seed. A 404 reads as {}.
+        self._cache.set(cache_key, json.dumps(data), CACHE_TTL_S)
+        return data
+
+    def _fetch(self, path: str, params: dict) -> dict:
+        """One uncached read. {} for a 404; raises for any other failure."""
         r = http_retry.get(
             f"{API}{path}",
-            params={"api_key": self._api_key, **extra},
+            params={"api_key": self._api_key, **params},
             timeout=self._timeout,
         )
         if r.status_code == 404:
-            # Cache the miss too (like trakt.py's `related()` deliberately does): without this, a
-            # title TMDB doesn't have is re-fetched every run for every user who has it as a seed.
-            self._cache.set(cache_key, json.dumps({}), CACHE_TTL_S)
             return {}
         if r.status_code != 200:
             # Never raise_for_status(): its message embeds the full URL, api_key included
             # (plex-safety rule 9 — secrets never in exception messages).
             raise RuntimeError(f"TMDB API error HTTP {r.status_code} for {path}")
-        data = r.json()
-        self._cache.set(cache_key, json.dumps(data), CACHE_TTL_S)
-        return data
+        return r.json()
 
     def ping(self) -> bool:
         return bool(self._get("/configuration"))
@@ -185,7 +211,7 @@ class TmdbClient:
         return [c["name"] for c in cast[:limit] if isinstance(c, dict) and c.get("name")]
 
     def discover(
-        self, media_type: MediaType, genre_ids: list[int], *, min_votes: int = 200, page: int = 1
+        self, media_type: MediaType, genre_ids: list[int], *, min_votes: int = DISCOVER_MIN_VOTES, page: int = 1
     ) -> list[dict]:
         """Popular, well-reviewed titles in the given genres — the 'discover by taste' source.
 
@@ -202,6 +228,70 @@ class TmdbClient:
             "page": page,
         }
         return self._get(f"/discover/{kind}", params=params).get("results", [])
+
+    def discover_all(self, media_type: MediaType, params: dict) -> list[dict]:
+        """Every title a discover query matches, read to its last page and cached as ONE entry.
+
+        What a season's list is read with (discussion #124). Three things about it are measured, not
+        chosen (tests/fixtures/tmdb_discover_paged.json):
+
+        * the order is RELEASE DATE. Paged by popularity, a list loses titles between page reads because
+          popularity moves while it is being read — 3,133 unique titles out of 3,370 for Christmas;
+        * pages stop at 500, because TMDB answers HTTP 400 past that;
+        * the result is cached whole, never per page: pages cached at different moments expire at
+          different moments and would be re-read against a list that has shifted since.
+
+        Raises if any page fails, so a partial list is never returned or cached.
+
+        Args:
+            media_type: Films or shows.
+            params: The query itself, e.g. ``{"with_keywords": "3335|9694"}``. Sort order and the adult
+                filter are added here.
+
+        Returns:
+            The matching titles, de-duplicated by id, each reduced to ``_LIST_FIELDS``.
+        """
+        kind = "movie" if media_type is MediaType.MOVIE else "tv"
+        path = f"/discover/{kind}"
+        query = {
+            **params,
+            "sort_by": "primary_release_date.asc" if media_type is MediaType.MOVIE else "first_air_date.asc",
+            "include_adult": "false",
+        }
+        cache_key = "tmdb:all:" + path + "?" + urlencode(sorted((k, str(v)) for k, v in query.items()))
+        if cached := self._cache.get(cache_key):
+            return json.loads(cached)
+
+        def read(page: int) -> dict:
+            # `_fetch` answers a 404 with {}, which is right for a title TMDB lacks and wrong here: taken as
+            # an empty page it would cache a short list for a week.
+            data = self._fetch(path, {**query, "page": page})
+            if "results" not in data:
+                raise RuntimeError(f"TMDB list {path} returned no page {page}")
+            return data
+
+        first = read(1)
+        total_pages = int(first.get("total_pages") or 1)
+        if total_pages > MAX_DISCOVER_PAGES:
+            logger.warning(
+                "tmdb list {} has {} pages; TMDB serves {}, so the rest of it is not read",
+                path,
+                total_pages,
+                MAX_DISCOVER_PAGES,
+            )
+        last = min(total_pages, MAX_DISCOVER_PAGES)
+        pages = [first]
+        if last > 1:
+            with ThreadPoolExecutor(max_workers=_LIST_PAGE_WORKERS) as pool:
+                pages += pool.map(read, range(2, last + 1))
+        titles: dict[int, dict] = {}
+        for page in pages:
+            for item in page.get("results") or []:
+                titles.setdefault(item["id"], {field: item[field] for field in _LIST_FIELDS if field in item})
+        result = list(titles.values())
+        logger.debug("tmdb list {} · {} titles over {} pages", path, len(result), last)
+        self._cache.set(cache_key, json.dumps(result), CACHE_TTL_S)
+        return result
 
     def external_ids(self, tmdb_id: int, media_type: MediaType) -> dict:
         """A title's ids in other databases (``tvdb_id``, ``imdb_id``, …); {} if TMDB has none."""
