@@ -12,7 +12,8 @@ All notable changes to this project are documented here. This project follows
 
 - **Seasonal rows that follow the calendar.** A row can follow seasons — Valentine's Day, Halloween,
   Christmas. In season it holds that season's films from your library, ranked for each person; between
-  seasons it is hidden but kept, so it comes straight back next year without being rebuilt. Pick the
+  seasons it is hidden but kept, and the night before its next season it is rebuilt for that season
+  while still hidden, so it appears on the day already filled. Pick the
   seasons on the row, and how many days before and after each one it shows (30 before and none after,
   to begin with). Start from the new **Seasonal** template. The row's name can use `{season}` and
   `{season_emoji}`, and follows the season it is in (#124).

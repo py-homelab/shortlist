@@ -10,6 +10,24 @@ below is later work.
 
 ---
 
+## OPEN — v1.9.1 release review, two LOW (2026-09-16)
+
+The release-PR Architecture Review over `v1.9.0..dev` (PR #129) found no HIGH or MED. A third LOW, the
+CHANGELOG saying a seasonal row returns "without being rebuilt", was fixed before the tag.
+
+- **The Jobs catalogue overstates seasonal rows.** `rows.visibility`'s description
+  (`shortlist/server/services/jobs.py:326-328`) says a hidden row "comes straight back without being built
+  again". True for a day schedule, not for a season: the recipe carries `season=<slug>@<anchor date>` and
+  `_reusable_prior` drops out-of-season titles, so each new season rebuilds the row the night before it
+  opens (`docs/guides/rows.md:148-150` already says so). Fix: scope "without being built again" to days off.
+- **Every seedless seasonal pick explains itself as "in genres you watch".** `reason_for`
+  (`shortlist/engine/picker.py:23`) uses that line for any seedless `season` candidate, but
+  `candidates.py` admits season titles with no genre overlap (fit is only a 0.5–1.0 weight), and a failed
+  genre lookup leaves the claim empty for every title. Fix: an always-true line ("Right for the season"),
+  or the genre wording only above the fit floor.
+
+---
+
 ## OPEN — LOW: unmarked duplicates of a shared row (found 2026-09-15, discussion #124 review)
 
 Before 2026-09-15 a rename from the rename screen took a shared row's `row_marker(0)` off its title, so
