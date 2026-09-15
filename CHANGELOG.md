@@ -24,6 +24,15 @@ All notable changes to this project are documented here. This project follows
 
 ### Fixed
 
+- **Renamed rows stay where you put them, and "Something else is reordering your shelf" stops
+  blaming other tools for it.** When a row changed its name overnight — a "Because you watched…" row
+  picking a new title — Plex kept showing Shortlist the old name in its shelf list, so Shortlist
+  stopped recognising the row as its own and could leave it out of place. Most nights the whole
+  shelf was also rebuilt and every row was counted as
+  "put back", which set off the alert after three runs in a day even with Agregarr told to leave
+  Shortlist's rows alone. Rows are now recognised by Plex's id for them rather than by name, and the
+  alert only counts rows that were actually out of place.
+
 - **Un-pausing someone on a row's day off no longer puts that row back on their Home.** A row named
   after a title they watched could reappear for the rest of the day when Shortlist couldn't tell which
   row it was, even though its schedule said to hide it that day. It is now left hidden, as the nightly

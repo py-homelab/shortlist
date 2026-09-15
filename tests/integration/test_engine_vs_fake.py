@@ -3411,6 +3411,68 @@ def test_the_default_placement_puts_our_rows_above_plex_own_hubs(fakes, tmp_path
         assert max(ours) < titles.index("Recently Added"), f"our rows must sit ABOVE Plex's own hub, got {titles}"
 
 
+def test_a_row_renamed_in_place_does_not_make_the_next_pass_rebuild_the_shelf(fakes, tmp_path):
+    """A rename leaves the shelf as it was, and the ordering pass must see that.
+
+    Plex's manage listing keeps the title a collection had when it was promoted, and the fake now does
+    too (`pms_managed_hub_renamed_collection.json`). While hubs were matched to rows by title, every
+    row renamed in place read as a foreign hub, so the pass rebuilt the whole shelf and reported each
+    row as put back. On SFLIX that happened on most nights, because `{top_seed}` rows are renamed
+    whenever their seed changes, and it is what kept the "something else is reordering" bell ringing.
+    """
+    state, pms_url, _tmdb_app = fakes
+
+    def rows(gems_title: str):
+        def build(p):
+            return [
+                RowSpec(slug="picked", name_template="✨ {library_name} Picked for You", size=8),
+                RowSpec(
+                    slug="gems",
+                    name_template=gems_title,
+                    size=8,
+                    hub_anchors={str(s.key): HubAnchor(anchor_row="picked") for s in p.sections()},
+                ),
+                # A row BELOW the renamed one, as SFLIX's shared row sits below "Because you watched".
+                # Without it a misread renamed row is simply the next foreign hub after `picked`, the
+                # arrangement comes out the same, and this test passes with the bug in place.
+                RowSpec(
+                    slug="classics",
+                    name_template="Classics {library_name}",
+                    size=8,
+                    hub_anchors={str(s.key): HubAnchor(anchor_row="gems") for s in p.sections()},
+                ),
+            ]
+
+        return build
+
+    plex, ctx, users = _placement_ctx(state, pms_url, tmp_path, rows("Hidden Gems {library_name}"))
+    first = engine_run(ctx, users)
+    assert not first.error, first.error
+    assert any(e.get("repositioned") for e in first.hub_orderings), "precondition: the first pass placed the rows"
+
+    ledger = {}
+    prefixes = (("Hidden Gems", "gems"), ("Classics", "classics"))
+    for user in users:
+        for section in plex.sections():
+            for c in plex.find_owned_collections(section, f"shortlist_{user.slug}"):
+                title = strip_marker(c.title)
+                slug = next((row for prefix, row in prefixes if title.startswith(prefix)), "picked")
+                ledger[(user.slug, slug, str(section.key))] = c.ratingKey
+    shelf_before = {s.key: [h.identifier for h in s.managedHubs()] for s in plex.sections()}
+
+    plex, ctx, users = _placement_ctx(state, pms_url, tmp_path, rows("Buried Treasure {library_name}"))
+    ctx.delivered_keys = ledger
+    second = engine_run(ctx, users)
+
+    assert not second.error, second.error
+    renamed = [c for s in plex.sections() for c in plex.find_owned_collections(s, f"shortlist_{users[0].slug}")]
+    assert any(strip_marker(c.title).startswith("Buried Treasure") for c in renamed), "precondition: renamed in place"
+    stale = [strip_marker(h.title) for s in plex.sections() for h in s.managedHubs()]
+    assert any(t.startswith("Hidden Gems") for t in stale), "precondition: the manage listing kept the old title"
+    assert second.hub_orderings == [], second.hub_orderings
+    assert {s.key: [h.identifier for h in s.managedHubs()] for s in plex.sections()} == shelf_before
+
+
 def test_an_anchor_the_owner_switched_off_in_plex_is_reported_not_silently_skipped(fakes, tmp_path):
     """The other half: a row anchored to one of Plex's own hubs that the owner has switched OFF.
 

@@ -1,0 +1,30 @@
+{
+  "_note": "One Shortlist row's collection, read three ways on the same PMS moments after an in-place rename. The ratingKey is neutralised, and each title's per-account marker is stripped (title_had_marker records it was there). Everything else is verbatim.",
+  "pms_version": "1.43.4.10903-e5521bd8c",
+  "manage_hub": {
+    "_source": "GET /hubs/sections/1/manage (what LibrarySection.managedHubs() reads)",
+    "identifier": "custom.collection.1.500001",
+    "title": "🎯 Because you watched The Super Mario Galaxy Movie",
+    "recommendationsVisibility": "all",
+    "homeVisibility": "shared",
+    "promotedToRecommended": "1",
+    "promotedToOwnHome": "0",
+    "promotedToSharedHome": "1",
+    "deletable": "1",
+    "title_had_marker": true
+  },
+  "collection": {
+    "_source": "GET /library/metadata/500001",
+    "ratingKey": "500001",
+    "type": "collection",
+    "subtype": "movie",
+    "title": "🎯 Because you watched Dumbo",
+    "title_had_marker": true
+  },
+  "served_hub": {
+    "_source": "GET /hubs/sections/1 (the shelf viewers are served)",
+    "hubIdentifier": "custom.collection.1.500001.500001",
+    "title": "🎯 Because you watched Dumbo",
+    "context": "hub.custom.collection"
+  }
+}

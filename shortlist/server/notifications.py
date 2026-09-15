@@ -816,9 +816,10 @@ def _rows_we_cannot_hide(session: Session) -> dict | None:
 
 #: How many times one row must be put back, inside `_CONTENTION_WINDOW`, before we call it a fight.
 #: A settled shelf re-orders NOTHING — an ordering pass returns "already in place" and writes no event
-#: at all — so any repeat is already abnormal. Three is chosen to clear the one legitimate way a row
-#: moves more than once: it was delivered, then re-delivered under a new title (a rename, a
-#: `{top_seed}` row) within the window. Nothing benign moves the same row three times in a day.
+#: at all — so any repeat is already abnormal. Three clears the legitimate ways a row moves more than
+#: once in a day: placed when it is first delivered, then again when the owner changes where it sits.
+#: A rename is not one of them — hubs are matched by ratingKey, so a renamed row stays where it is.
+#: Nothing benign moves the same row three times in a day.
 _CONTENTION_REPEATS = 3
 _CONTENTION_WINDOW = timedelta(days=1)
 
