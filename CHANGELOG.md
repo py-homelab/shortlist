@@ -6,7 +6,16 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1] - 2026-09-16
+
 ### Added
+
+- **Seasonal rows that follow the calendar.** A row can follow seasons — Valentine's Day, Halloween,
+  Christmas. In season it holds that season's films from your library, ranked for each person; between
+  seasons it is hidden but kept, so it comes straight back next year without being rebuilt. Pick the
+  seasons on the row, and how many days before and after each one it shows (30 before and none after,
+  to begin with). Start from the new **Seasonal** template. The row's name can use `{season}` and
+  `{season_emoji}`, and follows the season it is in (#124).
 
 - **Choose what the webhook tells you, and give it a key.** The webhook sent one thing: a run
   failing. In Settings → Notifications you now tick what to send — runs starting, finishing, partly
@@ -22,6 +31,13 @@ All notable changes to this project are documented here. This project follows
   receiver needs a key (ntfy, Gotify, n8n), add a header name and value on the same card. It is sent
   with every message and stored encrypted; clear the name to stop sending it.
 
+### Changed
+
+- **The API refuses a row setting it does not know.** A misspelt field sent to create or edit a row
+  (`POST`/`PATCH /api/collections`) used to be ignored and the row saved as if nothing were wrong. It is
+  now answered with an error naming the field. The Shortlist app itself is unaffected; this only
+  matters if you script against the API.
+
 ### Fixed
 
 - **Renamed rows stay where you put them, and "Something else is reordering your shelf" stops
@@ -32,6 +48,23 @@ All notable changes to this project are documented here. This project follows
   "put back", which set off the alert after three runs in a day even with Agregarr told to leave
   Shortlist's rows alone. Rows are now recognised by Plex's id for them rather than by name, and the
   alert only counts rows that were actually out of place.
+
+- **A new row keeps the request settings you gave it.** The row editor lets you set a row's own
+  request floors and Radarr/Sonarr target before you first save it, but those were dropped on create
+  and only stuck once you edited the row again.
+
+- **"Avoid these genres" holds at the front of a row.** When a row had more candidates than it could
+  keep, the kept titles were re-sorted without the genre, franchise and cast dials, so an avoided genre
+  could still lead the row.
+
+- **Renaming a shared row no longer builds a second copy of it.** The rename dropped the row's
+  invisible marker, so the next run did not recognise the renamed row and built it again.
+
+- **The row editor stops asking which watch a shared row follows.** A shared row follows nobody's
+  watches, but a leftover setting from before it was shared still brought the question back.
+
+- **The run's AI token tile stops repeating its total.** Web search is the only AI step now, so the
+  "breakdown" was just the total again; it shows only when more than one step used tokens.
 
 - **Un-pausing someone on a row's day off no longer puts that row back on their Home.** A row named
   after a title they watched could reappear for the rest of the day when Shortlist couldn't tell which
