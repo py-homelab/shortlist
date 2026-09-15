@@ -47,7 +47,7 @@ from shortlist.server.api.row_changes import (
     RowChange,
     plan_row_changes,
 )
-from shortlist.server.api.schemas import PassthroughModel
+from shortlist.server.api.schemas import PassthroughModel, StrictRequestModel
 from shortlist.server.auth import require_owner
 from shortlist.server.db.models import (
     DEFAULT_SLUG,
@@ -145,7 +145,7 @@ class PosterIn(BaseModel):
     style: str = Field(default="", max_length=400)
 
 
-class CollectionIn(BaseModel):
+class CollectionIn(StrictRequestModel):
     name: str = Field(min_length=1, max_length=255)
     build: str = _closed_set(BUILDS, "per_person", "Who the row is built for: one per person, or one shared row.")
     audience: str = _closed_set(AUDIENCES, "everyone", "Everyone, or the subset named by audience_user_ids.")

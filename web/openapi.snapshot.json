@@ -568,6 +568,7 @@
         "type": "object"
       },
       "CollectionIn": {
+        "additionalProperties": false,
         "properties": {
           "audience": {
             "default": "everyone",

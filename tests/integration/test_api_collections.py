@@ -3265,6 +3265,20 @@ def stored_setting(client: TestClient, key: str):
         return SettingsStore(session, client.app.state.secrets).get(key)
 
 
+class TestAnUnknownFieldIsRefused:
+    """A misspelt setting used to be dropped without a word: the row saved, the setting never took."""
+
+    def test_on_create(self, client: TestClient):
+        r = client.post("/api/collections", json={"name": "Typo", "reqmin_rating": 7.5})
+        assert r.status_code == 422, r.text
+        assert "reqmin_rating" in r.text
+
+    def test_on_edit(self, client: TestClient):
+        cid = client.post("/api/collections", json={"name": "Typo"}).json()["id"]
+        r = client.patch(f"/api/collections/{cid}", json={"name": "Typo", "seasons_lead_days": 10})
+        assert r.status_code == 422, r.text
+
+
 class TestANewRowsRequestSettings:
     def test_a_new_row_keeps_the_request_settings_it_was_created_with(self, client: TestClient):
         """The editor offers a row's own request floors before the row is first saved, and the create
