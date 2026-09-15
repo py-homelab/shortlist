@@ -1193,7 +1193,7 @@ export function RowEditor({
 
             {/* Only for a row that builds from one or two watches. Above that it is blending a whole
                 history and "which watch does it follow" has no answer, so asking would be noise. */}
-            {(input.max_seeds ?? 0) > 0 && (input.max_seeds ?? 0) <= 2 && (
+            {!isSharedRow && (input.max_seeds ?? 0) > 0 && (input.max_seeds ?? 0) <= 2 && (
               <div className="space-y-3 border-t pt-4">
                 <p className="text-sm font-medium">Which watch it follows</p>
                 <p className="text-sm text-muted-foreground">

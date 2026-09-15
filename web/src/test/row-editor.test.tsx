@@ -1844,6 +1844,13 @@ describe("RowEditor — a shared row hides the dials that do not apply to it", (
     expect(screen.getByRole("group", { name: /order/i })).toBeInTheDocument();
   });
 
+  it("does not ask which watch a shared row follows, even with a small seed budget stored", () => {
+    // A shared row has no seeds to follow: it is the server's most-watched titles. A budget of 1 or 2 left
+    // over from its per-person days used to bring the question back while the budget itself stayed hidden.
+    renderEditor(row({ build: "shared", min_watchers: 2, max_seeds: 1 }));
+    expect(screen.queryByText("Which watch it follows")).not.toBeInTheDocument();
+  });
+
   it("hides the release-date weight, which a shared row has nothing to apply it to", () => {
     // Recency weights a title's release date inside a SCORED CANDIDATE POOL. A shared row is the
     // server's most-watched titles ranked by how many people watched them, so there is no pool and
