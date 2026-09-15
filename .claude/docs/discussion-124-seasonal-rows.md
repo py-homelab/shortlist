@@ -213,8 +213,27 @@ real PMS, TMDB and watch cache — nothing persisted to the app database, scratc
 - **UI:** the real app on :5960 against the e2e fakes, driven with Playwright at 1280/1024/390 — template
   tile, Seasons group (new, saved, out of season, weekly-schedule warning), row card badges, run trace.
 
-What the live test did NOT cover: the server resolving seasons from its clock, the API and the midnight
-job against real Plex (unit and integration tests cover those), and a nightly run of a real seasonal row.
+### Deployed proof (`d07fe5e4` on the maintainer's server, 2026-09-15)
+
+- **No regression, measured before and after the deploy:** a dry run of every person (47, AI web search
+  left out so two runs compare) on the old image and again on the new one: every status, row decision,
+  pick and would-be diff identical. A read-only snapshot of every Shortlist collection (186: title,
+  labels, items, surfaces), every account's share filter (48), the rows and the ledger: identical after
+  the deploy, and identical again after the live test below. Migration 0092 ran with its pre-migration
+  backup; existing rows came up with no seasons. Every page endpoint answered 200 and every page rendered
+  at 1280 and 390 with no console errors; the log since the deploy holds no error.
+- **Live, on the MooHouse canary only, through the real API:**
+  - refusals: an unknown field, and a season name on a row with no seasons (422, nothing created);
+    a new row keeps its request settings;
+  - a Halloween row (90 days' lead) reported `showing Halloween until 31 Oct` on the server's clock;
+    its scoped run delivered 10 films, all on TMDB's Halloween list, as a marked, labelled collection;
+  - the rename screen renamed it in place (same ratingKey, marker and items);
+  - lead days cut to 0: the PATCH's visibility pass took it off every surface and kept its items, and a
+    run marked it `out_of_season` and left it untouched;
+  - deleted: collection, row and ledger entries gone.
+
+Still not covered live: a seasonal row turning over at the real midnight, and a shared seasonal row (a
+subset of one cannot reach the two-watcher floor, and an everyone-row would show on other people's Home).
 
 ## Build order
 
