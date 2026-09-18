@@ -212,7 +212,19 @@ fix has to resolve the picks BEFORE the repair's delete, and keep the breakdown 
 
 ---
 
-## CLOSED — issue #108 watch-status follow-ups (2026-09-02, closed 2026-09-18)
+## CLOSED — issue #108 watch-status follow-ups (2026-09-02; the REPORTER closed it 2026-09-05)
+
+**This section was stale and cost a wasted investigation on 2026-09-18. Read this first.** The notes
+below were written 2026-09-02 and say three of nine watch-status paths fail. On **2026-09-05** the
+reporter retested against `dev` (fd6259d, PMS 1.43.3.10896) and said of the one that mattered — marking a
+SEASON watched — "I cannot say what has changed but I can no longer reproduce the error. I've tried with
+3 new shows and it's now working just fine", then confirmed every other point. The issue was closed that
+day. Nothing here was ever left to build.
+
+Manual marks DO sync, and always did on these paths: `unwatched=0` for movies is Plex's own watched flag
+and includes a mark-as-watched, and shows are read with `viewedLeafCount!=0` precisely BECAUSE marking a
+series or a season does not set the show's own watch-state row while the episode counts stay correct
+(`plex_pms.watched_titles`).
 
 All three resolved: 2 and 3 were closed on the dates noted below, and 1 was investigated on
 2026-09-18 and ruled out — the sweep it proposed would have marked 52 unwatched shows as watched.
