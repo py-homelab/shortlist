@@ -75,48 +75,55 @@ season reason is the always-true "Right for the season", pinned by
 
 ---
 
-## OPEN — LOW: unmarked duplicates of a shared row (found 2026-09-15; a fix was BLOCKED 2026-09-18)
+## CLOSED — LOW: unmarked duplicates of a shared row (found 2026-09-15, fixed 2026-09-18 on the 2nd attempt)
 
-**Do not put this in `sweep_broken_rows`.** A first attempt did, deleting an unmarked collection under a
-shared label when a `row_marker(0)` sibling existed in the same library. Architecture Review blocked it
-with a HIGH it reproduced twice by running the real sweep:
+`_remove_shared_row_duplicates`, called from `_deliver_one` once the row has been resolved. It deletes
+collections under this row's SHARED label in this library that are not the resolved row, are not marked
+with `row_marker(0)`, are not name-freeing helpers, and are the right type for the library. It never
+raises: a failed delete of a duplicate must not cost the audience their row.
 
-- **The "sibling" can be debris.** `_reclaim_orphaned_name` writes a name-freeing helper whose title is
-  `FREED_NAME_PREFIX + hex + row_marker(0)` and then labels it with the shared label, and a helper left
-  by a stopped run is exactly what the sweep is supposed to clean. So helper + live unmarked row in one
-  library made the sweep delete BOTH and report success. `collection_reconcile.py:814` already excludes
-  helpers from this same decision, so the omission was an asymmetry, not a hypothetical.
-- **A marked copy being deleted in the same pass still authorised the delete.** A marked shared copy of
-  the wrong subtype is `unhidable`, so it is destroyed that pass — and on the way it licensed deleting
-  the well-typed unmarked row beside it.
+**The first attempt put this in `sweep_broken_rows` and Architecture Review blocked it**, reproducing the
+failure twice against the real sweep. Keep both reasons — they are why the code is where it is:
 
-Guarding both is a two-line change, but the placement is the real objection and guards do not fix it:
+- In the sweep the only evidence is a title suffix. A leftover name-freeing helper's title is
+  `FREED_NAME_PREFIX + hex + row_marker(0)` and it carries the shared label, so it counted as the
+  "marked sibling" that authorised the delete — and the live unmarked row was deleted with it, with the
+  run reporting success. A marked copy of the wrong subtype, itself being swept as `unhidable`, did the
+  same on its way out.
+- The sweep is also the wrong PLACE even with guards. Its purpose is rows Plex CANNOT hide, and it runs
+  before anything that can fail because leaks cannot wait. This duplicate is not a leak — both copies
+  carry the same shared label, so every exclude hides them identically. And an unmarked target makes
+  `delete_owned_collection` fall back to a label re-read whose empty answer raises, which `_sweep_phase`
+  (`pipeline.py:443`) turns into a whole-run abort. A cosmetic duplicate must not be able to do that.
 
-- This duplicate is **not a leak**. Both copies carry the same shared label, so every account's exclude
-  hides them identically. The sweep exists for rows Plex CANNOT hide and runs before anything that can
-  fail precisely because leaks cannot wait. A cosmetic duplicate has no claim on that slot.
-- The target is **unmarked**, so `delete_owned_collection` must fall back to a label re-read, and an empty
-  answer there raises `PermissionError`. `_sweep_phase` (`pipeline.py:443`) turns any raise into a
-  whole-run abort. A cosmetic cleanup must not be able to abort the nightly run for all 46 users.
+By `_deliver_one`, `_find_this_rows_collection` has already answered which collection IS the row from an
+exact title match or the ledger's ratingKey, so `keep` is an identity rather than a guess.
 
-*Correct direction:* delete the loser in the delivery path, where identity is answered by the ledger's
-`ratingKey` rather than by a title suffix — `_find_this_rows_collection` (`delivery.py:1527`) already
-resolves the row that way. Two further review findings to carry over when someone does: the `run.sweep`
-audit `reason` (`run_persistence.py:1439`) does not describe this deletion, and a shared row must be
-recorded under `f"{SHARED_SLUG_PREFIX}_{slug}"` or `pipeline.py:512`'s lookup cannot join it.
+**Which guard actually protects the live row:** the `endswith(row_marker(0))` one. Every resolution path
+requires the marker, so a resolved shared row is always marked and can never be selected for deletion.
+The ratingKey comparison is redundancy — verified by mutation: removing it changes no test, while removing
+the marker check fails `test_another_MARKED_copy_is_left_alone`. Do not drop the marker check on the
+grounds that the ratingKey check looks sufficient.
 
-Before 2026-09-15 a rename from the rename screen took a shared row's `row_marker(0)` off its title, so
-the next run could not find the collection and built a second, marked one beside it. Both carry the
-`shortlist__shared_<row>` label, so `promote_shared_row` keeps both on Home. Not a privacy problem.
+**What it does NOT cover** (second review, 2026-09-18 — read this before trusting "CLOSED"). The cleanup
+is opportunistic: it runs only on a run that actually delivers this row to THIS library, so a duplicate
+survives a run where the row got no picks for the library, was scoped out, was dormant or out of season,
+or had no audience. It is also skipped when the row cannot be RESOLVED, and a duplicate guarantees
+`len(owned) != 1` so the `sole_row` fallback cannot fire either — meaning a shared row whose title has
+since moved on (renamed library, new season) resolves to None and a third collection is built. Neither is
+a regression; both are the pre-existing shape. Fixing the second means either passing the shared row's
+ledger keys through `_shared_row`'s `deliver_rows` call, or relaxing the `sole_row` fallback for a shared
+label to "exactly one MARKED collection" — true for shared rows by construction, not for per-person ones.
 
-The rename no longer strips the marker, and it now leaves an unmarked copy alone when a marked one is in
-the same library (`collection_reconcile.reconcile_row_rename_iter`). What is left: servers that renamed
-a shared row before the fix may still hold the unmarked copy. Nothing deletes it while the row is live
-(the sweep skips it: the shared slug is not in its markers map); removing the row does, through
-`remove_row_collections`. Fix when it matters: delete an unmarked collection
-under a shared label when a marked sibling exists in the same library, with the usual confirm-twice guard.
+The same review raised a HIGH that is fixed: the delete reached no audit trail. It now returns the removed
+titles and `_deliver_one` puts them in `CollectionDiff.deleted`, so it flows through `combined.deleted`
+into the per-library breakdown and the run page. A delete on someone's server must be answerable from the
+UI, not from a container log (rule 10).
 
----
+Nine tests in `test_delivery.py::TestSharedRowDuplicates`, five of which assert nothing is deleted:
+helper, wrong-typed, unresolved row, another marked copy, and a per-person row's unmarked sibling. Plus
+the audit-trail assertion, and a failed delete that must not cost the audience their row — that last one
+guards the "never raises" promise, which is the entire reason this is not in the sweep.
 
 ## CLOSED — v1.9.0 release review, three LOW (2026-09-14)
 

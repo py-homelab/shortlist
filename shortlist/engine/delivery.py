@@ -15,6 +15,7 @@ from shortlist.engine.clients.plex_pms import CollectionRejectedItems, PlexClien
 from shortlist.engine.clients.poster import PosterArtist
 from shortlist.engine.models import (
     LABEL_PREFIX,
+    SHARED_LABEL_PREFIX,
     SHARED_SLUG_PREFIX,
     CollectionDiff,
     EngineConfig,
@@ -1467,6 +1468,105 @@ def _create_labelled_collection(
     return stored, collection, vanished
 
 
+def _remove_shared_row_duplicates(
+    plex: PlexClient,
+    section,
+    owned: list,
+    keep,
+    *,
+    marker: str,
+    label_prefix: str,
+    dry_run: bool,
+    who: str,
+) -> list[str]:
+    """Delete the unmarked leftovers of a SHARED row, keeping the collection already resolved as the row.
+
+    A rename from the rename screen before 2026-09-15 took a shared row's ``row_marker(0)`` off its title,
+    so the next run could not find that collection and built a second, marked one beside it. Both carry
+    the shared label, so ``promote_shared_row`` keeps both on shared Home and the audience sees the row
+    twice (#124 review).
+
+    **Why here and not in ``sweep_broken_rows``.** An Architecture Review blocked the sweep version on
+    2026-09-18: there the only evidence available is a title suffix, and a leftover name-freeing helper
+    carries the shared label AND ``row_marker(0)``, so it counted as the sibling that authorised the
+    delete — and the live row was destroyed with it, twice, in a reproduction against the real sweep. By
+    this point ``_find_this_rows_collection`` has already resolved which collection IS the row — for a
+    shared row that is the EXACT TITLE MATCH, since ``_shared_row`` passes no ledger keys and the
+    ledger branch cannot fire. Everything else under the same shared label in the same library is the
+    leftover, and the two cases the sweep owns are handed back to it rather than judged twice.
+
+    **Opportunistic, and only as far as the row is resolved.** It runs only on a run that actually
+    delivers this row to THIS library, so a duplicate survives a run where the row got no picks for the
+    library, was scoped out, was dormant or out of season, or had no audience. It is also skipped when the
+    row cannot be resolved at all: with a duplicate present ``len(owned) != 1``, so the ``sole_row``
+    fallback cannot fire either, and a shared row whose title has since moved on (a renamed library, a new
+    season) resolves to None and a third collection is built instead. Both are pre-existing shapes this
+    does not make worse, and neither is fixed here.
+
+    Never raises: this is cosmetic housekeeping, and a failed delete of a duplicate must not cost the
+    audience their row. The sweep's placement made the opposite true — an unmarked target makes
+    ``delete_owned_collection`` fall back to a label re-read, an empty answer raises, and
+    ``_sweep_phase`` turns any raise into a whole-run abort.
+
+    Args:
+        plex: The Plex client.
+        section: The library the row was delivered to.
+        owned: The collections carrying this row's shared label in ``section``.
+        keep: The collection resolved as this row — never deleted.
+        marker: This row's invisible marker (``row_marker(0)`` for a shared row). Passed rather than
+            re-derived so that a caller which ever reached here for a per-person row would delete
+            NOTHING, instead of every other row of that person in this library.
+        label_prefix: The label prefix Shortlist owns.
+        dry_run: Log the would-be delete and change nothing.
+        who: For the log line only.
+
+    Returns:
+        The human titles of the collections removed, for ``CollectionDiff.deleted`` — a delete on
+        someone's real server has to reach the audit trail, not just the log (rule 10).
+    """
+    keep_key = _rating_key(keep)
+    removed: list[str] = []
+    for other in owned:
+        # The MARKER check is the load-bearing one: every path in `_find_this_rows_collection` — exact
+        # title, ledger ratingKey, sole row — requires `endswith(marker)`, so a resolved row is always
+        # marked and can never be selected here. The ratingKey check is redundancy in case that ever
+        # changes; do not drop the marker check because this one looks sufficient.
+        if _rating_key(other) == keep_key or other.title.endswith(marker):
+            continue  # the row itself, or another properly marked copy — not a leftover
+        if is_name_freeing_helper(other.title):
+            continue  # debris from a stopped run; `sweep_broken_rows` owns it
+        if not plex.matches_section(other, section):
+            continue  # wrong type for this library: the sweep deletes it as a leak (unhidable)
+        logger.warning(
+            "{}{}: removing a duplicate of the shared row in '{}' (ratingKey {}) — a rename before "
+            "2026-09-15 dropped its marker, so a second copy was built beside it and both showed on Home",
+            "[dry-run] " if dry_run else "",
+            who,
+            getattr(section, "title", "?"),
+            _rating_key(other),
+        )
+        removed.append(strip_marker(other.title))
+        if dry_run:
+            continue
+        try:
+            plex.delete_owned_collection(other, label_prefix)
+        except Exception as exc:
+            # Never re-raised: this is cosmetic housekeeping and must not cost the audience their row.
+            # The message is deliberately NOT logged — plexapi embeds the request URL, which carries a
+            # token (rule 9). `_rebuild_under_twin_name` logs the message because the exception there is
+            # one of ours; this one comes from the PMS.
+            logger.warning(
+                "{}: could not delete the duplicate shared row in '{}' (ratingKey {}, {}). Both copies of "
+                "a shared row are public by design, so this is no more visible than the live one — the "
+                "audience just sees the row twice until a later run clears it.",
+                who,
+                getattr(section, "title", "?"),
+                _rating_key(other),
+                type(exc).__name__,
+            )
+    return removed
+
+
 def _find_this_rows_collection(
     plex: PlexClient,
     section,
@@ -1636,6 +1736,18 @@ def _deliver_one(
     collection = _find_this_rows_collection(
         plex, section, owned, title, marker, delivered_key, sole_row, profile.username
     )
+    removed_duplicates: list[str] = []
+    if collection is not None and label.lower().startswith(SHARED_LABEL_PREFIX.lower()):
+        removed_duplicates = _remove_shared_row_duplicates(
+            plex,
+            section,
+            owned,
+            collection,
+            marker=marker,
+            label_prefix=label_prefix,
+            dry_run=dry_run,
+            who=profile.username,
+        )
 
     wanted_titles = [p.title for p in picks]
     if collection is None:
@@ -1687,6 +1799,10 @@ def _deliver_one(
         removed=[i.title for i in existing_items if i.ratingKey not in wanted_set],
         kept=[title_by_key.get(k, str(k)) for k in wanted_keys if k in current_keys],
         collection_title=display,  # the human title: the marker is Plex's business, not the owner's
+        # A duplicate removed above is a real deletion on someone's server, so it belongs in the diff
+        # the run reports and audits, not only in the log (rule 10). Only this branch can carry any: the
+        # cleanup runs solely when a collection was RESOLVED, which is what sends us down this path.
+        deleted=list(removed_duplicates),
     )
     to_add_keys = [k for k in wanted_keys if k not in current_keys]
     to_remove_count = sum(1 for i in existing_items if i.ratingKey not in wanted_set)
