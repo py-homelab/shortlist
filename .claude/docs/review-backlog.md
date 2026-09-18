@@ -166,10 +166,41 @@ shows, of which **52 are invisible to the show-level read**. Those season rows c
 about how much — the same shape as the show-level bug one level down. Every one on that server is old
 (2017–2024), so they are historical residue there rather than fresh marks.
 
-*Fix direction:* read `?type=3&unwatched=0`, roll up by `parentRatingKey`. **Open question first:**
-such a show has a watched season and zero watched episodes per Plex, so what does
-`viewed_leaf_count` become? Recording 0 makes it not count as watched anyway, which defeats the
-point. Needs a decision, not just code.
+*DECIDED 2026-09-18 (owner): roll up AND count the episodes.* The open question — what
+`viewed_leaf_count` becomes — has an honest answer: both numbers really are available, so nothing is
+invented.
+
+Re-measured on SFLIX section 2 (2026-09-18), every figure still exact:
+
+- `type=2&viewedLeafCount!=0` (today's show-level read): 494 shows, all carrying `viewedLeafCount`, 0.84s.
+- `type=3&unwatched=0`: 1,050 watched seasons -> 525 parent shows, and **0** of those rows carry
+  `viewedLeafCount`, confirming the counts are genuinely absent. 0.24s.
+- Parents absent from the show-level read: **52**.
+- `/library/metadata/{season}/children`: **0.010s** each, and it yields a real episode count.
+
+So for an affected show, `leaf_count` = the show's own `leafCount` (present on its metadata — measured
+8, 6, 15, 3, 6 on the first five) and `viewed_leaf_count` = the episodes in its marked seasons, summed
+from `/children`. Both real numbers.
+
+**Why counting beats leaving the counts empty.** `_watched_titles` (`rows.py:314`) treats an unknown
+total as WATCHED, so empty counts would stop the show being re-recommended — but `The Old Man` is 6
+episodes of 15, and marking that finished buries a show they are 40% through. Empty counts also leave
+the show seeding at `watch_count = max(1, 0)` = 1, one movie play, which on an active watcher's library
+almost certainly never makes the seed cut — so the "I finished a season and got nothing like it" half of
+the complaint would survive untouched.
+
+**Cost is not the constraint.** The detection query is 0.24s per person per show library (~11s across 46
+users) and ANY version of this fix needs it. Counting adds ~10ms per affected season, one-off for the
+historical backlog and ~0 on a quiet night. One TV collection write on that server costs 15-17s.
+
+**Build notes.** `watched_titles`'s show branch is a paginated read with incremental (`since`) semantics,
+a sort-honoured cutoff and `WatchedRead.covers_window` — do NOT thread the rollup through that loop. Add
+a separate PMS method that takes the show keys the show-level read already returned and rolls up only the
+parents missing from it, then merge in `fetch_section`. Param filtering does not work on this endpoint at
+all (see the `watched_titles` docstring), so the season read is always a full read — which is what makes
+it safe on an incremental pass too. Still needed: a recorded fixture of the `type=3` response shape (rule
+11), `fake_plex` support so the matrix can be exercised, and the `user_type` matrix per
+`.claude/rules/testing.md`.
 
 **2. The "Finished" date does not move when a partly-watched show is marked fully watched.** CLOSED.
 Plex does not update a show's own `lastViewedAt` when its episodes are MARKED, so a series finished
