@@ -226,6 +226,13 @@ and includes a mark-as-watched, and shows are read with `viewedLeafCount!=0` pre
 series or a season does not set the show's own watch-state row while the episode counts stay correct
 (`plex_pms.watched_titles`).
 
+**Proved end to end 2026-09-18** on the managed test account, which has NO watch history at all — the
+exact case the stale note called broken. `The 'Burbs`, 8 episodes, `viewedLeafCount` 0: scrobbled ONE
+season, the show went to 8/8 and `watched_titles` returned it as `(8, 8)`; unscrobbled, back to 0 and
+absent again. So a marked season counts with no prior history, and the 52 shows the abandoned rollup
+flagged cannot have been marked at all — every level read zero watched episodes, which marking would have
+changed. Do not reopen this without a fresh reproduction from a real server.
+
 All three resolved: 2 and 3 were closed on the dates noted below, and 1 was investigated on
 2026-09-18 and ruled out — the sweep it proposed would have marked 52 unwatched shows as watched.
 See the measurement under item 1. Nothing here is actionable without a fresh report from a server
