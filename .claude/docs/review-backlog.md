@@ -166,41 +166,42 @@ shows, of which **52 are invisible to the show-level read**. Those season rows c
 about how much — the same shape as the show-level bug one level down. Every one on that server is old
 (2017–2024), so they are historical residue there rather than fresh marks.
 
-*DECIDED 2026-09-18 (owner): roll up AND count the episodes.* The open question — what
-`viewed_leaf_count` becomes — has an honest answer: both numbers really are available, so nothing is
-invented.
+*INVESTIGATED 2026-09-18 — DO NOT BUILD THIS. The detection query is wrong and would mark 52 shows on
+SFLIX as watched that nobody has watched.*
 
-Re-measured on SFLIX section 2 (2026-09-18), every figure still exact:
+The plan was `?type=3&unwatched=0`, roll up by `parentRatingKey`, count the episodes. Measured, in this
+order, and each step moved the conclusion:
 
-- `type=2&viewedLeafCount!=0` (today's show-level read): 494 shows, all carrying `viewedLeafCount`, 0.84s.
-- `type=3&unwatched=0`: 1,050 watched seasons -> 525 parent shows, and **0** of those rows carry
-  `viewedLeafCount`, confirming the counts are genuinely absent. 0.24s.
-- Parents absent from the show-level read: **52**.
-- `/library/metadata/{season}/children`: **0.010s** each, and it yields a real episode count.
+- `type=2&viewedLeafCount!=0` (today's show-level read) returns 494 shows. `type=3&unwatched=0` returns
+  1,050 seasons over 525 parents. **52 parents are absent from the show-level read** — the figure in the
+  original note, still exact.
+- Those 52 are **false positives, every one**. Show `viewedLeafCount=0`, and via
+  `/library/metadata/{show}/children` **every season also reads `viewedLeafCount=0`**, and every episode
+  reads `viewCount=0`. The only non-zero field is the SEASON's own `viewCount` (1-5). Nobody watched or
+  marked anything: something established a play record on the season object. `Bob's Burgers` is in the
+  52 with 0 of ~300 episodes watched, and `Below Deck Mediterranean` with 0 of ~189.
+- **`unwatched=0` on seasons has exactly the flaw `watched_titles` already documents for shows.** Its
+  docstring says `unwatched=0` "filters on the show's own watch-state row, which marking a series or a
+  season does not establish". The inverse bites here: a season's own watch-state row can exist with no
+  episode watched at all, so `unwatched=0` returns it.
+- Control, to prove the reads themselves were sound: on shows the show-level read DOES return, season
+  `viewedLeafCount` matches the episodes exactly (8 of 8, and 4 of 10), and season `viewCount` is NOT the
+  watched-episode count (5 against a true 4). So `viewCount` could not stand in for it either.
 
-So for an affected show, `leaf_count` = the show's own `leafCount` (present on its metadata — measured
-8, 6, 15, 3, 6 on the first five) and `viewed_leaf_count` = the episodes in its marked seasons, summed
-from `/children`. Both real numbers.
+**The correct signal is a season with `viewedLeafCount > 0` under a show with `viewedLeafCount = 0`, and
+it cannot be had cheaply.** The section-level `type=3` response carries NO `viewedLeafCount` under any
+param tried (`unwatched=0`, `includeUserState=1`, bare, and `viewedLeafCount!=0`), and
+`type=3&viewedLeafCount!=0` is SILENTLY IGNORED — 1,732 rows against 1,050 for `unwatched=0` and 10,631
+for the whole library, so it is filtering on something else entirely. The only place the number appears is
+`/library/metadata/{show}/children`: one read per show, 525 per person per library, ~5s each and ~4
+minutes across 46 users, every sync.
 
-**Why counting beats leaving the counts empty.** `_watched_titles` (`rows.py:314`) treats an unknown
-total as WATCHED, so empty counts would stop the show being re-recommended — but `The Old Man` is 6
-episodes of 15, and marking that finished buries a show they are 40% through. Empty counts also leave
-the show seeding at `watch_count = max(1, 0)` = 1, one movie play, which on an active watcher's library
-almost certainly never makes the seed cut — so the "I finished a season and got nothing like it" half of
-the complaint would survive untouched.
-
-**Cost is not the constraint.** The detection query is 0.24s per person per show library (~11s across 46
-users) and ANY version of this fix needs it. Counting adds ~10ms per affected season, one-off for the
-historical backlog and ~0 on a quiet night. One TV collection write on that server costs 15-17s.
-
-**Build notes.** `watched_titles`'s show branch is a paginated read with incremental (`since`) semantics,
-a sort-honoured cutoff and `WatchedRead.covers_window` — do NOT thread the rollup through that loop. Add
-a separate PMS method that takes the show keys the show-level read already returned and rolls up only the
-parents missing from it, then merge in `fetch_section`. Param filtering does not work on this endpoint at
-all (see the `watched_titles` docstring), so the season read is always a full read — which is what makes
-it safe on an incremental pass too. Still needed: a recorded fixture of the `type=3` response shape (rule
-11), `fake_plex` support so the matrix can be exercised, and the `user_type` matrix per
-`.claude/rules/testing.md`.
+**On this server that cost buys zero findings** — there are no genuine cases, which is consistent with the
+original note's "could not be reproduced on the maintainer's server". So: do not build the sweep. If the
+reporter hits it again, read `/library/metadata/{show}/children` for THAT show and check whether a season
+has `viewedLeafCount > 0` while the show reads 0. That is one request, and it settles it. Only if that
+comes back positive is there a bug here at all, and then the question of what `viewed_leaf_count` becomes
+is answered by the season's own count rather than needing a decision.
 
 **2. The "Finished" date does not move when a partly-watched show is marked fully watched.** CLOSED.
 Plex does not update a show's own `lastViewedAt` when its episodes are MARKED, so a series finished
