@@ -10,10 +10,39 @@ below is later work.
 
 ---
 
-## OPEN — v1.9.1 release review, two LOW (2026-09-16)
+## OPEN — allow lists do nothing to a SHARED account (measured 2026-09-18)
+
+`pms_share_filter_allow_lists.json`'s conclusion 3 — an allow list hides an account's own row until its
+label is admitted — was recorded on a **managed Home** account. It does not reproduce on a **shared**
+one. Measured on SFLIX against MooHouse (shared, no parental profile), writing only its `filterMovies`
+and restoring byte-identical each time:
+
+- `label=Overlay` (a real Kometa label on that library) planted beside the existing excludes, given 45s
+  to propagate: all four of its own row collections stayed visible, and all 30 items inside its movie
+  row stayed readable via `GET /library/metadata/{keys}` with its own token. Unchanged after
+  `plan_share_filter` admitted `Shortlist_moohouse` into the allow group.
+- The same filter's `label!=` excludes DID still apply throughout — no other person's row was visible at
+  any point — so Plex was not ignoring the filter wholesale. The asymmetry is specific to the allow
+  clause.
+
+So `privacy.admit_own_rows` is inert for shared accounts on this PMS (1.43.3.10793) and matters only for
+managed ones. It is not wrong and not harmful: admitting an account's own row label only ever widens what
+it sees of its OWN row. What is wrong is reading conclusion 3 as covering every account type.
+
+Not chased further because the one managed account on this server (`Tester`, id 841506001, no parental
+profile) **has no row of its own**, so the managed arm cannot be measured without first building one for
+it. Do that before trusting conclusion 3 for either account type. Only `label=` was tested; the fixture's
+`contentRating=` cases were not re-measured.
+
+---
+
+## CLOSED — v1.9.1 release review, two LOW (2026-09-16, both fixed 2026-09-18)
 
 The release-PR Architecture Review over `v1.9.0..dev` (PR #129) found no HIGH or MED. A third LOW, the
-CHANGELOG saying a seasonal row returns "without being rebuilt", was fixed before the tag.
+CHANGELOG saying a seasonal row returns "without being rebuilt", was fixed before the tag. The two below
+are now fixed too: the catalogue text scopes "without being built again" to days off, and the seedless
+season reason is the always-true "Right for the season", pinned by
+`test_picker.py::TestReasonFor::test_a_season_pick_does_not_claim_a_genre_match`.
 
 - **The Jobs catalogue overstates seasonal rows.** `rows.visibility`'s description
   (`shortlist/server/services/jobs.py:326-328`) says a hidden row "comes straight back without being built
