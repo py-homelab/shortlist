@@ -10,29 +10,47 @@ below is later work.
 
 ---
 
-## OPEN — allow lists do nothing to a SHARED account (measured 2026-09-18)
+## OPEN — #115 leaves an allow-list account's own row VISIBLE BUT EMPTY (measured 2026-09-18)
 
-`pms_share_filter_allow_lists.json`'s conclusion 3 — an allow list hides an account's own row until its
-label is admitted — was recorded on a **managed Home** account. It does not reproduce on a **shared**
-one. Measured on SFLIX against MooHouse (shared, no parental profile), writing only its `filterMovies`
-and restoring byte-identical each time:
+`privacy.admit_own_rows` was shipped to make an allow-list account "see its own rows, filled with titles
+it can watch". Measured against a real managed account, it does not do the second half.
 
-- `label=Overlay` (a real Kometa label on that library) planted beside the existing excludes, given 45s
-  to propagate: all four of its own row collections stayed visible, and all 30 items inside its movie
-  row stayed readable via `GET /library/metadata/{keys}` with its own token. Unchanged after
-  `plan_share_filter` admitted `Shortlist_moohouse` into the allow group.
-- The same filter's `label!=` excludes DID still apply throughout — no other person's row was visible at
-  any point — so Plex was not ignoring the filter wholesale. The asymmetry is specific to the allow
-  clause.
+**First two attempts were void — recorded so nobody repeats them.** They planted `label=Overlay` as the
+allow list. `Overlay` is a Kometa label on **9,980 of 9,991** movies on that server, so the allow list
+admitted virtually the whole library and proved nothing. Always confirm the allow VALUE actually
+restricts before reading anything into the result.
 
-So `privacy.admit_own_rows` is inert for shared accounts on this PMS (1.43.3.10793) and matters only for
-managed ones. It is not wrong and not harmful: admitting an account's own row label only ever widens what
-it sees of its OWN row. What is wrong is reading conclusion 3 as covering every account type.
+**The real measurement.** `Tester` (the one managed Home account, no parental profile) was given a real
+row for this, then `label=recommended` was planted on its `filterMovies` alone — 11 of 9,991 movies, none
+of them in the row — with 45s to propagate and the value restored byte-identical afterwards:
 
-Not chased further because the one managed account on this server (`Tester`, id 841506001, no parental
-profile) **has no row of its own**, so the managed arm cannot be measured without first building one for
-it. Do that before trusting conclusion 3 for either account type. Only `label=` was tested; the fixture's
-`contentRating=` cases were not re-measured.
+| state | own row collections visible | items inside the movie row |
+| --- | --- | --- |
+| baseline | both | 30 / 30 |
+| allow list planted | both | **0 / 30** |
+| after `plan_share_filter` admitted `Shortlist_tester` | both | **0 / 30** |
+
+Two conclusions, both new:
+
+1. **The allow list works on ITEMS and never hid the row object at all.** The collection stayed visible in
+   all three states, so the premise "an allow-list account cannot see its own row" did not reproduce on
+   PMS 1.43.3.10793 — for a managed account, which is the type the fixture recorded.
+2. **Admitting the row's own label does not bring its contents back.** A share filter matches ITEMS by
+   label, and the row's member titles carry no `shortlist_*` label — only the collection does. So adding
+   `Shortlist_tester` as an allow value can admit the collection (already visible) and none of its 30
+   members. The account gets an empty row.
+
+The fixture's conclusion 3 is literally consistent with this — "inside it exactly the items the allow list
+admits" is 0 when none of the row's titles carry the allowed label. What overstates is
+`.claude/rules/plex-safety.md`'s "filled with titles it can watch", now corrected there.
+
+`admit_own_rows` is still harmless and still additive, so there is nothing to revert. What is open is
+whether the feature is worth anything: to fill the row, the row's TITLES would have to carry the label,
+which means labelling other people's media — a much larger decision than #115 made.
+
+Residue note: `CanaryAllow_DELETE_ME` now appears in the movie library's label list with 0 items, from the
+first void attempt. Inert, and that list already carries several empty names (`Kometa`, `Based`, `Decade`,
+`Genre`, `RequestNeeded` are all 0).
 
 ---
 
@@ -57,7 +75,35 @@ season reason is the always-true "Right for the season", pinned by
 
 ---
 
-## OPEN — LOW: unmarked duplicates of a shared row (found 2026-09-15, discussion #124 review)
+## OPEN — LOW: unmarked duplicates of a shared row (found 2026-09-15; a fix was BLOCKED 2026-09-18)
+
+**Do not put this in `sweep_broken_rows`.** A first attempt did, deleting an unmarked collection under a
+shared label when a `row_marker(0)` sibling existed in the same library. Architecture Review blocked it
+with a HIGH it reproduced twice by running the real sweep:
+
+- **The "sibling" can be debris.** `_reclaim_orphaned_name` writes a name-freeing helper whose title is
+  `FREED_NAME_PREFIX + hex + row_marker(0)` and then labels it with the shared label, and a helper left
+  by a stopped run is exactly what the sweep is supposed to clean. So helper + live unmarked row in one
+  library made the sweep delete BOTH and report success. `collection_reconcile.py:814` already excludes
+  helpers from this same decision, so the omission was an asymmetry, not a hypothetical.
+- **A marked copy being deleted in the same pass still authorised the delete.** A marked shared copy of
+  the wrong subtype is `unhidable`, so it is destroyed that pass — and on the way it licensed deleting
+  the well-typed unmarked row beside it.
+
+Guarding both is a two-line change, but the placement is the real objection and guards do not fix it:
+
+- This duplicate is **not a leak**. Both copies carry the same shared label, so every account's exclude
+  hides them identically. The sweep exists for rows Plex CANNOT hide and runs before anything that can
+  fail precisely because leaks cannot wait. A cosmetic duplicate has no claim on that slot.
+- The target is **unmarked**, so `delete_owned_collection` must fall back to a label re-read, and an empty
+  answer there raises `PermissionError`. `_sweep_phase` (`pipeline.py:443`) turns any raise into a
+  whole-run abort. A cosmetic cleanup must not be able to abort the nightly run for all 46 users.
+
+*Correct direction:* delete the loser in the delivery path, where identity is answered by the ledger's
+`ratingKey` rather than by a title suffix — `_find_this_rows_collection` (`delivery.py:1527`) already
+resolves the row that way. Two further review findings to carry over when someone does: the `run.sweep`
+audit `reason` (`run_persistence.py:1439`) does not describe this deletion, and a shared row must be
+recorded under `f"{SHARED_SLUG_PREFIX}_{slug}"` or `pipeline.py:512`'s lookup cannot join it.
 
 Before 2026-09-15 a rename from the rename screen took a shared row's `row_marker(0)` off its title, so
 the next run could not find the collection and built a second, marked one beside it. Both carry the
@@ -130,7 +176,21 @@ The early hide from browse at creation (`PlexClient.hide_from_browse`) stays, fo
 
 ---
 
-## OPEN — every pick vanishing before a create fails the person (2026-09-13)
+## PARTLY CLOSED — every pick vanishing before a create fails the person (2026-09-13, 2026-09-18)
+
+**The race is unchanged and still self-heals; what changed is that it now says so.** 2026-09-18:
+`_create_labelled_collection` raises a message naming the person, the row, the library and the pick
+count when `picks and not items and vanished`, instead of letting plexapi answer
+`BadRequest('Must include items to add when creating new collection')` — which named none of them and
+cost a full investigation to place. Behaviour is deliberately identical: that person's row is not built
+tonight and the next run rebuilds it.
+
+The gate includes `vanished` on purpose. An earlier attempt at this fired on an empty `items` alone and
+broke 25 tests: "no items and nothing vanished" is a different situation that must keep its behaviour.
+
+Still NOT done, and deliberately: making the delivery actually succeed. That needs the picks resolved
+BEFORE the repair's delete, per the reverted attempt below, and the race has never been observed —
+see the evidence in the original note.
 
 Found auditing #119, LOW, pre-existing. **Never observed on SFLIX:** 0 in 7 days of logs, and 0 vanished
 picks in run history back to 2026-07-24 (checked 2026-09-13). Leave it unless it is ever seen. If every pick for a library is deleted from Plex in the seconds
@@ -145,7 +205,12 @@ fix has to resolve the picks BEFORE the repair's delete, and keep the breakdown 
 
 ---
 
-## OPEN — issue #108 watch-status follow-ups (2026-09-02)
+## CLOSED — issue #108 watch-status follow-ups (2026-09-02, closed 2026-09-18)
+
+All three resolved: 2 and 3 were closed on the dates noted below, and 1 was investigated on
+2026-09-18 and ruled out — the sweep it proposed would have marked 52 unwatched shows as watched.
+See the measurement under item 1. Nothing here is actionable without a fresh report from a server
+that can produce a season with `viewedLeafCount > 0` under a show reading 0.
 
 Six commits landed for #108 (`dd2614a`, `a829724`, `1c61a9c`, `ac0a165`, `545a340`, `83cf07a`), and
 the reporter then tested all nine watch-status paths against `2bf1d90`. **Six pass**: mark a show

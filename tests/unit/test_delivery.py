@@ -511,6 +511,29 @@ class TestDeliverRows:
         )
         existing.items.assert_called_once()  # membership read exactly once, not twice
 
+    def test_every_pick_vanishing_before_a_create_names_the_row_instead_of_plexapis_message(
+        self, engine_config: EngineConfig, movies, shows
+    ):
+        """If every pick for a library is deleted from Plex between curation and `fetch_items`,
+        `create_collection(section, title, [])` reaches plexapi's `Collection._create`, which raises
+        `BadRequest('Must include items to add when creating new collection')` before any request —
+        naming neither the person, the row nor the library. The delivery still fails for them tonight
+        and heals tomorrow; this only makes the reason legible (found auditing #119, pre-existing)."""
+        plex = self._plex(movies, shows)
+        profile = make_profile()
+        plex.find_owned_collections.return_value = []
+        picks = [Pick(1, 1001, "Dune", rank=1, reason="r", media_type=MediaType.MOVIE)]
+        plex.fetch_items.return_value = ([], [1001])  # every pick deleted from Plex since curation
+
+        with pytest.raises(RuntimeError) as raised:
+            deliver_rows(plex, profile, picks, engine_config)
+
+        message = str(raised.value)
+        assert profile.username in message
+        assert "Movies" in message
+        assert "vanished" in message
+        plex.create_collection.assert_not_called()
+
     def test_a_vanished_pick_does_not_erase_a_live_pick_that_shares_its_title(
         self, engine_config: EngineConfig, movies, shows
     ):

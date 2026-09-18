@@ -254,7 +254,9 @@ def _rebuild_under_name(
             on_write=on_write,
         )
     except Exception as exc:
-        _log_kept(profile, old, title, section, f"rebuilding the row under it failed ({type(exc).__name__})")
+        # The MESSAGE, not just the class name: the create path raises one that names the person, the
+        # row, the library and the pick count, and logging only `RuntimeError` threw all of it away.
+        _log_kept(profile, old, title, section, f"rebuilding the row under it failed ({type(exc).__name__}: {exc})")
         return None
     try:
         plex.delete_owned_collection(old, label_prefix)
@@ -1384,6 +1386,25 @@ def _create_labelled_collection(
             len(vanished),
             title,
             ", ".join(sorted(gone)),
+        )
+    if picks and not items and vanished:
+        # Every pick for this library was deleted from Plex between curation and the read above.
+        # `create_collection(section, title, [])` reaches plexapi's `Collection._create`, which raises
+        # `BadRequest('Must include items to add when creating new collection')` before issuing any
+        # request — naming neither the person, the row nor the library, so placing it cost a full
+        # investigation once already.
+        #
+        # This raises in the same place for the same reason, so behaviour is unchanged: their row is not
+        # built tonight and the next run rebuilds it. Deliberately NOT "return nothing created" — that
+        # was tried and reverted, because on the repair path it let an already-deleted row be reported
+        # as a success with a ledger entry still naming the deleted ratingKey.
+        #
+        # Gated on `vanished` as well as the empty `items`: "no items and nothing vanished" is a
+        # different situation that must keep whatever behaviour it had.
+        raise RuntimeError(
+            f"{profile.username}: all {len(picks)} pick(s) for '{display}' in "
+            f"'{getattr(section, 'title', '?')}' vanished from Plex before the row could be created — "
+            "not built tonight, and the next run rebuilds it"
         )
     if on_write is not None:
         on_write({"row": display, "library": section.title, "creating": len(items)})
