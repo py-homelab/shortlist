@@ -107,6 +107,9 @@ class Recommender(Protocol):
     #: else, and only falls back to cold start if it answers with nothing.
     serves_cold: bool
 
+    # Optional: `begin_run()` is called by `pipeline.run` before the first pool of a run, for an
+    # engine that memoises anything — the run is the unit it may remember across.
+
     def recommend(
         self,
         ctx: EngineContext,

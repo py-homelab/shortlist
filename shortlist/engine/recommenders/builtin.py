@@ -8,6 +8,8 @@ it — which seeds to derive, what to exclude, how each library's row is then se
 
 from __future__ import annotations
 
+import copy
+import threading
 from collections.abc import Callable
 from datetime import date
 from typing import TYPE_CHECKING
@@ -188,6 +190,7 @@ def _candidate_pool(
     recency: float = 0.0,
     visible: Callable[[list[int]], set[int] | None] | None = None,
     season: seasons_mod.SeasonTitles | None = None,
+    gather: Callable[..., list[Candidate]] = candidates_mod.gather_candidates,
 ) -> tuple[tuple[list[Candidate], list[Candidate], list[Candidate]], candidates_mod.GatherStats]:
     """Gather TMDB candidates for ``seeds`` and intersect them with the library.
 
@@ -215,7 +218,7 @@ def _candidate_pool(
     # so a blocked title may still surface if a different seed's similar-titles search suggests it.
     # Matches the UI's "Don't seed" wording, which promises exactly that and no more.
     gather_stats = candidates_mod.GatherStats()
-    pool = candidates_mod.gather_candidates(
+    pool = gather(
         ctx.tmdb,
         seeds,
         sources=sources if sources is not None else ctx.config.candidate_sources,
@@ -315,11 +318,58 @@ def _candidate_pool(
 
 
 class BuiltinRecommender:
-    """The engine Shortlist ships with. Stateless: every dial arrives on the request or the context."""
+    """The engine Shortlist ships with. Every dial arrives on the request or the context; the only
+    state is a per-run memo of gathers, so a person's `missing` surface reuses the search their
+    library surface already paid for (the web-search source bills per search)."""
 
     name = "builtin"
     # No seeds means no gather, so a person under `min_history` is cold-started before any pool is built.
     serves_cold = False
+
+    def __init__(self) -> None:
+        self._gathers: dict[tuple, tuple[list[Candidate], candidates_mod.GatherStats]] = {}
+        self._lock = threading.Lock()
+
+    def begin_run(self) -> None:
+        """Forget last run's gathers: a source that answered yesterday may not tonight, and a row
+        must see tonight's answer (`pipeline.run` calls this; a context reused across runs relies on it)."""
+        with self._lock:
+            self._gathers.clear()
+
+    def _memo_gather(self, req: RecommendRequest) -> Callable[..., list[Candidate]]:
+        """`gather_candidates` memoised on everything that decides its answer for this person — the
+        seeds, the sources, the media and the season. Users run concurrently, hence the lock; a hit
+        hands back COPIES, because the pipeline mutates candidates as it filters and ranks them, and
+        the same object in two surfaces' lists would carry one surface's stamps into the other."""
+        key = (
+            req.user.plex_account_id,
+            tuple((s.tmdb_id, s.media_type) for s in req.seeds),
+            req.sources,
+            # The gather itself is media-blind (the seeds decide what comes back; media narrows AFTER),
+            # except that a seasonal row's season items are added per media type.
+            req.media if req.season is not None else "*",
+            req.recent_count,
+            # A season is its title set; the same set on two rows is the same gather.
+            tuple(sorted((k.value, tuple(sorted(v))) for k, v in req.season.ids.items())) if req.season else (),
+        )
+
+        def gather(*args, stats: candidates_mod.GatherStats | None = None, **kwargs) -> list[Candidate]:
+            with self._lock:
+                hit = self._gathers.get(key)
+            if hit is not None:
+                pool, first_stats = hit
+                if stats is not None:
+                    # The trace is what the run page shows per pool; the cost was paid once and is
+                    # already on the report, so a hit adds no tokens or searches.
+                    stats.trace = copy.deepcopy(first_stats.trace)
+                return copy.deepcopy(pool)
+            own = stats if stats is not None else candidates_mod.GatherStats()
+            pool = candidates_mod.gather_candidates(*args, stats=own, **kwargs)
+            with self._lock:
+                self._gathers[key] = (copy.deepcopy(pool), own)
+            return pool
+
+        return gather
 
     def recommend(
         self,
@@ -328,6 +378,8 @@ class BuiltinRecommender:
         *,
         visible: Callable[[list[int]], set[int] | None] | None = None,
     ) -> RecommendResult:
+        if req.surface == "missing":
+            return self._missing(ctx, req)
         (pool, in_library, ranked), stats = _candidate_pool(
             ctx,
             req.seeds,
@@ -341,7 +393,61 @@ class BuiltinRecommender:
             recency=req.recency,
             visible=visible,
             season=req.season,
+            gather=self._memo_gather(req),
         )
         for c in in_library:
             c.kids = is_kids(c.genres)
         return RecommendResult(ranked=ranked, in_library=in_library, gathered=pool, ordered=False, stats=stats)
+
+    def _missing(self, ctx: EngineContext, req: RecommendRequest) -> RecommendResult:
+        """Titles the search turned up that no library holds, ranked by the same score the rows use.
+
+        This is the per-person request surface: what someone could ask for. The old request inbox
+        walked this same pool sorted by how many people wanted a title — the demand head — and only
+        ever looked at what many people's watches pointed at. Ranked per person, the personal tail
+        surfaces. Same exclusions and genre rules as a row; nothing is intersected with the library.
+        """
+        stats = candidates_mod.GatherStats()
+        pool = self._memo_gather(req)(
+            ctx.tmdb,
+            req.seeds,
+            sources=list(req.sources) if req.sources else ctx.config.candidate_sources,
+            curator=ctx.curator,
+            profile=req.user,
+            trakt=ctx.trakt,
+            search=ctx.search,
+            web_search_mode=ctx.config.web_search_provider,
+            web_search_cache=ctx.web_search_cache,
+            recent_count=req.recent_count or ctx.config.recent_count,
+            stats=stats,
+        )
+        watched = (
+            req.watched_exclusions
+            if req.watched_exclusions is not None
+            else {(s.tmdb_id, s.media_type) for s in req.seeds}
+        )
+        excluded = {g.lower() for g in req.excluded_genres}
+        kinds = [MediaType.MOVIE, MediaType.SHOW] if req.media == "both" else [MediaType(req.media)]
+        missing = [
+            c
+            for c in pool
+            if c.media_type in kinds
+            and req.library_index.get(c.media_type, {}).get(c.tmdb_id) is None
+            and (c.tmdb_id, c.media_type) not in watched
+            and not (excluded and any(g.lower() in excluded for g in c.genres))
+            and (req.season is None or req.season.contains(c.tmdb_id, c.media_type))
+        ]
+        for c in missing:
+            c.kids = is_kids(c.genres)
+        ranked = ranking.cut_for_recency(
+            missing,
+            kinds,
+            req.limit_per_media,
+            req.recency,
+            _run_year(ctx.run_day),
+            ctx.config.genre_avoidance,
+            ctx.config.franchise,
+            ctx.config.cast,
+        )
+        stats.trace.setdefault("sources", [])
+        return RecommendResult(ranked=ranked, in_library=[], gathered=pool, ordered=True, stats=stats)

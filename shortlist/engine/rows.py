@@ -395,6 +395,9 @@ _UNDATED_BEFORE = datetime(1971, 1, 1, tzinfo=UTC)
 #: How many finished titles a rewatch row carries per library slot: the row itself, the spares a
 #: refresh night swaps in (it may not reuse what it carried), and room for a carried pick to leave.
 _REWATCH_SPARES_PER_SLOT = 3
+# How many missing titles per media type a person's request surface holds. Deep enough that the
+# family lane and the dismissals still leave a full deck; shallow enough to persist nightly for everyone.
+MISSING_PER_MEDIA = 150
 
 
 @dataclass
@@ -2175,7 +2178,68 @@ def _warm_start(
     if demand is not None:
         _record_demand(policy, demand)
     report.status = "ok"
-    return any(p.ranked for p in pools)
+    # Their request surface, once the rows' pools exist (a builtin engine answers it from the same
+    # gather). Only when something ranked: a person the engine has nothing for gets nothing here either.
+    if any(p.ranked for p in pools):
+        report.missing = _missing_titles(policy)
+        return True
+    return False
+
+
+def _missing_titles(policy: RowPolicy) -> list[dict]:
+    """This person's request surface: what the engine would suggest that no library holds, best first.
+
+    One call, not one per row — a person has one taste, and the surface is theirs rather than a row's.
+    Seeded from their widest row (every medium, every library) so nothing narrows it; excludes
+    everything they have touched (a 0% row's rule), and their excluded genres. An engine that cannot
+    serve the surface, or fails, leaves it empty — the page then says so rather than showing stale
+    titles, and last night's list is what the adapter keeps until a run replaces it.
+    """
+    ctx, user, specs = policy.ctx, policy.user, policy.specs
+    spec = next((s for s in specs if s.media == "both" and not s.library_keys), specs[0])
+    request = RecommendRequest(
+        user=user,
+        seeds=policy.seeds_for(spec),
+        history=policy.resolved_history,
+        library_index=policy.library_index,
+        watched_exclusions=policy.zero_pct_exclusions(),
+        excluded_genres=user.excluded_genres,
+        media="both",
+        surface="missing",
+        limit_per_media=MISSING_PER_MEDIA,
+        sources=policy.effective_sources(spec),
+        recent_count=policy.effective_recent_count(spec),
+        recency=policy.cfg.recency,
+    )
+    try:
+        result = ctx.recommender.recommend(ctx, request)
+    except Exception as e:
+        logger.warning("{}: no missing titles tonight ({}: {})", user.username, type(e).__name__, e)
+        return []
+    out = []
+    for rank, c in enumerate(result.ranked):
+        seed = c.top_seed
+        out.append(
+            {
+                "rank": rank + 1,
+                "tmdb_id": c.tmdb_id,
+                "media_type": c.media_type.value,
+                "title": c.title,
+                "year": c.year,
+                "genres": list(c.genres),
+                "rating": c.rating,
+                "vote_count": c.vote_count,
+                "poster_path": c.poster_path,
+                "overview": c.overview,
+                "language": c.language,
+                "reason": picker.reason_for(c),
+                "kids": bool(c.kids),
+                "seed_tmdb_id": seed.tmdb_id if seed else None,
+                "seed_title": seed.title if seed else None,
+                "sources": sorted(c.sources),
+            }
+        )
+    return out
 
 
 def _record_demand(policy: RowPolicy, demand: requests_mod.RowDemand) -> None:

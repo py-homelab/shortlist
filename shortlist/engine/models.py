@@ -1385,6 +1385,10 @@ class UserRunReport:
     # Plex reuses `metadata_items.id`, so that key can come to name a different collection under this
     # same label — and `promote_user_rows` reads the ledger too, so it is not only removals at stake.
     removed_deliveries: list[dict] = field(default_factory=list)
+    # This person's MISSING titles — what the engine would suggest that no library holds, best first,
+    # as plain dicts (`rows._missing_titles`). The per-person request surface; the adapter persists it
+    # as their suggestions. Empty on the cold path and for engines that do not serve the surface.
+    missing: list[dict] = field(default_factory=list)
     # Each delivered collection, as (section key, marked TITLE), mapped to the slug of the row that
     # produced it, so the promote phase applies the right row's placement/pin. Keyed by library as well
     # as title: a {top_seed} title differs library to library, and two of one person's rows may share a

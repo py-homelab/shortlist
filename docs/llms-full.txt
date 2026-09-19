@@ -1429,8 +1429,8 @@ call). The request:
 - `limit_per_media` is how many titles per media type the row build will look at; more are cut,
   never re-ranked.
 - `surface` is `library` for rows. `missing` (titles the libraries do **not** hold) is reserved.
-- `season` names a seasonal row's season, for an engine that wants to know; Shortlist filters to the
-  season's titles itself.
+- `season` is a seasonal row's title set (`{"movie": [...], "show": [...]}`, null otherwise), for
+  an engine that wants to rank within it; Shortlist filters the answer to the season's titles itself.
 
 The answer, best first:
 
