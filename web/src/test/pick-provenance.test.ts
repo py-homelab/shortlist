@@ -13,6 +13,15 @@ function pick(over: Partial<Pick> = {}): Pick {
 }
 
 describe("provenanceLabel", () => {
+  it("names an external engine by its own name and claims no strength for it", () => {
+    expect(
+      provenanceLabel(pick({ sources: ["engine:recommendarr"], affinity: 1.0 })),
+    ).toBe("suggested by Your engine (recommendarr)");
+    expect(provenanceLabel(pick({ sources: ["engine:"], affinity: 1.0 }))).toBe(
+      "suggested by Your engine",
+    );
+  });
+
   it("names the source and how strong the match was", () => {
     expect(
       provenanceLabel(pick({ sources: ["tmdb_similar"], affinity: 1.0 })),

@@ -60,8 +60,10 @@ shortlist/
 │   │   ├── pipeline.py           # per-user stage orchestration (history→candidates→filter→rank→curate→deliver→privacy)
 │   │   ├── models.py             # dataclasses: Seed, Candidate, Pick, UserProfile, RunReport
 │   │   ├── history.py            # HistorySource protocol; ShareTokenWatchSource (reads PMS per-user watched set), seed derivation
-│   │   ├── candidates.py         # TMDB similar/recommended pooling + seed tagging
-│   │   ├── ranking.py            # heuristic pre-rank (seed_freq × rating × recency)
+│   │   ├── recommender.py        # the engine boundary: Recommender protocol, RecommendRequest/Result — rows.py calls ctx.recommender per pool
+│   │   ├── recommenders/         # builtin.py (the gather+rank below, moved verbatim), http.py (an engine elsewhere, order final), fallback.py
+│   │   ├── candidates.py         # TMDB similar/recommended pooling + seed tagging (the built-in engine's)
+│   │   ├── ranking.py            # heuristic pre-rank (seed_freq × rating × recency); external_rank short-circuits it
 │   │   ├── curator/              # LLM providers behind Curator protocol
 │   │   │   ├── base.py           # curate(profile, candidates, k) -> [Pick]; strict JSON schema; validates output ⊆ input
 │   │   │   ├── anthropic.py · openai.py · google.py · ollama.py · null.py (heuristic+template reasons)

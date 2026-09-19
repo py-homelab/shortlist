@@ -2,7 +2,7 @@
 title: AI and cost
 description: Shortlist works with no AI at all. What AI adds when you turn it on, which search backend to pick, and how to control what it costs.
 heading: AI and cost
-nav_order: 5
+nav_order: 6
 ---
 
 ## What AI does, and what it costs

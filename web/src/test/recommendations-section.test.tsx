@@ -31,6 +31,42 @@ function renderSection(settings: Settings) {
 describe("RecommendationsSection", () => {
   beforeEach(() => putSettings.mockClear());
 
+  // The engine card is the first thing on the page. With Shortlist's own engine chosen the sources
+  // are its dials and stay; with an external one they would be controls that do nothing, so they go.
+  it("offers the built-in engine and its sources by default", () => {
+    renderSection({});
+    expect(screen.getByLabelText(/Which engine ranks/i)).toHaveValue("builtin");
+    expect(screen.getByText(/Title sources/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Engine address/i)).not.toBeInTheDocument();
+  });
+
+  it("with an external engine chosen, shows its address and hides the built-in sources", () => {
+    renderSection({
+      "engine.backend": "http",
+      "engine.url": "http://recommendarr:8090",
+      "engine.fallback": "none",
+    });
+    expect(screen.getByLabelText(/Engine address/i)).toHaveValue(
+      "http://recommendarr:8090",
+    );
+    expect(screen.getByLabelText(/If the engine is down/i)).toHaveValue("none");
+    expect(screen.queryByText(/^Title sources$/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/belong to Shortlist’s own engine/i)).toBeInTheDocument();
+  });
+
+  it("saves the engine choice", async () => {
+    renderSection({});
+    fireEvent.change(screen.getByLabelText(/Which engine ranks/i), {
+      target: { value: "http" },
+    });
+    await waitFor(() =>
+      expect(putSettings).toHaveBeenCalledWith(
+        expect.objectContaining({ "engine.backend": "http" }),
+      ),
+    );
+    expect(screen.getByLabelText(/Engine address/i)).toBeInTheDocument();
+  });
+
   // The model is "intent + inline fix": a source's toggle is never disabled; when it's on but its
   // dependency is missing, the card shows exactly how to satisfy it right there.
 

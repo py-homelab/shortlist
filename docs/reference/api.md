@@ -190,6 +190,12 @@ GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first
      "What 'already watched' means for a show"), so the flag is a no-op. Refused for `media: "movie"`, where any view is already a finish.
      The finished bar itself is not configurable — it is `EngineConfig.watched_show_pct`, fixed at 0.8. Earlier revisions of this document cited a
      `recommendations.watched_show_pct` setting; no such key has ever existed.
+     `family` (`include` | `exclude` | `only`, default `include`) decides what the row does with children's and family titles — as the
+     engine tags them (`Candidate.kids`: the built-in engine reads TMDB's Animation + Family or Kids genres; an external engine may know
+     better). `include` is how every row behaved before the setting existed; `exclude` keeps them out; `only` builds the row from nothing
+     else. For a household watching under one Plex account: the grown-ups' rows `exclude`, one row is `only`. Recorded in the row's recipe
+     only when set away from the default, so upgrading rebuilds nothing. A cold-start row carries no tags, so a `family: only` row for
+     someone without enough history delivers the server's top-rated titles unfiltered — set that row's `cold_start` to `skip` if that matters.
      Both are refused (422) in combinations that cannot work: `rewatch` + `unstarted_only` together (they ask for opposite things — the row would fill
      with titles nobody has seen, under a "you've already seen" name), and `unstarted_only` on a `media: "movie"` row. PATCH validates the MERGED row,
      not just the fields sent, so neither invalid pair can be reached one field at a time.
@@ -392,7 +398,7 @@ anything reaches it, including from quoted exception messages.
 GET  /api/support/health -> {checks[{name, ok, detail}], text} (Plex, libraries, tokens, TMDB, curator, database, clocks, last run — each probed independently so one failure is content, not a 500)
 GET  /api/support/title?q= -> {rows[{user, watched_record, viewed_leaf_count, leaf_count, counts_as_watched, cap_pct, delivered[], problem}], flagged[], text}
 GET  /api/support/person/{slug} -> {user_type, watched_movies, watched_shows, libraries[{section_key, library, titles_known, ever_read}], never_read[], text}
-GET  /api/support/rows -> {rows[{slug, watched_pct, watched_pct_source, refresh_days, refresh_days_source, idle_hold_days, idle_hold_source, rewatch, unstarted_only}], global_watched_pct, text}
+GET  /api/support/rows -> {rows[{slug, watched_pct, watched_pct_source, refresh_days, refresh_days_source, idle_hold_days, idle_hold_source, rewatch, unstarted_only, family}], global_watched_pct, text}
 GET  /api/support/row-schedule -> {rows[{slug, refresh_days_source, rebuild_every_days, idle_hold_days, idle_hold_source, last_built_at, days_since_built, due}], text}
 GET  /api/support/libraries -> {libraries[{key, title, type, items}], error, text}
 GET  /api/support/connection -> {users[{user, has_token, libraries_read[], never_read[]}], problems[], text}

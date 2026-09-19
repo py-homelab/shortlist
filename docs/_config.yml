@@ -82,6 +82,8 @@ nav:
         url: /guides/rows/
       - title: What goes in a row
         url: /guides/picks/
+      - title: Bring your own engine
+        url: /guides/engines/
       - title: Schedules and runs
         url: /guides/schedules/
       - title: AI and cost

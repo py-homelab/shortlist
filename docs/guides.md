@@ -4,7 +4,7 @@ description: How to do the things people actually want to do with Shortlist, fro
 heading: Guides
 ---
 
-Eight short pages instead of one long one. If you know what you want to do, start here.
+Nine short pages instead of one long one. If you know what you want to do, start here.
 
 ## What do you want to do?
 
@@ -18,6 +18,8 @@ Eight short pages instead of one long one. If you know what you want to do, star
 | Give a row its own artwork                       | [Row posters](guides/rows.md#row-posters)                               |
 | Give a row a description, or sort it in Collections | [Description and sort order](guides/rows.md#description-and-sort-order) |
 | Change where the suggestions come from           | [What goes in a row](guides/picks.md)                                   |
+| Use a recommendation engine of my own            | [Bring your own engine](guides/engines.md)                              |
+| Keep the kids' cartoons off the grown-ups' rows  | [Children's and family titles](guides/rows.md#childrens-and-family-titles) |
 | Stop one film skewing someone's picks            | [Blocking a seed](guides/picks.md#blocking-a-seed)                      |
 | Change how often a row's picks CHANGE            | [What goes in a row](guides/picks.md)                                   |
 | Change WHEN a row runs overnight                 | [Schedules and runs](guides/schedules.md)                               |
@@ -35,6 +37,7 @@ Eight short pages instead of one long one. If you know what you want to do, star
 | [The web interface](guides/interface.md)                 | What every page does, and what each dashboard figure means                  |
 | [Rows and templates](guides/rows.md)                     | Starting from a template, naming, ordering, where a row shows, posters, descriptions |
 | [What goes in a row](guides/picks.md)                    | Recommendation sources, rebuild cadence, per-row and per-person overrides   |
+| [Bring your own engine](guides/engines.md)               | Plugging in a recommendation engine you run yourself, and its protocol      |
 | [Schedules and runs](guides/schedules.md)                | Each row's own schedule, custom schedules, the jobs worth knowing about     |
 | [AI and cost](guides/ai.md)                              | What AI does, which search backend to pick, how to keep the bill down       |
 | [Requests (Radarr, Sonarr, Overseerr)](guides/requests.md) | Setting it up, the approval inbox, guardrails, why a title is still waiting |

@@ -118,6 +118,24 @@ finished in the last**, or set 0 to allow everything), titles they rated low (ag
 ratings are on), and genres you excluded for them. Someone with too little history still gets their
 finished titles first, with the server's top-rated titles filling any room left.
 
+## Children's and family titles
+
+A household that watches under one Plex account — the living-room TV signed in as the owner, with
+the kids' cartoons and the grown-ups' dramas in the same history — gets rows that are half Bluey.
+**Children's & family titles** in the row editor is the way out, without splitting the account:
+
+| Choice                             | What it does                                                                                         |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **Mixed in with everything else**  | The default, and how every row has always behaved.                                                   |
+| **Left out of this row**           | Nothing tagged as children's or family viewing reaches the row — for the grown-ups' rows.            |
+| **This row is the family row**     | Only children's and family titles, still ranked for this person — one shelf for the kids.            |
+
+What counts as a children's title is the engine's call. Shortlist's own goes by TMDB's genres
+(Animation together with Family, or the TV "Kids" genre); an [engine of your own](engines.md) can
+tag by certification or anything else it knows. Changing the choice rebuilds the row on the next
+run. A person with too little history gets the server's top-rated titles on every row, untagged —
+set the family row's cold start to **Don't build their row** if that matters.
+
 ## Seasonal rows
 
 A seasonal row follows the calendar. In October it holds Halloween films and horror, in December
