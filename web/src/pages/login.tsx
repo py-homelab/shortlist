@@ -23,13 +23,16 @@ import { queryKeys, useSession, useSetupState } from "@/lib/queries";
 export function LoginPage() {
   const session = useSession();
   const authenticated = session.data?.authenticated ?? false;
+  const person = session.data?.role === "person";
   // Setup state is owner-only. Asking for it before sign-in 401s, and the visitor would sit
-  // behind this very skeleton instead of seeing the button they came here to press.
+  // behind this very skeleton instead of seeing the button they came here to press. A person is
+  // refused it too (403) and has nowhere but /me to go, so it is never asked for them.
   const setup = useSetupState({
-    enabled: authenticated || !(session.data?.login_required ?? true),
+    enabled: (authenticated && !person) || !(session.data?.login_required ?? true),
   });
   const queryClient = useQueryClient();
 
+  if (authenticated && person) return <Navigate to="/me" replace />;
   if (session.isPending || (authenticated && setup.isPending)) {
     return (
       <div className="flex min-h-screen items-center justify-center">
@@ -75,7 +78,8 @@ export function LoginPage() {
           <CardHeader className="pb-4">
             <CardTitle className="text-base">Sign in to continue</CardTitle>
             <CardDescription>
-              Use the Plex account that owns this server.
+              Use your Plex account. The server&rsquo;s owner lands in
+              Shortlist; everyone else on the server lands on their own picks.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">

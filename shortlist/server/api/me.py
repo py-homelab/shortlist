@@ -107,7 +107,7 @@ async def me(request: Request) -> dict:
     return await run_in_threadpool(load)
 
 
-class SuggestionsOut(PassthroughModel):
+class MySuggestionsOut(PassthroughModel):
     state: str
     items: list[dict]
     queued: list[dict]
@@ -119,7 +119,7 @@ class SuggestionsOut(PassthroughModel):
     seerr: dict
 
 
-@router.get("/suggestions", response_model=SuggestionsOut)
+@router.get("/suggestions", response_model=MySuggestionsOut)
 async def suggestions(request: Request, family: str = "exclude") -> dict:
     if family not in picks.FAMILY_MODES:
         raise HTTPException(status_code=422, detail=f"family must be one of {list(picks.FAMILY_MODES)}")
@@ -146,12 +146,12 @@ async def suggestions(request: Request, family: str = "exclude") -> dict:
     return await run_in_threadpool(load)
 
 
-class DismissedOut(PassthroughModel):
+class MyDismissedOut(PassthroughModel):
     never: list[dict]
     later: list[dict]
 
 
-@router.get("/dismissed", response_model=DismissedOut)
+@router.get("/dismissed", response_model=MyDismissedOut)
 async def dismissed(request: Request) -> dict:
     def load() -> dict:
         with request.app.state.sessions() as session:
@@ -175,7 +175,7 @@ async def dismissed(request: Request) -> dict:
     return await run_in_threadpool(load)
 
 
-class ActIn(StrictRequestModel):
+class PickActionIn(StrictRequestModel):
     action: Literal["request", "never", "later", "skip", "undo"]
     tmdb_id: int = 0
     media_type: Literal["movie", "show", ""] = ""
@@ -187,14 +187,14 @@ class ActIn(StrictRequestModel):
     undone: Literal["never", "later", "skip"] | None = None
 
 
-class ActOut(PassthroughModel):
+class PickActionOut(PassthroughModel):
     ok: bool
     code: str | None = None
     message: str | None = None
 
 
-@router.post("/act", response_model=ActOut)
-async def act(body: ActIn, request: Request) -> dict:
+@router.post("/act", response_model=PickActionOut)
+async def act(body: PickActionIn, request: Request) -> dict:
     limiter = _limiter(request)
 
     def do() -> dict:
@@ -307,24 +307,24 @@ async def act(body: ActIn, request: Request) -> dict:
     return await run_in_threadpool(do)
 
 
-class SeenItemIn(StrictRequestModel):
+class PickSeenItemIn(StrictRequestModel):
     tmdb_id: int
     media_type: Literal["movie", "show"]
     surface: Literal["deck", "grid"]
     position: int | None = Field(default=None, ge=0)
 
 
-class SeenIn(StrictRequestModel):
-    items: list[SeenItemIn] = Field(max_length=picks.SEEN_BATCH_MAX)
+class PickSeenIn(StrictRequestModel):
+    items: list[PickSeenItemIn] = Field(max_length=picks.SEEN_BATCH_MAX)
 
 
-class SeenOut(PassthroughModel):
+class PickSeenOut(PassthroughModel):
     ok: bool
     logged: int
 
 
-@router.post("/seen", response_model=SeenOut)
-async def seen(body: SeenIn, request: Request) -> dict:
+@router.post("/seen", response_model=PickSeenOut)
+async def seen(body: PickSeenIn, request: Request) -> dict:
     limiter = _limiter(request)
 
     def do() -> dict:

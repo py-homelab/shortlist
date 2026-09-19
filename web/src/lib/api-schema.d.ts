@@ -2875,47 +2875,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** ActIn */
-        ActIn: {
-            /**
-             * Action
-             * @enum {string}
-             */
-            action: "request" | "never" | "later" | "skip" | "undo";
-            /**
-             * Last
-             * @default false
-             */
-            last: boolean;
-            /**
-             * Media Type
-             * @default
-             * @enum {string}
-             */
-            media_type: "movie" | "show" | "";
-            /** Position */
-            position?: number | null;
-            /** Surface */
-            surface?: ("deck" | "grid") | null;
-            /**
-             * Tmdb Id
-             * @default 0
-             */
-            tmdb_id: number;
-            /** Undone */
-            undone?: ("never" | "later" | "skip") | null;
-        };
-        /** ActOut */
-        ActOut: {
-            /** Code */
-            code?: string | null;
-            /** Message */
-            message?: string | null;
-            /** Ok */
-            ok: boolean;
-        } & {
-            [key: string]: unknown;
-        };
         /** ApiTokenCreatedOut */
         ApiTokenCreatedOut: {
             /** Created At */
@@ -3667,6 +3626,13 @@ export interface components {
             /** Id */
             id: string;
         };
+        /** DismissedOut */
+        DismissedOut: {
+            /** Ok */
+            ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * EffectivenessReportOut
          * @description The dashboard tracking report for one window.
@@ -4179,6 +4145,50 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** MyDismissedOut */
+        MyDismissedOut: {
+            /** Later */
+            later: {
+                [key: string]: unknown;
+            }[];
+            /** Never */
+            never: {
+                [key: string]: unknown;
+            }[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** MySuggestionsOut */
+        MySuggestionsOut: {
+            /** Built At */
+            built_at?: string | null;
+            /** Family */
+            family: string;
+            /** Genres */
+            genres: {
+                [key: string]: unknown;
+            }[];
+            /** Has Family */
+            has_family: boolean;
+            /** Hidden Available */
+            hidden_available: number;
+            /** Items */
+            items: {
+                [key: string]: unknown;
+            }[];
+            /** Queued */
+            queued: {
+                [key: string]: unknown;
+            }[];
+            /** Seerr */
+            seerr: {
+                [key: string]: unknown;
+            };
+            /** State */
+            state: string;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * NotificationOut
          * @description One alert as the React bell renders it — plain text throughout, no HTML.
@@ -4339,6 +4349,47 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** PickActionIn */
+        PickActionIn: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "request" | "never" | "later" | "skip" | "undo";
+            /**
+             * Last
+             * @default false
+             */
+            last: boolean;
+            /**
+             * Media Type
+             * @default
+             * @enum {string}
+             */
+            media_type: "movie" | "show" | "";
+            /** Position */
+            position?: number | null;
+            /** Surface */
+            surface?: ("deck" | "grid") | null;
+            /**
+             * Tmdb Id
+             * @default 0
+             */
+            tmdb_id: number;
+            /** Undone */
+            undone?: ("never" | "later" | "skip") | null;
+        };
+        /** PickActionOut */
+        PickActionOut: {
+            /** Code */
+            code?: string | null;
+            /** Message */
+            message?: string | null;
+            /** Ok */
+            ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * PickOut
          * @description One delivered recommendation, as the run detail lists it.
@@ -4365,6 +4416,37 @@ export interface components {
             title: string;
             /** Year */
             year?: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** PickSeenIn */
+        PickSeenIn: {
+            /** Items */
+            items: components["schemas"]["PickSeenItemIn"][];
+        };
+        /** PickSeenItemIn */
+        PickSeenItemIn: {
+            /**
+             * Media Type
+             * @enum {string}
+             */
+            media_type: "movie" | "show";
+            /** Position */
+            position?: number | null;
+            /**
+             * Surface
+             * @enum {string}
+             */
+            surface: "deck" | "grid";
+            /** Tmdb Id */
+            tmdb_id: number;
+        };
+        /** PickSeenOut */
+        PickSeenOut: {
+            /** Logged */
+            logged: number;
+            /** Ok */
+            ok: boolean;
         } & {
             [key: string]: unknown;
         };
@@ -5402,37 +5484,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** SeenIn */
-        SeenIn: {
-            /** Items */
-            items: components["schemas"]["SeenItemIn"][];
-        };
-        /** SeenItemIn */
-        SeenItemIn: {
-            /**
-             * Media Type
-             * @enum {string}
-             */
-            media_type: "movie" | "show";
-            /** Position */
-            position?: number | null;
-            /**
-             * Surface
-             * @enum {string}
-             */
-            surface: "deck" | "grid";
-            /** Tmdb Id */
-            tmdb_id: number;
-        };
-        /** SeenOut */
-        SeenOut: {
-            /** Logged */
-            logged: number;
-            /** Ok */
-            ok: boolean;
-        } & {
-            [key: string]: unknown;
-        };
         /** SeenRelease */
         SeenRelease: {
             /** Version */
@@ -5595,37 +5646,6 @@ export interface components {
             count: number;
             /** Label */
             label: string;
-        } & {
-            [key: string]: unknown;
-        };
-        /** SuggestionsOut */
-        SuggestionsOut: {
-            /** Built At */
-            built_at?: string | null;
-            /** Family */
-            family: string;
-            /** Genres */
-            genres: {
-                [key: string]: unknown;
-            }[];
-            /** Has Family */
-            has_family: boolean;
-            /** Hidden Available */
-            hidden_available: number;
-            /** Items */
-            items: {
-                [key: string]: unknown;
-            }[];
-            /** Queued */
-            queued: {
-                [key: string]: unknown;
-            }[];
-            /** Seerr */
-            seerr: {
-                [key: string]: unknown;
-            };
-            /** State */
-            state: string;
         } & {
             [key: string]: unknown;
         };
@@ -6401,26 +6421,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** DismissedOut */
-        shortlist__server__api__me__DismissedOut: {
-            /** Later */
-            later: {
-                [key: string]: unknown;
-            }[];
-            /** Never */
-            never: {
-                [key: string]: unknown;
-            }[];
-        } & {
-            [key: string]: unknown;
-        };
-        /** DismissedOut */
-        shortlist__server__api__notifications__DismissedOut: {
-            /** Ok */
-            ok: boolean;
-        } & {
-            [key: string]: unknown;
-        };
     };
     responses: never;
     parameters: never;
@@ -6984,7 +6984,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ActIn"];
+                "application/json": components["schemas"]["PickActionIn"];
             };
         };
         responses: {
@@ -6994,7 +6994,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ActOut"];
+                    "application/json": components["schemas"]["PickActionOut"];
                 };
             };
             /** @description Validation Error */
@@ -7023,7 +7023,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["shortlist__server__api__me__DismissedOut"];
+                    "application/json": components["schemas"]["MyDismissedOut"];
                 };
             };
         };
@@ -7037,7 +7037,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["SeenIn"];
+                "application/json": components["schemas"]["PickSeenIn"];
             };
         };
         responses: {
@@ -7047,7 +7047,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SeenOut"];
+                    "application/json": components["schemas"]["PickSeenOut"];
                 };
             };
             /** @description Validation Error */
@@ -7078,7 +7078,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SuggestionsOut"];
+                    "application/json": components["schemas"]["MySuggestionsOut"];
                 };
             };
             /** @description Validation Error */
@@ -7131,7 +7131,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["shortlist__server__api__notifications__DismissedOut"];
+                    "application/json": components["schemas"]["DismissedOut"];
                 };
             };
             /** @description Validation Error */
@@ -7184,7 +7184,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["shortlist__server__api__notifications__DismissedOut"];
+                    "application/json": components["schemas"]["DismissedOut"];
                 };
             };
             /** @description Validation Error */

@@ -1,0 +1,13 @@
+{
+  "name": "Shortlist picks",
+  "short_name": "Picks",
+  "description": "Your own picks: titles your Plex watch history points at that the library does not have yet.",
+  "start_url": "me",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1115",
+  "theme_color": "#0f1115",
+  "icons": [
+    { "src": "favicon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

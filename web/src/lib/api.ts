@@ -30,6 +30,13 @@ import type {
   ImageProviderStatus,
   PosterInput,
   PinStatus,
+  ActBody,
+  ActResult,
+  FamilyLane,
+  Me,
+  MyDismissed,
+  MySuggestions,
+  SeenBody,
   PlexServer,
   ProbeRequest,
   ProbeResult,
@@ -206,6 +213,16 @@ export const api = {
   getSession: (): Promise<Session> => request("/api/auth/session"),
 
   logout: (): Promise<void> => request("/api/auth/logout", { method: "POST" }),
+
+  // --- A person's own picks ---
+  getMe: (): Promise<Me> => request("/api/me"),
+  getMySuggestions: (family: FamilyLane): Promise<MySuggestions> =>
+    request(`/api/me/suggestions?family=${family}`),
+  getMyDismissed: (): Promise<MyDismissed> => request("/api/me/dismissed"),
+  act: (body: ActBody): Promise<ActResult> =>
+    request("/api/me/act", { method: "POST", body: JSON.stringify(body) }),
+  seen: (body: SeenBody): Promise<{ ok: boolean; logged: number }> =>
+    request("/api/me/seen", { method: "POST", body: JSON.stringify(body) }),
 
   // --- Setup wizard ---
   /** Servers this account can see, each advertised address already probed for reachability. */
