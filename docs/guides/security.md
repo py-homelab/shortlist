@@ -29,7 +29,10 @@ only at these addresses** (`auth.admin_hosts`). Under any other name — the pub
 owner gets only their own picks, and every admin page and API refuses (the API token too). Route the
 admin address through your proxy's internal-only rule and the public one through its login, and
 the admin app is never reachable from the internet at all. Set it only once the listed address
-reaches Shortlist, or you lock yourself out of the page that changes it.
+reaches Shortlist, or you lock yourself out of the page that changes it. Proxy sign-in (below) is
+never believed under an admin address: that route usually has no login in front of it, so an
+identity header or token arriving there is whatever the client sent. The owner signs in there with
+Plex.
 
 **Signing people in through your own proxy.** If a reverse proxy in front of Shortlist already
 authenticates visitors (authentik, Authelia, oauth2-proxy), it can name them to Shortlist instead

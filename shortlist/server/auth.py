@@ -241,6 +241,12 @@ def _proxy_identity(request: Request) -> dict | None:
     request, since the only way it happens is a proxy misconfiguration or someone probing.
     """
     state = request.app.state
+    if _on_a_listed_admin_host(request):
+        # The admin names (`auth.admin_hosts`) are where the owner signs in with Plex; proxy identity is
+        # for the public name, behind the proxy's forward-auth. An admin route usually has no such
+        # auth in front of it, so a header or token arriving there is whatever the client sent — an
+        # unsigned JWT naming the owner would otherwise be a full admin session. Never believed here.
+        return None
     # A state without the hook (a bare test app, an embedding that never wired it) has the feature off.
     proxy_auth = getattr(state, "proxy_auth", None)
     cfg = proxy_auth() if proxy_auth is not None else {}
@@ -387,6 +393,14 @@ def _rate_limit_token_failures() -> None:
         _TOKEN_FAILS.popleft()
     if len(_TOKEN_FAILS) >= _TOKEN_MAX_FAILS:
         raise HTTPException(status_code=429, detail="Too many failed API-token attempts — wait a minute.")
+
+
+def _on_a_listed_admin_host(request: Request) -> bool:
+    """This request came in by one of the configured admin names (never true while none is set)."""
+    hosts_for = getattr(request.app.state, "admin_hosts", None)
+    hosts = hosts_for() if hosts_for is not None else set()
+    host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+    return bool(hosts) and host in hosts
 
 
 def admin_here(request: Request) -> bool:

@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.5] - 2026-09-19 (py-homelab fork)
+
+### Security
+
+- **Proxy sign-in is never believed under an admin address** (`auth.admin_hosts`). The admin route
+  typically has no forward-auth in front of it, so an identity header or JWT arriving there came from
+  the client — with JWT sign-in unverified (no JWKS URL), an unsigned token naming the owner was a
+  full admin session on the admin address. The owner signs in there with Plex; proxy identity now
+  applies only under the public name(s).
+
 ## [1.9.1-py.4] - 2026-09-19 (py-homelab fork)
 
 ### Fixed

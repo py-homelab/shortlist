@@ -388,6 +388,31 @@ class TestProxyJwtSignIn:
             assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is False
 
 
+class TestProxyIdentityNeverOnAnAdminHost:
+    """An admin route has no forward-auth in front of it: an identity header there is the client's own."""
+
+    CLAIM = "ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id"
+
+    def test_a_forged_owner_jwt_on_the_admin_name_is_nobody(self, client: TestClient):
+        values = {
+            "auth.proxy.jwt_header": "X-authentik-jwt",
+            "auth.proxy.jwt_claim": self.CLAIM,
+            "auth.admin_hosts": ["shortlist.home.example"],
+        }
+        assert (
+            client.put("/api/settings", json={"values": values}, headers={"host": "shortlist.home.example"}).status_code
+            == 200
+        )
+        client.cookies.delete(SESSION_COOKIE)
+        forged = {"X-authentik-jwt": TestProxyJwtSignIn._jwt(str(OWNER_ID))}
+        admin = {"host": "shortlist.home.example", **forged}
+        assert client.get("/api/auth/session", headers=admin).json()["authenticated"] is False
+        assert client.get("/api/settings", headers=admin).status_code in (401, 403)
+        # The same token on the public name is the proxy's to vouch for: the owner, but never admin there.
+        public = client.get("/api/auth/session", headers={"host": "picks.example", **forged}).json()
+        assert public["authenticated"] is True and public["admin"] is False
+
+
 class TestAdminHosts:
     """With `auth.admin_hosts` set, the admin app answers only under those names; on any other (the
     public address people reach their picks on) the owner is a person like anyone else."""
