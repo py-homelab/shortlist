@@ -6,6 +6,8 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.1] - 2026-09-19 (py-homelab fork)
+
 ### Added
 
 - **Bring your own recommendation engine.** The step that decides which titles a person's rows draw
@@ -29,6 +31,17 @@ All notable changes to this project are documented here. This project follows
   to learn from. Installable as a home-screen app. The owner has **My picks**. Sessions carry a
   `role` (`owner` | `person`), re-resolved against the roster on every request; a person reaches
   `/api/me/*` and nothing else. Migration 0094.
+- **Family households, per person.** Whether someone shares their account with children is decided
+  from their own recent viewing (the engine reports the counts; thresholds `family.*` in Settings →
+  Finding titles; override per person on their page). Rows gain `family: auto` — children's titles
+  left out for family households only — and a family-only row is built only for them. `/me` follows
+  the same household: a family gets the Family lane toggle, everyone else sees children's titles with
+  everything else. `users.household` records the last decision (migration 0096).
+- **The admin app only at chosen addresses** (`auth.admin_hosts`): under any other hostname even the
+  owner gets only their own picks, so the public address can serve `/me` while the admin app is only
+  reachable on the internal one.
+- **JWT sign-in from a proxy** (`auth.proxy.jwt_header`, `auth.proxy.jwt_claim`, optional
+  `auth.proxy.jwks_url` for RS256/ES256 signature checks): e.g. authentik's `X-authentik-jwt`.
 - **Trusted-proxy sign-in** (`auth.proxy.header` + `auth.proxy.secret`): a reverse proxy that
   already authenticated the visitor names their Plex account id in a header and proves itself with
   a shared secret; without the secret the header is ignored.

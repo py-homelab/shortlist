@@ -28,7 +28,7 @@ from shortlist.server.db.models import Delivery, Dismissal, PickEvent, RequestLo
 
 ACTIONS = ("request", "never", "later", "skip", "undo")
 SURFACES = ("deck", "grid")
-FAMILY_MODES = ("exclude", "only", "include")
+FAMILY_MODES = ("auto", "exclude", "only", "include")
 SNOOZE_DAYS = 30
 SEEN_BATCH_MAX = 200
 #: Per person, per minute. Generous for a human, tight for a script.
@@ -243,6 +243,21 @@ def build_view(session: Session, user: User, seerr: SeerrView) -> dict:
             "configured": seerr.error != "no_seerr",
         },
     }
+
+
+def household_label(user: User) -> str | None:
+    """The label the last run settled on for this person (adult | family | kids), or None."""
+    hh = user.household if isinstance(user.household, dict) else None
+    label = hh.get("label") if hh else None
+    return label if label in ("adult", "family", "kids") else None
+
+
+def family_lane(user: User, family: str) -> str:
+    """What `family=auto` means for this person: a FAMILY household keeps children's titles in their
+    own lane (exclude here, `only` behind the toggle); anyone else sees them with everything else."""
+    if family != "auto":
+        return family
+    return "exclude" if household_label(user) == "family" else "include"
 
 
 def family_filter(items: list[dict], family: str) -> list[dict]:

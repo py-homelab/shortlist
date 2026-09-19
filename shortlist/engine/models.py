@@ -340,6 +340,9 @@ class UserProfile:
     row_name_template: str | None = None
     # Per-row overrides keyed by collection slug; a slug absent here uses the row's own settings.
     row_overrides: dict[str, RowOverride] = field(default_factory=dict)
+    # The owner's word on who watches under this account (`HOUSEHOLD_OVERRIDES`); "auto" = decide from
+    # their viewing, which is what everyone starts on.
+    household_override: str = "auto"
 
     def __post_init__(self) -> None:
         if not self.slug:
@@ -395,8 +398,15 @@ class RowSeason:
     anchor: date
 
 
-#: `RowSpec.family` values. "include" is the default and the pre-1.10 behaviour.
-FAMILY_MODES = ("include", "exclude", "only")
+#: `RowSpec.family` values. "include" is the default and the pre-1.10 behaviour. "auto" decides per
+#: person: children's titles are left out for a FAMILY household and kept for everyone else.
+FAMILY_MODES = ("include", "exclude", "only", "auto")
+
+#: Who watches under an account (`household.resolve_household`): "adult", "family" (a household sharing
+#: the account with children) or "kids" (a child's own account). `UserProfile.household_override`
+#: also accepts "auto" — decide from their viewing.
+HOUSEHOLDS = ("adult", "family", "kids")
+HOUSEHOLD_OVERRIDES = ("auto", *HOUSEHOLDS)
 
 
 @dataclass
@@ -448,9 +458,10 @@ class RowSpec:
     # Meaningless for movies (a movie with any view is already finished), so it applies to shows only.
     unstarted_only: bool = False
     # Children's / family titles (`Candidate.kids`): "include" keeps them with everything else — how
-    # every row has always behaved; "exclude" keeps them out; "only" builds the row from nothing else.
-    # For a household watching under one account: the grown-ups' rows exclude, and one row is the
-    # family's. Decided from what the engine tagged, never from the person's Plex restrictions.
+    # every row has always behaved; "exclude" keeps them out; "only" builds the row from nothing else;
+    # "auto" excludes them for a FAMILY household and includes them for anyone else. A row set to
+    # "only" is built only for family households once a household is known (see `household.py`).
+    # Decided from what the engine tagged, never from the person's Plex restrictions.
     family: str = "include"
     # How often this row re-picks its titles, in DAYS: 0 = never once built (frozen), 1 = nightly,
     # N = every N days. None -> inherit EngineConfig.refresh_days.
@@ -704,6 +715,14 @@ class EngineConfig:
     # public "Popular on this server" rows — so disabling someone removes them from Shortlist entirely.
     hide_shared_from_disabled: bool = True
     min_history: int = 10  # below this -> cold-start row
+    # Family households (`household.resolve_household`): a person whose recent viewing is at least
+    # `family_min_share` children's titles, from at least `family_min_kids_titles` of them, shares the
+    # account with children; above `kids_account_min_share` it is a child's own account; with fewer than
+    # `household_min_titles` titles to go on, nobody is labelled anything but adult.
+    family_min_share: float = 0.15
+    family_min_kids_titles: int = 4
+    kids_account_min_share: float = 0.80
+    household_min_titles: int = 10
     # What a cold-start user gets, server-wide: "popular" (a row of the server's top-rated titles) or
     # "skip" (no row built at all, and any row they already have is REMOVED — skipping has to mean
     # gone, or last month's row sits on their Home going stale for ever). Row-overridable via
@@ -937,6 +956,9 @@ class UserRunReport:
     # as plain dicts (`rows._missing_titles`). The per-person request surface; the adapter persists it
     # as their suggestions. Empty on the cold path and for engines that do not serve the surface.
     missing: list[dict] = field(default_factory=list)
+    # Who watches under this account tonight (`household.Household.as_dict()`): the label, what decided
+    # it (override | engine | none) and the counts behind it. None until a pool reports one.
+    household: dict | None = None
     # Each delivered collection, as (section key, marked TITLE), mapped to the slug of the row that
     # produced it, so the promote phase applies the right row's placement/pin. Keyed by library as well
     # as title: a {top_seed} title differs library to library, and two of one person's rows may share a

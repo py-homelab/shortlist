@@ -120,21 +120,32 @@ finished titles first, with the server's top-rated titles filling any room left.
 
 ## Children's and family titles
 
-A household that watches under one Plex account — the living-room TV signed in as the owner, with
-the kids' cartoons and the grown-ups' dramas in the same history — gets rows that are half Bluey.
-**Children's & family titles** in the row editor is the way out, without splitting the account:
+Some people share their Plex account with their children — the living-room TV signed in as a
+parent, cartoons and dramas in one history — and their rows come out half cartoons. Most people
+don't, and one account may be a child's own. So Shortlist sorts **each person** by their own recent
+viewing:
 
-| Choice                             | What it does                                                                                         |
-| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| **Mixed in with everything else**  | The default, and how every row has always behaved.                                                   |
-| **Left out of this row**           | Nothing tagged as children's or family viewing reaches the row — for the grown-ups' rows.            |
-| **This row is the family row**     | Only children's and family titles, still ranked for this person — one shelf for the kids.            |
+| Household | Decided when (defaults) | What they get |
+| --- | --- | --- |
+| **Family** | 15% or more of what they watched is children's titles, from at least 4 of them | Their own rows leave children's titles out; a **family row** carries them, ranked for them |
+| **A child's own account** | over 80% children's titles | Children's titles stay in their rows — they are the point |
+| **Grown-up viewing** | everyone else, and anyone with fewer than 10 titles to go on | Nothing is split; the odd animated film ranks with everything else |
 
-What counts as a children's title is the engine's call. Shortlist's own goes by TMDB's genres
-(Animation together with Family, or the TV "Kids" genre); an [engine of your own](engines.md) can
-tag by certification or anything else it knows. Changing the choice rebuilds the row on the next
-run. A person with too little history gets the server's top-rated titles on every row, untagged —
-set the family row's cold start to **Don't build their row** if that matters.
+The row editor's **Children's & family titles** setting decides what each row does with it:
+
+| Choice | What it does |
+| --- | --- |
+| **Decided per person** | Left out for a family household, kept for everyone else. Use this on the usual rows. |
+| **Mixed in with everything else** | Always kept — how every row behaved before this existed. |
+| **Left out of this row** | Always left out, whoever it is. |
+| **This row is the family row** | Only children's and family titles. Built only for family households; anyone else's copy is removed. |
+
+The thresholds are in **Settings → Finding titles → Family households**, and each person's page
+says what the last run decided and lets you override it (**Who watches under this account**). The
+counts come from the engine: an [engine of your own](engines.md) that reports each person's viewing
+(`household` in its answer). With Shortlist's own engine nobody is sorted, "Decided per person"
+keeps children's titles, and a family row is a plain children's-titles row for everyone it is set
+up for. What counts as a children's title is the engine's call.
 
 ## Seasonal rows
 

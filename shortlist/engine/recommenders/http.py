@@ -124,7 +124,10 @@ class HttpRecommender:
             len(in_library),
             len(ranked),
         )
-        return RecommendResult(ranked=ranked, in_library=in_library, gathered=[], ordered=True, stats=stats)
+        household = body.get("household") if isinstance(body.get("household"), dict) else None
+        return RecommendResult(
+            ranked=ranked, in_library=in_library, gathered=[], ordered=True, stats=stats, household=household
+        )
 
 
 def _candidate(item: object, source: str) -> Candidate | None:

@@ -33,6 +33,7 @@ from shortlist.engine.curator import make_curator
 from shortlist.engine.delivery import render_row_name
 from shortlist.engine.history import ShareTokenWatchSource, distinct_recent, ratings_are_trustworthy
 from shortlist.engine.models import (
+    HOUSEHOLD_OVERRIDES,
     EngineConfig,
     HubAnchor,
     MediaType,
@@ -907,6 +908,9 @@ class ContextBuilder:
                     blocked_seeds=blocked_ids(prefs),
                     row_name_template=prefs.get("row_name_tpl"),
                     row_overrides=overrides.get(user.id, {}),
+                    household_override=(
+                        prefs.get("household") if prefs.get("household") in HOUSEHOLD_OVERRIDES else "auto"
+                    ),
                 )
             )
         return profiles
@@ -1001,6 +1005,10 @@ class ContextBuilder:
             max_seeds=int(store.get("recommendations.max_seeds") or 30),
             rating_source=store.get("recommendations.rating_source") or "tmdb",
             min_history=int(store.get("recommendations.min_history") or 10),
+            family_min_share=float(store.get("family.min_share")),
+            family_min_kids_titles=int(store.get("family.min_kids_titles")),
+            kids_account_min_share=float(store.get("family.kids_account_share")),
+            household_min_titles=int(store.get("family.min_titles")),
             cold_start=store.get("recommendations.cold_start") or "popular",
             # The switch collapses into the threshold rather than travelling beside it: the
             # engine's one question is "at or below what?", and None answers "never". Two fields

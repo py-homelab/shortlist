@@ -2548,6 +2548,17 @@
             "title": "Counts",
             "type": "object"
           },
+          "household": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Household"
+          },
           "name": {
             "title": "Name",
             "type": "string"
@@ -2646,6 +2657,17 @@
           "hidden_available": {
             "title": "Hidden Available",
             "type": "integer"
+          },
+          "household": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Household"
           },
           "items": {
             "items": {
@@ -5513,6 +5535,11 @@
             ],
             "title": "Account Id"
           },
+          "admin": {
+            "default": false,
+            "title": "Admin",
+            "type": "boolean"
+          },
           "authenticated": {
             "title": "Authenticated",
             "type": "boolean"
@@ -6402,6 +6429,18 @@
             ],
             "title": "Hit Rate"
           },
+          "household": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Household"
+          },
           "id": {
             "title": "Id",
             "type": "integer"
@@ -6747,6 +6786,23 @@
               }
             ],
             "title": "Excluded Genres"
+          },
+          "household": {
+            "anyOf": [
+              {
+                "enum": [
+                  "auto",
+                  "adult",
+                  "family",
+                  "kids"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Household"
           },
           "paused": {
             "anyOf": [
@@ -8455,7 +8511,7 @@
             "name": "family",
             "required": false,
             "schema": {
-              "default": "exclude",
+              "default": "auto",
               "title": "Family",
               "type": "string"
             }

@@ -138,6 +138,9 @@ class User(Base):
     # pre-Shortlist filters, which uninstall restores from (plex-safety rule 2).
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     cold_start: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Who watches under this account as of the last run (`engine.household.Household.as_dict()`): the
+    # label, what decided it and the counts behind it. NULL until a run could say.
+    household: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     label: Mapped[str] = mapped_column(String(255), default="")  # as stored by Plex (title-cased)
     prefs: Mapped[dict] = mapped_column(JSON, default=dict)
 

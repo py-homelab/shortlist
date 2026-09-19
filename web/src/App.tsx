@@ -70,7 +70,9 @@ function RequireApp() {
   const session = useSession();
   const authenticated = session.data?.authenticated ?? false;
   const loginRequired = session.data?.login_required ?? true;
-  const person = session.data?.role === "person";
+  // A person — or the owner on the public address, where the admin app does not answer
+  // (`auth.admin_hosts`). Either way their whole app is /me.
+  const person = session.data?.role === "person" || (session.data?.authenticated === true && session.data?.admin === false);
   // Setup state is owner-only once the instance is claimed: asking for it before we know who this
   // is just 401s, and the visitor would sit behind a skeleton instead of the login screen. A
   // PERSON never gets it either (403) — their whole app is /me, so they go there before it is asked.

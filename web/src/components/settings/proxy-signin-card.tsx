@@ -19,7 +19,23 @@ import type { Settings } from "@/lib/types";
  */
 export function ProxySignInCard({ settings }: { settings: Settings }) {
   const [header, setHeader] = useState(() => settingString(settings, "auth.proxy.header"));
-  const save = useAutosavedSettings({ header }, () => ({ "auth.proxy.header": header.trim() }));
+  const [jwtHeader, setJwtHeader] = useState(() => settingString(settings, "auth.proxy.jwt_header"));
+  const [jwtClaim, setJwtClaim] = useState(() => settingString(settings, "auth.proxy.jwt_claim"));
+  const [jwksUrl, setJwksUrl] = useState(() => settingString(settings, "auth.proxy.jwks_url"));
+  const [adminHosts, setAdminHosts] = useState(() => {
+    const value = settings["auth.admin_hosts"];
+    return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string").join(", ") : "";
+  });
+  const save = useAutosavedSettings({ header, jwtHeader, jwtClaim, jwksUrl, adminHosts }, () => ({
+    "auth.proxy.header": header.trim(),
+    "auth.proxy.jwt_header": jwtHeader.trim(),
+    "auth.proxy.jwt_claim": jwtClaim.trim(),
+    "auth.proxy.jwks_url": jwksUrl.trim(),
+    "auth.admin_hosts": adminHosts
+      .split(",")
+      .map((h) => h.trim())
+      .filter(Boolean),
+  }));
   const secretSave = useSaveSettings();
   const stored = settingString(settings, "auth.proxy.secret");
   const [secret, setSecret] = useState(stored ? REDACTED : "");
@@ -39,7 +55,53 @@ export function ProxySignInCard({ settings }: { settings: Settings }) {
           </p>
         </div>
         <div className="space-y-2">
-          <Label htmlFor="proxy-header">Header carrying the Plex account id</Label>
+          <Label htmlFor="proxy-jwt-header">JWT header (e.g. X-authentik-jwt)</Label>
+          <Input
+            id="proxy-jwt-header"
+            placeholder="X-authentik-jwt"
+            className="max-w-xs"
+            value={jwtHeader}
+            onChange={(e) => setJwtHeader(e.target.value)}
+          />
+          <Label htmlFor="proxy-jwt-claim">Claim holding the Plex account id</Label>
+          <Input
+            id="proxy-jwt-claim"
+            placeholder="ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id"
+            className="max-w-xl"
+            value={jwtClaim}
+            onChange={(e) => setJwtClaim(e.target.value)}
+          />
+          <Label htmlFor="proxy-jwks">Signing keys URL (optional)</Label>
+          <Input
+            id="proxy-jwks"
+            placeholder="https://auth.example.com/application/o/<app>/jwks/"
+            className="max-w-xl"
+            value={jwksUrl}
+            onChange={(e) => setJwksUrl(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            With a keys URL the token&rsquo;s signature is checked. Without one it is trusted only
+            because nothing but the proxy can reach Shortlist &mdash; publish no port.
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="admin-hosts">Admin app only at these addresses</Label>
+          <Input
+            id="admin-hosts"
+            placeholder="shortlist.home.example.com"
+            className="max-w-xl"
+            value={adminHosts}
+            onChange={(e) => setAdminHosts(e.target.value)}
+          />
+          <p className="text-xs text-muted-foreground">
+            Comma-separated hostnames. Under any other address &mdash; the public one people use for
+            their picks &mdash; even you get only your own picks. Blank = the admin app answers
+            everywhere. Set it only once the listed address reaches Shortlist, or you lock yourself out
+            of this page.
+          </p>
+        </div>
+        <div className="space-y-2">
+          <Label htmlFor="proxy-header">Or: a plain header carrying the Plex account id</Label>
           <Input
             id="proxy-header"
             placeholder="X-Plex-Account-Id"

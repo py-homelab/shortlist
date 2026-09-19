@@ -111,6 +111,11 @@ The answer, best first:
   beside the pick.
 - `kids` is what a row's **Children's & family titles** setting reads.
 - `trace` is free-form and shown on the person's run page next to Shortlist's own trace.
+- `household` (optional, top level): `{"label", "kids_titles", "window_titles", "window_days"}` —
+  how many of the titles this person watched over the engine's recent window were children's titles.
+  Shortlist turns the counts into adult / family / kids with its own thresholds (see
+  [Children's and family titles](rows.md#childrens-and-family-titles)); `label` is the engine's own
+  suggestion, shown beside Shortlist's.
 
 Only `tmdb_id` and `media_type` (`movie` | `show`) are required per item; a malformed item is
 skipped, not fatal. Send a token as `Authorization: Bearer …` if you set one. Shortlist retries a

@@ -91,6 +91,19 @@ DEFAULTS: dict[str, Any] = {
     # FORWARDED_ALLOW_IPS is `*`. Both empty (the default) = off; Plex sign-in always works too.
     "auth.proxy.header": "",
     "auth.proxy.secret": "",
+    # Or: the proxy attaches a JWT (authentik's `X-authentik-jwt`) and the account id is one of its
+    # claims, by dotted path (`ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id`). With
+    # `auth.proxy.jwks_url` set the signature is verified against the proxy's keys; without it the token
+    # is trusted only because nothing but the proxy can reach the container — publish no port.
+    # Hostnames the admin app answers on (e.g. ["shortlist.home.example.com"]). Empty = everywhere, which
+    # is how Shortlist always behaved. With a list set, a request arriving under any other name — the
+    # public one people reach their picks on — is treated as a person's even for the owner: `/me` works,
+    # every admin page and API refuses. The reverse proxy decides which names reach Shortlist from
+    # where; this decides what each name may do.
+    "auth.admin_hosts": [],
+    "auth.proxy.jwt_header": "",
+    "auth.proxy.jwt_claim": "",
+    "auth.proxy.jwks_url": "",
     # Which engine ranks each person's candidates (engine/recommender.py):
     #   'builtin' — Shortlist's own: the sources above, TMDB similarity, the ranking dials.
     #   'http'    — an engine running elsewhere, speaking the /v1 engine protocol at `engine.url`.
@@ -183,6 +196,16 @@ DEFAULTS: dict[str, Any] = {
     # falling back to the server's top-rated titles. Was welded to the engine default (10) and
     # unreachable; owners of small or new servers legitimately want it lower.
     "recommendations.min_history": 10,
+    # Family households (engine/household.py): who shares an account with children, decided per person
+    # from the engine's counts of their recent viewing. A person is a FAMILY household at this share of
+    # children's titles or more, from at least `family.min_kids_titles` of them; above
+    # `family.kids_account_share` it is a child's own account; under `family.min_titles` titles to go on,
+    # nobody is labelled anything but adult. A row set to "auto" drops children's titles for family
+    # households only; a family-only row is built only for them. Per person, the owner can override.
+    "family.min_share": 0.15,
+    "family.min_kids_titles": 4,
+    "family.kids_account_share": 0.80,
+    "family.min_titles": 10,
     # What someone below that threshold gets: "popular" (a row of the server's highest-rated titles)
     # or "skip" (no row at all, and any row they already have is removed). Row-overridable — a
     # `{top_seed}` row is the one most worth skipping, since it has no seed to name itself after.

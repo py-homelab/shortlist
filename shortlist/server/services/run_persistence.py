@@ -1299,6 +1299,8 @@ def _replace_suggestions(session: Session, run_id: int, user: User, missing: lis
 def _persist_user_report(session: Session, run_id: int, user: User, user_report, dry_run: bool) -> None:
     """One user's RunUser row, their picks (non-dry-run only), and their run.user audit event."""
     user.cold_start = user_report.status == "cold_start"
+    if user_report.household is not None:
+        user.household = user_report.household
     session.add(
         RunUser(
             run_id=run_id,

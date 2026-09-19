@@ -3,6 +3,7 @@ fallback between them, and what the row build does with an engine's final order.
 
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest.mock import MagicMock
 
 import httpx
@@ -25,10 +26,18 @@ from tests.conftest import MemorySnapshotStore, make_candidate, make_profile, ma
 class FakeEngineClient:
     """An `EngineClient` that answers from a canned body and remembers what it was asked."""
 
-    def __init__(self, items: list[dict] | Exception, *, name: str = "fake-engine", trace: dict | None = None):
+    def __init__(
+        self,
+        items: list[dict] | Exception,
+        *,
+        name: str = "fake-engine",
+        trace: dict | None = None,
+        household: dict | None = None,
+    ):
         self.items = items
         self.name = name
         self.trace = trace
+        self.household = household
         self.payloads: list[dict] = []
 
     def recommend(self, payload: dict) -> dict:
@@ -38,6 +47,8 @@ class FakeEngineClient:
         body = {"engine": {"name": self.name, "version": "0.1"}, "ordered": True, "items": self.items}
         if self.trace is not None:
             body["trace"] = self.trace
+        if self.household is not None:
+            body["household"] = self.household
         return body
 
     def info(self) -> dict:
@@ -525,3 +536,96 @@ class TestEngineClient:
 def test_result_defaults():
     r = RecommendResult(ranked=[])
     assert r.in_library == [] and r.gathered == [] and r.ordered is False and r.stats.trace == {}
+
+
+FAMILY = {"label": "family", "kids_titles": 66, "window_titles": 187, "window_days": 365}
+ADULT = {"label": "adult", "kids_titles": 1, "window_titles": 94, "window_days": 365}
+
+
+class TestHouseholds:
+    """The family split follows each person's own viewing: an "auto" row drops children's titles for a
+    family household only, and a family-only row exists only for family households."""
+
+    ROWS: ClassVar[list[RowSpec]] = [
+        RowSpec(slug="picked", name_template="Picked", size=5, family="auto"),
+        RowSpec(slug="fam", name_template="Family", size=5, family="only"),
+    ]
+
+    def _items(self):
+        return [_item(10, "Cartoon", kids=True), _item(20, "Drama"), _item(30, "Anime", kids=True)]
+
+    def _by_row(self, report):
+        out = {}
+        for p in report.picks:
+            out.setdefault(p.collection_slug, []).append(p.tmdb_id)
+        return out
+
+    def test_a_family_household_gets_a_grown_up_row_and_a_family_row(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=FAMILY))
+        report = _run(ctx, mock_plextv, self.ROWS)
+        assert self._by_row(report) == {"picked": [20], "fam": [10, 30]}
+        assert report.household == {
+            "label": "family",
+            "source": "engine",
+            "kids_titles": 66,
+            "window_titles": 187,
+            "window_days": 365,
+            "engine_label": "family",
+        }
+
+    def test_an_adult_keeps_children_s_titles_and_has_no_family_row(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=ADULT))
+        report = _run(ctx, mock_plextv, self.ROWS)
+        assert self._by_row(report) == {"picked": [10, 20, 30]}
+        assert report.rows_considered["fam"] == "not_a_family_household"
+
+    def test_shortlist_s_thresholds_decide_not_the_engine_s_label(self, ctx, mock_plextv):
+        # The engine says adult; at a 1% family threshold Shortlist says family.
+        ctx.config.family_min_share = 0.01
+        ctx.config.family_min_kids_titles = 1
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=ADULT))
+        report = _run(ctx, mock_plextv, self.ROWS)
+        assert report.household["label"] == "family" and report.household["engine_label"] == "adult"
+        assert self._by_row(report) == {"picked": [20], "fam": [10, 30]}
+
+    def test_the_owner_s_override_wins(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=ADULT))
+        ctx.config.rows = self.ROWS
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        profile = make_profile("sarah", account_id=100, household_override="family")
+        report = pipeline_mod.run(ctx, [profile]).users[0]
+        assert report.household["label"] == "family" and report.household["source"] == "override"
+        assert self._by_row(report) == {"picked": [20], "fam": [10, 30]}
+
+    def test_with_nothing_to_go_on_nobody_is_labelled_and_nothing_is_filtered(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items()))  # no household reported
+        report = _run(ctx, mock_plextv, self.ROWS)
+        assert report.household == {
+            "label": None,
+            "source": "none",
+            "kids_titles": None,
+            "window_titles": None,
+            "window_days": None,
+            "engine_label": None,
+        }
+        assert self._by_row(report) == {"picked": [10, 20, 30], "fam": [10, 30]}
+
+
+class TestClassify:
+    def test_the_default_thresholds(self):
+        from shortlist.engine.household import classify
+
+        cfg = EngineConfig()
+        assert classify(5, 5, cfg) == "adult"  # too few to judge
+        assert classify(10, 9, cfg) == "kids"
+        assert classify(187, 66, cfg) == "family"
+        assert classify(26, 4, cfg) == "family"
+        assert classify(27, 4, cfg) == "adult"  # 14.8%
+        assert classify(305, 23, cfg) == "adult"
+        assert classify(20, 3, cfg) == "adult"  # 15% but only 3 titles
+
+    def test_a_malformed_report_is_ignored(self):
+        from shortlist.engine.household import resolve_household
+
+        hh = resolve_household(make_profile("s"), {"label": "family", "kids_titles": "lots"}, EngineConfig())
+        assert hh.label is None and hh.source == "none"

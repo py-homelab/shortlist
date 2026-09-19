@@ -367,7 +367,7 @@ export type ActResult = Schemas["PickActionOut"] & {
   request_id?: number | null;
 };
 export type SeenBody = Schemas["PickSeenIn"];
-export type FamilyLane = "exclude" | "only" | "include";
+export type FamilyLane = "auto" | "exclude" | "only" | "include";
 
 /** One title on a person's picks page, as `/api/me/suggestions` serves it. Hand-typed: the server
  *  passes the item through as a plain dict, so the schema says only `object`. */

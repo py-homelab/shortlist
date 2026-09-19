@@ -201,6 +201,14 @@ def _int_list(value: object) -> str | None:
     return None
 
 
+def _host_list(value: object) -> str | None:
+    """A list of bare hostnames (no scheme, port or path), or empty for "the admin app answers anywhere"."""
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        return "must be a list of hostnames"
+    bad = [v for v in value if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", v.strip())]
+    return f"not bare hostnames: {bad}" if bad else None
+
+
 def _header_name(value: object) -> str | None:
     """An HTTP header name, or blank to switch trusted-proxy identity off."""
     if value in (None, ""):
@@ -297,6 +305,10 @@ VALIDATORS = {
     # Floor of 1, not 0: at 0 nobody is ever cold, which silently disables the whole cold-start path
     # (and with it the "skip" setting below) in a way no owner would connect to this number.
     "recommendations.min_history": _bounded_int(1, 100),
+    "family.min_share": _bounded_float(0.0, 1.0),
+    "family.min_kids_titles": _bounded_int(1, 1000),
+    "family.kids_account_share": _bounded_float(0.0, 1.0),
+    "family.min_titles": _bounded_int(1, 1000),
     "recommendations.cold_start": _one_of("popular", "skip"),
     "recommendations.blocked_shared_seeds": _int_list,
     "recommendations.use_plex_ratings": _is_bool,
@@ -311,6 +323,8 @@ VALIDATORS = {
     "curator.provider": _one_of("anthropic", "openai", "openai_compatible", "google", "ollama", "none", ""),
     "row.name_template": _non_blank_row_template,
     "auth.proxy.header": _header_name,
+    "auth.admin_hosts": _host_list,
+    "auth.proxy.jwt_header": _header_name,
     "engine.backend": _one_of("builtin", "http"),
     "engine.fallback": _one_of("builtin", "none"),
     "engine.timeout_s": _bounded_int(1, 600),
@@ -338,6 +352,7 @@ _FETCHED_URL_KEYS = (
     "curator.openai_base_url",
     "searxng.url",  # fetched by the Test button and by the llm_web source on every run
     "engine.url",  # POSTed every person's seeds and history, every run
+    "auth.proxy.jwks_url",  # fetched to verify a proxy's JWT
     # POSTed to by `notify.send` for every event the owner chose, and by the Send-a-test button. Being an
     # outbound alert rather than an integration does not change what it is: a URL the server fetches
     # because the owner typed it.

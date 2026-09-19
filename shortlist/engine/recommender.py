@@ -94,6 +94,10 @@ class RecommendResult:
     gathered: list[Candidate] = field(default_factory=list)
     ordered: bool = False
     stats: GatherStats = field(default_factory=GatherStats)
+    #: Who watches under this account, as the engine sees it: ``{"label", "kids_titles",
+    #: "window_titles", "window_days"}``, or None when it cannot say (the built-in engine never can).
+    #: Shortlist re-derives the label from the counts with its own thresholds (`household.py`).
+    household: dict | None = None
 
 
 class Recommender(Protocol):
