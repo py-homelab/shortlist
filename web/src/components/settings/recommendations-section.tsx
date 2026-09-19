@@ -6,6 +6,7 @@ import { RECENT_COUNT_LABEL } from "@/components/recent-count-field";
 import { SaveStatus } from "@/components/save-status";
 import { AiWebSearchCard } from "@/components/settings/ai-web-search-card";
 import { EngineCard, usesExternalEngine } from "@/components/settings/engine-card";
+import { FamilyHouseholdsCard } from "@/components/settings/family-households-card";
 import { RefreshDaysField } from "@/components/settings/refresh-days-field";
 import { IdleHoldField } from "@/components/settings/idle-hold-field";
 import { InlineKeyField } from "@/components/settings/inline-key-field";
@@ -201,6 +202,13 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
           Engine
         </h3>
         <EngineCard settings={settings} />
+      </div>
+
+      <div className="space-y-2">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Family households
+        </h3>
+        <FamilyHouseholdsCard settings={settings} />
       </div>
 
       {/* The sources and AI search are the BUILT-IN engine's; an external engine never reads them,

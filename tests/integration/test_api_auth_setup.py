@@ -111,10 +111,10 @@ class TestAuthResponses:
     def test_a_signed_in_session_names_the_account(self, client: TestClient):
         body = client.get("/api/auth/session").json()
 
-        assert set(body) == {"authenticated", "login_required", "account_id", "username", "role"}
+        assert set(body) == {"authenticated", "login_required", "account_id", "username", "role", "admin"}
         assert body["authenticated"] is True
         assert body["account_id"] == OWNER_ID
-        assert body["role"] == "owner"
+        assert body["role"] == "owner" and body["admin"] is True
         assert body["login_required"] is True  # a linked server means this instance demands a login
 
     def test_an_anonymous_session_keeps_the_same_shape(self, client: TestClient):
@@ -124,7 +124,7 @@ class TestAuthResponses:
         with anonymous:
             body = anonymous.get("/api/auth/session").json()
 
-        assert set(body) == {"authenticated", "login_required", "account_id", "username", "role"}
+        assert set(body) == {"authenticated", "login_required", "account_id", "username", "role", "admin"}
         assert body["authenticated"] is False and body["login_required"] is True
         assert body["account_id"] is None and body["username"] is None
 
@@ -346,6 +346,83 @@ class TestTrustedProxyIdentity:
         owner = {"account_id": OWNER_ID, "username": "owner"}
         client.cookies.set(SESSION_COOKIE, session_serializer(client.app.state.session_secret).dumps(owner))
         assert client.put("/api/settings", json={"values": {"auth.proxy.header": "no spaces here"}}).status_code == 422
+
+
+class TestProxyJwtSignIn:
+    """authentik-style: the account id is a claim in `X-authentik-jwt` (unverified here — the
+    deployment guarantees only the proxy can reach the container)."""
+
+    CLAIM = "ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id"
+
+    @staticmethod
+    def _jwt(account: str) -> str:
+        import base64
+        import json as _json
+
+        def b64(raw: bytes) -> str:
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+        payload = {"ak_proxy": {"user_attributes": {"additionalHeaders": {"X-Plex-Account-Id": account}}}}
+        return f"{b64(b'{}')}.{b64(_json.dumps(payload).encode())}.sig"
+
+    def _configure(self, client: TestClient) -> None:
+        values = {"auth.proxy.jwt_header": "X-authentik-jwt", "auth.proxy.jwt_claim": self.CLAIM}
+        assert client.put("/api/settings", json={"values": values}).status_code == 200
+        client.cookies.delete(SESSION_COOKIE)
+
+    def test_a_person_named_in_the_jwt_is_signed_in_as_a_person(self, client: TestClient):
+        self._configure(client)
+        headers = {"X-authentik-jwt": self._jwt("555000100")}
+        body = client.get("/api/auth/session", headers=headers).json()
+        assert body["authenticated"] is True and body["role"] == "person" and body["username"] == "sarah"
+        assert client.get("/api/users", headers=headers).status_code == 403
+
+    def test_the_owner_named_in_the_jwt_is_the_owner(self, client: TestClient):
+        self._configure(client)
+        headers = {"X-authentik-jwt": self._jwt(str(OWNER_ID))}
+        assert client.get("/api/users", headers=headers).status_code == 200
+
+    def test_a_stranger_or_a_claimless_jwt_is_nobody(self, client: TestClient):
+        self._configure(client)
+        for headers in ({"X-authentik-jwt": self._jwt("999")}, {"X-authentik-jwt": "not.a.jwt"}, {}):
+            assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is False
+
+
+class TestAdminHosts:
+    """With `auth.admin_hosts` set, the admin app answers only under those names; on any other (the
+    public address people reach their picks on) the owner is a person like anyone else."""
+
+    def _configure(self, client: TestClient) -> None:
+        values = {"auth.admin_hosts": ["shortlist.home.example"]}
+        assert (
+            client.put("/api/settings", json={"values": values}, headers={"host": "shortlist.home.example"}).status_code
+            == 200
+        )
+
+    def test_empty_is_the_old_behaviour(self, client: TestClient):
+        assert client.get("/api/users", headers={"host": "picks.example"}).status_code == 200
+        assert client.get("/api/auth/session", headers={"host": "picks.example"}).json()["admin"] is True
+
+    def test_the_owner_is_admin_only_under_a_listed_name(self, client: TestClient):
+        self._configure(client)
+        assert client.get("/api/users", headers={"host": "shortlist.home.example"}).status_code == 200
+        assert client.get("/api/users", headers={"host": "shortlist.home.example:443"}).status_code == 200
+        public = {"host": "picks.example"}
+        assert client.get("/api/users", headers=public).status_code == 403
+        assert client.get("/api/settings", headers=public).status_code == 403
+        assert client.get("/api/setup/state", headers=public).status_code == 403
+        session = client.get("/api/auth/session", headers=public).json()
+        assert session["authenticated"] is True and session["role"] == "owner" and session["admin"] is False
+
+    def test_the_api_token_is_refused_on_the_public_name_too(self, client: TestClient):
+        self._configure(client)
+        client.cookies.delete(SESSION_COOKIE)
+        r = client.get("/api/users", headers={"host": "picks.example", "Authorization": "Bearer shl_whatever"})
+        assert r.status_code == 403
+
+    def test_a_malformed_list_is_refused(self, client: TestClient):
+        for bad in ("shortlist.home", ["https://x.example"], ["a b"]):
+            assert client.put("/api/settings", json={"values": {"auth.admin_hosts": bad}}).status_code == 422
 
 
 class TestApiToken:

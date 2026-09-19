@@ -36,6 +36,7 @@ from shortlist.engine.delivery import (
     target_sections,
 )
 from shortlist.engine.history import RatingsPolicy, derive_seeds, ratings_policy
+from shortlist.engine.household import Household, resolve_household
 from shortlist.engine.models import (
     SHARED_SLUG_PREFIX,
     Candidate,
@@ -974,8 +975,12 @@ def row_recipe(policy: RowPolicy, spec: RowSpec) -> str:
     )
 
 
-def _family_admits(spec: RowSpec, candidate: Candidate) -> bool:
-    """Whether this row's `family` setting lets a candidate in (see `RowSpec.family`)."""
+def _family_admits(spec: RowSpec, candidate: Candidate, household: Household | None = None) -> bool:
+    """Whether this row's `family` setting lets a candidate in (see `RowSpec.family`). "auto" leaves
+    children's titles out for a FAMILY household only — anyone else, or a person nothing could label,
+    keeps them."""
+    if spec.family == "auto":
+        return not (candidate.kids and household is not None and household.is_family)
     if spec.family == "exclude":
         return not candidate.kids
     if spec.family == "only":
@@ -1469,24 +1474,62 @@ def _drop_cold_skipped_rows(
             len(user.history),
             cfg.min_history,
         )
-        # write_lock: same as the muted/retired sweep — every Plex mutation is serialized when users
-        # run concurrently. Scans EVERY library, not the run's delivery sections, so a copy left in a
-        # library the row no longer targets goes too.
-        with ctx.write_lock:
-            removed_in = remove_row(
-                ctx.plex,
-                user,
-                cfg,
-                spec,
-                dry_run=cfg.dry_run,
-                diff=report.diff if report.diff is not None else CollectionDiff(),
-                sections=ctx.plex.sections(),
-                delivered_keys=_ledger_keys(ctx, user, spec),
-                # Every library is scanned, so a title another row builds under must not be taken for
-                # this one's (issue #121).
-                other_rows=cfg.per_person_rows(),
-            )
-        _forget(report, spec, removed_in)
+        _take_row_down(ctx, user, cfg, spec, report)
+    return keep
+
+
+def _take_row_down(
+    ctx: EngineContext, user: UserProfile, cfg: EngineConfig, spec: RowSpec, report: UserRunReport
+) -> None:
+    """Remove this person's copy of a row they should not have tonight, in every library."""
+    # write_lock: same as the muted/retired sweep — every Plex mutation is serialized when users
+    # run concurrently. Scans EVERY library, not the run's delivery sections, so a copy left in a
+    # library the row no longer targets goes too.
+    with ctx.write_lock:
+        removed_in = remove_row(
+            ctx.plex,
+            user,
+            cfg,
+            spec,
+            dry_run=cfg.dry_run,
+            diff=report.diff if report.diff is not None else CollectionDiff(),
+            sections=ctx.plex.sections(),
+            delivered_keys=_ledger_keys(ctx, user, spec),
+            # Every library is scanned, so a title another row builds under must not be taken for
+            # this one's (issue #121).
+            other_rows=cfg.per_person_rows(),
+        )
+    _forget(report, spec, removed_in)
+
+
+def _settle_household(policy: RowPolicy) -> list[RowSpec]:
+    """Decide who watches under this account from tonight's pools, and take down any family-only row a
+    person is not a family household for. Returns the rows still to build.
+
+    A family-only row for someone nothing could label (no engine counts, no override) is kept and
+    built as a plain children's-titles row — the owner asked for it explicitly, and "unknown" is not
+    evidence that nobody there watches with children.
+    """
+    reported = next((p.household for p in policy.pool_cache.values() if p.household), None)
+    household = resolve_household(policy.user, reported, policy.cfg)
+    policy.household = household
+    policy.report.household = household.as_dict()
+    if household.label is None or household.is_family:
+        return policy.specs
+    keep = []
+    for spec in policy.specs:
+        if spec.family != "only":
+            keep.append(spec)
+            continue
+        logger.info(
+            "{}: row '{}' not built — a family row, and this account is {} ({})",
+            policy.user.username,
+            spec.slug,
+            household.label,
+            household.source,
+        )
+        _take_row_down(policy.ctx, policy.user, policy.cfg, spec, policy.report)
+        policy.report.rows_considered[spec.slug] = "not_a_family_household"
     return keep
 
 
@@ -1622,6 +1665,8 @@ class RowPolicy:
     # Set by the first failed TMDB genre lookup for a rewatch row; every later title is then kept out
     # without asking (`_in_excluded_genre`).
     genres_unreadable: bool = False
+    # Who watches under this account tonight (`household.resolve_household`), set once the pools are in.
+    household: Household | None = None
     # ratingKey -> can this person see it (`visible`). Memoised across their rows: one read per title.
     visibility: dict[int, bool] = field(default_factory=dict)
     # Set by the first read that fails; the rest of this person's run then picks as it always did.
@@ -2406,7 +2451,11 @@ def _build_section_picks(
             continue
         sec_idx = ctx.section_index.get(section.key, {})
         pct = policy.effective_watched_pct(spec)
-        sub = [c for c in pool_for_row if c.media_type is kind and c.tmdb_id in sec_idx and _family_admits(spec, c)]
+        sub = [
+            c
+            for c in pool_for_row
+            if c.media_type is kind and c.tmdb_id in sec_idx and _family_admits(spec, c, policy.household)
+        ]
         rewatch_reasons: dict[tuple[int, MediaType], str] = {}
         if spec.rewatch:
             # History first, then the pool's unseen titles as the top-up. The pool holds no finished
@@ -2940,7 +2989,10 @@ def _run_user(
 
     base_cold: list[Pick] = []
     try:
-        if not cold and not _warm_start(policy, library_of_watch, library_of_seed) and thin:
+        warm = not cold and _warm_start(policy, library_of_watch, library_of_seed)
+        if not cold:
+            policy.specs = specs = _settle_household(policy)
+        if not cold and not warm and thin:
             # The engine took them on and answered with nothing — the ordinary cold start, arrived at
             # late. Rows set to skip a cold start come off now, exactly as they would have up front.
             cold = True

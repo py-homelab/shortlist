@@ -226,17 +226,31 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 )
                 return {"user_id": user.id, "username": user.username, "slug": user.slug} if user else None
 
-        def proxy_auth() -> tuple[str, str]:
-            """(header name, shared secret) for trusted-proxy identity; either empty = off."""
+        def proxy_auth() -> dict:
+            """Trusted-proxy identity settings: header + shared secret, and/or a JWT header + claim path
+            (+ optional JWKS URL). Blank = that mode is off."""
             with sessions() as session:
                 store = SettingsStore(session, secret_box)
-                header = str(store.get("auth.proxy.header") or "").strip().lower()
-                return header, str(store.get("auth.proxy.secret") or "")
+                return {
+                    "header": str(store.get("auth.proxy.header") or "").strip().lower(),
+                    "secret": str(store.get("auth.proxy.secret") or ""),
+                    "jwt_header": str(store.get("auth.proxy.jwt_header") or "").strip().lower(),
+                    "jwt_claim": str(store.get("auth.proxy.jwt_claim") or "").strip(),
+                    "jwks_url": str(store.get("auth.proxy.jwks_url") or "").strip(),
+                }
 
         app.state.owner_account_id = owner_account_id
         app.state.holds_secrets = holds_secrets
         app.state.verify_api_token = verify_api_token
+
+        def admin_hosts() -> set[str]:
+            """Hostnames the admin app answers on; empty = everywhere (see `auth.admin_hosts`)."""
+            with sessions() as session:
+                hosts = SettingsStore(session, secret_box).get("auth.admin_hosts") or []
+            return {h.strip().lower() for h in hosts if isinstance(h, str) and h.strip()}
+
         app.state.person_account = person_account
+        app.state.admin_hosts = admin_hosts
         app.state.proxy_auth = proxy_auth
 
         with sessions() as session:

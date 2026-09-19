@@ -3724,6 +3724,8 @@ export interface components {
             counts: {
                 [key: string]: unknown;
             };
+            /** Household */
+            household?: string | null;
             /** Name */
             name: string;
             /** Role */
@@ -3768,6 +3770,8 @@ export interface components {
             has_family: boolean;
             /** Hidden Available */
             hidden_available: number;
+            /** Household */
+            household?: string | null;
             /** Items */
             items: {
                 [key: string]: unknown;
@@ -4972,6 +4976,11 @@ export interface components {
         SessionOut: {
             /** Account Id */
             account_id?: number | null;
+            /**
+             * Admin
+             * @default false
+             */
+            admin: boolean;
             /** Authenticated */
             authenticated: boolean;
             /** Login Required */
@@ -5359,6 +5368,10 @@ export interface components {
             history_depth: number;
             /** Hit Rate */
             hit_rate: number | null;
+            /** Household */
+            household?: {
+                [key: string]: unknown;
+            } | null;
             /** Id */
             id: number;
             /** Last Run At */
@@ -5468,6 +5481,8 @@ export interface components {
             blocked_seeds?: (number | components["schemas"]["BlockSeedBody"])[] | null;
             /** Excluded Genres */
             excluded_genres?: string[] | null;
+            /** Household */
+            household?: ("auto" | "adult" | "family" | "kids") | null;
             /** Paused */
             paused?: boolean | null;
             /** Row Name Tpl */

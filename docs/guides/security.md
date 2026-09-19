@@ -23,6 +23,14 @@ Shortlist; any other person on the server reaches **their own picks page** (`/me
 else — see [Everyone's own picks](picks.md#everyones-own-picks). Login is rate-limited, and so are
 failed API-token attempts.
 
+**Keeping the admin app off the public address.** If people reach their picks at a public
+address, list the address(es) the admin app should answer on in **Settings → Advanced → Admin app
+only at these addresses** (`auth.admin_hosts`). Under any other name — the public one — even the
+owner gets only their own picks, and every admin page and API refuses (the API token too). Route the
+admin address through your proxy's internal-only rule and the public one through its login, and
+the admin app is never reachable from the internet at all. Set it only once the listed address
+reaches Shortlist, or you lock yourself out of the page that changes it.
+
 **Signing people in through your own proxy.** If a reverse proxy in front of Shortlist already
 authenticates visitors (authentik, Authelia, oauth2-proxy), it can name them to Shortlist instead
 of each person signing in with Plex twice: **Settings → Advanced → Trusted proxy sign-in**. The proxy
@@ -30,9 +38,14 @@ sends the visitor's Plex account id in the header you name there, and proves it 
 shared secret in `X-Shortlist-Proxy-Secret`. The secret is what makes the header trustworthy — with
 `FORWARDED_ALLOW_IPS` at `*`, a client address alone proves nothing, and anyone could send the id
 header. A request without the secret is simply anonymous, never refused, so a misconfigured proxy
-degrades to the login screen. Keep the admin pages for yourself with the proxy's own rules
-(everything but `/me`, `/api/me/*` and `/api/auth/*`), or rely on Shortlist's own check — a person
-named by the proxy is still only a person here.
+degrades to the login screen. A person named by the proxy is still only a person here.
+
+If the proxy attaches a **JWT** instead (authentik's `X-authentik-jwt`), name that header and the
+claim holding the Plex account id — e.g. `ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id`
+— and optionally the proxy's **signing keys URL** (JWKS). With the keys URL the signature and expiry
+are checked. Without it the token is trusted only because nothing but the proxy can reach Shortlist:
+publish no port, and let the proxy's forward-auth replace the header on every request. The keys URL
+is always Shortlist's own setting — never taken from a request, where a forger chooses it.
 
 **The API token is owner-level access.** Anything holding it can do anything you can, including
 deleting rows and rewriting share filters. Rotate it from Settings → API access if it leaks; the old

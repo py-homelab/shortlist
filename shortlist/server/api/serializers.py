@@ -65,6 +65,9 @@ class UserOut(PassthroughModel):
     enabled: bool
     manage_sharing: bool
     cold_start: bool
+    # Who watches under this account as of the last run: {label, source, kids_titles, window_titles,
+    # window_days, engine_label}, or null before a run could say.
+    household: dict | None = None
     # Free-form JSON, deliberately left untyped here: which keys exist varies by DATA, not by branch
     # (`history_depth` appears after the first watch sync, `paused` only once someone is paused), and
     # a model with defaults would INVENT the absent ones into every payload. `UserPrefs` in
@@ -158,6 +161,7 @@ def user_dict(
         # their share filters, and an account can be on with its sharing untouched.
         "manage_sharing": user.manage_sharing,
         "cold_start": user.cold_start,
+        "household": user.household,
         "prefs": user.prefs or {},
         "history_depth": history_depth,
         "last_run_at": iso_utc(last_run_at),

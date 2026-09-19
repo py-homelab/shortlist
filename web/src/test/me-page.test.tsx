@@ -126,7 +126,7 @@ describe("MePage", () => {
     expect(screen.getByText(/📺 4\/5/)).toBeInTheDocument();
     expect(screen.getByText("1 already requested or on the way")).toBeInTheDocument();
     expect(screen.getByText("2 of 2")).toBeInTheDocument();
-    expect(getMySuggestions).toHaveBeenCalledWith("exclude");
+    expect(getMySuggestions).toHaveBeenCalledWith("auto");
   });
 
   it("filters by type and genre, and sorts", async () => {

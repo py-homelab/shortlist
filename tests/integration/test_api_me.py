@@ -48,6 +48,13 @@ def _seed(client: TestClient, account_id: int, titles: list[tuple[int, str, str,
         session.commit()
 
 
+def _set_household(client: TestClient, account_id: int, label: str | None) -> None:
+    with client.app.state.sessions() as session:
+        user = session.query(User).filter(User.plex_account_id == account_id).one()
+        user.household = None if label is None else {"label": label, "source": "engine"}
+        session.commit()
+
+
 def _configure_seerr(client: TestClient) -> None:
     r = client.put("/api/settings", json={"values": {"seerr.url": SEERR, "seerr.apikey": "k"}})
     assert r.status_code == 200, r.text
@@ -87,15 +94,17 @@ class TestReadingMyPicks:
             client, SARAH, [(10, "movie", "Ten", False), (20, "show", "Twenty", False), (30, "movie", "Cartoon", True)]
         )
         _seed(client, MIKE, [(99, "movie", "Mike's", False)])
+        _set_household(client, SARAH, "family")
         _sign_in_as(client, SARAH)
 
         me = client.get("/api/me").json()
         assert me["state"] == "ok" and me["account_id"] == SARAH and me["role"] == "person"
+        assert me["household"] == "family"
         assert me["counts"] == {"items": 3, "queued": 0, "hidden_available": 0, "family": 1}
         assert me["seerr"]["configured"] is False and me["seerr"]["linked"] is False
 
         body = client.get("/api/me/suggestions").json()
-        assert [i["tmdb_id"] for i in body["items"]] == [10, 20]  # family excluded by default
+        assert [i["tmdb_id"] for i in body["items"]] == [10, 20]  # a family household: kids in their own lane
         assert body["has_family"] is True and body["family"] == "exclude"
         assert body["genres"] == [{"name": "Drama", "count": 2}]
         assert body["items"][0]["requestable"] is False
@@ -104,6 +113,16 @@ class TestReadingMyPicks:
         assert [i["tmdb_id"] for i in client.get("/api/me/suggestions?family=only").json()["items"]] == [30]
         assert len(client.get("/api/me/suggestions?family=include").json()["items"]) == 3
         assert client.get("/api/me/suggestions?family=all").status_code == 422
+
+    def test_anyone_else_sees_children_s_titles_with_everything_else_and_no_toggle(self, client: TestClient):
+        _seed(client, SARAH, [(10, "movie", "Ten", False), (30, "movie", "Cartoon", True)])
+        for household in (None, "adult", "kids"):
+            _set_household(client, SARAH, household)
+            _sign_in_as(client, SARAH)
+            body = client.get("/api/me/suggestions").json()
+            assert [i["tmdb_id"] for i in body["items"]] == [10, 30], household
+            assert body["family"] == "include" and body["has_family"] is False
+            assert body["household"] == household
 
     def test_the_owner_sees_their_own_page_too(self, client: TestClient):
         with client.app.state.sessions() as session:

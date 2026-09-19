@@ -18,6 +18,8 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
+from shortlist.server.proxy_jwt import account_id_from_jwt
+
 PLEXTV = "https://plex.tv"
 PRODUCT = "Shortlist"
 SESSION_COOKIE = "shortlist_session"
@@ -241,20 +243,9 @@ def _proxy_identity(request: Request) -> dict | None:
     state = request.app.state
     # A state without the hook (a bare test app, an embedding that never wired it) has the feature off.
     proxy_auth = getattr(state, "proxy_auth", None)
-    header, secret = proxy_auth() if proxy_auth is not None else ("", "")
-    if not header or not secret:
-        return None
-    claimed = request.headers.get(header)
-    if not claimed:
-        return None
-    proof = request.headers.get(PROXY_SECRET_HEADER, "")
-    if not hmac.compare_digest(proof, secret):
-        logger.warning("proxy identity header present without the proxy secret — ignored")
-        return None
-    try:
-        account_id = int(claimed)
-    except ValueError:
-        logger.warning("proxy identity header is not a Plex account id — ignored")
+    cfg = proxy_auth() if proxy_auth is not None else {}
+    account_id = _account_from_jwt(request, cfg) or _account_from_header(request, cfg)
+    if account_id is None:
         return None
     owner_id = state.owner_account_id()
     if owner_id is not None and account_id == owner_id:
@@ -269,6 +260,36 @@ def _person_account(state, account_id: int) -> dict | None:
     """`state.person_account`, or nobody on a state that never wired a roster."""
     lookup = getattr(state, "person_account", None)
     return lookup(account_id) if lookup is not None else None
+
+
+def _account_from_header(request: Request, cfg: dict) -> int | None:
+    """Header + shared-secret mode: the id is believed only beside the proxy's secret."""
+    header, secret = cfg.get("header") or "", cfg.get("secret") or ""
+    if not header or not secret:
+        return None
+    claimed = request.headers.get(header)
+    if not claimed:
+        return None
+    proof = request.headers.get(PROXY_SECRET_HEADER, "")
+    if not hmac.compare_digest(proof, secret):
+        logger.warning("proxy identity header present without the proxy secret — ignored")
+        return None
+    try:
+        return int(claimed)
+    except ValueError:
+        logger.warning("proxy identity header is not a Plex account id — ignored")
+        return None
+
+
+def _account_from_jwt(request: Request, cfg: dict) -> int | None:
+    """JWT mode (`proxy_jwt.py`): the id is a claim in a token the proxy attached."""
+    header, claim = cfg.get("jwt_header") or "", cfg.get("jwt_claim") or ""
+    if not header or not claim:
+        return None
+    token = request.headers.get(header)
+    if not token:
+        return None
+    return account_id_from_jwt(token, claim, cfg.get("jwks_url") or "")
 
 
 def read_identity(request: Request) -> dict | None:
@@ -368,6 +389,21 @@ def _rate_limit_token_failures() -> None:
         raise HTTPException(status_code=429, detail="Too many failed API-token attempts — wait a minute.")
 
 
+def admin_here(request: Request) -> bool:
+    """Whether the admin app answers under the name this request arrived by (`auth.admin_hosts`).
+
+    The Host header is the reverse proxy's routing key, so it is exactly what decides which of its
+    routes — and so which of its access rules — a request passed through. An empty list is the old
+    behaviour: the admin app everywhere.
+    """
+    hosts_for = getattr(request.app.state, "admin_hosts", None)
+    hosts = hosts_for() if hosts_for is not None else set()
+    if not hosts:
+        return True
+    host = (request.headers.get("host") or "").split(":")[0].strip().lower()
+    return host in hosts
+
+
 def require_owner(request: Request) -> dict:
     """The owner, and nobody else. The default gate for everything except the setup wizard.
 
@@ -380,6 +416,9 @@ def require_owner(request: Request) -> dict:
     pre-link window loses all access the moment a different account links a server.
     """
     owner_id = request.app.state.owner_account_id()
+    if owner_id is not None and not admin_here(request):
+        # The public name people reach their picks on. The owner is a person here like anyone else.
+        raise HTTPException(status_code=403, detail="the admin app is not available at this address")
     # Programmatic access: a valid Bearer API token grants owner-level access. A browser never sends
     # it automatically, so this path needs no CSRF check (unlike the cookie below). An invalid or
     # revoked token is rejected outright — it must never fall through to the cookie path.
@@ -438,7 +477,7 @@ def require_setup_access(request: Request) -> dict:
     session = read_session(request)
     owner_id = request.app.state.owner_account_id()
     if owner_id is not None:
-        if session is None or session.get("account_id") != owner_id:
+        if session is None or session.get("account_id") != owner_id or not admin_here(request):
             raise HTTPException(status_code=403, detail="only the server owner can run setup")
         return session
     if request.app.state.holds_secrets():
@@ -619,6 +658,9 @@ class SessionOut(BaseModel):
     username: str | None = None
     # `owner` or `person` (see ROLE_*), resolved against today's state; absent when not signed in.
     role: str | None = None
+    # Whether the admin app is available to this caller at this address (the owner, on a name listed
+    # in `auth.admin_hosts` or anywhere when it is empty). False sends the SPA to /me.
+    admin: bool = False
 
 
 @router.get("/session", response_model=SessionOut)
@@ -631,8 +673,9 @@ async def get_session(request: Request) -> dict:
     # the wizard, and `read_identity` (which needs an owner to compare against) would call them nobody.
     session = read_identity(request) if request.app.state.owner_account_id() is not None else read_session(request)
     if session is None:
-        return {"authenticated": False, "login_required": login_required}
-    return {"authenticated": True, "login_required": login_required, **session}
+        return {"authenticated": False, "login_required": login_required, "admin": False}
+    admin = session.get("role", ROLE_OWNER) == ROLE_OWNER and admin_here(request)
+    return {"authenticated": True, "login_required": login_required, **session, "admin": admin}
 
 
 class LogoutOut(BaseModel):

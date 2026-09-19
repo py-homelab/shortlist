@@ -41,6 +41,7 @@ USER_KEYS = {
     "enabled",
     "manage_sharing",
     "cold_start",
+    "household",
     "prefs",
     "history_depth",
     "last_run_at",
@@ -1526,3 +1527,23 @@ class TestUserPickOutcomes:
 
     def test_an_unknown_user_is_a_404(self, client: TestClient):
         assert client.get("/api/users/999999/outcomes").status_code == 404
+
+
+def test_the_household_override_is_a_closed_set(client: TestClient):
+    uid = client.get("/api/users").json()[0]["id"]
+    assert client.patch(f"/api/users/{uid}", json={"prefs": {"household": "family"}}).status_code == 200
+    user = next(u for u in client.get("/api/users").json() if u["id"] == uid)
+    assert user["prefs"]["household"] == "family"
+    assert client.patch(f"/api/users/{uid}", json={"prefs": {"household": "pets"}}).status_code == 422
+
+
+def test_the_family_thresholds_are_validated(client: TestClient):
+    ok = {
+        "family.min_share": 0.2,
+        "family.min_kids_titles": 5,
+        "family.kids_account_share": 0.9,
+        "family.min_titles": 12,
+    }
+    assert client.put("/api/settings", json={"values": ok}).status_code == 200
+    for bad in ({"family.min_share": 1.5}, {"family.min_kids_titles": 0}, {"family.kids_account_share": -1}):
+        assert client.put("/api/settings", json={"values": bad}).status_code == 422

@@ -72,6 +72,8 @@ class MeOut(PassthroughModel):
     name: str
     account_id: int
     role: str
+    # adult | family | kids as of the last run, or null. A family household gets the family lane.
+    household: str | None = None
     built_at: str | None = None
     rows: list[dict]
     seerr: dict
@@ -93,6 +95,7 @@ async def me(request: Request) -> dict:
                 "name": user.nickname or user.friendly_name or user.username,
                 "account_id": user.plex_account_id,
                 "role": identity.get("role") or ROLE_OWNER,
+                "household": picks.household_label(user),
                 "built_at": view["built_at"].isoformat() if view["built_at"] else None,
                 "rows": view["rows"],
                 "seerr": view["seerr"],
@@ -114,13 +117,14 @@ class MySuggestionsOut(PassthroughModel):
     hidden_available: int
     family: str
     has_family: bool
+    household: str | None = None
     genres: list[dict]
     built_at: str | None = None
     seerr: dict
 
 
 @router.get("/suggestions", response_model=MySuggestionsOut)
-async def suggestions(request: Request, family: str = "exclude") -> dict:
+async def suggestions(request: Request, family: str = "auto") -> dict:
     if family not in picks.FAMILY_MODES:
         raise HTTPException(status_code=422, detail=f"family must be one of {list(picks.FAMILY_MODES)}")
 
@@ -130,14 +134,18 @@ async def suggestions(request: Request, family: str = "exclude") -> dict:
             seerr = _seerr_cache(request).view(user.plex_account_id)
             view = picks.build_view(session, user, seerr)
             session.commit()
-            shown = picks.family_filter(view["items"], family)
+            lane = picks.family_lane(user, family)
+            shown = picks.family_filter(view["items"], lane)
             return {
                 "state": view["state"],
                 "items": shown,
                 "queued": view["queued"],
                 "hidden_available": view["hidden_available"],
-                "family": family,
-                "has_family": any(i["kids"] for i in view["items"]),
+                "family": lane,
+                # The family toggle is for a household that shares the account with children. For anyone
+                # else children's titles are already in the list, so there is nothing to switch to.
+                "has_family": picks.household_label(user) == "family" and any(i["kids"] for i in view["items"]),
+                "household": picks.household_label(user),
                 "genres": picks.genre_counts(shown),
                 "built_at": view["built_at"].isoformat() if view["built_at"] else None,
                 "seerr": view["seerr"],

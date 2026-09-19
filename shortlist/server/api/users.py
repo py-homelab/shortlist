@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
@@ -61,6 +62,10 @@ class UserPrefs(BaseModel):
     # OpenAPI schema, so the SPA's generated type lost the record shape and had to re-declare it.
     blocked_seeds: list[int | BlockSeedBody] | None = None
     paused: bool | None = None
+    # Who watches under this account, as the owner knows it: "auto" (decide from their viewing — the
+    # default), "adult", "family" (shares it with children: their own rows leave children's titles
+    # out and a family row carries them) or "kids" (a child's own account).
+    household: Literal["auto", "adult", "family", "kids"] | None = None
 
     @field_validator("row_name_tpl")
     @classmethod

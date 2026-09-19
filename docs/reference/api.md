@@ -21,7 +21,7 @@ POST /api/setup/probe · POST /api/setup/link · GET/PUT /api/setup/state
 ## Users
 
 ```
-GET  /api/users · PATCH /api/users/{id} {enabled?, manage_sharing?, prefs?} — a `prefs` key sent as `null` CLEARS that preference. Only the keys actually present are touched: an omitted key keeps its stored value, so a partial write cannot wipe the rest. · DELETE /api/users/{id} (only for someone plex.tv no longer lists: drops their picks and run history and hides them from the list; keeps the users row and their pre-Shortlist share-filter snapshot, which uninstall restores from — 409 for anyone still on the share) · POST /api/users/sync (shared + Home users from plex.tv, plus the server owner, whom that list never returns)
+GET  /api/users · PATCH /api/users/{id} {enabled?, manage_sharing?, prefs?} (`prefs.household`: auto|adult|family|kids overrides who watches under the account; `household` on GET is what the last run decided: {label, source, kids_titles, window_titles, window_days, engine_label}) — a `prefs` key sent as `null` CLEARS that preference. Only the keys actually present are touched: an omitted key keeps its stored value, so a partial write cannot wipe the rest. · DELETE /api/users/{id} (only for someone plex.tv no longer lists: drops their picks and run history and hides them from the list; keeps the users row and their pre-Shortlist share-filter snapshot, which uninstall restores from — 409 for anyone still on the share) · POST /api/users/sync (shared + Home users from plex.tv, plus the server owner, whom that list never returns)
 POST /api/users/set-enabled {enabled} (bulk enable/disable every user at once)
 ```
 
@@ -190,7 +190,7 @@ GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first
      "What 'already watched' means for a show"), so the flag is a no-op. Refused for `media: "movie"`, where any view is already a finish.
      The finished bar itself is not configurable — it is `EngineConfig.watched_show_pct`, fixed at 0.8. Earlier revisions of this document cited a
      `recommendations.watched_show_pct` setting; no such key has ever existed.
-     `family` (`include` | `exclude` | `only`, default `include`) decides what the row does with children's and family titles — as the
+     `family` (`include` | `exclude` | `only` | `auto`, default `include`; `auto` = left out for a FAMILY household only, and an `only` row is built only for family households — see `users.household`) decides what the row does with children's and family titles — as the
      engine tags them (`Candidate.kids`: the built-in engine reads TMDB's Animation + Family or Kids genres; an external engine may know
      better). `include` is how every row behaved before the setting existed; `exclude` keeps them out; `only` builds the row from nothing
      else. For a household watching under one Plex account: the grown-ups' rows `exclude`, one row is `only`. Recorded in the row's recipe
@@ -394,7 +394,7 @@ GET  /api/support/title?q= -> {rows[{user, watched_record, viewed_leaf_count, le
 GET  /api/support/person/{slug} -> {user_type, watched_movies, watched_shows, libraries[{section_key, library, titles_known, ever_read}], never_read[], text}
 # A person's own picks (any signed-in person on the server, or the owner as themselves; never the API token)
 GET  /api/me                                  -> {state, name, account_id, role, built_at, rows[], seerr{linked, user_id, quota, error, configured}, counts{}}
-GET  /api/me/suggestions?family=exclude|only|include -> {state, items[], queued[], hidden_available, family, has_family, genres[{name,count}], built_at, seerr}
+GET  /api/me/suggestions?family=auto|exclude|only|include (auto, the default = their household's lane) -> {state, items[], queued[], hidden_available, family, has_family, genres[{name,count}], built_at, seerr}
 GET  /api/me/dismissed                        -> {never[], later[]}
 POST /api/me/act {action: request|never|later|skip|undo, tmdb_id, media_type, surface?, position?, last?, undone?}
 POST /api/me/seen {items[{tmdb_id, media_type, surface, position}]}   -> {ok, logged}   (impressions, one per title/surface/day)

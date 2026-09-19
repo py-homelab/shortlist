@@ -9,7 +9,9 @@ The protocol is two JSON endpoints, deliberately small so any service can implem
     Request (see ``recommend_payload``): who, their seeds and history as Shortlist sees them, the
     candidate universe (tmdb ids per media type), what to exclude, and how many to return per media
     type. Response: ``{"engine": {"name", "version"}, "ordered": bool, "items": [...], "trace": {...}}``
-    where each item is ``{"tmdb_id", "media_type", "title", "year", "genres", "rating", "vote_count",
+    and optionally ``"household": {"label", "kids_titles", "window_titles", "window_days"}`` — who
+    watches under this account, over the engine's recent window. Each item is ``{"tmdb_id",
+    "media_type", "title", "year", "genres", "rating", "vote_count",
     "poster_path", "overview", "language", "reason", "kids", "seed": {"tmdb_id", "title",
     "media_type"} | null, "sources": [...]}`` in the engine's final order, best first.
 

@@ -326,7 +326,9 @@ export default function MePage() {
   const session = useSession();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
-  const [family, setFamily] = useState<FamilyLane>("exclude");
+  // "auto" = what their household calls for: a family sharing the account sees children's titles in
+  // their own lane (the Family toggle), anyone else sees them mixed in.
+  const [family, setFamily] = useState<FamilyLane>("auto");
   const [layout, setLayout] = useState<Layout>(() => (load("picks.mode") as Layout) || "auto");
   const [type, setType] = useState<MediaFilter>(() => (load("picks.type") as MediaFilter) || "all");
   const [genre, setGenre] = useState<string>(() => load("picks.genre") || "");
@@ -685,7 +687,7 @@ export default function MePage() {
         <Button size="sm" variant="outline" onClick={() => setHelp(true)} aria-label="How this works">
           <HelpCircle aria-hidden="true" />
         </Button>
-        {session.data?.role === "owner" && (
+        {session.data?.admin === true && (
           <Button size="sm" variant="ghost" onClick={() => navigate("/")}>
             Admin
           </Button>
@@ -746,7 +748,7 @@ export default function MePage() {
           <Button
             size="sm"
             variant={family === "only" ? "default" : "outline"}
-            onClick={() => setFamily(family === "only" ? "exclude" : "only")}
+            onClick={() => setFamily(family === "only" ? "auto" : "only")}
             title="Show family titles instead"
           >
             👪 Family

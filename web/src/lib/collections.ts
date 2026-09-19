@@ -243,7 +243,9 @@ export function rowOverrides(
     parts.push("Never started only");
   }
 
-  if (collection.family === "only") {
+  if (collection.family === "auto") {
+    parts.push("Family titles: per person");
+  } else if (collection.family === "only") {
     parts.push("Family titles only");
   } else if (collection.family === "exclude") {
     parts.push("No family titles");

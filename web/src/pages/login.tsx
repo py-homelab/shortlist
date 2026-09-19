@@ -23,7 +23,8 @@ import { queryKeys, useSession, useSetupState } from "@/lib/queries";
 export function LoginPage() {
   const session = useSession();
   const authenticated = session.data?.authenticated ?? false;
-  const person = session.data?.role === "person";
+  const person =
+    session.data?.role === "person" || (session.data?.authenticated === true && session.data?.admin === false);
   // Setup state is owner-only. Asking for it before sign-in 401s, and the visitor would sit
   // behind this very skeleton instead of seeing the button they came here to press. A person is
   // refused it too (403) and has nowhere but /me to go, so it is never asked for them.
