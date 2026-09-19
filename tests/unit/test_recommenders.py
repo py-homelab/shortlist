@@ -437,6 +437,44 @@ class TestColdStartWithAnEngine:
         assert report.picks == []
         assert "Not enough watch history" in (report.reason or "")
 
+    def test_skip_means_no_row_for_a_thin_history_even_when_the_engine_would_serve_one(self, ctx, mock_plextv):
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        client = FakeEngineClient([_item(20, "Twenty"), _item(777, "Not Here Yet")], name="e")
+        ctx.recommender = HttpRecommender(client, name="e", serves_cold=True)
+
+        report = _run(ctx, mock_plextv, [RowSpec(slug="picked", name_template="Picked", size=5, cold_start="skip")])
+
+        assert report.status == "cold_start"
+        assert report.picks == []
+        # No row was asked for — but their request page still gets the engine's suggestions (the
+        # titles no library holds).
+        assert [p["surface"] for p in client.payloads] == ["missing"]
+        assert [m["tmdb_id"] for m in report.missing] == [777]
+
+    def test_the_server_wide_skip_applies_to_every_row(self, ctx, mock_plextv):
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        ctx.config.cold_start = "skip"
+        ctx.recommender = HttpRecommender(FakeEngineClient([_item(20, "Twenty")], name="e"), name="e", serves_cold=True)
+        report = _run(
+            ctx,
+            mock_plextv,
+            [RowSpec(slug="a", name_template="A", size=5), RowSpec(slug="b", name_template="B", size=5)],
+        )
+        assert report.status == "cold_start" and report.picks == []
+
+    def test_a_row_left_on_popular_still_goes_to_the_engine(self, ctx, mock_plextv):
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        ctx.recommender = HttpRecommender(FakeEngineClient([_item(20, "Twenty")], name="e"), name="e", serves_cold=True)
+        report = _run(
+            ctx,
+            mock_plextv,
+            [
+                RowSpec(slug="skipped", name_template="Skipped", size=5, cold_start="skip"),
+                RowSpec(slug="kept", name_template="Kept", size=5, cold_start="popular"),
+            ],
+        )
+        assert _rows(report) == {"kept": [20]}
+
     def test_an_engine_that_does_not_serve_cold_is_not_asked(self, ctx, mock_plextv):
         ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
         client = FakeEngineClient([_item(20, "Twenty")], name="e")

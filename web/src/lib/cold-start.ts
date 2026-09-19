@@ -23,8 +23,8 @@ export const COLD_START_LABELS: Record<ColdStart, string> = {
 /** The consequence, not a restatement of the label — what actually lands on their Plex. */
 export const COLD_START_HINTS: Record<ColdStart, string> = {
   popular:
-    "They still get a row, filled with what rates highest on this server, until they’ve watched enough for real recommendations.",
-  skip: "No row is created, and any row they already have is removed. It appears on its own once they’ve watched enough.",
+    "They still get a row, filled with what rates highest on this server (or your own engine’s picks for new viewers, if it offers them), until they’ve watched enough for real recommendations.",
+  skip: "No row is created, and any row they already have is removed — with your own engine too. It appears on its own once they’ve watched enough; their request page still gets suggestions.",
 };
 
 export function asColdStart(value: unknown): ColdStart {

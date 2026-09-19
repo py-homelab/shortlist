@@ -2285,6 +2285,29 @@ def _warm_start(
     return False
 
 
+def _request_surface_only(
+    ctx: EngineContext,
+    user: UserProfile,
+    cfg: EngineConfig,
+    specs: list[RowSpec],
+    library_index: dict[MediaType, dict[int, int]],
+    seed_index: dict[int, int],
+    report: UserRunReport,
+) -> None:
+    """Their request surface without building a row — for a thin history whose rows all skip."""
+    policy = RowPolicy(
+        ctx=ctx,
+        user=user,
+        cfg=cfg,
+        specs=specs,
+        library_index=library_index,
+        report=report,
+        resolve=_rating_key_resolver(seed_index),
+    )
+    policy.load_watched_breakdown()
+    report.missing = _missing_titles(policy)
+
+
 def _missing_titles(policy: RowPolicy) -> list[dict]:
     """This person's request surface: what the engine would suggest that no library holds, best first.
 
@@ -3029,9 +3052,18 @@ def _run_user(
     # every row do they take the cold-start path after all — see `_warm_start`'s return.
     thin = len(user.history) < cfg.min_history
     cold = thin and not ctx.recommender.serves_cold
-    if cold:
+    if thin:
+        # A row set to skip a cold start is skipped for a thin history WHOEVER ranks it. An engine that
+        # serves thin histories can still fill it — but from popularity, which is not personal, and the
+        # owner who chose "skip" said a generic row is not worth a personal one (another tool's
+        # "popular" rows cover it). Rows left on "popular" still go to such an engine below.
+        wanted = specs
         specs = _cold_skip(ctx, user, cfg, specs, user_report)
         if not specs:
+            if ctx.recommender.serves_cold:
+                # No rows, but their request page still gets the engine's suggestions: someone new is
+                # exactly who browses and asks for things.
+                _request_surface_only(ctx, user, cfg, wanted, library_index, seed_index, user_report)
             return bool(dormant)  # nothing built, but an out-of-season row of theirs still needs hiding
 
     policy = RowPolicy(

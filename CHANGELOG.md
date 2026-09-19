@@ -6,6 +6,16 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.4] - 2026-09-19 (py-homelab fork)
+
+### Fixed
+
+- **"Skip" for a thin watch history now holds with an external engine.** A person below **Enough
+  watch history** gets no row from a row set to skip a cold start (or the server-wide setting) even
+  when the engine offers to serve new viewers — its popular picks are not personal, and generic
+  "popular" rows are better left to other tools. Any row they already have is removed, as before.
+  Their request page still gets the engine's suggestions.
+
 ## [1.9.1-py.3] - 2026-09-19 (py-homelab fork)
 
 ### Fixed

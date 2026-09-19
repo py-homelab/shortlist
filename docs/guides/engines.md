@@ -53,7 +53,9 @@ engine's overall order, but only approximate what their settings ask for.
 wants to be asked about people with fewer watches than **Enough watch history** — Shortlist's own
 cannot seed a search from a thin history, so it cold-starts those people up front; an engine that
 answers `true` is asked like anyone else, and only if it returns nothing do they get the cold-start
-row. `ready: false` means it has no build to serve from yet; the Test button says so.
+row. A row set to skip a cold start (`recommendations.cold_start`, or the row's own setting) is skipped
+for them whatever `serves_cold` says; their request page is still asked for. `ready: false` means it
+has no build to serve from yet; the Test button says so.
 
 Optional health fields let Shortlist tell you when an engine is up but serving old lists — the one
 failure nothing else notices, because a stale engine still answers:
