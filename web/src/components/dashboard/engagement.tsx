@@ -97,30 +97,6 @@ function deadRows(rows: EffectivenessReport["per_row"]): Problem[] {
 }
 
 /**
- * Titles fetched for people that nobody then watched.
- *
- * Deliberately NOT a flag for "a row landed picks but finished none". A series only counts as
- * finished when every episode is watched, so a TV row sitting on zero finishes is the normal case
- * (21 of 158 credited show picks on a real server), and flagging it would fire every day on every
- * server — which is how a list like this stops being read.
- */
-function unwatchedRequests(
-  requests: EffectivenessReport["requests"],
-): Problem | null {
-  if (requests.sent < 5 || requests.watched_after_sent > 0) return null;
-  return {
-    key: "requests",
-    text: (
-      <>
-        <strong className="font-medium text-foreground">{requests.sent}</strong>{" "}
-        titles were fetched for people and none have been watched since
-      </>
-    ),
-    hint: "Worth checking they actually arrived, and that the row picked them up afterwards.",
-  };
-}
-
-/**
  * Somebody started a pick and gave up. The one signal Plex's own watched flag cannot give.
  *
  * "Gave up" is a real claim, and it only became a true one when `SETTLING_HOURS` landed: an outcome
@@ -180,9 +156,9 @@ export function NeedsALook({
         <h2 className="text-sm font-medium text-muted-foreground">
           Worth a look
         </h2>
-        {/* Covers BOTH halves of the list, which "Where the picks are not landing" did not. Three of
-            the four item kinds here are picks nobody started — idle people, dead rows, unfetched
-            requests. The fourth is the opposite: somebody DID start it. A partial watch is the pick
+        {/* Covers BOTH halves of the list, which "Where the picks are not landing" did not. Two of
+            the three item kinds here are picks nobody started — idle people and dead rows. The third
+            is the opposite: somebody DID start it. A partial watch is the pick
             landing and then losing them, which is a different fact and not a failure to land, and
             calling it one told the owner something untrue about their own server. */}
         <p className="mt-0.5 text-xs text-muted-foreground/80">
@@ -214,7 +190,6 @@ export function NeedsALook({
               ...(tooEarly || idleCoversEveryone
                 ? []
                 : deadRows(report.per_row)),
-              unwatchedRequests(report.requests),
               ...gaveUp(data.people),
             ].filter((p): p is Problem => p !== null);
             const tooEarlyNote = tooEarly ? (

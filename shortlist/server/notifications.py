@@ -347,27 +347,6 @@ def privacy_exposure_alert(accounts: int) -> dict:
     }
 
 
-def requests_waiting_alert(waiting: int, new: int) -> dict:
-    """Titles are waiting for the owner's approval (`requests.waiting`).
-
-    Args:
-        waiting: How many wait now.
-        new: How many more than the last time this was sent.
-
-    Returns:
-        A notification dict that names no account.
-    """
-    return {
-        "id": f"requests-waiting-{waiting}",
-        "severity": "info",
-        "title": f"{waiting} {'title' if waiting == 1 else 'titles'} waiting for your approval",
-        "body": f"{new} new since the last message. Open Requests to send or reject them.",
-        "action_url": "/requests",
-        "action_label": "Open Requests",
-        "dismissable": True,
-    }
-
-
 def _last_run_problem(session: Session) -> dict | None:
     last = session.query(Run).filter(Run.status.in_(("ok", "error"))).order_by(Run.id.desc()).first()
     if last is None:
@@ -471,7 +450,7 @@ def _rows_with_no_name_for_newcomers(session: Session, store: SettingsStore) -> 
 
 def _recent_service_errors(session: Session) -> dict | None:
     """A count of service-level error events in the last day that AREN'T already covered by a failed
-    run — e.g. a plex.tv write that 429'd repeatedly, or a request send that errored.
+    run — e.g. a plex.tv write that 429'd repeatedly, or a search provider that errored.
 
     Dismissable, and the id encodes the NEWEST error, so dismissing acknowledges everything up to
     that point and the next error re-surfaces it.
@@ -506,131 +485,6 @@ def _recent_service_errors(session: Session) -> dict | None:
         "body": "Shortlist logged some errors recently. Check the recent runs and the container log.",
         "action_url": "/runs",
         "action_label": "See runs",
-        "dismissable": True,
-    }
-
-
-def _mdblist_quota(session: Session) -> dict | None:
-    """MDBList hit its daily request cap in a recent run, so some ratings fell back to TMDB. The id
-    encodes the day so a fresh hit re-surfaces after dismissal, but the same day's stays dismissed."""
-    since = datetime.now(UTC) - timedelta(days=1)
-    event = (
-        session.query(Event)
-        .filter(Event.scope == "requests.rate_limited", Event.ts >= since)
-        .order_by(Event.ts.desc())
-        .first()
-    )
-    if event is None:
-        return None
-    return {
-        "id": f"mdblist-quota-{event.ts.date().isoformat()}",
-        "severity": "warning",
-        "title": "MDBList daily limit reached",
-        "body": (
-            "A recent run used up your MDBList request quota, so some titles were rated from TMDB "
-            "instead of your chosen source. It resets daily — or raise your MDBList plan for more."
-        ),
-        "action_url": "/settings#requests",
-        "action_label": "Requests settings",
-        "dismissable": True,
-    }
-
-
-def _is_evidence_of_nothing_requested(event: Event) -> bool:
-    """Whether one ``requests.none_qualified`` event says anything about the owner's SETTINGS.
-
-    See :func:`_requests_found_nothing` for why a dry run and a demand-unreachable run don't. An
-    event predating those fields counts as evidence — the old behaviour, which is the safe default
-    for an alert whose whole job is to break a five-day silence.
-    """
-    data = event.message if isinstance(event.message, dict) else {}
-    return not data.get("dry_run") and not data.get("demand_unreachable")
-
-
-def _requests_found_nothing(session: Session) -> dict | None:
-    """Recent runs wanted titles but the rating gate passed none of them, so nothing reached
-    Sonarr/Radarr and nothing reached the inbox either.
-
-    This is the one request outcome with no trace anywhere the owner looks: a run that sends nothing
-    and queues nothing shows "0 requested" on a green run, which is also what a run with nothing to
-    do shows. It went unnoticed for five days in production. Fires only after TWO runs, so a single
-    quiet night — genuinely common — never nags.
-
-    Two shapes of that zero are NOT evidence and are filtered out before counting, because both
-    fired this alert on the maintainer's server while the nightly run was requesting normally
-    (2026-09-03: six events, every one of them from a one-user manual run):
-
-    * a **dry run** asked for nothing by definition, so it can't be short of things to ask for;
-    * a run covering fewer people than its own ``min_demand`` (``demand_unreachable``) could not have
-      filled the pool whatever the settings were — telling that owner to loosen their floors is
-      advice they can follow forever without effect. Same mis-attribution the language branch below
-      exists to prevent, one level up.
-
-    Filtered in Python rather than SQL: both facts live inside the event's JSON message, and the
-    fetch is widened so a burst of skipped test runs cannot crowd the real ones out of the window.
-    """
-    since = datetime.now(UTC) - timedelta(days=3)
-    candidates = (
-        session.query(Event)
-        .filter(Event.scope == "requests.none_qualified", Event.ts >= since)
-        .order_by(Event.ts.desc())
-        .limit(50)
-        .all()
-    )
-    events = [e for e in candidates if _is_evidence_of_nothing_requested(e)][:5]
-    if len(events) < 2:
-        return None
-    latest = events[0]
-    data = latest.message if isinstance(latest.message, dict) else {}
-    wanted, pool = data.get("wanted", 0), data.get("pool_size", 0)
-    examined = data.get("examined", 0)
-    # Two different problems wearing the same "0 requested". Only one is about the rating floor.
-    if not wanted and not pool:
-        # Nothing missing, or an event written before `wanted` was recorded. Either way there is no
-        # honest sentence to write — "found 0 titles you don't have" reads as a fault and isn't one.
-        return None
-    if not pool:
-        # Name the limit that ACTUALLY bound. Since the language mode became a base floor, a pool can
-        # be empty purely because "only these languages" removed everything — and telling that owner
-        # to loosen their demand or year settings is advice they can follow forever without effect.
-        dropped_by_language = data.get("dropped_by_language", 0)
-        if dropped_by_language and dropped_by_language >= wanted:
-            body = (
-                f"The last {len(events)} runs found {wanted} titles people wanted that you don't have, and "
-                "your Language setting ruled out every one of them. Allow another language, or switch "
-                "to 'Prefer these' so the rest wait in your inbox instead."
-            )
-        elif dropped_by_language:
-            body = (
-                f"The last {len(events)} runs found {wanted} titles people wanted that you don't have. "
-                f"Your Language setting ruled out {dropped_by_language} of them, and the rest didn't clear "
-                "your minimum number of people or your release-year range."
-            )
-        else:
-            body = (
-                f"The last {len(events)} runs found {wanted} titles people wanted that you don't have, and "
-                "none of them cleared your minimum number of people or your release-year range. Loosen "
-                "either to let some through."
-            )
-    elif data.get("exhausted_pool"):
-        body = (
-            f"The last {len(events)} runs rated every title they checked ({pool} checks across the rows), "
-            "and none cleared your minimum rating. Lower it, or widen the year range, to let some "
-            "through."
-        )
-    else:
-        body = (
-            f"The last {len(events)} runs got through {examined} of {pool} checks before running out of "
-            "rating lookups, and none of those cleared your minimum rating. "
-            "Raise how many to auto-request per run so each run looks further, or lower the minimum."
-        )
-    return {
-        "id": f"requests-none-qualified-{latest.ts.date().isoformat()}",
-        "severity": "warning",
-        "title": "Nothing is being requested",
-        "body": body,
-        "action_url": "/settings#requests",
-        "action_label": "Requests settings",
         "dismissable": True,
     }
 
@@ -1061,8 +915,6 @@ def build_notifications(session: Session, store: SettingsStore, current_version:
         _secrets_we_cannot_read(store),
         _last_run_problem(session),
         _failed_jobs(session),
-        _mdblist_quota(session),
-        _requests_found_nothing(session),
         _recent_service_errors(session),
         _rows_with_no_name_for_newcomers(session, store),
         _rows_we_cannot_hide(session),

@@ -149,15 +149,6 @@ class RunsSummaryOut(PassthroughModel):
     last_status: str | None
 
 
-class TraceRequestOut(PassthroughModel):
-    """What became of one wanted-but-missing title, keyed `"<tmdb_id>:<media_type>"` on the trace."""
-
-    status: Literal["pending", "sent", "rejected"]
-    detail: str
-    arr_slug: str | None
-    excluded: bool  # on the arr's import-exclusion list — approving is a no-op
-
-
 class RunUserTraceOut(PassthroughModel):
     """The full pipeline trace for one user in one run.
 
@@ -175,7 +166,6 @@ class RunUserTraceOut(PassthroughModel):
     #: the trace's stages are the engine's and have changed several times.
     trace: dict[str, Any]
     breakdown: list[dict[str, Any]]
-    requests: dict[str, TraceRequestOut]
 
 
 class RunLogLineOut(PassthroughModel):
@@ -299,12 +289,6 @@ class ReportRunsOut(PassthroughModel):
     errors_last: int
 
 
-class ReportRequestsOut(PassthroughModel):
-    sent: int
-    pending: int
-    watched_after_sent: int  # requests that paid off: asked for, then watched
-
-
 class TrendPointOut(PassthroughModel):
     week: str  # "%Y-%W"
     watched: int
@@ -391,7 +375,6 @@ class EffectivenessReportOut(PassthroughModel):
     watch_sync: WatchSyncOut
     coverage: CoverageOut
     runs: ReportRunsOut
-    requests: ReportRequestsOut
     trend: list[TrendPointOut]
     per_user: list[PerUserOut]
     per_row: list[PerRowOut]

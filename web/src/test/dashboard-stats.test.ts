@@ -15,7 +15,6 @@ function makeUser(overrides: Partial<User> = {}): User {
     cold_start: false,
     history_depth: 100,
     last_run_at: null,
-    request_tag: "",
     hit_rate: null,
     nickname: "",
     friendly_name: "",

@@ -20,7 +20,6 @@ and what changes on Plex the moment you save one. → **[Settings reference](ref
 - <span id="environment-variables-container"></span>[Environment variables (container)](reference/settings.md#environment-variables-container)
 - <span id="serving-from-a-subpath"></span>[Serving from a subpath](reference/settings.md#serving-from-a-subpath)
 - <span id="settings-keys-db-backed-settings-ui-or-put-apisettings"></span>[Settings keys, with every default](reference/settings.md#settings-keys-db-backed-settings-ui-or-put-apisettings)
-- <span id="per-row-request-overrides"></span>[Per-row request overrides](reference/settings.md#per-row-request-overrides)
 - <span id="how-settings-take-effect"></span>[How settings take effect](reference/settings.md#how-settings-take-effect)
 - <span id="when-a-row-appears-collectionsshow_days"></span>[When a row appears](reference/settings.md#when-a-row-appears-collectionsshow_days)
 - <span id="files-under-config"></span>[Files under /config](reference/settings.md#files-under-config)

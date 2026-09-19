@@ -6,7 +6,6 @@ import {
   Loader2,
   BookOpen,
   Gauge,
-  Inbox,
   LifeBuoy,
   ListChecks,
   ScrollText,
@@ -44,7 +43,6 @@ const NAV_ITEMS = [
   { to: "/users", label: "Users", icon: UsersIcon, end: false },
   { to: "/runs", label: "Runs", icon: ListChecks, end: false },
   { to: "/logs", label: "Logs", icon: ScrollText, end: false },
-  { to: "/requests", label: "Requests", icon: Inbox, end: false },
   { to: "/jobs", label: "Jobs", icon: Wrench, end: false },
   { to: "/settings", label: "Settings", icon: SettingsIcon, end: false },
   // The owner's OWN picks page — what every other person on the server sees as the whole app.
@@ -348,7 +346,7 @@ export function AppShell() {
           can never shrink below its widest unbreakable child and the WHOLE PAGE gains a horizontal
           scrollbar. One `whitespace-nowrap` button ("Run all rows now") did exactly that. */}
       <main className="min-w-0 flex-1 px-4 py-6 md:px-8 md:py-8">
-        {/* Fill the width next to the left nav — dense pages (Runs, Requests, Users) were wasting half
+        {/* Fill the width next to the left nav — dense pages (Runs, Users) were wasting half
             the screen at max-w-6xl. A high cap keeps line lengths sane on an ultrawide without floating
             a narrow block in the middle. Individual pages that want to stay narrow cap their own content. */}
         <div className="mx-auto max-w-[1800px] animate-fade-in">

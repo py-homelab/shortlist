@@ -41,7 +41,7 @@ from sqlalchemy.orm import Session
 
 from shortlist.engine.clients.http_retry import redact
 from shortlist.server import notifications
-from shortlist.server.db.models import Job, RequestCandidate, Run
+from shortlist.server.db.models import Job, Run
 from shortlist.server.services import jobs
 from shortlist.server.settings_store import SettingsStore
 from shortlist.server.version_check import check_for_update
@@ -57,7 +57,6 @@ EVENTS: tuple[str, ...] = (
     "job.finished",
     "job.failed",
     "privacy.exposure",
-    "requests.waiting",
     "update.available",
 )
 
@@ -356,7 +355,7 @@ def enqueue_job_event(sessions, job_id: int, event: str) -> int | None:
 
 
 def after_run(sessions, run_id: int, current_version: str) -> None:
-    """The checks every finished real run makes: a privacy exposure, requests waiting, a newer release.
+    """The checks every finished real run makes: a privacy exposure, a newer release.
 
     Blocking — the update check can reach GitHub — so the run calls this from an executor. Each check
     is independent and none raises: a failure in one is logged and the others still run.
@@ -374,7 +373,7 @@ def after_run(sessions, run_id: int, current_version: str) -> None:
     except Exception as e:
         _could_not_queue(f"run {run_id} follow-up", e)
         return
-    for check in (_check_privacy, _check_requests, _check_update):
+    for check in (_check_privacy, _check_update):
         try:
             check(sessions, current_version)
         except Exception as e:
@@ -404,23 +403,6 @@ def _check_privacy(sessions, _current_version: str) -> None:
     _queue(sessions, "privacy.exposure", item)
     with sessions() as session:
         SettingsStore(session).set("notify.webhook.privacy_sent_at", now.isoformat())
-
-
-def _check_requests(sessions, _current_version: str) -> None:
-    """`requests.waiting`, when more titles wait than the last time this looked.
-
-    The count is recorded on every look, falls included, so "new" always means new since then.
-    """
-    with sessions() as session:
-        store = SettingsStore(session)
-        waiting = session.query(RequestCandidate).filter(RequestCandidate.status == "pending").count()
-        seen = int(store.get("notify.webhook.requests_seen") or 0)
-        if waiting != seen:
-            store.set("notify.webhook.requests_seen", waiting)
-        if waiting <= seen or not _wanted(session, "requests.waiting"):
-            return
-        item = notifications.requests_waiting_alert(waiting, waiting - seen)
-    _queue(sessions, "requests.waiting", item)
 
 
 def _check_update(sessions, current_version: str) -> None:

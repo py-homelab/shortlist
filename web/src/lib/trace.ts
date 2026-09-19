@@ -11,7 +11,6 @@ import type {
   RunUserTrace,
   RunUserTraceResponse,
   TraceFate,
-  TraceRequestOutcome,
   TraceSeed,
   TraceSource,
   TraceWatch,
@@ -434,33 +433,4 @@ export function orderingRows(picks: Pick[]): OrderingRow[] {
     lastSeed = seed;
     return row;
   });
-}
-
-/** What became of a wanted-but-missing title, in one readable clause — or null if the request pass
- *  never considered it (requests off, or it never reached the demand pool).
- *
- *  The "not in your libraries" group IS the request pool, so this is the line that connects the two
- *  halves of the product: a title Shortlist wanted, could not deliver, and either asked Radarr/Sonarr
- *  for or deliberately did not. "pending" on its own never answered the only question worth asking —
- *  why didn't this one go? — which is why the engine now keeps the reason it always computed.
- */
-export function requestNote(
-  outcome: TraceRequestOutcome | undefined,
-): string | null {
-  if (!outcome) return null;
-  // Status first, exclusion only as a qualifier on a title still waiting — matching
-  // `RequestOutcomeTag` on the same page. `excluded` is never cleared when a title is later sent or
-  // rejected by hand, so testing it first made one title read "requested" in one place and "not
-  // requested — on an Arr exclusion list" a few lines away.
-  if (outcome.status === "sent")
-    return outcome.detail ? `requested — ${outcome.detail}` : "requested";
-  if (outcome.status === "rejected")
-    return outcome.detail ? `not requested — ${outcome.detail}` : "not requested";
-  if (outcome.excluded)
-    return outcome.detail && outcome.detail !== "on an Arr exclusion list"
-      ? `waiting — on an Arr exclusion list (${outcome.detail})`
-      : "waiting — on an Arr exclusion list";
-  return outcome.detail
-    ? `waiting for approval — ${outcome.detail}`
-    : "waiting for approval";
 }

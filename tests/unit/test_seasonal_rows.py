@@ -583,35 +583,6 @@ class TestWhatDecidesARebuild:
         assert policy.pool_key(christmas) != policy.pool_key(halloween)
 
 
-class TestRequestsFromASeasonalRow:
-    def test_the_inbox_names_the_row_as_it_reads_in_its_season(self, ctx, monkeypatch):
-        """A request is labelled with the row that surfaced it. The label is filled by hand in
-        `_record_demand`, apart from the renderer, so it has to get the season filled too."""
-        from shortlist.engine.models import ArrTarget, RequestConfig, RequestReport
-
-        ctx.tmdb.suggestions.return_value = [
-            ({"id": 77, "title": "Not On This Server", "genre_ids": [28], "vote_average": 8.0}, 1.0),
-            ({"id": 20, "title": "Die Hard 2", "genre_ids": [28], "vote_average": 7.0}, 1.0),
-        ]
-        ctx.config.requests = RequestConfig(
-            enabled=True,
-            radarr=ArrTarget(url="http://radarr.test", api_key="k", quality_profile_id=1, root_folder="/m"),
-        )
-        ctx.config.rows = [seasonal_spec()]
-        captured = {}
-
-        def spy(cfg, tmdb, demand, *, dry_run, already_handled=None, **kw):
-            captured["demand"] = demand
-            return RequestReport()
-
-        monkeypatch.setattr(pipeline_mod.requests_mod, "request_missing", spy)
-
-        pipeline_mod.run(ctx, _people())
-
-        (row,) = captured["demand"]
-        assert [why.row for why in row.demand[(77, MediaType.MOVIE)].why][:1] == ["🎄 Christmas picks"]
-
-
 class TestCarryingASeasonalRowForward:
     def test_a_title_no_longer_in_the_season_does_not_carry_forward(self, ctx):
         """A night that keeps last run's picks must not keep one the season list no longer holds: only a new

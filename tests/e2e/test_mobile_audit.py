@@ -163,7 +163,6 @@ def _routes(app: ShortlistApp) -> list[tuple[str, str, str | None]]:
         # "AI tokens|Summary|user" matched nothing this page renders — it shows DURATION,
         # ROWS BUILT, PEOPLE. It only ever "passed" by falling through the 8s timeout.
         ("run detail", f"/runs/{run_id}", "ROWS BUILT|DURATION|Run #"),
-        ("requests", "/requests", "request"),
         ("jobs", "/jobs", "Schedules|job|Backup"),
         ("logs", "/logs", "log|level"),
         ("settings", "/settings", "Connections"),

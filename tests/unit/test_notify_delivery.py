@@ -16,7 +16,7 @@ someone unpicks them:
   `deliver()` the 3am failure reaches, so a webhook that answers the button is a webhook that will
   answer the failure. A test button with its own send path proves nothing about the real one.
 
-No test may touch the network: `respx` intercepts every httpx call, exactly as `test_arr.py` does.
+No test may touch the network: `respx` intercepts every httpx call, exactly as `test_seerr.py` does.
 """
 
 from __future__ import annotations

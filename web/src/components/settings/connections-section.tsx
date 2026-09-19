@@ -1,4 +1,4 @@
-import { Compass, Film, Globe, Inbox, Tv, Webhook } from "lucide-react";
+import { Compass, Globe, Inbox, Webhook } from "lucide-react";
 
 import {
   MdblistGlyph,
@@ -406,62 +406,20 @@ export function ConnectionsSection({ settings }: { settings: Settings }) {
         />
         <ConnectionCard
           service="overseerr"
-          title="Overseerr / Jellyseerr"
-          purpose="An alternative to connecting Radarr and Sonarr directly: Shortlist files a request here and it fetches the title, using its own quality settings and approval rules. Works with Overseerr, Jellyseerr and Seerr — they share one API."
+          title="Overseerr / Jellyseerr / Seerr"
+          purpose="Where each person's requests go from their own picks page — filed as them, with their own quota and approval. The key needs Manage Users, so Shortlist can match each person's Plex account to their account here. Nothing is requested without a person asking."
           settings={settings}
-          summary={settingString(settings, "requests.overseerr.url")}
+          summary={settingString(settings, "seerr.url")}
           glyph={<Inbox aria-hidden className="text-primary" />}
           fields={[
             {
-              key: "requests.overseerr.url",
+              key: "seerr.url",
               label: "Address",
               kind: "text",
               placeholder: "http://your-host:5055",
             },
             {
-              key: "requests.overseerr.apikey",
-              label: "API key",
-              kind: "password",
-            },
-          ]}
-        />
-        <ConnectionCard
-          service="radarr"
-          title="Radarr"
-          purpose="Fetches films Shortlist wanted to recommend but couldn’t find on your server."
-          settings={settings}
-          summary={settingString(settings, "requests.radarr.url")}
-          glyph={<Film aria-hidden className="text-primary" />}
-          fields={[
-            {
-              key: "requests.radarr.url",
-              label: "Address",
-              kind: "text",
-              placeholder: "http://your-host:7878",
-            },
-            {
-              key: "requests.radarr.apikey",
-              label: "API key",
-              kind: "password",
-            },
-          ]}
-        />
-        <ConnectionCard
-          service="sonarr"
-          title="Sonarr"
-          purpose="Fetches shows Shortlist wanted to recommend but couldn’t find on your server."
-          settings={settings}
-          summary={settingString(settings, "requests.sonarr.url")}
-          glyph={<Tv aria-hidden className="text-primary" />}
-          fields={[
-            {
-              key: "requests.sonarr.url",
-              label: "Address",
-              kind: "text",
-              placeholder: "http://your-host:8989",
-            },
-            {
-              key: "requests.sonarr.apikey",
+              key: "seerr.apikey",
               label: "API key",
               kind: "password",
             },
@@ -491,22 +449,20 @@ export function ConnectionsSection({ settings }: { settings: Settings }) {
         <ConnectionCard
           service="mdblist"
           title="MDBList"
-          // Two consumers, not one: `requests.rating_source` gates what gets requested, and
-          // `recommendations.rating_source` orders any row set to "Highest rated". Naming only
-          // Requests left the row-ordering setting looking like it needed nothing.
+          // One consumer: `recommendations.rating_source` orders any row set to "Highest rated".
           // "off TMDB" read two ways — scores taken FROM TMDB, or a row switched AWAY from TMDB —
           // and it means the second. Say which score is being swapped for which instead.
-          purpose="IMDb, Rotten Tomatoes, Metacritic and Trakt scores in one lookup. Only needed if you want a “Highest rated” row ranked by one of those instead of by TMDB’s score, or requests judged by them."
+          purpose="IMDb, Rotten Tomatoes, Metacritic and Trakt scores in one lookup. Only needed if you want a “Highest rated” row ranked by one of those instead of by TMDB’s score."
           settings={settings}
           summary={
-            settingString(settings, "requests.mdblist.apikey")
+            settingString(settings, "recommendations.mdblist.apikey")
               ? "API key saved"
               : ""
           }
           glyph={<MdblistGlyph />}
           fields={[
             {
-              key: "requests.mdblist.apikey",
+              key: "recommendations.mdblist.apikey",
               label: "API key",
               kind: "password",
               placeholder: "Free key from mdblist.com",

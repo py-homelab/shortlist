@@ -73,7 +73,7 @@ shortlist/
 │   │   ├── privacy.py            # filter parse/merge/serialize, snapshot, diff, throttled apply
 │   │   ├── acquire.py            # Radarr/Sonarr/Seerr, capped
 │   │   ├── posters.py            # PIL branded collection posters (3 templates)
-│   │   └── clients/              # plex.py (plexapi + raw plex.tv: pins, users, filters, home-switch), tautulli.py, tmdb.py, arr.py
+│   │   └── clients/              # plex.py (plexapi + raw plex.tv: pins, users, filters, home-switch), tautulli.py, tmdb.py, seerr.py (per-person requests), engine_http.py
 │   ├── server/                   # FastAPI app
 │   │   ├── main.py               # app factory; serves web/dist; /api mount; healthz
 │   │   ├── auth.py               # PIN flow, owner-only session, signed httpOnly cookie
@@ -182,7 +182,7 @@ architectural shape only; a second copy of ~60 endpoints in a design doc drifts,
 /users/*       roster, enable/pause/prefs, per-person row overrides, sync from plex.tv + Tautulli
 /collections/* the multi-row surface: CRUD, audience, placement, posters, rename (SSE), cleanup
 /runs/*        list/detail/trace/cancel, POST to run (optionally scoped to users and/or rows)
-/requests/*    the approval inbox — send to Radarr/Sonarr, reject, restore
+/me/*          a person's own picks — suggestions, request as them, never/later/skip, impressions
 /settings/*    typed settings + per-service connection tests
 /system/*      health · version · logs · libraries · backups · api-token · uninstall
                · jobs  ← the durable maintenance queue (GET history, POST to trigger the two safe kinds)

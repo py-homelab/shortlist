@@ -138,7 +138,7 @@ class TestTheGuardsAreWired:
         """Parameterised over the tuple itself, not over one hand-picked key.
 
         `_FETCHED_URL_KEYS` is the whole list of settings the SERVER later fetches, and it grows —
-        it just gained `requests.overseerr.url`. Testing one member proves the guard runs for that
+        it just gained `seerr.url`. Testing one member proves the guard runs for that
         member; testing the tuple proves a new door cannot be added without one.
         """
         client = self._client(tmp_path)
@@ -156,11 +156,11 @@ class TestTheGuardsAreWired:
             "/api/settings",
             json={
                 "values": {
-                    "requests.radarr.url": "http://192.168.1.50:7878",
+                    "seerr.url": "http://192.168.1.50:5055",
                     "curator.ollama_url": "http://ollama:11434",
                 }
             },
         )
 
         assert r.status_code == 200
-        assert client.get("/api/settings").json()["requests.radarr.url"] == "http://192.168.1.50:7878"
+        assert client.get("/api/settings").json()["seerr.url"] == "http://192.168.1.50:5055"

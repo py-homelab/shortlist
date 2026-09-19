@@ -107,7 +107,7 @@ class TestLastRunProblem:
 
 class TestRecentServiceErrors:
     def test_fires_on_a_recent_non_run_error(self, session):
-        session.add(Event(scope="requests.send", level="error", ts=datetime.now(UTC)))
+        session.add(Event(scope="plextv.write", level="error", ts=datetime.now(UTC)))
         session.commit()
 
         result = notif._recent_service_errors(session)
@@ -124,11 +124,11 @@ class TestRecentServiceErrors:
         count falls as old events age out of the 24h window, which would re-surface an alert that
         nothing new had happened to.
         """
-        session.add(Event(scope="requests.send", level="error", ts=datetime.now(UTC)))
+        session.add(Event(scope="plextv.write", level="error", ts=datetime.now(UTC)))
         session.commit()
         first = notif._recent_service_errors(session)
 
-        session.add(Event(scope="arr.send", level="error", ts=datetime.now(UTC)))
+        session.add(Event(scope="search.llm_web", level="error", ts=datetime.now(UTC)))
         session.commit()
         second = notif._recent_service_errors(session)
 
@@ -143,13 +143,13 @@ class TestRecentServiceErrors:
         assert notif._recent_service_errors(session) is None
 
     def test_excludes_events_below_error_level(self, session):
-        session.add(Event(scope="requests.send", level="warning", ts=datetime.now(UTC)))
+        session.add(Event(scope="plextv.write", level="warning", ts=datetime.now(UTC)))
         session.commit()
 
         assert notif._recent_service_errors(session) is None
 
     def test_excludes_errors_older_than_a_day(self, session):
-        session.add(Event(scope="requests.send", level="error", ts=datetime.now(UTC) - timedelta(days=2)))
+        session.add(Event(scope="plextv.write", level="error", ts=datetime.now(UTC) - timedelta(days=2)))
         session.commit()
 
         assert notif._recent_service_errors(session) is None
@@ -157,204 +157,13 @@ class TestRecentServiceErrors:
     def test_pluralizes_the_count(self, session):
         session.add_all(
             [
-                Event(scope="requests.send", level="error", ts=datetime.now(UTC)),
+                Event(scope="plextv.write", level="error", ts=datetime.now(UTC)),
                 Event(scope="settings.save", level="error", ts=datetime.now(UTC)),
             ]
         )
         session.commit()
 
         assert "2 errors" in notif._recent_service_errors(session)["title"]
-
-
-class TestMdblistQuota:
-    def test_fires_on_a_recent_rate_limited_event(self, session):
-        event = Event(scope="requests.rate_limited", level="warning", ts=datetime.now(UTC))
-        session.add(event)
-        session.commit()
-
-        result = notif._mdblist_quota(session)
-
-        assert result["id"] == f"mdblist-quota-{event.ts.date().isoformat()}"
-        assert result["severity"] == "warning"
-
-    def test_does_not_fire_with_no_recent_rate_limit_event(self, session):
-        assert notif._mdblist_quota(session) is None
-
-    def test_does_not_fire_for_an_event_older_than_a_day(self, session):
-        session.add(Event(scope="requests.rate_limited", level="warning", ts=datetime.now(UTC) - timedelta(days=2)))
-        session.commit()
-
-        assert notif._mdblist_quota(session) is None
-
-
-class TestRequestsFoundNothing:
-    """A run that sends nothing AND queues nothing looked exactly like a run with nothing to do:
-    "0 requested" on a green run, no inbox rows, no event. Production sat that way for five days."""
-
-    @staticmethod
-    def _event(**message):
-        return Event(scope="requests.none_qualified", level="warning", ts=datetime.now(UTC), message=message)
-
-    def test_names_the_floors_when_nothing_cleared_them(self, session):
-        """The most actionable shape there is, and the one keying on `pool_size` used to skip: 702
-        titles wanted, none past the base floors. That is what the maintainer's server was doing."""
-        session.add_all([self._event(wanted=702, pool_size=0, examined=0, exhausted_pool=False) for _ in range(2)])
-        session.commit()
-
-        body = notif._requests_found_nothing(session)["body"]
-
-        assert "702 titles" in body
-        assert "minimum number of people or your release-year range" in body
-
-    def test_blames_the_language_setting_when_it_ruled_everything_out(self, session):
-        """Since the language mode became a base floor, a pool can be empty purely because "only
-        these languages" removed everything — and telling that owner to loosen their demand or
-        release-year settings is advice they can follow forever without any effect. This codebase
-        has already had to fix that exact mis-attribution once ("name the limit that ACTUALLY
-        bound"), which is why it is pinned here rather than left to review."""
-        session.add_all(
-            [
-                self._event(wanted=40, pool_size=0, examined=0, exhausted_pool=False, dropped_by_language=40)
-                for _ in range(2)
-            ]
-        )
-        session.commit()
-
-        body = notif._requests_found_nothing(session)["body"]
-
-        assert "Language setting ruled out every one of them" in body
-        assert "Prefer these" in body, "the fix has to be named, not just the cause"
-        assert "minimum number of people" not in body, "must not send them after the wrong setting"
-
-    def test_names_both_causes_when_the_language_setting_took_only_some(self, session):
-        session.add_all(
-            [
-                self._event(wanted=40, pool_size=0, examined=0, exhausted_pool=False, dropped_by_language=12)
-                for _ in range(2)
-            ]
-        )
-        session.commit()
-
-        body = notif._requests_found_nothing(session)["body"]
-
-        assert "ruled out 12 of them" in body
-        assert "minimum number of people or your release-year range" in body
-
-    def test_keeps_the_old_wording_when_language_ruled_out_nothing(self, session):
-        """The overwhelmingly common case — the mode is "any" — must read exactly as it did."""
-        session.add_all(
-            [
-                self._event(wanted=702, pool_size=0, examined=0, exhausted_pool=False, dropped_by_language=0)
-                for _ in range(2)
-            ]
-        )
-        session.commit()
-
-        body = notif._requests_found_nothing(session)["body"]
-
-        assert "minimum number of people or your release-year range" in body
-        assert "Language" not in body
-
-    def test_stays_silent_when_nothing_was_missing_at_all(self, session):
-        """`wanted == 0` is not a problem to report — the library simply had everything."""
-        session.add_all([self._event(wanted=0, pool_size=0, examined=0) for _ in range(3)])
-        session.commit()
-
-        assert notif._requests_found_nothing(session) is None
-
-    def test_does_not_fire_for_a_single_quiet_night(self, session):
-        """One run finding nothing is ordinary — nagging about it would train the owner to ignore it."""
-        session.add(self._event(wanted=900, pool_size=400, examined=100, exhausted_pool=False))
-        session.commit()
-
-        assert notif._requests_found_nothing(session) is None
-
-    def test_tells_the_owner_to_look_further_when_the_gate_ran_out(self, session):
-        session.add_all([self._event(wanted=900, pool_size=400, examined=100, exhausted_pool=False) for _ in range(2)])
-        session.commit()
-
-        result = notif._requests_found_nothing(session)
-
-        assert result["severity"] == "warning"
-        assert "100 of 400 checks" in result["body"]
-        # Not "of the 400 titles people wanted": `pool_size` is a sum of per-row checks, so on a
-        # multi-row run it double-counts a title two rows share, while the `wanted` on the same
-        # card is distinct. Calling both "titles wanted" made them contradict each other in print
-        # (release review 2026-08-18).
-        assert "titles people wanted" not in result["body"]
-        assert "looks further" in result["body"], "the actionable half: the gate never saw the rest"
-
-    def test_blames_the_floor_when_the_whole_pool_was_rated(self, session):
-        """The other shape of the same zero — everything WAS rated and none of it was good enough.
-        Telling this owner to raise max_per_run would be advice that cannot possibly work."""
-        session.add_all([self._event(wanted=90, pool_size=40, examined=40, exhausted_pool=True) for _ in range(2)])
-        session.commit()
-
-        body = notif._requests_found_nothing(session)["body"]
-
-        assert "40 checks" in body
-        assert "titles people wanted" not in body
-        assert "looks further" not in body
-
-    def test_does_not_fire_for_events_older_than_the_window(self, session):
-        old = datetime.now(UTC) - timedelta(days=5)
-        for _ in range(3):
-            session.add(Event(scope="requests.none_qualified", level="warning", ts=old, message={}))
-        session.commit()
-
-        assert notif._requests_found_nothing(session) is None
-
-    def test_ignores_a_run_that_covered_fewer_people_than_its_own_demand_floor(self, session):
-        """The false positive this alert actually produced. `min_demand=2` counts DISTINCT wanters,
-        so a one-user manual run cannot fill the pool whatever the settings are — and the maintainer
-        was told six times to loosen floors that were never the reason, while the nightly 46-user run
-        was requesting normally (2026-09-03)."""
-        session.add_all(
-            [
-                self._event(wanted=650, pool_size=0, examined=0, users=1, demand_floor=2, demand_unreachable=True)
-                for _ in range(6)
-            ]
-        )
-        session.commit()
-
-        assert notif._requests_found_nothing(session) is None
-
-    def test_ignores_dry_runs(self, session):
-        """A dry run asked for nothing by definition, so it is no evidence that there was nothing to
-        ask for. Three of the maintainer's six false positives were dry runs."""
-        session.add_all([self._event(wanted=650, pool_size=0, examined=0, dry_run=True) for _ in range(3)])
-        session.commit()
-
-        assert notif._requests_found_nothing(session) is None
-
-    def test_still_fires_when_real_runs_hide_behind_a_burst_of_skipped_ones(self, session):
-        """The reason the fetch is widened before filtering. An afternoon of test runs is a burst of
-        events that say nothing, and the two real ones sit UNDER them — filtering a page of 5 would
-        have dropped exactly the evidence the alert exists for."""
-        now = datetime.now(UTC)
-        for i in range(20):
-            event = self._event(wanted=650, pool_size=0, examined=0, users=1, demand_floor=2, demand_unreachable=True)
-            event.ts = now - timedelta(minutes=i)
-            session.add(event)
-        for i in range(2):
-            real = self._event(wanted=11424, pool_size=0, examined=0, users=46, demand_floor=2)
-            real.ts = now - timedelta(hours=24 + i)
-            session.add(real)
-        session.commit()
-
-        result = notif._requests_found_nothing(session)
-
-        assert result is not None
-        assert "The last 2 runs" in result["body"], "only the real runs may be counted"
-        assert "11424 titles" in result["body"]
-
-    def test_counts_an_event_from_before_the_new_fields_existed(self, session):
-        """An event written by an older build carries neither `users` nor `demand_unreachable`. The
-        safe default for an alert whose job is to break a five-day silence is to still speak."""
-        session.add_all([self._event(wanted=702, pool_size=0, examined=0) for _ in range(2)])
-        session.commit()
-
-        assert notif._requests_found_nothing(session) is not None
 
 
 class TestFailedJobs:
@@ -558,7 +367,6 @@ class TestSeverityVocabulary:
         store = SettingsStore(session)
         store.set("paused_all", True)
         session.add(Run(trigger="manual", status="ok", stats={"users_ok": 1, "users_error": 1}))
-        session.add(Event(scope="requests.rate_limited", level="warning", ts=datetime.now(UTC)))
         session.add(Event(scope="settings.save", level="error", ts=datetime.now(UTC)))
         session.add(Job(kind="user.cleanup", status="failed"))
         session.commit()

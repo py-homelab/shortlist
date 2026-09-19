@@ -147,7 +147,6 @@ Settings → Finding titles sets what a row uses **unless the row says otherwise
 | **Recent releases**                                  | How much release date counts for this row — a “new and notable” shelf, or one that digs up older films |
 | **Row size**, **Audience**                           | How many titles, and who gets it                                                          |
 | **Watches the AI web search looks up**               | How many recent watches AI web search looks up for this row (shown only on rows using it) |
-| **Request tag**                                      | The Radarr or Sonarr tag on titles requested for this row's audience                      |
 
 So a "What to watch next" row can be Trakt-only, a "Hidden gems" row can use AI web search alone
 pointed at just your 4K library with **Recent releases** turned all the way down, a "New & notable"

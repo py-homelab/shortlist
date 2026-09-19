@@ -34,94 +34,6 @@ class TestSettingsValidation:
         resp = client.put("/api/settings", json={"values": {"row.name_template": "{season_emoji} {season} picks"}})
         assert resp.status_code == 422, resp.text
 
-    def test_the_sonarr_monitor_mode_accepts_only_the_modes_shortlist_offers(self, client: TestClient):
-        # Sonarr 400s the whole add on a monitor value it doesn't know, so a typo saved here would
-        # surface a fortnight later as shows that never arrived — with nothing on screen to explain it.
-        for offered in ("all", "firstSeason", "lastSeason", "pilot", "none"):
-            resp = client.put("/api/settings", json={"values": {"requests.sonarr.monitor": offered}})
-            assert resp.status_code == 200, f"{offered}: {resp.text}"
-
-        # The accepted set is a SUBSET of Sonarr's enum, so these are refused even though Sonarr
-        # itself would take them. `future`/`existing`/`recent` monitor nothing at all on a show the
-        # server doesn't have yet (measured on Sonarr 4.0.19: 0 of 162 episodes), which is what
-        # `none` says plainly; `missing` is the opposite — with nothing on disk it measured
-        # identically to `all` (156/162), so it is `all` under a name suggesting restraint; `skip`
-        # and `monitorSpecials` are internal / season-0 only. Accepting any of them would put a mode
-        # in the DB that no screen can show or undo.
-        for refused in ("recent", "future", "existing", "missing", "skip", "monitorSpecials", "first season"):
-            resp = client.put("/api/settings", json={"values": {"requests.sonarr.monitor": refused}})
-            assert resp.status_code == 422, f"{refused} was accepted"
-
-    def test_the_language_mode_accepts_only_the_modes_shortlist_offers(self, client: TestClient):
-        for offered in ("any", "prefer", "only"):
-            resp = client.put("/api/settings", json={"values": {"requests.language_mode": offered}})
-            assert resp.status_code == 200, f"{offered}: {resp.text}"
-        for refused in ("english_only", "prefer_english", "en", "", "ANY"):
-            resp = client.put("/api/settings", json={"values": {"requests.language_mode": refused}})
-            assert resp.status_code == 422, f"{refused} was accepted"
-
-    def test_preferred_languages_must_be_iso_639_1_codes(self, client: TestClient):
-        """A code that isn't two letters matches no title's `original_language`, so every title on the
-        server would silently reclassify as "other" and take the higher bar — the feature appearing to
-        misbehave, with nothing on screen to connect it to the typo that caused it."""
-        assert client.put("/api/settings", json={"values": {"requests.preferred_languages": ["en"]}}).status_code == 200
-        assert (
-            client.put("/api/settings", json={"values": {"requests.preferred_languages": ["en", "ja"]}}).status_code
-            == 200
-        )
-        # Empty is legal and meaningful: in "only" mode it requests nothing.
-        assert client.put("/api/settings", json={"values": {"requests.preferred_languages": []}}).status_code == 200
-        for refused in (["english"], ["e"], ["en-US"], ["e1"], "en", [5]):
-            resp = client.put("/api/settings", json={"values": {"requests.preferred_languages": refused}})
-            assert resp.status_code == 422, f"{refused} was accepted"
-
-    def test_a_long_list_of_bad_codes_says_how_many_it_did_not_show(self, client: TestClient):
-        """Same reason as the row endpoint: a truncated list without a count sends the owner round
-        the loop twice."""
-        resp = client.put(
-            "/api/settings",
-            json={"values": {"requests.preferred_languages": [f"{c}1" for c in "abcdefg"]}},
-        )
-        assert resp.status_code == 422
-        assert "(+2 more)" in resp.text
-
-    def test_too_many_languages_is_refused(self, client: TestClient):
-        """Unbounded, this is a setting an owner can store megabytes into — and it is read on every
-        run, so the ceiling is cheaper than the audit."""
-        ok = client.put("/api/settings", json={"values": {"requests.preferred_languages": ["en"] * 50}})
-        assert ok.status_code == 200
-        too_many = client.put("/api/settings", json={"values": {"requests.preferred_languages": ["en"] * 51}})
-        assert too_many.status_code == 422
-        assert "too many languages" in too_many.text
-
-    def test_the_other_language_bar_accepts_null_because_null_is_a_meaning(self, client: TestClient):
-        """None is not "unset" here — it means "follow min_rating + 1.5", which is the SHIPPED default
-        precisely so no fixed number of ours is imposed on anyone's server. A validator that rejected
-        null would make the default unsettable from the UI."""
-        assert client.put("/api/settings", json={"values": {"requests.min_rating_other": 11}}).status_code == 422
-        assert client.put("/api/settings", json={"values": {"requests.min_rating_other": -1}}).status_code == 422
-
-        def round_trip(value):
-            """Accepting a value is not the same as STORING it — assert what reads back, because a
-            store that coerced null to 0.0 would pass a status-code check and then hand every run a
-            bar of zero."""
-            assert client.put("/api/settings", json={"values": {"requests.min_rating_other": value}}).status_code == 200
-            return client.get("/api/settings").json()["requests.min_rating_other"]
-
-        assert round_trip(8.5) == 8.5
-        assert round_trip(None) is None, "null must survive as null, or the bar stops following"
-        # 0.0 is falsy and is a REAL bar (nothing can fail it). It must not read back as null, or the
-        # owner's deliberate "send anything" becomes "follow my minimum rating + 1.5" on the next run.
-        assert round_trip(0.0) == 0.0
-
-    def test_the_shipped_language_defaults_change_nothing(self, client: TestClient):
-        """An upgrade must not start filtering anyone's requests. The mode is what is off; the
-        language list is merely the value that mode never reads."""
-        values = client.get("/api/settings").json()
-        assert values["requests.language_mode"] == "any"
-        assert values["requests.preferred_languages"] == ["en"]
-        assert values["requests.min_rating_other"] is None
-
     @staticmethod
     def _last_settings_event(client: TestClient) -> dict:
         import json
@@ -144,7 +56,7 @@ class TestSettingsValidation:
         """
         resp = client.put(
             "/api/settings",
-            json={"values": {"requests.min_rating": 7.9}},
+            json={"values": {"plex.timeout_s": 79}},
             headers={"User-Agent": "Mozilla/5.0 (Macintosh) TestBrowser/1.0"},
         )
         assert resp.status_code == 200, resp.text
@@ -160,7 +72,7 @@ class TestSettingsValidation:
         assert actor["account_id"], "the account id is the field the whole feature exists to record"
         assert "TestBrowser/1.0" in actor["client"]
         # The change itself is still recorded — the actor is an addition, not a replacement.
-        assert "requests.min_rating" in message["changed"]
+        assert "plex.timeout_s" in message["changed"]
 
     def test_the_actor_distinguishes_an_api_token_from_a_browser(self, client: TestClient):
         """The untested half, and the likelier culprit: a value that moves with nobody owning up to
@@ -172,7 +84,7 @@ class TestSettingsValidation:
             _pytest.skip("no API token endpoint on this build")
         resp = client.put(
             "/api/settings",
-            json={"values": {"requests.min_votes": 111}},
+            json={"values": {"plex.timeout_s": 111}},
             headers={"Authorization": f"Bearer {token}", "User-Agent": "curl/8.4.0"},
         )
         assert resp.status_code == 200, resp.text
@@ -184,7 +96,7 @@ class TestSettingsValidation:
         """A script with no UA must not store an empty string that reads like a real client."""
         resp = client.put(
             "/api/settings",
-            json={"values": {"requests.min_votes": 122}},
+            json={"values": {"plex.timeout_s": 122}},
             headers={"User-Agent": ""},
         )
         assert resp.status_code == 200, resp.text
@@ -244,12 +156,6 @@ class TestSettingsValidation:
         entry = {"2": {"anchor": "New Series (Unwatched)", "before": False}}
 
         assert client.put("/api/settings", json={"values": {"rows.hub_anchor": entry}}).status_code == 422
-
-    def test_request_year_bounds_are_validated(self, client: TestClient):
-        # Both ends of the request year window share the 0..2100 bound (0 = that end disabled).
-        assert client.put("/api/settings", json={"values": {"requests.max_year": 3000}}).status_code == 422
-        assert client.put("/api/settings", json={"values": {"requests.max_year": 1990}}).status_code == 200
-        assert client.put("/api/settings", json={"values": {"requests.min_year": 2000}}).status_code == 200
 
     def test_paused_all_must_be_a_real_boolean(self, client: TestClient):
         # A non-empty string is truthy in Python, so "false" PAUSED every run while the UI read "off".
@@ -387,7 +293,7 @@ class TestSettingsValidation:
     def test_a_valid_settings_payload_still_saves(self, client: TestClient):
         r = client.put(
             "/api/settings",
-            json={"values": {"row.size": 15, "requests.min_rating": 7.5, "requests.max_per_run": 5}},
+            json={"values": {"row.size": 15, "plex.timeout_s": 45, "run.concurrency": 4}},
         )
         assert r.status_code == 200
 
@@ -438,11 +344,11 @@ class TestSettingsChangeAudit:
         return client.get("/api/events/log", params={"scope": "settings.change"}).json()
 
     def test_a_changed_setting_records_its_before_and_after(self, client: TestClient):
-        client.put("/api/settings", json={"values": {"requests.auto_min_rating": 8.0}})
-        client.put("/api/settings", json={"values": {"requests.auto_min_rating": 7.1}})
+        client.put("/api/settings", json={"values": {"plextv.throttle_s": 8.0}})
+        client.put("/api/settings", json={"values": {"plextv.throttle_s": 7.1}})
 
         latest = self._changes(client)[0]["message"]["changed"]
-        assert latest["requests.auto_min_rating"] == {"from": 8.0, "to": 7.1}
+        assert latest["plextv.throttle_s"] == {"from": 8.0, "to": 7.1}
 
     def test_switching_an_off_able_schedule_off_is_recorded_the_first_time(self, client: TestClient):
         """Turning the drift check off must be auditable, and on a fresh install it was not.
@@ -461,9 +367,9 @@ class TestSettingsChangeAudit:
 
     def test_an_unchanged_key_is_not_recorded(self, client: TestClient):
         """The form PUTs the whole object, so recording every key would bury the one that moved."""
-        client.put("/api/settings", json={"values": {"row.size": 20, "requests.max_per_run": 5}})
+        client.put("/api/settings", json={"values": {"row.size": 20, "plex.timeout_s": 60}})
         before = len(self._changes(client))
-        client.put("/api/settings", json={"values": {"row.size": 20, "requests.max_per_run": 5}})
+        client.put("/api/settings", json={"values": {"row.size": 20, "plex.timeout_s": 60}})
 
         assert len(self._changes(client)) == before, "a no-op save must not add an event"
 
@@ -582,10 +488,10 @@ class TestSettingsApi:
 
         client.put(
             "/api/settings",
-            json={"values": {"requests.overseerr.url": "http://overseerr:5055", "requests.overseerr.apikey": "ok-123"}},
+            json={"values": {"seerr.url": "http://overseerr:5055", "seerr.apikey": "ok-123"}},
         )
         # The key is a secret like any other: encrypted at rest, redacted on read (rule 9).
-        assert client.get("/api/settings").json()["requests.overseerr.apikey"] == "•••••"
+        assert client.get("/api/settings").json()["seerr.apikey"] == "•••••"
 
         monkeypatch.setattr(
             "shortlist.engine.clients.seerr.SeerrClient.ping", lambda self: "Connected to Overseerr as serverowner"
@@ -593,53 +499,6 @@ class TestSettingsApi:
         ok = client.post("/api/settings/test/overseerr").json()
         assert ok["ok"] is True and "serverowner" in ok["message"]
         assert set(half) == {"ok", "message"} and set(ok) == {"ok", "message"}
-
-    def test_overseerr_options_lists_the_accounts_and_says_when_it_cannot(self, client: TestClient, monkeypatch):
-        """The "Request as" dropdown's source. 409 before it is connected — the UI shows its own
-        "connect it first" panel on that, rather than an error it cannot act on."""
-        assert client.get("/api/settings/overseerr/options").status_code == 409
-
-        client.put(
-            "/api/settings",
-            json={"values": {"requests.overseerr.url": "http://overseerr:5055", "requests.overseerr.apikey": "ok-123"}},
-        )
-        users = [
-            {
-                "id": 1,
-                "name": "serverowner",
-                "auto_approve_movies": True,
-                "auto_approve_tv": True,
-                "is_plex_user": True,
-            },
-            {
-                "id": 4,
-                "name": "Shortlist",
-                "auto_approve_movies": False,
-                "auto_approve_tv": False,
-                "is_plex_user": False,
-            },
-        ]
-        monkeypatch.setattr("shortlist.engine.clients.seerr.SeerrClient.users", lambda self: users)
-        monkeypatch.setattr("shortlist.engine.clients.seerr.SeerrClient.whoami", lambda self: 1)
-        body = client.get("/api/settings/overseerr/options").json()
-        # `default_user_id` is what lets the screen resolve "Server default" to a real account and
-        # say whether it approves — without it the commonest setting is an unknown.
-        assert body == {"users": users, "default_user_id": 1}
-
-        def boom(self):
-            raise RuntimeError("Overseerr unreachable (ConnectError)")
-
-        monkeypatch.setattr("shortlist.engine.clients.seerr.SeerrClient.users", boom)
-        down = client.get("/api/settings/overseerr/options")
-        assert down.status_code == 502
-        # The card keeps its picker usable on this, so the message has to say what to do.
-        assert "Overseerr" in down.json()["detail"]
-
-    def test_the_request_target_only_accepts_a_known_route(self, client: TestClient):
-        """A typo here would silently route every request to the wrong app, or to none."""
-        assert client.put("/api/settings", json={"values": {"requests.target": "radarr"}}).status_code == 422
-        assert client.put("/api/settings", json={"values": {"requests.target": "overseerr"}}).status_code == 200
-        assert client.get("/api/settings").json()["requests.target"] == "overseerr"
 
     def test_the_removed_agregarr_connection_is_gone_from_every_surface(self, client: TestClient):
         """The Agregarr connection was removed. Three surfaces had to stop knowing about it, and a
@@ -900,32 +759,6 @@ class TestSettingsApi:
             body = client.post("/api/settings/test/notify").json()
         assert body["ok"] is False and "403" in body["message"]
         assert webhook not in body["message"] and "S3cr3t-T0ken-Value" not in body["message"]
-
-    def test_arr_options_serve_the_dropdowns_the_settings_form_needs(self, client: TestClient, monkeypatch):
-        """Quality profiles and root folders, so a non-technical owner picks from a list instead of
-        hunting down a numeric profile id and a server path."""
-        from types import SimpleNamespace
-
-        client.put(
-            "/api/settings",
-            json={"values": {"requests.radarr.url": "http://radarr", "requests.radarr.apikey": "k"}},
-        )
-        fake = SimpleNamespace(
-            quality_profiles=lambda: [{"id": 1, "name": "HD-1080p"}],
-            root_folders=lambda: [{"id": 2, "path": "/movies"}],
-        )
-        monkeypatch.setattr("shortlist.engine.clients.arr.make_arr_client", lambda service, target: fake)
-
-        body = client.get("/api/settings/arr/radarr/options").json()
-
-        assert set(body) == {"quality_profiles", "root_folders"}
-        assert [set(p) for p in body["quality_profiles"]] == [{"id", "name"}]
-        assert [set(f) for f in body["root_folders"]] == [{"id", "path"}]
-        assert body["quality_profiles"] == [{"id": 1, "name": "HD-1080p"}]
-        assert body["root_folders"] == [{"id": 2, "path": "/movies"}]
-
-    def test_arr_options_are_409_before_the_arr_is_connected(self, client: TestClient):
-        assert client.get("/api/settings/arr/sonarr/options").status_code == 409
 
     def test_connection_error_redacts_a_plex_token(self, client: TestClient, monkeypatch):
         # plexapi errors can embed the tokened request URL; the connection-test response must never

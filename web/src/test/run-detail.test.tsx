@@ -66,7 +66,7 @@ function run(breakdown: RunDetail["users"][number]["breakdown"]): RunDetail {
     began_at: "2026-07-15T04:18:00Z",
     finished_at: "2026-07-15T04:24:00Z",
     dry_run: false,
-    stats: { users_ok: 1, users_error: 0, titles_requested: 0 },
+    stats: { users_ok: 1, users_error: 0 },
     error: null,
     promotion_blockers: [],
     users: [
@@ -280,7 +280,6 @@ describe("RunDetailPage — grouped by library", () => {
       users_error: 1,
       titles_added: 5,
       titles_removed: 3,
-      titles_requested: 4,
       llm_tokens: 377428,
       llm_tokens_by_step: { curate: 251295, llm_web: 126133 },
       exa_searches: 46,
@@ -310,7 +309,6 @@ describe("RunDetailPage — grouped by library", () => {
     r.stats = {
       users_ok: 47,
       users_error: 0,
-      titles_requested: 0,
       llm_tokens: 691422,
       // 7, not 1: the Rows-built tile also renders a small integer, and "1" appearing twice made
       // this assertion ambiguous rather than wrong.
@@ -335,7 +333,6 @@ describe("RunDetailPage — grouped by library", () => {
       users_error: 0,
       titles_added: 0,
       titles_removed: 0,
-      titles_requested: 0,
       llm_tokens: 0,
       exa_searches: 0,
     };
@@ -938,7 +935,6 @@ describe("RunDetail — a skipped person is not a success", () => {
       users_ok: 1,
       users_error: 1,
       users_skipped: 1,
-      titles_requested: 0,
     };
     r.users = [
       { ...skippedUser("sarah", 1), status: "ok", reason: null },
@@ -969,7 +965,6 @@ describe("RunDetail — a skipped person is not a success", () => {
       users_ok: 0,
       users_error: 0,
       users_skipped: 3,
-      titles_requested: 0,
     };
     r.users = ["sarah", "mike", "jess"].map((u, i) =>
       skippedUser(u, i),
@@ -993,7 +988,6 @@ describe("RunDetail — a skipped person is not a success", () => {
       users_ok: 0,
       users_error: 0,
       users_skipped: 3,
-      titles_requested: 0,
     };
     r.users = ["sarah", "mike", "jess"].map((u, i) =>
       skippedUser(u, i),
@@ -1022,7 +1016,6 @@ describe("RunDetail — a skipped person is not a success", () => {
       users_ok: 1,
       users_error: 0,
       users_skipped: 0,
-      titles_requested: 0,
     };
     r.users = [
       {
@@ -1051,7 +1044,7 @@ describe("RunDetail — shows the display name, not the bare username", () => {
     // the endpoint only emitted `username`. It now carries display_name (nickname → Tautulli →
     // username); the row must render that, keeping `username` only for the avatar + search.
     const r = run([]);
-    r.stats = { users_ok: 1, users_error: 0, titles_requested: 0 };
+    r.stats = { users_ok: 1, users_error: 0 };
     r.users = [
       {
         ...skippedUser("moohouse", 1),
@@ -1146,7 +1139,7 @@ describe("RunDetail — 'N people failed with the same problem' (issue 7.1)", ()
 
   it("claims commonality for two people who hit the SAME recognised error class", async () => {
     const r = run([]);
-    r.stats = { users_ok: 0, users_error: 3, titles_requested: 0 };
+    r.stats = { users_ok: 0, users_error: 3 };
     r.users = [
       failedUser("sarah", "HTTP 500 while updating collection 12"),
       failedUser("mike", "HTTP 500 while updating collection 99"),
@@ -1174,7 +1167,7 @@ describe("RunDetail — 'N people failed with the same problem' (issue 7.1)", ()
     // sentence for anything unrecognised — so these two unrelated failures bucketed together and
     // the page asserted they were "the same problem", which was false.
     const r = run([]);
-    r.stats = { users_ok: 0, users_error: 2, titles_requested: 0 };
+    r.stats = { users_ok: 0, users_error: 2 };
     r.users = [
       failedUser("sarah", "KeyError: 'ratingKey'"),
       failedUser("mike", "AttributeError: NoneType has no attribute 'guid'"),
@@ -1401,7 +1394,6 @@ describe("RunDetailPage — a run that failed for PEOPLE, not for itself", () =>
       stats: {
         users_ok: ok,
         users_error: failures.length,
-        titles_requested: 0,
       },
       users: [
         ...base.users,

@@ -698,206 +698,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/requests": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List Requests
-         * @description The whole inbox: pending first (most-wanted, best-rated on top), then sent, then rejected.
-         *
-         *     Rows the owner cleared from the Sent log (``hidden``) are excluded — they stay in the DB as sent
-         *     tombstones (so the title isn't re-requested) but never show in the UI again.
-         *
-         *     Args:
-         *         request: The FastAPI request, for the session factory.
-         *         wanted_by: Repeated query parameter (``?wanted_by=sarah&wanted_by=mike``) naming the people
-         *             whose titles to keep — matched against ``wanters``, which holds bare Plex usernames.
-         *             A title is kept if ANY of the named people wanted it (union, not intersection), matching
-         *             what the inbox's "Wanted by" chips mean. Omitted (or empty) means everyone, which is the
-         *             unfiltered inbox — no caller that leaves it off sees any change.
-         *
-         *     Returns:
-         *         The matching rows, capped at :data:`MAX_INBOX`.
-         *
-         *     The cap is applied AFTER the status sort, in Python, because the ordering is by
-         *     (status, demand, rating) and a SQL LIMIT before that sort would cut arbitrary rows rather than
-         *     the tail of the history. ``wanted_by`` is applied BEFORE the cap — a filter applied to the capped
-         *     page could only ever search the 500 rows the cap left, and "what does this new person still
-         *     need?" is precisely the question that wants everything on file for one person.
-         *
-         *     The name filter runs in Python rather than SQL: the read below is already unbounded (`.all()`
-         *     over every non-hidden row — the cap bounds the PAYLOAD, not the query), so filtering the rows
-         *     already in memory costs nothing extra, and it avoids depending on SQLite's JSON1 `json_each` to
-         *     ask whether a JSON array column contains a value.
-         */
-        get: operations["list_requests_api_requests_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/requests/clear": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Clear Requests
-         * @description Clear the given SENT titles from the send log — hide them, don't delete them.
-         *
-         *     A sent row is a load-bearing tombstone: dropping it lets a still-downloading title look "missing"
-         *     and get re-requested every night (see ``delete_requests``). So "clear" sets ``hidden`` instead —
-         *     the row stays ``sent`` and keeps protecting against re-request, but never shows in the inbox again.
-         *     Only ``sent`` rows are cleared; a pending/rejected id is ignored (those have Delete / Reject).
-         */
-        post: operations["clear_requests_api_requests_clear_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/requests/delete": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Delete Requests
-         * @description Remove the given titles from the inbox entirely, leaving no trace.
-         *
-         *     Unlike ``/reject`` (a permanent tombstone), a deleted row is gone — so if a later run's picks turn
-         *     up the same title again, it returns to the pending queue. Two uses: clear a title off the list
-         *     without blocking it forever, or delete a previously *rejected* title to let it come back.
-         *
-         *     ``sent`` rows are never deleted: that status is a load-bearing tombstone (``_persist_request_queue``)
-         *     that stops a still-downloading title from being seen as "missing" and re-requested every night.
-         *     Dropping it would resurrect that bug, so a ``sent`` id in the request is skipped, not deleted.
-         */
-        post: operations["delete_requests_api_requests_delete_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/requests/reject": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reject Requests
-         * @description Permanently dismiss the given titles.
-         *
-         *     A rejected title is kept on file as a tombstone: it leaves the pending list AND every later run
-         *     skips re-queuing it (``_persist_request_queue`` only touches ``pending`` rows), so a dismissed
-         *     suggestion can never come back on its own. Use ``/delete`` instead to remove a title without
-         *     blocking it — or to lift a rejection so a future run may surface it again.
-         */
-        post: operations["reject_requests_api_requests_reject_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/requests/restore": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Restore Requests
-         * @description Un-reject: move rejected titles back to the pending queue (Waiting) so they can be sent again.
-         *
-         *     Only ``rejected`` rows are restored; ``pending``/``sent`` are left as they are. The row keeps its
-         *     recorded demand/wanters/why/tags, so it reappears in Waiting exactly as it was, ready to send —
-         *     unlike a run, which would only re-surface it if the same taste turned it up again.
-         */
-        post: operations["restore_requests_api_requests_restore_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/requests/send": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Send Requests
-         * @description Ask Sonarr/Radarr for the chosen pending titles.
-         *
-         *     A dry run previews the outcomes without asking and leaves every row pending. A real send marks a
-         *     row ``sent`` only when the app accepted it; a skip/error leaves it pending with the reason recorded,
-         *     so the owner can see why it didn't go and try again.
-         */
-        post: operations["send_requests_api_requests_send_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/requests/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Arr Status
-         * @description Arr download status for every request row, keyed by request id, plus per-app reachability.
-         *
-         *     Covers waiting rows as well as sent ones. A waiting title is normally absent from the Arrs — the
-         *     nightly pass drops anything they already track — so a status there means the owner (or another
-         *     tool) added it by hand since, which is exactly the case where "why is this still waiting?" needs
-         *     an answer. Rejected rows are skipped: nothing is going to happen to them.
-         *
-         *     Whole-library maps, not per-title lookups, so the cost is a handful of calls no matter how long
-         *     the inbox is — which is what makes it cheap enough for the inbox to poll. Runs in an executor
-         *     since the Arr clients are sync. A title neither app tracks appears as None.
-         */
-        get: operations["get_arr_status_api_requests_status_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/runs": {
         parameters: {
             query?: never;
@@ -1112,27 +912,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/settings/arr/{service}/options": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Arr Options
-         * @description Quality profiles + root folders for a connected Sonarr/Radarr, so the UI offers dropdowns
-         *     rather than asking a non-technical owner to hunt down numeric profile ids and server paths.
-         */
-        get: operations["arr_options_api_settings_arr__service__options_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/settings/curator/models": {
         parameters: {
             query?: never;
@@ -1154,30 +933,6 @@ export interface paths {
          *     endpoint returns an empty list, and the UI falls back to the free-text override.
          */
         post: operations["curator_models_api_settings_curator_models_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/settings/overseerr/options": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Overseerr Options
-         * @description The instance's accounts, so the UI can offer a "request as" dropdown.
-         *
-         *     The *seerr equivalent of ``arr_options``, and deliberately much smaller: quality profiles and
-         *     root folders are Overseerr's business on this route, so the only choice left to Shortlist is
-         *     whose name the request goes out under.
-         */
-        get: operations["overseerr_options_api_settings_overseerr_options_get"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2906,48 +2661,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** ArrOptionsOut */
-        ArrOptionsOut: {
-            /** Quality Profiles */
-            quality_profiles: components["schemas"]["QualityProfileOut"][];
-            /** Root Folders */
-            root_folders: components["schemas"]["RootFolderOut"][];
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * ArrStatusOut
-         * @description Per-row download status, plus whether each app actually answered.
-         *
-         *     ``reach`` is the half this used to omit. A failed Arr lookup is swallowed on purpose (one app
-         *     being down must not blank the other), so an unreachable Radarr produced an all-``null`` map —
-         *     byte-identical to "Radarr is fine and tracks none of these". The inbox therefore showed no
-         *     badges, for ever, with nothing anywhere saying why.
-         */
-        ArrStatusOut: {
-            /**
-             * Overseerr
-             * @default off
-             * @enum {string}
-             */
-            overseerr: "ok" | "unreachable" | "off";
-            /**
-             * Radarr
-             * @enum {string}
-             */
-            radarr: "ok" | "unreachable" | "off";
-            /**
-             * Sonarr
-             * @enum {string}
-             */
-            sonarr: "ok" | "unreachable" | "off";
-            /** Statuses */
-            statuses: {
-                [key: string]: string | null;
-            };
-        } & {
-            [key: string]: unknown;
-        };
         /**
          * BackupCreatedOut
          * @description A manual backup carries no `created_at`: it was just taken, which is the answer.
@@ -3097,13 +2810,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** ClearedOut */
-        ClearedOut: {
-            /** Cleared */
-            cleared: number;
-        } & {
-            [key: string]: unknown;
-        };
         /** CollectionIn */
         CollectionIn: {
             /**
@@ -3223,53 +2929,6 @@ export interface components {
             recent_count?: number | null;
             /** Refresh Days */
             refresh_days?: number | null;
-            /** Req Auto Min Demand */
-            req_auto_min_demand?: number | null;
-            /** Req Auto Min Rating */
-            req_auto_min_rating?: number | null;
-            /** Req Auto Send */
-            req_auto_send?: boolean | null;
-            /** Req Auto User Tag */
-            req_auto_user_tag?: boolean | null;
-            /**
-             * Req Language Mode
-             * @enum {unknown}
-             */
-            req_language_mode?: "any" | "prefer" | "only" | null;
-            /** Req Max Per Row */
-            req_max_per_row?: number | null;
-            /** Req Max Year */
-            req_max_year?: number | null;
-            /** Req Min Demand */
-            req_min_demand?: number | null;
-            /** Req Min Rating */
-            req_min_rating?: number | null;
-            /** Req Min Rating Other */
-            req_min_rating_other?: number | null;
-            /** Req Min Votes */
-            req_min_votes?: number | null;
-            /** Req Min Year */
-            req_min_year?: number | null;
-            /** Req Preferred Languages */
-            req_preferred_languages?: string[] | null;
-            /** Req Radarr Quality Profile Id */
-            req_radarr_quality_profile_id?: number | null;
-            /** Req Radarr Root Folder */
-            req_radarr_root_folder?: string | null;
-            /**
-             * Req Sonarr Monitor
-             * @enum {unknown}
-             */
-            req_sonarr_monitor?: "all" | "firstSeason" | "lastSeason" | "pilot" | "none" | null;
-            /** Req Sonarr Quality Profile Id */
-            req_sonarr_quality_profile_id?: number | null;
-            /** Req Sonarr Root Folder */
-            req_sonarr_root_folder?: string | null;
-            /**
-             * Request Tag
-             * @default
-             */
-            request_tag: string;
             /**
              * Rewatch
              * @default false
@@ -3430,61 +3089,6 @@ export interface components {
             recent_count: number | null;
             /** Refresh Days */
             refresh_days: number | null;
-            /** Req Auto Min Demand */
-            req_auto_min_demand: number | null;
-            /** Req Auto Min Rating */
-            req_auto_min_rating: number | null;
-            /** Req Auto Send */
-            req_auto_send: boolean | null;
-            /**
-             * Req Auto User Tag
-             * @description Tag this row's Sonarr/Radarr requests with the wanting person's slug; null inherits the global requests.auto_user_tag.
-             */
-            req_auto_user_tag?: boolean | null;
-            /**
-             * Req Language Mode
-             * @description How this row treats a title's original language when requesting: 'any' (one bar for everything), 'prefer' (other languages need a higher rating to auto-send), or 'only' (never request another language); null inherits the global requests.language_mode.
-             * @enum {unknown}
-             */
-            req_language_mode: "any" | "prefer" | "only" | null;
-            /** Req Max Per Row */
-            req_max_per_row: number | null;
-            /** Req Max Year */
-            req_max_year: number | null;
-            /** Req Min Demand */
-            req_min_demand: number | null;
-            /** Req Min Rating */
-            req_min_rating: number | null;
-            /**
-             * Req Min Rating Other
-             * @description Rating another language must reach for this row to auto-send it. Null inherits the global requests.min_rating_other, which may itself be unset — in which case this row derives from its own req_min_rating plus 1.5.
-             */
-            req_min_rating_other: number | null;
-            /** Req Min Votes */
-            req_min_votes: number | null;
-            /** Req Min Year */
-            req_min_year: number | null;
-            /**
-             * Req Preferred Languages
-             * @description ISO 639-1 codes this row treats as preferred; null inherits the global requests.preferred_languages. An empty list is a row that cleared its languages.
-             */
-            req_preferred_languages: string[] | null;
-            /** Req Radarr Quality Profile Id */
-            req_radarr_quality_profile_id: number | null;
-            /** Req Radarr Root Folder */
-            req_radarr_root_folder: string | null;
-            /**
-             * Req Sonarr Monitor
-             * @description How much of a show Sonarr monitors for this row's requests (Sonarr's Add Series 'Monitor' choice); null inherits the global requests.sonarr.monitor.
-             * @enum {unknown}
-             */
-            req_sonarr_monitor: "all" | "firstSeason" | "lastSeason" | "pilot" | "none" | null;
-            /** Req Sonarr Quality Profile Id */
-            req_sonarr_quality_profile_id: number | null;
-            /** Req Sonarr Root Folder */
-            req_sonarr_root_folder: string | null;
-            /** Request Tag */
-            request_tag: string;
             /** Rewatch */
             rewatch: boolean;
             /** Rewatch Cooldown Days */
@@ -3598,13 +3202,6 @@ export interface components {
             /** Provider */
             provider?: string | null;
         };
-        /** DeletedOut */
-        DeletedOut: {
-            /** Deleted */
-            deleted: number;
-        } & {
-            [key: string]: unknown;
-        };
         /**
          * DeletedRowOut
          * @description History belonging to a row that no longer exists.
@@ -3648,7 +3245,6 @@ export interface components {
             per_user: components["schemas"]["PerUserOut"][];
             /** Recent */
             recent: components["schemas"]["RecentWatchOut"][];
-            requests: components["schemas"]["ReportRequestsOut"];
             runs: components["schemas"]["ReportRunsOut"];
             /** Since */
             since: string | null;
@@ -4673,15 +4269,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** QualityProfileOut */
-        QualityProfileOut: {
-            /** Id */
-            id: number;
-            /** Name */
-            name: string;
-        } & {
-            [key: string]: unknown;
-        };
         /** RecentWatchOut */
         RecentWatchOut: {
             /** Display Name */
@@ -4710,21 +4297,6 @@ export interface components {
             watched_at: string | null;
             /** Year */
             year: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * RejectedOut
-         * @description How many rows the action actually touched — not how many ids were sent. Each of the four
-         *     inbox actions skips the statuses it does not own, so the count is the only honest receipt.
-         *
-         *     ``extra="allow"`` is on every response model here (and every nested one): a strict model would
-         *     silently DROP any key the handler returns but the model has not declared, so a field missed
-         *     here would vanish from the payload rather than fail loudly.
-         */
-        RejectedOut: {
-            /** Rejected */
-            rejected: number;
         } & {
             [key: string]: unknown;
         };
@@ -4773,17 +4345,6 @@ export interface components {
              */
             old_template: string;
         };
-        /** ReportRequestsOut */
-        ReportRequestsOut: {
-            /** Pending */
-            pending: number;
-            /** Sent */
-            sent: number;
-            /** Watched After Sent */
-            watched_after_sent: number;
-        } & {
-            [key: string]: unknown;
-        };
         /** ReportRunsOut */
         ReportRunsOut: {
             /** Errors Last */
@@ -4801,111 +4362,10 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** RequestAction */
-        RequestAction: {
-            /**
-             * Dry Run
-             * @default false
-             */
-            dry_run: boolean;
-            /** Ids */
-            ids: number[];
-        };
-        /** RequestCandidateOut */
-        RequestCandidateOut: {
-            /** Arr Slug */
-            arr_slug?: string | null;
-            /** Demand */
-            demand: number;
-            /** Detail */
-            detail: string;
-            /**
-             * Excluded
-             * @default false
-             */
-            excluded: boolean;
-            /** Id */
-            id: number;
-            /**
-             * Imdb Id
-             * @default
-             */
-            imdb_id: string;
-            /**
-             * Language
-             * @default
-             */
-            language: string;
-            /** Media Type */
-            media_type: string;
-            /**
-             * Overview
-             * @default
-             */
-            overview: string;
-            /**
-             * Poster Path
-             * @default
-             */
-            poster_path: string;
-            /** Rating */
-            rating: number;
-            /** Row Slug */
-            row_slug?: string | null;
-            /** Status */
-            status: string;
-            /** Tags */
-            tags: string[];
-            /** Title */
-            title: string;
-            /** Tmdb Id */
-            tmdb_id: number;
-            /** Updated At */
-            updated_at: string | null;
-            /** Vote Count */
-            vote_count: number;
-            /** Wanters */
-            wanters: string[];
-            /** Why */
-            why: components["schemas"]["RequestWhyOut"][];
-            /** Year */
-            year: number | null;
-        } & {
-            [key: string]: unknown;
-        };
-        /** RequestWhyOut */
-        RequestWhyOut: {
-            /** Row */
-            row: string;
-            /** Seed */
-            seed: string;
-            /** Source */
-            source: string;
-            /** User */
-            user: string;
-        } & {
-            [key: string]: unknown;
-        };
         /** RestoreRequest */
         RestoreRequest: {
             /** Name */
             name: string;
-        };
-        /** RestoredOut */
-        RestoredOut: {
-            /** Restored */
-            restored: number;
-        } & {
-            [key: string]: unknown;
-        };
-        /** RootFolderOut */
-        RootFolderOut: {
-            /** Id */
-            id: number;
-            /** Path */
-            path: string;
-        } & {
-            [key: string]: unknown;
         };
         /**
          * RowDeletePreviewOut
@@ -5326,10 +4786,6 @@ export interface components {
             error: string | null;
             /** Reason */
             reason: string | null;
-            /** Requests */
-            requests: {
-                [key: string]: components["schemas"]["TraceRequestOut"];
-            };
             /** Status */
             status: string;
             /** Trace */
@@ -5488,67 +4944,6 @@ export interface components {
         SeenRelease: {
             /** Version */
             version: string;
-        };
-        /** SeerrOptionsOut */
-        SeerrOptionsOut: {
-            /** Default User Id */
-            default_user_id?: number | null;
-            /** Users */
-            users: components["schemas"]["SeerrUserOut"][];
-        } & {
-            [key: string]: unknown;
-        };
-        /** SeerrUserOut */
-        SeerrUserOut: {
-            /**
-             * Auto Approve Movies
-             * @default false
-             */
-            auto_approve_movies: boolean;
-            /**
-             * Auto Approve Tv
-             * @default false
-             */
-            auto_approve_tv: boolean;
-            /** Id */
-            id: number;
-            /**
-             * Is Plex User
-             * @default false
-             */
-            is_plex_user: boolean;
-            /** Name */
-            name: string;
-        } & {
-            [key: string]: unknown;
-        };
-        /** SendOut */
-        SendOut: {
-            /** Dry Run */
-            dry_run: boolean;
-            /** Outcomes */
-            outcomes: components["schemas"]["SendOutcomeOut"][];
-            /** Sent */
-            sent: number;
-        } & {
-            [key: string]: unknown;
-        };
-        /**
-         * SendOutcomeOut
-         * @description What the Arr said about one title. `status` is the engine's outcome — "requested",
-         *     "would_request" on a dry run, or a skip/error reason the owner can act on.
-         */
-        SendOutcomeOut: {
-            /** Detail */
-            detail: string;
-            /** Id */
-            id: number;
-            /** Status */
-            status: string;
-            /** Title */
-            title: string;
-        } & {
-            [key: string]: unknown;
         };
         /**
          * ServerConnectionOut
@@ -5766,25 +5161,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /**
-         * TraceRequestOut
-         * @description What became of one wanted-but-missing title, keyed `"<tmdb_id>:<media_type>"` on the trace.
-         */
-        TraceRequestOut: {
-            /** Arr Slug */
-            arr_slug: string | null;
-            /** Detail */
-            detail: string;
-            /** Excluded */
-            excluded: boolean;
-            /**
-             * Status
-             * @enum {string}
-             */
-            status: "pending" | "sent" | "rejected";
-        } & {
-            [key: string]: unknown;
-        };
         /** TransferIn */
         TransferIn: {
             /**
@@ -5999,8 +5375,6 @@ export interface components {
             };
             /** Preview Titles */
             preview_titles: string[];
-            /** Request Tag */
-            request_tag: string;
             /** Restricted */
             restricted: boolean;
             /** Restriction Profile */
@@ -6024,8 +5398,6 @@ export interface components {
             /** Nickname */
             nickname?: string | null;
             prefs?: components["schemas"]["UserPrefs"] | null;
-            /** Request Tag */
-            request_tag?: string | null;
         };
         /**
          * UserPickOut
@@ -7384,223 +6756,6 @@ export interface operations {
             };
         };
     };
-    list_requests_api_requests_get: {
-        parameters: {
-            query?: {
-                /** @description Only titles at least one of these people wanted (the `wanters` usernames). */
-                wanted_by?: string[] | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RequestCandidateOut"][];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    clear_requests_api_requests_clear_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RequestAction"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ClearedOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    delete_requests_api_requests_delete_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RequestAction"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeletedOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reject_requests_api_requests_reject_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RequestAction"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RejectedOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    restore_requests_api_requests_restore_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RequestAction"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RestoredOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    send_requests_api_requests_send_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RequestAction"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SendOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_arr_status_api_requests_status_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ArrStatusOut"];
-                };
-            };
-        };
-    };
     list_runs_api_runs_get: {
         parameters: {
             query?: {
@@ -7940,37 +7095,6 @@ export interface operations {
             };
         };
     };
-    arr_options_api_settings_arr__service__options_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                service: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ArrOptionsOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     curator_models_api_settings_curator_models_post: {
         parameters: {
             query?: never;
@@ -8000,26 +7124,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    overseerr_options_api_settings_overseerr_options_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SeerrOptionsOut"];
                 };
             };
         };

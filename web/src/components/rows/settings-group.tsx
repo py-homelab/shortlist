@@ -10,8 +10,8 @@ import { ChevronRight } from "lucide-react";
  * to leave everything visible, and a heading with a sentence under it does the orienting the
  * collapsed summaries were doing.
  *
- * `defaultOpen={false}` is kept for the two groups that really are optional (artwork, request
- * tags), where a closed section is a fair signal that most people can skip it.
+ * `defaultOpen={false}` is there for a group that really is optional, where a closed section is a
+ * fair signal that most people can skip it.
  */
 export function SettingsGroup({
   title,

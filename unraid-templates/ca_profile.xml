@@ -8,7 +8,7 @@
     It runs as a single Docker container with a web UI and a ~10-minute setup wizard. Optional AI
     curation (Claude / OpenAI / Gemini / local Ollama) picks the titles and explains each one with a
     "Because you watched X", or you can run it with no AI at all. It only ever recommends titles
-    already in your library, and can optionally ask Radarr/Sonarr for the ones you're missing.
+    already in your library, and lets everyone request the ones you're missing from their own picks page.
 
     Requires Plex Media Server 1.43.2.10687+, Plex Pass on the admin account, and a free TMDB key.
 

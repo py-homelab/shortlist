@@ -203,7 +203,7 @@ class TestNotifications:
         monkeypatch.setattr(notif, "check_for_update", lambda _v: None)
         with client.app.state.sessions() as session:
             session.add(Run(trigger="manual", status="ok", stats={"users_ok": 1, "users_error": 2}))
-            session.add(Event(scope="requests.send", level="error", message={"detail": "arr down"}))
+            session.add(Event(scope="plextv.write", level="error", message={"detail": "plex.tv down"}))
             session.commit()
 
         items = client.get("/api/notifications").json()["notifications"]

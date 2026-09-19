@@ -266,12 +266,6 @@ export function RowPreview({
         {input.show_days.length > 0 && (
           <Fact label="Only on" value={showDaysSummary(input.show_days)} />
         )}
-        {input.request_tag.trim() && (
-          <Fact
-            label="Request tag"
-            value={`Tagged “${input.request_tag.trim()}”`}
-          />
-        )}
       </dl>
     </div>
   );

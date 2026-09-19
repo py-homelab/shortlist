@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated
@@ -24,17 +23,11 @@ from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import target_sections
 from shortlist.engine.models import (
     FAMILY_MODES,
-    LANGUAGE_MODES,
     MAX_REFRESH_DAYS,
     MAX_ROW_SIZE,
     MIN_ROW_SIZE,
-    SONARR_MONITOR_MODES,
     RowSpec,
     dedupe_slug,
-    normalise_languages,
-    row_language_mode_or_inherit,
-    row_languages_or_inherit,
-    row_monitor_or_inherit,
     slugify,
 )
 from shortlist.engine.placeholders import refusal
@@ -59,7 +52,6 @@ from shortlist.server.db.models import (
     Event,
     Job,
     PickRow,
-    RequestCandidate,
     RunSharedRow,
     SharedRowWatch,
     User,
@@ -179,7 +171,6 @@ class CollectionIn(StrictRequestModel):
         return value
 
     min_watchers: int = Field(default=2, ge=2)  # a public row must never be shaped by one person
-    request_tag: str = Field(default="", max_length=64)  # tag added to titles requested via this row
     candidate_sources: list[str] = Field(default_factory=list)  # [] -> inherit global candidates.sources
     watched_pct: float | None = Field(default=None, ge=0.0, le=1.0)  # None -> inherit global watched cap
     # Set by a caller that is about to stream the rename itself (the rename page). The PATCH then
@@ -217,44 +208,6 @@ class CollectionIn(StrictRequestModel):
         json_schema_extra={"enum": [*sorted(COLD_STARTS), None]},
         description="What this row does for someone with too little watch history; null inherits the global setting.",
     )
-    # This row's own Sonarr/Radarr settings; null -> inherit the global `requests.*` setting. Only
-    # the profile and root folder are per row — URL and API key stay global (one Radarr, different
-    # folders). `max_per_run` and the rating source are deliberately NOT here: they are the run's
-    # ceiling and its one MDBList account, and `req_max_per_row` may only restrict below the former.
-    # Meaningless on a shared row, which surfaces nothing missing to request.
-    req_min_rating: float | None = Field(default=None, ge=0.0, le=10.0)
-    req_min_votes: int | None = Field(default=None, ge=0)
-    req_min_demand: int | None = Field(default=None, ge=1)
-    req_min_year: int | None = Field(default=None, ge=0, le=2999)
-    req_max_year: int | None = Field(default=None, ge=0, le=2999)
-    req_auto_send: bool | None = None
-    req_auto_min_demand: int | None = Field(default=None, ge=1)
-    req_auto_min_rating: float | None = Field(default=None, ge=0.0, le=10.0)
-    req_max_per_row: int | None = Field(default=None, ge=0, le=100)
-    req_radarr_quality_profile_id: int | None = Field(default=None, ge=1)
-    req_radarr_root_folder: str | None = Field(default=None, max_length=512)
-    req_sonarr_quality_profile_id: int | None = Field(default=None, ge=1)
-    req_sonarr_root_folder: str | None = Field(default=None, max_length=512)
-    # How much of a show Sonarr monitors for this row; null inherits requests.sonarr.monitor.
-    # Enforced in `_validate` (a plain-English 422 naming the modes, which a Pydantic enum error is
-    # not). The enum is ADVERTISED so the SPA's generated type is the union rather than a bare
-    # string — the row editor picks from it, and a bare string there checks nothing.
-    req_sonarr_monitor: str | None = Field(
-        default=None, max_length=32, json_schema_extra={"enum": [*SONARR_MONITOR_MODES, None]}
-    )
-    # This row's language preference; null on any of the three inherits the matching global. Same
-    # advertised-enum reasoning as `req_sonarr_monitor` above.
-    req_language_mode: str | None = Field(
-        default=None, max_length=16, json_schema_extra={"enum": [*LANGUAGE_MODES, None]}
-    )
-    # null inherits the owner's list; [] is a row that CLEARED its languages and means it (in "only"
-    # mode it requests nothing). The two must stay distinct all the way to the column — see 0085.
-    req_preferred_languages: list[str] | None = Field(default=None, max_length=50)
-    # null means "follow this row's own req_min_rating + 1.5", not "unset" — so a row that raises its
-    # base floor carries this bar up with it.
-    req_min_rating_other: float | None = Field(default=None, ge=0.0, le=10.0)
-    # Tag this row's requests with the wanting person's slug; null inherits requests.auto_user_tag.
-    req_auto_user_tag: bool | None = None
     # How many recent watches the row cycles between, one per run. 1 = always the most recent.
     # Capped at 20: past that the "recent" the row's title claims stops being true, and the cycle takes
     # three weeks to come round — indistinguishable from the stuck row this exists to fix.
@@ -417,7 +370,6 @@ class CollectionOut(PassthroughModel):
     description: str
     sort_title_prefix: str
     min_watchers: int
-    request_tag: str
     candidate_sources: list[str]
     watched_pct: float | None
     rewatch: bool
@@ -434,56 +386,6 @@ class CollectionOut(PassthroughModel):
         description="What this row does for someone with too little watch history; null inherits the global setting.",
     )
     seed_window: int
-    req_min_rating: float | None
-    req_min_votes: int | None
-    req_min_demand: int | None
-    req_min_year: int | None
-    req_max_year: int | None
-    req_auto_send: bool | None
-    req_auto_min_demand: int | None
-    req_auto_min_rating: float | None
-    req_max_per_row: int | None
-    req_radarr_quality_profile_id: int | None
-    req_radarr_root_folder: str | None
-    req_sonarr_quality_profile_id: int | None
-    req_sonarr_root_folder: str | None
-    # Required, not defaulted (see `_closed_set_out`): every one of these comes from `_serialize`,
-    # and a default would let a handler that stopped sending it INVENT the key instead of failing.
-    req_sonarr_monitor: str | None = Field(
-        description=(
-            "How much of a show Sonarr monitors for this row's requests "
-            "(Sonarr's Add Series 'Monitor' choice); null inherits the global requests.sonarr.monitor."
-        ),
-        json_schema_extra={"enum": [*SONARR_MONITOR_MODES, None]},
-    )
-    req_language_mode: str | None = Field(
-        description=(
-            "How this row treats a title's original language when requesting: 'any' (one bar for "
-            "everything), 'prefer' (other languages need a higher rating to auto-send), or 'only' "
-            "(never request another language); null inherits the global requests.language_mode."
-        ),
-        json_schema_extra={"enum": [*LANGUAGE_MODES, None]},
-    )
-    req_preferred_languages: list[str] | None = Field(
-        description=(
-            "ISO 639-1 codes this row treats as preferred; null inherits the global "
-            "requests.preferred_languages. An empty list is a row that cleared its languages."
-        )
-    )
-    req_min_rating_other: float | None = Field(
-        description=(
-            "Rating another language must reach for this row to auto-send it. Null inherits the "
-            "global requests.min_rating_other, which may itself be unset — in which case this row "
-            "derives from its own req_min_rating plus 1.5."
-        )
-    )
-    req_auto_user_tag: bool | None = Field(
-        default=None,
-        description=(
-            "Tag this row's Sonarr/Radarr requests with the wanting person's slug; "
-            "null inherits the global requests.auto_user_tag."
-        ),
-    )
     pick_order: str = _closed_set_out(ORDERS, "How the delivered collection is ordered.")
     placement: str = _closed_set_out(PLACEMENTS, "Where the OWNER's own collection appears.")
     placement_friends: str = _closed_set_out(PLACEMENTS, "Where each FRIEND's own collection appears.")
@@ -591,36 +493,6 @@ def _validate(body: CollectionIn) -> None:
         raise HTTPException(status_code=422, detail=f"cold_start must be null or one of {sorted(COLD_STARTS)}")
     if body.family not in FAMILY_MODES:
         raise HTTPException(status_code=422, detail=f"family must be one of {list(FAMILY_MODES)}")
-    if body.req_sonarr_monitor is not None and body.req_sonarr_monitor not in SONARR_MONITOR_MODES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"req_sonarr_monitor must be null or one of {sorted(SONARR_MONITOR_MODES)}",
-        )
-    if body.req_language_mode is not None and body.req_language_mode not in LANGUAGE_MODES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"req_language_mode must be null or one of {sorted(LANGUAGE_MODES)}",
-        )
-    if body.req_preferred_languages is not None:
-        # `[a-z]{2}`, not `.isalpha()` — see `_language_codes` in api/settings.py for why a
-        # Unicode-aware check lets a homoglyph through that matches no TMDB language.
-        bad = [c for c in body.req_preferred_languages if not re.fullmatch(r"[a-z]{2}", str(c).strip().lower())]
-        if bad:
-            more = f" (+{len(bad) - 5} more)" if len(bad) > 5 else ""
-            raise HTTPException(
-                status_code=422,
-                # Only the first few, but the rest are COUNTED — otherwise an owner fixes what they
-                # were shown and is rejected again for values the message implied were fine.
-                detail=(
-                    f"req_preferred_languages must be ISO 639-1 codes (two letters, e.g. 'en'); got {bad[:5]}{more}"
-                ),
-            )
-        # Normalised on the way IN as well as on the way out. This is defence in depth, not a guard
-        # anything currently depends on: `_serialize` normalises this column on the way out, so the
-        # editor never sees a raw value and the run reads through `row_languages_or_inherit` anyway.
-        # It is here so the stored value matches what every reader assumes, for anything that reaches
-        # the column without going through those — a SQL query, a support bundle, a future consumer.
-        body.req_preferred_languages = list(normalise_languages(body.req_preferred_languages))
     if body.placement not in PLACEMENTS:
         raise HTTPException(status_code=422, detail=f"placement must be one of {sorted(PLACEMENTS)}")
     if body.placement_friends not in PLACEMENTS:
@@ -855,7 +727,6 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
         "description": collection.description or "",
         "sort_title_prefix": collection.sort_title_prefix or "",
         "min_watchers": collection.min_watchers,
-        "request_tag": collection.request_tag or "",
         "candidate_sources": list(collection.candidate_sources or []),
         "watched_pct": collection.watched_pct,
         "rewatch": bool(collection.rewatch),
@@ -869,28 +740,6 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
         "max_seeds": collection.max_seeds,
         "cold_start": collection.cold_start,
         "seed_window": int(collection.seed_window or 1),
-        "req_min_rating": collection.req_min_rating,
-        "req_min_votes": collection.req_min_votes,
-        "req_min_demand": collection.req_min_demand,
-        "req_min_year": collection.req_min_year,
-        "req_max_year": collection.req_max_year,
-        "req_auto_send": collection.req_auto_send,
-        "req_auto_min_demand": collection.req_auto_min_demand,
-        "req_auto_min_rating": collection.req_auto_min_rating,
-        "req_max_per_row": collection.req_max_per_row,
-        "req_radarr_quality_profile_id": collection.req_radarr_quality_profile_id,
-        "req_radarr_root_folder": collection.req_radarr_root_folder,
-        "req_sonarr_quality_profile_id": collection.req_sonarr_quality_profile_id,
-        "req_sonarr_root_folder": collection.req_sonarr_root_folder,
-        # Not the raw column: a mode this build no longer offers is served as null ("inherits"),
-        # which is also what the run does with it. Serving it raw let the editor PATCH it straight
-        # back and be refused by the closed-set check, so a row holding a retired mode could not be
-        # saved at all — not even renamed.
-        "req_sonarr_monitor": row_monitor_or_inherit(collection.req_sonarr_monitor),
-        "req_language_mode": row_language_mode_or_inherit(collection.req_language_mode),
-        "req_preferred_languages": row_languages_or_inherit(collection.req_preferred_languages),
-        "req_min_rating_other": collection.req_min_rating_other,
-        "req_auto_user_tag": collection.req_auto_user_tag,
         "pick_order": collection.pick_order or "best",
         "placement": collection.placement or "both",
         "show_days": list(collection.show_days or []),
@@ -994,8 +843,8 @@ def _unique_slug(session, base: str) -> str:
 
     The slug is a row's identity in every history table, and deleting a row frees it in `collections`
     alone. A new row that took it over inherited the deleted row's last picks (redelivered as "not due
-    to rebuild"), its delivery ledger, its shared-row picks and watch credits, and its queued requests —
-    seen live on 2026-09-13. A delivered row's history is kept (run pruning leaves picks, deliveries and
+    to rebuild"), its delivery ledger, and its shared-row picks and watch credits — seen live on
+    2026-09-13. A delivered row's history is kept (run pruning leaves picks, deliveries and
     watch credits alone), so in practice its slug stays reserved for good.
 
     A pending `row.reconcile` for the slug counts too. DELETE queues it before dropping the row, and it
@@ -1013,7 +862,6 @@ def _unique_slug(session, base: str) -> str:
         Delivery.collection_slug,
         RunSharedRow.collection_slug,
         SharedRowWatch.collection_slug,
-        RequestCandidate.row_slug,
     )
 
     def is_taken(slug: str) -> bool:
@@ -1148,7 +996,6 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             # then overwrites on a replay.
             fallback_name=body.fallback_name,
             min_watchers=body.min_watchers,
-            request_tag=body.request_tag.strip(),
             candidate_sources=body.candidate_sources,
             watched_pct=body.watched_pct,
             rewatch=body.rewatch,
@@ -1175,7 +1022,6 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             poster=body.poster.model_dump(),
             description=body.description,
             sort_title_prefix=body.sort_title_prefix,
-            **{column: getattr(body, column) for column in _REQUEST_COLUMNS},
         )
         session.add(collection)
         session.flush()
@@ -1185,29 +1031,6 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
     rebuild_schedule(request.app)  # a new row may carry a schedule — register its cron job now
     return result
 
-
-#: This row's own request floors and Arr target; null on any of them means inherit the global. Named once
-#: for create and edit alike: the create constructor listed columns by hand and missed every one of these.
-_REQUEST_COLUMNS = (
-    "req_min_rating",
-    "req_min_votes",
-    "req_min_demand",
-    "req_min_year",
-    "req_max_year",
-    "req_auto_send",
-    "req_auto_min_demand",
-    "req_auto_min_rating",
-    "req_max_per_row",
-    "req_radarr_quality_profile_id",
-    "req_radarr_root_folder",
-    "req_sonarr_quality_profile_id",
-    "req_sonarr_root_folder",
-    "req_sonarr_monitor",
-    "req_language_mode",
-    "req_preferred_languages",
-    "req_min_rating_other",
-    "req_auto_user_tag",
-)
 
 # Columns a PATCH may set directly, name (needs a dup check) and audience (needs shaping)
 # handled separately.
@@ -1225,7 +1048,6 @@ _PATCHABLE_COLUMNS = (
     "description",
     "sort_title_prefix",
     "min_watchers",
-    "request_tag",
     "candidate_sources",
     "watched_pct",
     "rewatch",
@@ -1239,7 +1061,6 @@ _PATCHABLE_COLUMNS = (
     "max_seeds",
     "cold_start",
     "seed_window",
-    *_REQUEST_COLUMNS,
     "pick_order",
     "placement",
     "placement_friends",

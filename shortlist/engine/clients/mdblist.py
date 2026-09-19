@@ -1,6 +1,6 @@
 """MDBList client: one title's ratings (IMDb, Trakt, Rotten Tomatoes, Metacritic, TMDB) by TMDB id.
 
-Used when the owner picks a non-TMDB rating source for Sonarr/Radarr requests. A single lookup
+Used when the owner picks a non-TMDB rating source for ordering a row ("Highest rated"). A single lookup
 returns EVERY source's score at once, so we cache the whole set per title (persistent, cross-run):
 a title re-scored on a later night — or the same title under a different chosen source — is a cache
 hit, not another API call. That matters because MDBList's free tier is ~1000 requests/day; see
@@ -70,7 +70,7 @@ class MdbListClient:
         self._timeout = timeout
         # Lookups that actually cost an API call. The daily quota is spent here and NOWHERE else — a
         # cached title is answered from SQLite — so this, not the number of titles inspected, is what
-        # a caller rationing the free tier has to budget against. See `requests._gate_by_source`.
+        # a caller rationing the free tier has to budget against.
         self.live_lookups = 0
         # Circuit breaker. Consecutive transport/5xx failures; at `_BREAKER_TRIP` the client stops
         # calling MDBList for the rest of its life and answers None instantly. See `_fetch_all`.
@@ -104,8 +104,8 @@ class MdbListClient:
 
         Re-stamps the TTL on what is already stored; it never fetches, so it costs no quota and
         cannot change a stored score. For a caller that has just judged a title far short of its bar
-        and does not want to pay to re-ask soon — see ``requests._gate_by_source``. A title with
-        nothing cached is left alone (there is no verdict to hold on to).
+        and does not want to pay to re-ask soon. A title with nothing cached is left alone (there is
+        no verdict to hold on to).
         """
         key = f"{media_type.value}:{tmdb_id}"
         cached = self._cache.get(key)
@@ -117,9 +117,9 @@ class MdbListClient:
         self._consecutive_failures += 1
         if self._consecutive_failures >= _BREAKER_TRIP and not self._circuit_open:
             self._circuit_open = True
-            # WARNING, and said once: this changes what the run produces (titles go unrated, so they
-            # are not requested), and an owner seeing thin requests needs the reason without reading
-            # a hundred identical timeout lines.
+            # WARNING, and said once: this changes what the run produces (titles go unrated, so a
+            # rating-ordered row falls back to TMDB), and an owner needs the reason without reading a
+            # hundred identical timeout lines.
             logger.warning(
                 "MDBList has failed {} times in a row ({}); giving up on it for the rest of this run. "
                 "Titles will go unrated rather than each one waiting out the retries — roughly an hour "

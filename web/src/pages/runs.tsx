@@ -217,11 +217,6 @@ function RunRow({ run }: { run: Run }) {
           {(run.stats.titles_removed ?? 0) > 0 && (
             <span>· −{run.stats.titles_removed} rotated out</span>
           )}
-          {(run.stats.titles_requested ?? 0) > 0 && (
-            <span title="Titles requested from Sonarr/Radarr">
-              · {run.stats.titles_requested} requested
-            </span>
-          )}
           {(run.stats.llm_tokens ?? 0) > 0 && (
             <span title="AI input + output tokens this run, as the provider reported them">
               · {run.stats.llm_tokens!.toLocaleString()} tokens

@@ -139,7 +139,6 @@ class User(Base):
     removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     cold_start: Mapped[bool] = mapped_column(Boolean, default=False)
     label: Mapped[str] = mapped_column(String(255), default="")  # as stored by Plex (title-cased)
-    request_tag: Mapped[str] = mapped_column(String(64), default="")  # tag added to titles requested for them
     prefs: Mapped[dict] = mapped_column(JSON, default=dict)
 
     run_users: Mapped[list[RunUser]] = relationship(back_populates="user")
@@ -235,7 +234,10 @@ class Collection(Base):
     # Specific Plex library section keys this row builds in; [] -> every library of its media type.
     library_keys: Mapped[list] = mapped_column(JSON, default=list)
     min_watchers: Mapped[int] = mapped_column(Integer, default=2)  # shared: aggregate-privacy threshold
-    request_tag: Mapped[str] = mapped_column(String(64), default="")  # tag added to titles requested via this row
+    # RETIRED with the request inbox (0095) — nothing reads or writes it. The column stays because the
+    # frozen initial migration's default-row seed names it, and that seed runs against the HEAD schema
+    # on crash recovery (`test_a_crash_before_the_default_seed_still_seeds_it`).
+    request_tag: Mapped[str] = mapped_column(String(64), default="")
     # Where the row shows for the owner / home users: "both" (Home + Library), "home", or "library".
     placement: Mapped[str] = mapped_column(String(16), default="both")
     # Where the row shows for friends (shared users): "both" (Friends Home + Library), "home", or "library".
@@ -261,54 +263,6 @@ class Collection(Base):
     # Dead as of the curate removal (migration 0036 clears it): the LLM no longer ranks a candidate
     # pool, so there is no per-row curation recipe. Column kept — dropping it would rebuild the whole
     # table (inbound FKs); a future migration can remove it.
-    # This row's own Sonarr/Radarr request settings. NULL -> inherit the global `requests.*` setting,
-    # the same convention `watched_pct` / `recency` / `refresh_days` / `cold_start` already use, so an
-    # upgrade changes nothing until the owner sets one.
-    #
-    # Only PROFILE and ROOT FOLDER are per row; URL and API key stay global. The case this serves is
-    # one Radarr filing a kids row into /data/Kids at a lower profile, not a second Radarr.
-    #
-    # `max_per_run` and the rating source are deliberately absent: they are the run's ceiling and its
-    # one MDBList account, and a row able to raise either would make the global setting a suggestion.
-    # `req_max_per_row` may only ever RESTRICT below it (`resolve_request_config` clamps).
-    #
-    # Meaningless on a shared row, which is built from titles people have already WATCHED and so are
-    # already on the server — it surfaces nothing missing to request. The editor hides the section.
-    req_min_rating: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
-    req_min_votes: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_min_demand: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_min_year: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_max_year: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_auto_send: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
-    req_auto_min_demand: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_auto_min_rating: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
-    req_max_per_row: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_radarr_quality_profile_id: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_radarr_root_folder: Mapped[str | None] = mapped_column(String(512), nullable=True, default=None)
-    req_sonarr_quality_profile_id: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
-    req_sonarr_root_folder: Mapped[str | None] = mapped_column(String(512), nullable=True, default=None)
-    # How much of a show Sonarr monitors for THIS row's requests (Sonarr's Add Series "Monitor"
-    # choice). NULL -> inherit the global `requests.sonarr.monitor`. A kids row can take season 1
-    # only while everything else keeps the whole run of a show.
-    req_sonarr_monitor: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)
-    # This row's language preference for requests. NULL -> inherit the global `requests.language_mode`
-    # / `requests.preferred_languages` / `requests.min_rating_other`. A kids row can be English-only
-    # while an anime row stays on "any".
-    #
-    # `req_preferred_languages` is JSON rather than a comma string so an empty LIST stays distinct
-    # from NULL: [] is a row that cleared its languages (in "only" mode, requests nothing), where NULL
-    # is a row that inherits the owner's list. Collapsing the two would silently turn one into the
-    # other on a path that decides what gets added to Radarr.
-    req_language_mode: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
-    req_preferred_languages: Mapped[list | None] = mapped_column(JSON, nullable=True, default=None)
-    req_min_rating_other: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
-    # Tag this row's requests with the wanting person's slug, so the owner can see in Sonarr/Radarr
-    # who a title was added for. NULL -> inherit the global `requests.auto_user_tag`.
-    #
-    # Meaningless on a shared row, which is built from what the whole server watched and belongs to
-    # nobody in particular — there is no one person to name. The editor hides it there, exactly as it
-    # already hides `request_tag`.
-    req_auto_user_tag: Mapped[bool | None] = mapped_column(Boolean, nullable=True, default=None)
     prompt: Mapped[dict] = mapped_column(JSON, default=dict)
     # Custom collection poster for this row. {} -> Plex's own artwork. Shape:
     # {"mode": "upload"|"generate", "title", "subtitle", "style"}. No image bytes live here — an
@@ -820,11 +774,13 @@ class Event(Base):
 
 
 class RequestCandidate(Base):
-    """A wanted-but-missing title in the approval inbox: surfaced by a run, awaiting the owner's call.
+    """RETIRED — the owner-only request inbox this held was removed (migration 0095).
 
-    One row per (tmdb_id, media_type): a title re-surfaced by a later run refreshes its demand and
-    rating in place rather than duplicating. ``status`` is pending (waiting on the owner), sent (asked
-    of Sonarr/Radarr), or rejected (dismissed — never re-queued, so a "no" can't nag every night).
+    Nothing reads or writes it, and 0095 empties it. The TABLE stays because earlier migrations
+    (0044, 0051, 0071, 0085) alter it without a table-existence guard, and they are frozen: dropping
+    it would make every one of them un-replayable, and the crash-recovery guarantee
+    (`tests/integration/test_migration_recovery.py`) rests on every revision being replayable. The
+    model stays so the migrated schema and `models.py` still agree (`test_migrations.py`).
     """
 
     __tablename__ = "request_candidates"

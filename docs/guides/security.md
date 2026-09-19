@@ -38,8 +38,8 @@ named by the proxy is still only a person here.
 deleting rows and rewriting share filters. Rotate it from Settings → API access if it leaks; the old
 one stops working immediately.
 
-**URLs you enter are fetched by the server**, which is the point: your Plex, Tautulli, Radarr,
-Sonarr and Ollama are usually on private addresses, and all of those keep working. The only thing
+**URLs you enter are fetched by the server**, which is the point: your Plex, Tautulli,
+Overseerr and Ollama are usually on private addresses, and all of those keep working. The only thing
 Shortlist refuses is a cloud instance-metadata address (`169.254.169.254` and friends), which no media
 server runs on and which hands out credentials on a hosted VM.
 

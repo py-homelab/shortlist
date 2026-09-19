@@ -20,7 +20,7 @@ import httpx
 import pytest
 import respx
 
-from shortlist.server.db.models import Job, RequestCandidate, Run
+from shortlist.server.db.models import Job, Run
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.services import jobs, notify
 from shortlist.server.services.secrets import SecretBox
@@ -325,29 +325,6 @@ class TestPrivacyExposure:
         assert events_queued(sessions) == ["privacy.exposure", "privacy.exposure"]
 
 
-class TestRequestsWaiting:
-    def _pending(self, sessions, n: int) -> None:
-        with sessions() as session:
-            session.query(RequestCandidate).delete()
-            for i in range(n):
-                session.add(RequestCandidate(tmdb_id=i + 1, media_type="movie", title=f"T{i}", status="pending"))
-            session.commit()
-
-    def test_it_is_sent_only_when_more_titles_wait_than_last_time(self, sessions, secrets):
-        configure(sessions, secrets, events=["requests.waiting"])
-        self._pending(sessions, 3)
-        notify.after_run(sessions, make_run(sessions), "1.9.0")
-        notify.after_run(sessions, make_run(sessions), "1.9.0")  # still 3: nothing new
-        self._pending(sessions, 1)
-        notify.after_run(sessions, make_run(sessions), "1.9.0")  # fewer: nothing, and the count follows
-        self._pending(sessions, 2)
-        notify.after_run(sessions, make_run(sessions), "1.9.0")
-        items = queued(sessions)
-        assert [i["event"] for i in items] == ["requests.waiting", "requests.waiting"]
-        assert "3 titles" in items[0]["title"] and "2 titles" in items[1]["title"]
-        assert items[1]["action_url"] == "/requests"
-
-
 class TestUpdateAvailable:
     def test_each_newer_version_is_announced_once(self, sessions, secrets, monkeypatch):
         configure(sessions, secrets, events=["update.available"])
@@ -448,7 +425,6 @@ class TestAuthHeader:
         assert "notify.webhook.auth_header_value" in SECRET_KEYS
         assert {
             "notify.webhook.privacy_sent_at",
-            "notify.webhook.requests_seen",
             "notify.webhook.update_sent",
         } <= PRIVATE_KEYS
 

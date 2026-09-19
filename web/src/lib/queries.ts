@@ -10,7 +10,6 @@ import { runRefetchIntervalMs, runsListRefetchIntervalMs } from "./run-format";
 import { useSSE } from "./sse";
 import { useLiveClock } from "./use-live-clock";
 import type {
-  ArrStatus,
   CollectionInput,
   ReportWindow,
   Run,
@@ -42,11 +41,6 @@ export const queryKeys = {
   runLog: (runId: number) => ["run-log", runId] as const,
   settings: ["settings"] as const,
   collections: ["collections"] as const,
-  requests: ["requests"] as const,
-  arrOptions: (service: "radarr" | "sonarr") =>
-    ["arr-options", service] as const,
-  seerrOptions: ["seerr-options"] as const,
-  arrStatus: ["arrStatus"] as const,
   curatorModels: (provider: string, credential: string) =>
     ["curator-models", provider, credential] as const,
   userRows: (id: number) => ["users", id, "rows"] as const,
@@ -436,27 +430,6 @@ export function useDeleteCollection() {
   });
 }
 
-/** Quality profiles + root folders for a Sonarr/Radarr — only fetched once it's connected. */
-export function useSeerrOptions(enabled: boolean) {
-  return useQuery({
-    queryKey: queryKeys.seerrOptions,
-    queryFn: () => api.getSeerrOptions(),
-    enabled,
-    staleTime: 60_000,
-    retry: false,
-  });
-}
-
-export function useArrOptions(service: "radarr" | "sonarr", enabled: boolean) {
-  return useQuery({
-    queryKey: queryKeys.arrOptions(service),
-    queryFn: () => api.getArrOptions(service),
-    enabled,
-    staleTime: 60_000,
-    retry: false,
-  });
-}
-
 /** A short non-crypto fingerprint (FNV-1a) so a credential can key the model-list cache without the
  * raw api key sitting in the query cache / React Query Devtools. Cache discriminator only. */
 function fingerprint(value: string): string {
@@ -658,122 +631,6 @@ export function useSetUserRowOverride(userId: number) {
   });
 }
 
-/**
- * The approval inbox, optionally narrowed to the people named in `wantedBy`.
- *
- * The narrowing is the SERVER's, not this page's: `GET /api/requests` applies it before its 500-row
- * cap, so picking a name searches the whole history rather than the page that happened to load.
- *
- * No names keeps the exact key (and URL) the unfiltered inbox has always used, so the page's own
- * unfiltered read and a `useRequests([])` share one cache entry instead of fetching twice. Names are
- * sorted into the key so ticking Sarah-then-Mike and Mike-then-Sarah are the same query. Every
- * mutation invalidates `["requests"]`, which is a prefix of these keys, so filtered reads refresh
- * with the rest.
- */
-export function useRequests(wantedBy: string[] = []) {
-  const names = [...wantedBy].sort();
-  return useQuery({
-    queryKey:
-      names.length > 0 ? [...queryKeys.requests, names] : queryKeys.requests,
-    queryFn: () => api.listRequests(names),
-  });
-}
-
-/**
- * A title genuinely mid-transfer — the only state that changes on its own within seconds.
- *
- * `queued` is deliberately NOT here. It reads like a transient but is not: `_status_for` returns it
- * for "monitored, nothing on disk, nothing in the queue" (`engine/clients/arr.py`), which is the
- * resting state of a monitored title that is unreleased or simply unfindable. One of those in the
- * inbox would hold a 10-second whole-library poll open for as long as the tab stayed focused,
- * waiting on a change that may be months away.
- */
-const ARR_DOWNLOADING = "downloading";
-
-/** An Arr that didn't answer. Worth re-asking — this one clears itself the moment it comes back. */
-const ARR_UNREACHABLE = "unreachable";
-
-/** How often to re-ask the Arrs, given what they last said. `false` = don't. */
-const ARR_FAST_MS = 10_000;
-const ARR_RECOVER_MS = 30_000;
-
-/**
- * How often to re-ask the Arrs, given their last answer. `false` = don't.
- *
- * Exported so the rule itself is testable. One fetch is a WHOLE-LIBRARY read from each Arr
- * (`RadarrClient.status_by_tmdb` pulls `/api/v3/movie` entire), so the difference between "poll
- * while something is moving" and "poll forever" is megabytes a minute on a large library for as
- * long as a tab happens to be open.
- *
- * Two things earn a timer, for opposite reasons. A DOWNLOADING title will change within seconds, so
- * it gets the fast pace. An UNREACHABLE app is the case that cannot recover on its own: a failed
- * lookup returns no statuses at all, so keying the timer off the titles meant the "Can't reach
- * Radarr" badge sat there until the operator happened to refocus the tab — the moment least likely
- * to coincide with the app coming back. Everything else has already settled and is left alone.
- */
-export function arrStatusInterval(
-  status: ArrStatus | undefined,
-): number | false {
-  if (!status) return false;
-  // The fast pace is for a title that will change within seconds. On the Overseerr route nothing
-  // reports that, so it never earns one — the same reasoning that already excludes `queued`.
-  //
-  // Overseerr's status enum has no "downloading right now": PROCESSING means "approved and handed
-  // to the Arr", which is the resting state of an approved-but-unreleased film, and
-  // PARTIALLY_AVAILABLE is the resting state of every currently-airing series. Both read as
-  // `downloading` here — permanently — so this would poll for ever. And one poll costs far more
-  // than on the Arr route: `RadarrClient.status_by_tmdb` is a single request, while Overseerr has
-  // no bulk lookup and must be walked a page at a time across the whole library — 27 requests on a
-  // real 26,941-row instance, against Radarr's one. An unreachable
-  // instance still earns the recovery timer below, because that is the state that cannot clear
-  // itself.
-  // Tested against the live values, never `!== "off"`: the field is absent from a response
-  // predating it, and `undefined !== "off"` would silently stop the fast poll on every Arr install.
-  const viaSeerr =
-    status.overseerr === "ok" || status.overseerr === "unreachable";
-  if (
-    !viaSeerr &&
-    Object.values(status.statuses ?? {}).some(
-      (title) => title === ARR_DOWNLOADING,
-    )
-  ) {
-    return ARR_FAST_MS;
-  }
-  return status.radarr === ARR_UNREACHABLE ||
-    status.sonarr === ARR_UNREACHABLE ||
-    status.overseerr === ARR_UNREACHABLE
-    ? ARR_RECOVER_MS
-    : false;
-}
-
-/**
- * Live Sonarr/Radarr state for the inbox's badges.
- *
- * It POLLS. It used to fetch once on mount with a 30s `staleTime` and no interval, so a title that
- * finished downloading while you watched the page went on reading "Searching" until you reloaded —
- * which is exactly the "it takes ages to say Downloaded" the inbox was reported for. Nothing
- * invalidated this key either, so a title you had just sent showed no status at all.
- *
- * Polls ONLY while a title is actually moving. One fetch is a whole-library read from each Arr
- * (`RadarrClient.status_by_tmdb` pulls `/api/v3/movie` entire), which is the right shape for asking
- * about a whole inbox at once and the wrong thing to repeat on a timer forever: an inbox where
- * everything has already downloaded has no reason to re-read the library every 30 seconds for as
- * long as the tab happens to be open, and on a large library that is megabytes a minute for nothing.
- *
- * So the timer exists exactly while it can change something — a title `queued` or `downloading` —
- * and stops once everything has settled. The two other ways the answer moves are both covered
- * without polling: sending a title invalidates this key outright (`useSendRequests`), and coming
- * back to the tab refetches on focus, which is when a title someone added to Radarr by hand shows
- * up. React Query also holds the interval to mounted components, so a closed page costs nothing.
- */
-export function useArrStatus() {
-  return useQuery({
-    queryKey: queryKeys.arrStatus,
-    queryFn: api.getArrStatus,
-    refetchInterval: (query) => arrStatusInterval(query.state.data),
-  });
-}
-
 export function useNotifications() {
   return useQuery({
     queryKey: queryKeys.notifications,
@@ -895,57 +752,6 @@ export function useSyncWatched() {
   });
   return useMutation({
     mutationFn: api.syncWatched,
-  });
-}
-
-export function useSendRequests() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: ({ ids, dryRun }: { ids: number[]; dryRun?: boolean }) =>
-      api.sendRequests(ids, dryRun ?? false),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.requests });
-      // The moment anything is worth asking the Arrs about is the moment you sent them something.
-      // Nothing invalidated this key at all before, so a title you had just sent sat with no badge
-      // until the next poll came round — or, with no poll, until a reload.
-      queryClient.invalidateQueries({ queryKey: queryKeys.arrStatus });
-    },
-  });
-}
-
-export function useRejectRequests() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (ids: number[]) => api.rejectRequests(ids),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.requests }),
-  });
-}
-
-export function useDeleteRequests() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (ids: number[]) => api.deleteRequests(ids),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.requests }),
-  });
-}
-
-export function useRestoreRequests() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (ids: number[]) => api.restoreRequests(ids),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.requests }),
-  });
-}
-
-export function useClearRequests() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (ids: number[]) => api.clearRequests(ids),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: queryKeys.requests }),
   });
 }
 

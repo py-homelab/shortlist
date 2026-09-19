@@ -33,6 +33,19 @@ All notable changes to this project are documented here. This project follows
   already authenticated the visitor names their Plex account id in a header and proves itself with
   a shared secret; without the secret the header is ignored.
 
+### Removed
+
+- **The owner's request inbox, and Shortlist asking Radarr/Sonarr itself.** Requests are each
+  person's own now, from their picks page, filed in Overseerr/Jellyseerr/Seerr as them. Gone with
+  it: the `/requests` page (it redirects to `/me`) and `/api/requests*`, direct Radarr/Sonarr routing
+  and their connection cards, the request gates (rating, votes, demand, year, language, auto-send),
+  request tags (global, per person, per row), the per-row request settings, the
+  `requests.waiting` webhook event, and the dashboard's Requests card. Migration 0095 moves
+  `requests.overseerr.url` / `.apikey` to `seerr.url` / `seerr.apikey` and `requests.mdblist.apikey`
+  to `recommendations.mdblist.apikey` (still used for "Highest rated" rows); every other
+  `requests.*` setting is purged on boot. The `request_candidates` table and `collections.request_tag`
+  column stay, emptied and unused, because frozen earlier migrations still reference them.
+
 ## [1.9.1] - 2026-09-16
 
 ### Added

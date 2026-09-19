@@ -8,7 +8,6 @@ import {
   sourceRole,
   watchedSummary,
   orderingRows,
-  requestNote,
   shortlistBreakdown,
   webMechanism,
 } from "@/lib/trace";
@@ -26,7 +25,6 @@ function trace(
     reason: null,
     trace: {},
     breakdown: [],
-    requests: {},
     ...patch,
   };
 }
@@ -605,80 +603,5 @@ describe("orderingRows — making the fairness passes visible", () => {
 
   it("is empty when nothing was delivered", () => {
     expect(orderingRows([])).toEqual([]);
-  });
-});
-
-describe("requestNote — what became of a wanted-but-missing title", () => {
-  it("says it went to the Arr, naming which", () => {
-    expect(
-      requestNote({
-        status: "sent",
-        detail: "added to Sonarr and searching",
-        excluded: false,
-        arr_slug: null,
-      }),
-    ).toBe("requested — added to Sonarr and searching");
-  });
-
-  it("gives the REASON a queued title is still waiting", () => {
-    // The whole point: "pending" alone never answered "so why didn't this one go?".
-    expect(
-      requestNote({
-        status: "pending",
-        detail: "rating below auto_min_rating (7.5)",
-        excluded: false,
-        arr_slug: null,
-      }),
-    ).toBe("waiting for approval — rating below auto_min_rating (7.5)");
-  });
-
-  it("falls back gracefully when an older run recorded no reason", () => {
-    expect(
-      requestNote({
-        status: "pending",
-        detail: "",
-        excluded: false,
-        arr_slug: null,
-      }),
-    ).toBe("waiting for approval");
-  });
-
-  it("calls out an exclusion on a title that is still waiting", () => {
-    expect(
-      requestNote({
-        status: "pending",
-        detail: "",
-        excluded: true,
-        arr_slug: null,
-      }),
-    ).toBe("waiting — on an Arr exclusion list");
-  });
-
-  it("reports a title the owner rejected", () => {
-    expect(
-      requestNote({
-        status: "rejected",
-        detail: "",
-        excluded: false,
-        arr_slug: null,
-      }),
-    ).toBe("not requested");
-  });
-
-  it("does not call a SENT title excluded", () => {
-    // `excluded` is never cleared when a title is later sent by hand, so testing it first made one
-    // title read "requested" in one place on the page and "not requested" a few lines away.
-    expect(
-      requestNote({
-        status: "sent",
-        detail: "added to Radarr and searching",
-        excluded: true,
-        arr_slug: null,
-      }),
-    ).toBe("requested — added to Radarr and searching");
-  });
-
-  it("is null for a title the request pass never considered", () => {
-    expect(requestNote(undefined)).toBeNull();
   });
 });

@@ -33,25 +33,17 @@ from shortlist.engine.curator import make_curator
 from shortlist.engine.delivery import render_row_name
 from shortlist.engine.history import ShareTokenWatchSource, distinct_recent, ratings_are_trustworthy
 from shortlist.engine.models import (
-    ArrTarget,
     EngineConfig,
     HubAnchor,
     MediaType,
     Pick,
     PosterSpec,
-    RequestConfig,
-    RequestOverrides,
     RowOverride,
     RowSpec,
-    SeerrTarget,
     UserProfile,
     UserType,
     WrittenDetails,
     is_human_rating,
-    normalise_languages,
-    row_language_mode_or_inherit,
-    row_languages_or_inherit,
-    row_monitor_or_inherit,
 )
 from shortlist.engine.recommender import Recommender
 from shortlist.engine.recommenders import BuiltinRecommender, FallbackRecommender, HttpRecommender
@@ -64,7 +56,6 @@ from shortlist.server.db.models import (
     CollectionUserOverride,
     Delivery,
     PickRow,
-    RequestCandidate,
     Server,
     User,
     WatchedTitle,
@@ -180,55 +171,6 @@ def _refuse_a_different_server(session, machine_id: str) -> None:
         f"Plex at this URL reports machine {machine_id}, but Shortlist is linked to {server.machine_id}. "
         "Refusing to run against a different server — re-link from setup if the move is intentional."
     )
-
-
-def _optional_float(raw: object) -> float | None:
-    """A stored number, or None when the setting is unset — never a silent 0.0.
-
-    Used for the settings whose None is a MEANING ("derive this") rather than an absence, where the
-    usual ``float(store.get(...) or default)`` would erase a deliberate 0.0.
-    """
-    if raw is None or raw == "":
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
-
-
-def row_request_overrides(collection: Collection) -> RequestOverrides | None:
-    """This row's own request floors and target, or None when it overrides nothing.
-
-    None rather than an all-None ``RequestOverrides`` so the engine can skip the resolve entirely
-    for the overwhelmingly common case of a row that inherits everything.
-
-    Shared rows never get one: a shared row is built from titles people have already WATCHED,
-    which are by definition already on the server, so it surfaces nothing missing to request
-    (`_shared_row` is passed no demand map at all). Handing it request settings would put controls
-    in the editor that could not do anything.
-    """
-    if collection.build == "shared":
-        return None
-    overrides = RequestOverrides(
-        min_rating=collection.req_min_rating,
-        min_votes=collection.req_min_votes,
-        min_demand=collection.req_min_demand,
-        min_year=collection.req_min_year,
-        max_year=collection.req_max_year,
-        auto_send=collection.req_auto_send,
-        auto_min_demand=collection.req_auto_min_demand,
-        auto_min_rating=collection.req_auto_min_rating,
-        max_per_row=collection.req_max_per_row,
-        radarr_quality_profile_id=collection.req_radarr_quality_profile_id,
-        radarr_root_folder=collection.req_radarr_root_folder or None,
-        sonarr_quality_profile_id=collection.req_sonarr_quality_profile_id,
-        sonarr_root_folder=collection.req_sonarr_root_folder or None,
-        sonarr_monitor=row_monitor_or_inherit(collection.req_sonarr_monitor),
-        language_mode=row_language_mode_or_inherit(collection.req_language_mode),
-        preferred_languages=row_languages_or_inherit(collection.req_preferred_languages),
-        min_rating_other=collection.req_min_rating_other,
-    )
-    return overrides if overrides != RequestOverrides() else None
 
 
 def _utc(value: datetime | None) -> datetime | None:
@@ -460,8 +402,8 @@ class ContextBuilder:
             # rows down. Read from the DB rather than this run's profiles for exactly that reason.
             paused_slugs = {u.slug for u in session.query(User).all() if (u.prefs or {}).get("paused")}
 
-            # INSIDE the `with`, deliberately. Two of the arguments below still touch `session`
-            # (`_handled_requests`, and `_build_mdblist` via `SettingsStore.get`). Built after the
+            # INSIDE the `with`, deliberately. One of the arguments below still touches `session`
+            # (`_build_mdblist` via `SettingsStore.get`). Built after the
             # block closed, SQLAlchemy silently re-opened a transaction that nothing ever closed, so
             # every `build_context()` checked a connection out of the pool and kept it until GC —
             # and `build_context` is on the path of every run, job and reconcile. The pool is 5 + 10,
@@ -516,7 +458,6 @@ class ContextBuilder:
                 # The DB read above succeeded, so `known_slugs` lists every user Shortlist has — the
                 # complete picture converge needs before it may DELETE an unattributable collection.
                 may_delete_orphans=True,
-                handled_requests=self._handled_requests(session),
                 progress=progress,
             )
 
@@ -552,37 +493,18 @@ class ContextBuilder:
         return FallbackRecommender(external, builtin)
 
     def _build_mdblist(self, store: SettingsStore) -> MdbListClient | None:
-        """A cache-backed MDBList client when any feature needs a non-TMDB rating, else None. Shares
+        """A cache-backed MDBList client when row ordering needs a non-TMDB rating, else None. Shares
         the persistent DB cache so ratings are looked up at most once per title per week — the whole
         point of caching against MDBList's daily request cap.
 
-        TWO settings can ask for one, and either alone is enough: `requests.rating_source` gates which
-        missing titles are worth requesting, and `recommendations.rating_source` decides what a row
-        ordered by "Highest rated" sorts on. Checking only the requests one left row ordering silently
-        inert on every default install — the engine no-opped while the row editor said "Highest IMDb
-        score first", which is the worst of both (nothing happens, and the UI says otherwise)."""
-        wants = {
-            store.get("requests.rating_source") or "tmdb",
-            store.get("recommendations.rating_source") or "tmdb",
-        }
-        if wants == {"tmdb"}:
+        `recommendations.rating_source` decides what a row ordered by "Highest rated" sorts on; TMDB
+        is already on every candidate, so only another source needs the client (and a key)."""
+        if (store.get("recommendations.rating_source") or "tmdb") == "tmdb":
             return None
-        key = store.get("requests.mdblist.apikey")
+        key = store.get("recommendations.mdblist.apikey")
         if not key:
             return None
         return MdbListClient(key, cache=DbCache(self._sessions, kind="mdblist"))
-
-    @staticmethod
-    def _handled_requests(session: Session) -> set[tuple[int, str]]:
-        """Titles the owner already sent or rejected in the inbox — the engine must not re-request them.
-
-        Without this, a title still downloading was still "missing", so it out-ranked everything by
-        demand and re-consumed a `max_per_run` slot every single night — the queue starved on the
-        same five titles forever. And a rejected title could be auto-sent by a later run, so a "no"
-        wasn't a no.
-        """
-        rows = session.query(RequestCandidate).filter(RequestCandidate.status.in_(("sent", "rejected"))).all()
-        return {(row.tmdb_id, row.media_type) for row in rows}
 
     def build_plex_only(self, *, dry_run: bool) -> EngineContext:
         """A context with the PMS, plex.tv and the watch-history source — and nothing else.
@@ -618,17 +540,16 @@ class ContextBuilder:
                 snapshots=DbSnapshotStore(self._sessions),
             )
 
-    def build_requests_only(self) -> tuple[RequestConfig | None, TmdbClient]:
-        """Just the pieces the approval inbox's manual send needs: the request config and a TMDB client.
+    def build_tmdb_only(self) -> TmdbClient:
+        """Just a cache-backed TMDB client, for handlers that look a title up and touch nothing else.
 
-        A request asks Sonarr/Radarr for a file — it touches no Plex object — so this deliberately does
-        NOT build a full EngineContext, which would connect to the PMS and construct the LLM curator and
-        thereby couple a manual send to Plex/LLM availability the send never uses.
+        The blocked-seed picker on a person's page is one: it searches TMDB by name, and building a
+        full EngineContext for that would connect to the PMS and construct the LLM curator, coupling
+        a title search to Plex/LLM availability it never uses.
         """
         with self._sessions() as session:
             store = SettingsStore(session, self._secrets)
-            tmdb = TmdbClient(store.get("tmdb.apikey"), cache=DbCache(self._sessions))
-            return self._build_requests(store), tmdb
+            return TmdbClient(store.get("tmdb.apikey"), cache=DbCache(self._sessions))
 
     def user_history(self, user_id: int, *, limit: int = 25) -> list[dict] | None:
         """Recent watches for one user, newest first — the same source that feeds recommendations.
@@ -973,10 +894,6 @@ class ContextBuilder:
             prefs = user.prefs or {}
             if prefs.get("paused"):
                 continue
-            # The tag the owner typed on this person, if any. The AUTOMATIC alternative — their slug,
-            # under `requests.auto_user_tag` — is applied in the engine, not here: it is overridable
-            # per row, so it cannot be baked into one value that every row then shares.
-            request_tag = (user.request_tag or "").strip()
             profiles.append(
                 UserProfile(
                     username=user.username,
@@ -989,7 +906,6 @@ class ContextBuilder:
                     # older install and records on a newer one, and the engine only wants ids.
                     blocked_seeds=blocked_ids(prefs),
                     row_name_template=prefs.get("row_name_tpl"),
-                    request_tag=request_tag,
                     row_overrides=overrides.get(user.id, {}),
                 )
             )
@@ -1105,7 +1021,6 @@ class ContextBuilder:
             # A per-row scheduled run rebuilds ONLY these rows (by slug); None = every row. Scopes
             # delivery only — classification/sync/sweep/promotion above still see the full list.
             build_only=self._build_only_slugs(session, collection_ids),
-            requests=self._build_requests(store),
         )
 
     def _build_rows(self, session: Session, store: SettingsStore) -> list[RowSpec]:
@@ -1163,8 +1078,6 @@ class ContextBuilder:
                     shared=shared,
                     audience=audience,
                     min_watchers=collection.min_watchers,
-                    request_tag=(collection.request_tag or "").strip(),
-                    auto_user_tag=collection.req_auto_user_tag,  # None -> inherit the global switch
                     candidate_sources=list(collection.candidate_sources or []),
                     watched_pct=collection.watched_pct,  # None -> inherit the global watched cap
                     rewatch=bool(collection.rewatch),
@@ -1189,7 +1102,6 @@ class ContextBuilder:
                     hub_anchors=self._row_hub_anchors(collection),
                     library_keys=[str(k) for k in (collection.library_keys or [])],
                     poster=self._build_poster(session, collection),
-                    request_overrides=row_request_overrides(collection),
                     description=collection.description or "",
                     sort_title_prefix=collection.sort_title_prefix or "",
                     seasons=list(collection.seasons or []),
@@ -1318,97 +1230,3 @@ class ContextBuilder:
                         before=bool(entry.get("before", False)),
                     )
         return anchors
-
-    @staticmethod
-    def _build_requests(store: SettingsStore) -> RequestConfig | None:
-        """Build the Sonarr/Radarr request config, or None when the feature is off.
-
-        A target (Radarr for movies, Sonarr for shows) is only built when BOTH its URL and its API
-        key are set; a half-configured app is left as None so that media type is simply skipped
-        rather than erroring mid-run.
-        """
-        if not store.get("requests.enabled"):
-            return None
-
-        incomplete: list[str] = []
-
-        def seerr_target() -> SeerrTarget | None:
-            """The Overseerr/Jellyseerr target, or None when it isn't fully connected.
-
-            Simpler than an Arr target because there is less to get right: a *seerr needs only a URL
-            and a key, since the quality profile and root folder are its own business.
-            """
-            url = (store.get("requests.overseerr.url") or "").strip()
-            api_key = store.get("requests.overseerr.apikey") or ""
-            if not url or not api_key:
-                msg = "Overseerr is the chosen request target but has no address or API key"
-                logger.warning("{} — nothing will be requested", msg)
-                incomplete.append(msg)
-                return None
-            return SeerrTarget(
-                url=url,
-                api_key=api_key,
-                request_as_user_id=int(store.get("requests.overseerr.request_as_user_id") or 0),
-            )
-
-        def target(prefix: str) -> ArrTarget | None:
-            url = (store.get(f"{prefix}.url") or "").strip()
-            api_key = store.get(f"{prefix}.apikey") or ""
-            if not url or not api_key:
-                return None
-            quality_profile_id = int(store.get(f"{prefix}.quality_profile_id") or 0)
-            root_folder = (store.get(f"{prefix}.root_folder") or "").strip()
-            if not quality_profile_id or not root_folder:
-                app = prefix.split(".")[-1].title()  # "requests.radarr" -> "Radarr"
-                missing = []
-                if not quality_profile_id:
-                    missing.append("quality profile")
-                if not root_folder:
-                    missing.append("root folder")
-                msg = f"{app} connected but {' and '.join(missing)} not selected"
-                logger.warning("{} — requests for that media type will be skipped", msg)
-                incomplete.append(msg)
-                return None
-            return ArrTarget(
-                url=url,
-                api_key=api_key,
-                quality_profile_id=quality_profile_id,
-                root_folder=root_folder,
-                tag=(store.get("requests.tag") or "").strip(),
-            )
-
-        # Branch on the target the owner CHOSE, never on which one happened to build. Deciding it by
-        # "did Overseerr resolve?" meant a half-configured Overseerr fell through to a Radarr left
-        # over from before the switch — silently sending to an app the owner had chosen to stop
-        # using. An unfinished choice must request nothing and say so, not route somewhere else.
-        #
-        # One target or the other, never both: the *seerr owns the download apps, so the Arr targets
-        # (and every per-row profile/folder override that acts on them) must not also be live.
-        via_seerr = store.get("requests.target") == "overseerr"
-        seerr = seerr_target() if via_seerr else None
-        return RequestConfig(
-            enabled=True,
-            target="overseerr" if via_seerr else "arr",
-            overseerr=seerr,
-            radarr=None if via_seerr else target("requests.radarr"),
-            sonarr=None if via_seerr else target("requests.sonarr"),
-            incomplete_targets=incomplete,
-            rating_source=store.get("requests.rating_source") or "tmdb",
-            mdblist_api_key=store.get("requests.mdblist.apikey") or "",
-            min_rating=float(store.get("requests.min_rating")),
-            min_votes=int(store.get("requests.min_votes")),
-            min_demand=int(store.get("requests.min_demand")),
-            min_year=int(store.get("requests.min_year")),
-            max_year=int(store.get("requests.max_year")),
-            max_per_run=int(store.get("requests.max_per_run")),
-            auto_send=bool(store.get("requests.auto_send")),
-            auto_min_demand=int(store.get("requests.auto_min_demand")),
-            auto_min_rating=float(store.get("requests.auto_min_rating")),
-            auto_user_tag=bool(store.get("requests.auto_user_tag")),
-            sonarr_monitor=store.get("requests.sonarr.monitor") or "all",
-            language_mode=store.get("requests.language_mode") or "any",
-            preferred_languages=normalise_languages(store.get("requests.preferred_languages")),
-            # Read WITHOUT `or`: None means "follow min_rating + the gap" and 0.0 is a real bar, so
-            # `x or default` would turn an owner's deliberate 0.0 into the derived 8.5.
-            min_rating_other=_optional_float(store.get("requests.min_rating_other")),
-        )

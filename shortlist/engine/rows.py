@@ -19,8 +19,7 @@ from functools import cached_property
 from loguru import logger
 
 from shortlist.engine import candidates as candidates_mod
-from shortlist.engine import picker, placeholders, ranking
-from shortlist.engine import requests as requests_mod
+from shortlist.engine import picker, ranking
 from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.clients.mdblist import MdbListRateLimitError
 from shortlist.engine.clients.plex_pms import _retry_idempotent
@@ -44,7 +43,6 @@ from shortlist.engine.models import (
     EngineConfig,
     MediaType,
     Pick,
-    RequestWhy,
     RowSpec,
     Seed,
     UserProfile,
@@ -2125,12 +2123,11 @@ def _cold_start(
 
 def _warm_start(
     policy: RowPolicy,
-    demand: requests_mod.DemandMap | None,
     library_of_watch: Callable[[WatchedItem], str],
     library_of_seed: Callable[[object], str],
 ) -> bool:
     """Derive this person's seeds, build every row's candidate pool up front, and record what came
-    back: the trace, the run counts, and (when requests are on) the titles no library holds.
+    back: the trace, the run counts, and their request surface (the titles no library holds).
 
     Raises when EVERY row's sources are down — that is a failed user, not a quiet "ok". Returns
     whether ANY pool holds a candidate: False is not a failure (every source answered, with nothing),
@@ -2156,7 +2153,7 @@ def _warm_start(
         ratings=policy.ratings,
     )
     _emit(ctx, user.slug, "candidates", {"history": len(user.history), "seeds": report.counts.seeds})
-    for spec in specs:  # build every row's pool up front so counts and demand see them all
+    for spec in specs:  # build every row's pool up front so counts and the request surface see them all
         policy.pools_for(spec)
     # Only if EVERY row's sources are down do we know nothing about this person: that's a failed
     # user, not a quiet "ok" that leaves yesterday's rows in place. One dead row among several
@@ -2175,8 +2172,6 @@ def _warm_start(
         {(c.tmdb_id, c.media_type) for p in pools for c in p.ranked}
         | {(c.tmdb_id, c.media_type) for cut in policy.recency_cuts.values() for c in cut}
     )
-    if demand is not None:
-        _record_demand(policy, demand)
     report.status = "ok"
     # Their request surface, once the rows' pools exist (a builtin engine answers it from the same
     # gather). Only when something ranked: a person the engine has nothing for gets nothing here either.
@@ -2240,94 +2235,6 @@ def _missing_titles(policy: RowPolicy) -> list[dict]:
             }
         )
     return out
-
-
-def _record_demand(policy: RowPolicy, demand: requests_mod.RowDemand) -> None:
-    """Record what this user wanted that the server doesn't have, for the run-wide request pass.
-
-    A missing title is attributed to exactly the rows whose pool surfaced it: it gets the user's own
-    request tag plus the tag of each such row. Deduped per user AND PER ROW, so demand counts each
-    person once within a row.
-
-    Kept in a separate map per row, not one flat map, because ``min_demand`` is a per-row floor. One
-    shared map would have a row set to "3 people" counting wanters from rows it has nothing to do
-    with — the number would silently change meaning the moment the setting became per-row, and change
-    it in a direction nobody would notice.
-    """
-    ctx, user, cfg = policy.ctx, policy.user, policy.cfg
-    # An EXPLICIT per-user tag always wins: the owner typed it, so it replaces the automatic slug
-    # rather than stacking with it — carrying both is the clutter that got auto-tagging dropped once
-    # already (2026-07-20). Only when there is no explicit tag does `auto_user_tag` supply the slug,
-    # and that decision is per row, so it is resolved inside the loop.
-    explicit_tag = {user.request_tag} if user.request_tag else set()
-    auto_tag = {user.slug} if user.slug else set()
-    global_auto = bool(cfg.requests and cfg.requests.auto_user_tag)
-    first_seen: dict[str, dict[tuple[int, MediaType], Candidate]] = {}
-    title_tags: dict[str, dict[tuple[int, MediaType], set[str]]] = {}
-    title_why: dict[str, dict[tuple[int, MediaType], list[RequestWhy]]] = {}
-    for spec in policy.specs:
-        pools = policy.pools_for(spec)
-        if pools is None:
-            continue
-        # The row's own name (the same one the user sees), so the inbox can say WHICH row a
-        # request came from. Fill the placeholders the template may carry.
-        row_template = resolve_row_template(spec, user, cfg)
-        # None -> inherit the global switch; True/False is this row's own answer.
-        row_auto = global_auto if spec.auto_user_tag is None else spec.auto_user_tag
-        # A missing title still has a media type, so {library_name} renders as the library that
-        # type would land in ("TV Shows" for a missing show). Keyed by media type; the first
-        # library of that type wins when the row spans several.
-        media_library: dict[MediaType, str] = {}
-        for section in target_sections(ctx.delivery_sections, spec):
-            media_library.setdefault(section_kind(section), getattr(section, "title", "") or "")
-        row_seen = first_seen.setdefault(spec.slug, {})
-        row_tags = title_tags.setdefault(spec.slug, {})
-        row_why = title_why.setdefault(spec.slug, {})
-        for c in requests_mod.collect_missing(pools.gathered, policy.library_index):
-            key = (c.tmdb_id, c.media_type)
-            row_seen.setdefault(key, c)
-            tags = row_tags.setdefault(key, set())
-            # The user wanted it, whatever the row's media — so their tag is not media-gated the way
-            # the row's own tag is below.
-            tags |= explicit_tag or (auto_tag if row_auto else set())
-            # ...but a row's tag only applies to titles that row could actually show, so a
-            # shows-only row never tags a missing movie (its pool holds both until delivery).
-            if spec.request_tag and spec.media in ("both", c.media_type.value):
-                tags.add(spec.request_tag)
-            # Provenance for the inbox: this row surfaced it for this user, seeded by the
-            # strongest history title behind the candidate ("because you watched …").
-            seed_title = c.top_seed.title if c.top_seed else ""
-            row_name = row_template.replace(placeholders.USER, user.display_name).replace(
-                placeholders.TOP_SEED, seed_title or "your favourites"
-            )
-            # {library_name} renders as the library this title's media type lands in; blank (an
-            # unknown media type) collapses the gap ("✨  Picked for You" -> "✨ Picked for You").
-            if placeholders.LIBRARY_NAME in row_name:
-                library_name = media_library.get(c.media_type, "")
-                row_name = " ".join(row_name.replace(placeholders.LIBRARY_NAME, library_name).split())
-            entry = RequestWhy(
-                user=user.username,
-                row=row_name,
-                seed=seed_title,
-                source=(sorted(c.sources)[0] if c.sources else ""),
-                row_slug=spec.slug,
-            )
-            why = row_why.setdefault(key, [])
-            if entry not in why:
-                why.append(entry)
-    # `demand` is the run-wide shared map; the per-user tally above is local, so only this
-    # merge needs the lock (Stage 3 parallel runs).
-    with ctx.write_lock:
-        for slug, seen in first_seen.items():
-            row_demand = demand.setdefault(slug, {})
-            for key, cand in seen.items():
-                requests_mod.accumulate(
-                    row_demand,
-                    [cand],
-                    tags=title_tags[slug][key],
-                    wanter=user.username,
-                    why=title_why[slug][key],
-                )
 
 
 def _season_cold_picks(season: seasons_mod.SeasonTitles, kind: MediaType, sec_idx: dict[int, int]) -> list[Pick]:
@@ -2846,9 +2753,9 @@ def _deliver_row(
         lock_wait_start = time.monotonic()
         # Timed, not bare: this is the ONLY write lock taken inside the per-row loop, so it is the
         # only one whose wait can make one row look slower than its sibling. The three setup-time
-        # locks stay bare — `_remove_muted_and_retired`'s sweep, `_drop_cold_skipped_rows`'s removal
-        # and `_record_demand`'s merge — because `setup_started` in `_run_user` now starts before the
-        # first of them, so all three land inside `setup_s` instead.
+        # locks stay bare — `_remove_muted_and_retired`'s sweep and `_drop_cold_skipped_rows`'s
+        # removal — because `setup_started` in `_run_user` now starts before the first of them, so
+        # both land inside `setup_s` instead.
         with _timed_lock(ctx, policy.report):
             # THE boundary a cancel actually needs. Every user's writes serialize on this one lock, so
             # at concurrency 8 seven people are parked right here when Cancel is pressed — already past
@@ -2926,7 +2833,6 @@ def _run_user(
     library_index: dict[MediaType, dict[int, int]],
     stored_labels: dict[str, str],
     user_report: UserRunReport,
-    demand: requests_mod.DemandMap | None = None,
     order_work: list[tuple] | None = None,
     on_first_row: Callable[[], None] | None = None,
 ) -> bool:
@@ -2935,8 +2841,8 @@ def _run_user(
     True when this person is a candidate for promotion: at least one row was delivered, or a row this
     run covers is out of season and its collection needs hiding.
 
-    When ``demand`` is provided (requests are on), the candidates this user wanted but no delivery
-    library holds are folded into it, so the run-wide request pass can ask Sonarr/Radarr for them.
+    The candidates this user wanted but no delivery library holds become their request surface
+    (`UserRunReport.missing`), which the adapter persists as their own suggestions.
     """
     cfg = ctx.config
 
@@ -3034,7 +2940,7 @@ def _run_user(
 
     base_cold: list[Pick] = []
     try:
-        if not cold and not _warm_start(policy, demand, library_of_watch, library_of_seed) and thin:
+        if not cold and not _warm_start(policy, library_of_watch, library_of_seed) and thin:
             # The engine took them on and answered with nothing — the ordinary cold start, arrived at
             # late. Rows set to skip a cold start come off now, exactly as they would have up front.
             cold = True

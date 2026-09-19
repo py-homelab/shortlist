@@ -43,37 +43,6 @@ class TestCostBlob:
         assert _cost_blob(UserRunReport(username="alex", slug="alex")) is None
 
 
-class TestARealFailureOutlivesAThresholdReason:
-    """A queued title now always carries a reason, so the merge had to learn which one matters.
-
-    Before: `row.detail = m.detail or row.detail` — so a title whose send genuinely errored
-    ("Sonarr returned HTTP 503") had that overwritten the next night by "max_per_run (3) already
-    filled", and the only record that Sonarr was broken was gone from the inbox and the trace.
-    """
-
-    def test_every_reason_the_engine_can_queue_is_classified_as_not_a_failure(self):
-        """Drives the real engine through each blocking branch, so rewording a reason cannot silently
-        reclassify it. Asserting substrings (the older tests do) would not catch that: "below
-        auto_min_demand" still contains "auto_min_demand" while no longer matching the prefix."""
-        from shortlist.engine.requests import QUEUE_REASON_PREFIXES
-        from shortlist.server.services.run_persistence import _is_failure_detail
-
-        for prefix in QUEUE_REASON_PREFIXES:
-            assert _is_failure_detail(prefix) is False, prefix
-            assert _is_failure_detail(f"{prefix} (3)") is False, prefix
-
-    def test_a_threshold_reason_does_not_erase_a_recorded_failure(self):
-        from shortlist.server.services.run_persistence import _is_failure_detail
-
-        assert _is_failure_detail("Sonarr GET /lookup returned HTTP 503") is True
-        assert _is_failure_detail("max_per_run (3) already filled") is False
-        assert _is_failure_detail("rating below auto_min_rating (7.5)") is False
-        assert _is_failure_detail("auto-send is off") is False
-        assert _is_failure_detail("on an Arr exclusion list") is False
-        assert _is_failure_detail("") is False
-        assert _is_failure_detail(None) is False
-
-
 class TestTheShelfEventsANightlyRunEmits:
     """`_emit_hub_ordering_events` — the RUN path, which `jobs._audit_hub_orderings` mirrors for the
     on-demand handlers.
@@ -130,51 +99,6 @@ class TestTheShelfEventsANightlyRunEmits:
         )
 
         assert [(a[0], a[1]) for a in seen] == [("run.hub_unplaced", "info"), ("run.hub_order", "info")]
-
-
-class TestTheZeroRequestedEventSaysWhetherItWasReachable:
-    """`_emit_request_events` — "0 requested" has two shapes and only one is about the owner's
-    settings. `min_demand` counts DISTINCT wanters, so a run covering fewer people than the floor
-    could never have filled the pool, whatever the settings were. Six such events on the
-    maintainer's server (2026-09-03, every one a one-user manual run) raised "Nothing is being
-    requested — loosen your floors" while the nightly 46-user run was requesting normally."""
-
-    @staticmethod
-    def _emit(*, users: int, demand_floor: int) -> dict:
-        from types import SimpleNamespace
-        from unittest.mock import patch
-
-        from shortlist.engine.models import RequestReport
-        from shortlist.server.services import run_persistence as rp
-
-        seen: list[tuple] = []
-        requests = RequestReport(wanted=650, pool_size=0, demand_floor=demand_floor)
-        report = SimpleNamespace(
-            requests=requests,
-            dry_run=False,
-            users=[UserRunReport(username=f"u{i}", slug=f"u{i}") for i in range(users)],
-        )
-        with patch.object(rp, "add_audit", lambda session, scope, level, **f: seen.append((scope, level, f))):
-            rp._emit_request_events(None, 7, report)
-        return next(f | {"_level": level} for scope, level, f in seen if scope == "requests.none_qualified")
-
-    def test_a_run_smaller_than_its_own_demand_floor_is_info_and_flagged(self):
-        fields = self._emit(users=1, demand_floor=2)
-
-        assert fields["_level"] == "info", "arithmetically guaranteed, so not an alarm"
-        assert fields["demand_unreachable"] is True
-        assert (fields["users"], fields["demand_floor"]) == (1, 2)
-
-    def test_a_full_roster_that_cleared_nothing_is_still_a_warning(self):
-        """The shape the alert exists for: plenty of people, plenty missing, floors too tight."""
-        fields = self._emit(users=46, demand_floor=2)
-
-        assert fields["_level"] == "warning"
-        assert fields["demand_unreachable"] is False
-
-    def test_a_floor_of_one_is_never_unreachable(self):
-        """The default. One person wanting a title is one wanter, so a single-user run clears it."""
-        assert self._emit(users=1, demand_floor=1)["demand_unreachable"] is False
 
 
 class TestPicksCarryTheBuiltAtStamp:

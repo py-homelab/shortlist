@@ -16,7 +16,6 @@ import { DashboardPage } from "@/pages/dashboard";
 import { LoginPage } from "@/pages/login";
 import MePage from "@/pages/me";
 import { NotFoundPage } from "@/pages/not-found";
-import { RequestsPage } from "@/pages/requests";
 import { RowEditPage } from "@/pages/row-edit";
 import { RowRenamePage } from "@/pages/row-rename";
 import { RowsPage } from "@/pages/rows";
@@ -172,7 +171,9 @@ export default function App() {
               path="runs/:id/trace/:userId"
               element={<RunUserTracePage />}
             />
-            <Route path="requests" element={<RequestsPage />} />
+            {/* The owner's request inbox is gone: requests are each person's own, from /me. Kept as a
+                redirect for bookmarks and the action links in notifications already sent. */}
+            <Route path="requests" element={<Navigate to="/me" replace />} />
             <Route path="jobs" element={<JobsPage />} />
             {/* Merged into Jobs. Redirect rather than remove: the old page was linked from docs
                 and may be bookmarked, and a 404 would read as the feature being gone. */}

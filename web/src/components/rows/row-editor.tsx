@@ -3,7 +3,6 @@ import type { ReactNode } from "react";
 import { useState } from "react";
 import { Link } from "react-router";
 
-import { RowRequestSettings } from "@/components/rows/row-request-settings";
 import { AudiencePicker } from "@/components/rows/audience-picker";
 import { GlobalDefaultToggle } from "@/components/rows/global-default-row";
 import { LibraryPicker } from "@/components/rows/library-picker";
@@ -397,7 +396,7 @@ export function RowEditor({
   })();
   // A shared row is built once for the whole server from aggregate history, so the per-person dials
   // have no meaning on it — and `_shared_row` ignores them regardless. Hidden rather than shown and
-  // ignored, following `request_tag`, which has always been hidden here for the same reason.
+  // ignored.
   const isSharedRow = input.build === "shared";
   const isSeasonal = input.seasons.length > 0;
   // Only asked for once the row follows seasons — an ordinary row's previews never mention one.
@@ -405,9 +404,6 @@ export function RowEditor({
   const chosenSeasons = (seasonCatalogue.data ?? []).filter((season) =>
     input.seasons.includes(season.slug),
   );
-  const requestSummary = input.request_tag
-    ? `Tagged “${input.request_tag}”`
-    : "No tag";
 
   const submit = () => {
     // Keep 'Top', 'off', and real anchors — a row slug or a collection title. Drop a half-set library
@@ -690,14 +686,7 @@ export function RowEditor({
               <Label>One row each, or one for everyone?</Label>
               <Segmented
                 value={input.build}
-                onChange={(build) =>
-                  // Shared rows never request missing titles, so a request tag on one is inert —
-                  // clear it when switching so no orphaned value lingers hidden in the row.
-                  set({
-                    build,
-                    ...(build === "shared" ? { request_tag: "" } : {}),
-                  })
-                }
+                onChange={(build) => set({ build })}
                 options={[
                   { value: "per_person", label: "Per person" },
                   { value: "shared", label: "Shared" },
@@ -897,7 +886,7 @@ export function RowEditor({
               )}
             </div>
 
-            {/* Hidden for a shared row, like the request tag below. `_shared_row` never calls
+            {/* Hidden for a shared row. `_shared_row` never calls
                 `_apply_watched_cap` or `_prefer_watched` — and more to the point, "how much of this
                 row may be things they have already seen" has no answer for a row nobody owns. A
                 control the engine ignores is worse than no control: it promises a behaviour. */}
@@ -1381,43 +1370,6 @@ export function RowEditor({
               media={input.media}
               onChange={(sort_title_prefix) => set({ sort_title_prefix })}
             />
-          </SettingsGroup>
-
-          <SettingsGroup
-            title="Requests"
-            description="What this row asks Sonarr and Radarr for when a pick isn't on the server yet, and where those titles land."
-            summary={requestSummary}
-            defaultOpen={false}
-          >
-            {input.build !== "shared" && (
-              <div className="space-y-2 border-t pt-4">
-                <Label htmlFor="row-request-tag">Request tag (optional)</Label>
-                <Input
-                  id="row-request-tag"
-                  value={input.request_tag}
-                  onChange={(event) => set({ request_tag: event.target.value })}
-                  placeholder="e.g. picked-for-family"
-                  maxLength={64}
-                  className="max-w-xs"
-                />
-                <p className="text-sm text-muted-foreground">
-                  An extra Radarr/Sonarr tag on requests from this row, beside
-                  the ones every Shortlist request already gets. Blank adds
-                  nothing.
-                </p>
-              </div>
-            )}
-            {/* Per-person rows only. A shared row is built from titles people have already WATCHED,
-                which are by definition already on the server, so it can never surface a missing
-                title to request — these controls would be offered and then silently ignored. */}
-            {!isSharedRow && (
-              <RowRequestSettings
-                input={input}
-                set={set}
-                settings={settings.data}
-                requestsEnabled={settings.data?.["requests.enabled"] === true}
-              />
-            )}
           </SettingsGroup>
 
           {save.isError && (

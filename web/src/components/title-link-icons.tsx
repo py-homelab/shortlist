@@ -4,7 +4,7 @@ import { ImdbGlyph, TmdbGlyph, TraktGlyph } from "@/components/brand-glyphs";
 import { type TitleLink, titleLinks } from "@/lib/title-links";
 import { cn } from "@/lib/utils";
 
-/** Each look-up link's brand mark — the same glyphs the requests inbox puts on the same links. */
+/** Each look-up link's brand mark. */
 const GLYPH: Record<TitleLink["label"], (props: { className?: string }) => ReactNode> = {
   TMDB: TmdbGlyph,
   IMDb: ImdbGlyph,

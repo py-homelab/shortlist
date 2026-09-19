@@ -80,7 +80,7 @@ schedule you set, and each row is visible only to its owner.
      claim instead of illustrating it. -->
 
 **It slots into the stack you already run.** Watch history comes straight from Plex (Tautulli
-optional), candidates from TMDB and Trakt, and gaps can be handed to **Radarr/Sonarr** — while
+optional), candidates from TMDB and Trakt, and everyone's requests go to **Overseerr/Jellyseerr** as them — while
 Kometa's collections are left completely alone. One container, no database of its own to run.
 
 ## Why this couldn't exist before 2026
@@ -145,10 +145,10 @@ anything.</sub>
 
 **Grow your library**
 
-- 📥 **Fills its own gaps (optional)** — when a great pick isn't in your library, Shortlist can ask
-  **Radarr/Sonarr** for it, or file a request in **Overseerr/Jellyseerr**. Off by default and
-  cautious: the strongest few auto-send each night, the rest wait in a **Requests** inbox for
-  one-click approval.
+- 📥 **Everyone's own picks (optional)** — each person signs in with their own Plex account and gets
+  a swipe deck of titles the library doesn't have yet, ranked for them, and requests them in
+  **Overseerr/Jellyseerr/Seerr** as themselves — their quota, their approval. Nothing downloads
+  unless someone asks.
 
 **Trust & safety**
 
@@ -174,7 +174,7 @@ each person and keep it private, inside Plex. It is designed to sit alongside wh
   (Plex Label)_, for instance. Or turn Shortlist's own shelf ordering off entirely.
 - **It merges share filters, never rebuilds them.** Existing conditions are left byte-for-byte
   identical, and the originals are snapshotted before the first change.
-- **It connects rather than duplicates.** Tautulli for richer history, Radarr/Sonarr for gaps, Trakt
+- **It connects rather than duplicates.** Tautulli for richer history, Overseerr for requests, Trakt
   and MDBList for candidates — all optional. Only Plex and a free TMDB key are required.
 - **Plex-only.** The privacy model depends on Plex's label-based share filters (PMS 1.43.2+), so
   there is no Jellyfin or Emby equivalent to port to.

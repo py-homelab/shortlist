@@ -49,9 +49,7 @@ def _seed(client: TestClient, account_id: int, titles: list[tuple[int, str, str,
 
 
 def _configure_seerr(client: TestClient) -> None:
-    r = client.put(
-        "/api/settings", json={"values": {"requests.overseerr.url": SEERR, "requests.overseerr.apikey": "k"}}
-    )
+    r = client.put("/api/settings", json={"values": {"seerr.url": SEERR, "seerr.apikey": "k"}})
     assert r.status_code == 200, r.text
 
 

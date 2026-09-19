@@ -11,7 +11,6 @@ import { BlockedSeedsList } from "@/components/user-detail/blocked-seeds";
 import { RecentRuns } from "@/components/user-detail/recent-runs";
 import { UserDetailHeader } from "@/components/user-detail/user-detail-header";
 import { UserNickname } from "@/components/user-detail/user-nickname";
-import { UserRequestTag } from "@/components/user-detail/user-request-tag";
 import { UserRowsSection } from "@/components/user-detail/user-row-card";
 import { UserSharing } from "@/components/user-detail/user-sharing";
 import { PickOutcomes } from "@/components/user-detail/pick-outcomes";
@@ -109,11 +108,6 @@ export function UserDetailBody({ user }: { user: User }) {
           <section className="space-y-3">
             <SectionHeading>What to call them</SectionHeading>
             <UserNickname user={user} />
-          </section>
-
-          <section className="space-y-3">
-            <SectionHeading>Requests</SectionHeading>
-            <UserRequestTag user={user} />
           </section>
 
           <section className="space-y-3">

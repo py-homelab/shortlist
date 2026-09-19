@@ -227,7 +227,7 @@ def _make_fake_tmdb(state: FakePlexState) -> FastAPI:
                     key: item.title,
                     "vote_average": item.audience_rating,
                     "genre_ids": [1],
-                    # Real TMDB list responses carry the poster path; the request inbox reads it from
+                    # Real TMDB list responses carry the poster path; a person's picks page reads it from
                     # here rather than paying a detail call per title.
                     "poster_path": f"/poster-{item.tmdb_id}.jpg",
                     ("release_date" if key == "title" else "first_air_date"): f"{item.year}-06-01",

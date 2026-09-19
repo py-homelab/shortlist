@@ -141,7 +141,7 @@ Everyone has a row and it will refresh on its own. Worth doing next:
   See [Rows and templates](guides/rows.md).
 - **Decide how often rows change.** Each row keeps its own schedule.
   See [Schedules](guides/schedules.md).
-- **Let it fill gaps in your library.** Shortlist can ask Radarr or Sonarr for titles your people
-  want but you don't have. See [Requests](guides/requests.md).
+- **Let people ask for what's missing.** Connect Overseerr, Jellyseerr or Seerr and everyone can
+  request titles from their own picks page, as themselves. See [Requests](guides/requests.md).
 
 If a row doesn't turn up, [Troubleshooting](guides/troubleshooting.md) lists what usually causes it.

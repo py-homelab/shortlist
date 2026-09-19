@@ -64,10 +64,6 @@ export type Settings =
 /** POST /api/settings/test/{service} response. */
 export type ConnectionTestResult = Schemas["ConnectionTestOut"];
 
-/** GET /api/settings/arr/{service}/options — dropdown data for a connected Sonarr/Radarr. */
-export type ArrOptions = Schemas["ArrOptionsOut"];
-export type SeerrOptions = Schemas["SeerrOptionsOut"];
-
 // --- Rows / collections ---
 
 /** Where a row sits in a library's Recommended shelf, keyed by library (section) key. A `top` entry
@@ -301,45 +297,11 @@ export type RunLogEntry = {
   counts?: Record<string, number | string>;
 } & Schemas["RunLogLineOut"];
 
-/** What the request subsystem did with a wanted-but-missing title (Sonarr/Radarr). Overlaid onto a
- *  "not in your libraries" fate so a drop reads "→ requested from Radarr" instead of a dead end.
- *  pending = queued for the owner's approval; sent = asked of Sonarr/Radarr; rejected = dismissed. */
-export type TraceRequestOutcome = Schemas["TraceRequestOut"];
-
 /** GET /api/runs/{id}/users/{uid}/trace response. */
 export type RunUserTraceResponse = {
   trace: RunUserTrace;
   breakdown: RunLibraryBreakdown[];
-  /** Keyed "<tmdb_id>:<media_type>" — the trace overlays it onto "not in your libraries" drops. */
-  requests: Record<string, TraceRequestOutcome>;
 } & Schemas["RunUserTraceOut"];
-
-// --- Requests inbox (Sonarr/Radarr) ---
-
-/** GET /api/requests — one wanted-but-missing title in the Sonarr/Radarr approval inbox. */
-export type RequestCandidate = Schemas["RequestCandidateOut"];
-
-/** One reason a missing title is in the inbox: a person, the row that wanted it, and what suggested it. */
-export type RequestWhy = Schemas["RequestWhyOut"];
-
-/** One title's result from POST /api/requests/send. */
-export type RequestSendOutcome = Schemas["SendOutcomeOut"];
-
-/** POST /api/requests/send response. */
-export type RequestSendResult = Schemas["SendOut"];
-
-/**
- * GET /api/requests/status — live Arr state for the inbox's badges.
- *
- * `statuses` is keyed by request id (JSON object keys are strings), and `radarr`/`sonarr` say
- * whether that app answered at all: "off" is not configured, "unreachable" is configured and down.
- * Without the second half an all-empty `statuses` is ambiguous between "nothing is tracked" and
- * "the app never replied", and the inbox drew the same nothing for both.
- */
-export type ArrStatus = Schemas["ArrStatusOut"];
-
-/** Whether one Arr answered the last status fetch. */
-export type ArrReach = ArrStatus["radarr"];
 
 // --- Setup wizard / auth ---
 
@@ -589,36 +551,6 @@ export interface RunStats {
   titles_added?: number;
   /** Titles rotated out of rows across all users this run. */
   titles_removed?: number;
-  /** Titles requested from Sonarr/Radarr this run (0 when requests are off). */
-  titles_requested?: number;
-  /** Warnings about incomplete Arr config (e.g. missing quality profile or root folder). */
-  requests_warnings?: string[];
-  /** How "0 requested" was arrived at. A bare zero reads the same whether nothing was missing, the
-   *  floors emptied the pool, the rating gate ran out of lookups, or titles simply went to the inbox
-   *  for approval — and only some of those are a problem. Absent on runs before 2026-08-18. */
-  requests_wanted?: number;
-  /** Titles that cleared the base floors (demand, year) — what the rating gate was handed. */
-  requests_pool?: number;
-  /** Of those, how many the rating gate actually rated. */
-  requests_examined?: number;
-  /** Live rating-API calls that cost quota; cached ratings are free and not counted. */
-  requests_lookups?: number;
-  /** Titles waiting in the inbox for the owner to approve. */
-  requests_queued?: number;
-  /** The same figures per row, which is what answers "why did THAT row send nothing". Absent when
-   *  requests are off or the run never reached the request phase. */
-  requests_by_row?: Record<
-    string,
-    {
-      pool: number;
-      examined: number;
-      considered: number;
-      /** What the caps allocated to this row — the figure that answers "did my row limit bind". */
-      claimed: number;
-      /** Of those, how many the Arr accepted; a claim can still fail at the send (the Arr refused it). */
-      sent: number;
-    }
-  >;
   /** Total AI tokens this run cost (curate + the AI candidate sources). Absent on legacy runs. */
   llm_tokens?: number;
   /** The output share of `llm_tokens`, billed at a higher rate than input. Absent on runs before it was
@@ -927,8 +859,6 @@ export type TestableService =
   | "tautulli"
   | "tmdb"
   | "llm"
-  | "radarr"
-  | "sonarr"
   | "overseerr"
   | "mdblist"
   | "trakt"

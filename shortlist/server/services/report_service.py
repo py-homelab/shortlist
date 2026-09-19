@@ -26,7 +26,6 @@ from shortlist.server.db.models import (
     DEFAULT_SLUG,
     Collection,
     PickRow,
-    RequestCandidate,
     Run,
     RunUser,
     SharedRowWatch,
@@ -514,59 +513,6 @@ def _breakdown(raw: dict, label) -> list[dict]:
     )
 
 
-def _requests_summary(session: Session, since: datetime | None) -> dict:
-    """Requests that paid off: titles asked of Sonarr/Radarr that were LATER watched by someone.
-
-    "Later" is the point. This used to be a plain set intersection with no ordering check, so a title
-    watched, then deleted from the library, then re-requested counted as a request that paid off. It
-    now compares against `sent_at`, stamped once when the status flips to "sent".
-
-    `updated_at` is the fallback for rows sent before that column existed. It is a poor proxy — it has
-    `onupdate`, so clearing an old title from the Sent log bumps it — but it is what those rows have,
-    and it is no worse than the behaviour they already had.
-    """
-
-    def sent_time(row) -> datetime | None:
-        return _as_utc(row.sent_at or row.updated_at) if (row.sent_at or row.updated_at) else None
-
-    sent_rows = [
-        row
-        for row in session.query(RequestCandidate).filter(RequestCandidate.status == "sent").all()
-        if (when := sent_time(row)) is not None and (since is None or when >= since)
-    ]
-    sent = {(row.tmdb_id, row.media_type): sent_time(row) for row in sent_rows}
-    # SHARED rows count, like everywhere else that counts a WATCH. The question here is "did asking
-    # for this title lead to someone watching it", and a shared row is how a title reaches most of
-    # the server — a request that landed on the shared row and was watched off it paid off exactly as
-    # much as one that landed in a personal row. Counting only `picks` undercounted it silently,
-    # which is the same half-applied shape as the runs delta above it.
-    watched_at_by_title: dict[tuple[int, str], datetime] = {}
-    for query in (
-        session.query(PickRow.tmdb_id, PickRow.media_type, func.max(PickRow.watched_at))
-        .filter(PickRow.watched_at.isnot(None))
-        .group_by(PickRow.tmdb_id, PickRow.media_type),
-        session.query(SharedRowWatch.tmdb_id, SharedRowWatch.media_type, func.max(SharedRowWatch.watched_at))
-        .filter(SharedRowWatch.watched_at.isnot(None))
-        .group_by(SharedRowWatch.tmdb_id, SharedRowWatch.media_type),
-    ):
-        for tid, mt, watched in query.all():
-            key = (tid, mt)
-            # The LATEST across both, matching the `func.max` each side already applies. A title on
-            # both a personal and a shared row is one thing that person watched.
-            if key not in watched_at_by_title or _as_utc(watched) > _as_utc(watched_at_by_title[key]):
-                watched_at_by_title[key] = watched
-    paid_off = sum(
-        1
-        for key, sent_at in sent.items()
-        if (watched := watched_at_by_title.get(key)) is not None and (sent_at is None or _as_utc(watched) >= sent_at)
-    )
-    return {
-        "sent": len(sent),
-        "pending": session.query(func.count(RequestCandidate.id)).filter_by(status="pending").scalar() or 0,
-        "watched_after_sent": paid_off,
-    }
-
-
 #: Below this, a start is "opened and closed" rather than "gave it a go". Two minutes of a film is a
 #: different signal from forty, and collapsing them loses the one that says "wrong pick entirely".
 BOUNCE_PERCENT = 5
@@ -992,7 +938,7 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
     Returns:
         Headline counts for the window with their change vs the previous equal period, the landing
         rate over a matured cohort, watch momentum, per-user and per-row breakdowns, the titles
-        landing best, requests that paid off, and a recent-watches feed.
+        landing best, and a recent-watches feed.
     """
     if window not in WINDOWS:
         window = DEFAULT_WINDOW
@@ -1125,8 +1071,6 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
         if last_run
         else 0
     )
-
-    requests = _requests_summary(session, since)
 
     # The titles landing best: most distinct watchers among titles watched in the window. Shared rows
     # count — a title everyone found through the shared row is exactly what "landing best" means.
@@ -1293,7 +1237,6 @@ def effectiveness(session: Session, window: str, *, next_watch_sync: str | None 
             "last_status": last_run.status if last_run else None,
             "errors_last": errors_last or 0,
         },
-        "requests": requests,
         "trend": [{"week": week, "watched": n, "finished": finished_by_week.get(week, 0)} for week, n in trend_rows],
         "per_user": per_user,
         "per_row": per_row,

@@ -24,7 +24,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from shortlist.engine.delivery import FREED_NAME_HELPER_KEY
 from shortlist.engine.models import SHARED_SLUG_PREFIX
-from shortlist.engine.requests import QUEUE_REASON_PREFIXES
 from shortlist.server.db.models import (
     Collection,
     CollectionAudience,
@@ -32,7 +31,6 @@ from shortlist.server.db.models import (
     Delivery,
     Event,
     PickRow,
-    RequestCandidate,
     Run,
     RunLogLine,
     RunSharedRow,
@@ -130,101 +128,6 @@ def _forget_removed_deliveries(session: Session, user_slug: str, removed: list[d
         row = session.get(Delivery, (slug, user_slug, library_key))
         if row is not None:
             session.delete(row)
-
-
-def _why_json(why) -> list[dict]:
-    """Serialize a missing title's provenance for storage + the API: [{user, row, seed, source, row_slug}].
-
-    `row` is the RENDERED name the person sees; `row_slug` is the stable identity beside it, which is
-    what resolves the row's Sonarr/Radarr target when the owner approves months later.
-    """
-    return [{"user": w.user, "row": w.row, "seed": w.seed, "source": w.source, "row_slug": w.row_slug} for w in why]
-
-
-def _is_failure_detail(detail: str | None) -> bool:
-    """Whether a detail describes a send that was ATTEMPTED and failed, rather than a threshold reason
-    for one that was never attempted.
-
-    The queue reasons are settings-derived and finite (`engine/requests.py`); anything else came from
-    an exception while actually talking to Radarr/Sonarr, and is the fact worth keeping.
-    """
-    if not detail:
-        return False
-    return not detail.startswith(QUEUE_REASON_PREFIXES)
-
-
-def _refresh_pending(row: RequestCandidate, m) -> None:
-    """Update a still-pending inbox row with what this run now knows about the title."""
-    row.title = m.title
-    row.year = m.year
-    row.imdb_id = m.imdb_id or row.imdb_id  # keep a known id if a later run couldn't re-fetch it
-    # Same rule as imdb_id, and it is also what backfills rows queued before 0044: the first run to
-    # re-surface the title fills the artwork in.
-    row.poster_path = m.poster_path or row.poster_path
-    row.overview = m.overview or row.overview  # same rule again — and the backfill for pre-0071 rows
-    row.rating = m.rating
-    row.vote_count = m.vote_count
-    # Same keep-what-we-know rule as imdb_id above, and the backfill for rows queued before 0085: a
-    # run that re-surfaces the title from a TMDB source fills the language in. A later run that only
-    # saw it via Trakt must not blank it back to unknown, which would drop the inbox chip and, worse,
-    # re-classify the title as preferred at the next gate.
-    row.language = m.language or row.language
-    row.demand = m.demand
-    row.tags = sorted(m.tags)
-    row.wanters = sorted(m.wanters)
-    row.why = _why_json(m.why)
-    # Keep the newest claim: that is the row whose target an approval would use now.
-    row.row_slug = _row_slug(m) or row.row_slug
-    # A queued title now always carries a reason ("max_per_run (5) already filled"), so a plain
-    # `m.detail or row.detail` would overwrite yesterday's REAL failure ("Sonarr returned HTTP 503")
-    # with today's threshold note — erasing the only record that Sonarr was broken. A failure detail
-    # is the more important fact, so it survives until a send actually succeeds.
-    if m.detail and (not _is_failure_detail(row.detail) or _is_failure_detail(m.detail)):
-        row.detail = m.detail
-    row.excluded = m.excluded  # refresh the exclusion flag each run (a removed exclusion clears it)
-
-
-def _candidate_row(m, run_id: int, *, status: str) -> RequestCandidate:
-    """One inbox row for a missing title, in whichever state the run left it."""
-    return RequestCandidate(
-        tmdb_id=m.tmdb_id,
-        media_type=m.media_type.value,
-        title=m.title,
-        year=m.year,
-        imdb_id=m.imdb_id,
-        poster_path=m.poster_path,
-        overview=m.overview,
-        rating=m.rating,
-        vote_count=m.vote_count,
-        language=m.language,
-        demand=m.demand,
-        tags=sorted(m.tags),
-        wanters=sorted(m.wanters),
-        why=_why_json(m.why),
-        status=status,
-        detail=m.detail,  # why it is not here yet: a threshold, or a real send failure
-        excluded=m.excluded,  # on a Sonarr/Radarr exclusion list — flagged in the inbox
-        arr_slug=m.arr_slug,  # set for auto-sent titles, so the inbox deep-links to the arr page
-        row_slug=_row_slug(m),
-        first_seen_run_id=run_id,
-    )
-
-
-def _row_slug(m) -> str | None:
-    """Which row this title came from, for resolving its Sonarr/Radarr target on a later approval.
-
-    Reads the slug the ENGINE recorded on the title, not the first `why` entry. Those diverged the
-    moment `_merge_across_rows` began unioning provenance across rows: a title two rows wanted now
-    carries both their slugs in `why`, and the one that matters is the row that actually CLAIMED it —
-    the row whose Sonarr/Radarr target the run used, and the one a later approval must reuse.
-
-    Falls back to the first recorded slug for a title that was never claimed (everything queued), and
-    to None when there is no provenance at all — which sends the approval to the global config, the
-    same behaviour as every row queued before per-row settings existed.
-    """
-    if getattr(m, "row_slug", None):
-        return m.row_slug
-    return next((w.row_slug for w in (m.why or []) if w.row_slug), None)
 
 
 def live_pick_ids(session: Session) -> dict[int, set[int]]:
@@ -1030,8 +933,6 @@ def persist_report(
         _emit_sweep_event(session, run_id, report)
         _emit_privacy_sync_events(session, run_id, report)
         _emit_hub_ordering_events(session, run_id, report)
-        _emit_request_events(session, run_id, report)
-        persist_request_queue(session, run_id, report)
         if report.error:
             _add_event(session, "run", "error", run_id, error=report.error)
         _finalize_run(run, report, status, error, ok, errors, skipped)
@@ -1541,149 +1442,6 @@ def _emit_hub_ordering_events(session: Session, run_id: int, report) -> None:
         )
 
 
-def _emit_request_events(session: Session, run_id: int, report) -> None:
-    # Sonarr/Radarr requests. Adding a title to a download app is a real outward-facing
-    # write (it consumes disk and bandwidth), so every request — and every skip — is audited
-    # with the app's own outcome message, dry-run included (plex-safety rule 10 spirit).
-    # A separate, always-checked signal (independent of whether any title was sent): MDBList ran
-    # out of quota mid-run, so ratings fell back to TMDB. Drives the owner's quota notification.
-    if report.requests is not None and report.requests.warnings:
-        for msg in report.requests.warnings:
-            _add_event(session, "requests.incomplete_config", "warning", run_id, dry_run=report.dry_run, detail=msg)
-    if report.requests is not None and report.requests.ratings_rate_limited:
-        _add_event(session, "requests.rate_limited", "warning", run_id, dry_run=report.dry_run)
-    # A run that asked for nothing used to emit nothing at all, so "Shortlist has sent Radarr nothing
-    # for five days" left no trace in the app — the only record was a single INFO line in the
-    # container log. Record the shape of the zero: how many titles cleared the base floors, how many
-    # the rating gate got to rate, and what that cost. A gate that stopped short of the pool is the
-    # actionable case (raise max_per_run / lower the floor); one that rated everything and still
-    # passed nothing means the floors themselves are too high for this library.
-    # Fires on `wanted`, not on `pool_size`: a run that wanted 702 titles and passed none of them
-    # through the base floors is the MOST actionable shape there is (loosen min_demand or the year
-    # window), and keying on the pool skipped exactly that case. `wanted == 0` stays silent — nothing
-    # was missing, which is not a problem to report.
-    if report.requests is not None and report.requests.wanted and not report.requests.considered:
-        # How many people's demand fed this pass, and the floor it had to clear. Demand counts
-        # DISTINCT wanters, so a run covering fewer people than the floor cannot fill the pool no
-        # matter what the settings say — a one-user manual run against `min_demand=2` is guaranteed
-        # to land here. That is not a warning and it is not the owner's floors: it is the run's own
-        # scope, so it is recorded as INFO and `notifications._requests_found_nothing` skips it.
-        population = len(report.users)
-        unreachable = report.requests.demand_floor > population
-        _add_event(
-            session,
-            "requests.none_qualified",
-            "info" if unreachable else "warning",
-            run_id,
-            dry_run=report.dry_run,
-            wanted=report.requests.wanted,
-            pool_size=report.requests.pool_size,
-            dropped_by_language=report.requests.dropped_by_language,
-            examined=report.requests.examined,
-            lookups_spent=report.requests.lookups_spent,
-            exhausted_pool=report.requests.examined >= report.requests.pool_size,
-            users=population,
-            demand_floor=report.requests.demand_floor,
-            demand_unreachable=unreachable,
-        )
-    if report.requests is None or not report.requests.outcomes:
-        return
-    _add_event(
-        session,
-        "run.requests",
-        "info",
-        run_id,
-        dry_run=report.dry_run,
-        considered=report.requests.considered,
-        outcomes=[
-            {
-                "tmdb_id": o.tmdb_id,
-                "title": o.title,
-                "media_type": o.media_type.value,
-                "status": o.status,
-                "detail": o.detail,
-            }
-            for o in report.requests.outcomes
-        ],
-    )
-
-
-def persist_request_queue(session: Session, run_id: int, report) -> None:
-    """Save the titles a run wanted but did not auto-send, for the owner to approve by hand.
-
-    Real runs only — a dry run is a preview and must not mutate the inbox. One row per
-    (tmdb_id, media_type): a re-surfaced title refreshes the live facts of a still-pending row;
-    a title already sent or rejected is left alone, so a download-in-progress isn't re-queued and
-    a dismissed suggestion can't reappear every night.
-
-    A pending title that has since ARRIVED in the library (grabbed elsewhere) is dropped, so the
-    inbox never lingers on titles the owner already has. Same for one an ARR now tracks (added
-    by hand, by another tool, or before the sent-ledger existed): while it downloads — or
-    forever, if unaired — it's absent from Plex, so only the arr-presence prune can catch it.
-    """
-    if report.requests is None or report.dry_run:
-        return
-    existing = {(r.tmdb_id, r.media_type): r for r in session.query(RequestCandidate).all()}
-    # Drop pending candidates the library now holds; leave sent/rejected alone (owner-actioned).
-    present = {(tid, mt.value) for tid, mt in report.library_present}
-    present |= report.requests.arr_present  # best-effort; empty when a check was skipped/failed
-    # A title this run SENT is never pruned, however the presence checks read it: the send is the
-    # newer fact, and filing it as `sent` is the whole reason a downloading title isn't re-requested
-    # tomorrow night. Without this the sent pass below re-inserts the key the prune just deleted.
-    sent_keys = {(m.tmdb_id, m.media_type.value) for m in report.requests.sent}
-    for key in [k for k, r in existing.items() if r.status == "pending" and k in present and k not in sent_keys]:
-        session.delete(existing.pop(key))
-    # The deletes go out BEFORE any insert below. SQLAlchemy orders a flush by mapper, not by the
-    # order you called it in, so INSERTs for a table precede its DELETEs — and one key that is both
-    # pruned and re-filed then trips the UNIQUE constraint, losing the ENTIRE report, not just the
-    # inbox row (issue #104). Nothing below re-files a pruned key any more; this keeps it that way.
-    session.flush()
-    for m in report.requests.queued:
-        key = (m.tmdb_id, m.media_type.value)
-        if key in present:
-            # The library or an Arr already has it — the prune above is the right answer, and
-            # re-queueing would put the row straight back for the next run to delete again.
-            continue
-        row = existing.get(key)
-        if row is None:
-            # Registered, not just added: a key reaching this loop twice would otherwise insert
-            # twice and lose the ENTIRE report to the UNIQUE constraint. The engine dedupes before
-            # this point, but the barrier belongs on both sides of that contract (issue #104).
-            existing[key] = _candidate_row(m, run_id, status="pending")
-            session.add(existing[key])
-        elif row.status == "pending":
-            _refresh_pending(row, m)
-
-    # The titles this run AUTO-SENT are filed as `sent` too. Without this the ledger only knew
-    # about titles the owner sent by hand, so an auto-sent title still downloading was "missing"
-    # again tomorrow: it out-ranked everything by demand, re-consumed one of `max_per_run` every
-    # single night, and the queue starved on the same few titles forever.
-    # The Arr's answer per auto-sent title, so the sent log records the outcome ("requested",
-    # "already in Radarr", …), not just that it went.
-    auto_outcomes = {(o.tmdb_id, o.media_type.value): o for o in report.requests.outcomes}
-    for m in report.requests.sent:
-        key = (m.tmdb_id, m.media_type.value)
-        row = existing.get(key)
-        outcome = auto_outcomes.get(key)
-        if row is None:
-            new_row = _candidate_row(m, run_id, status="sent")
-            new_row.sent_at = datetime.now(UTC)
-            if outcome is not None:
-                new_row.detail = outcome.detail
-            existing[key] = new_row  # same barrier as the queued pass above
-            session.add(new_row)
-        else:
-            # Only on the TRANSITION: a title re-surfaced by a later run is not a second send,
-            # and re-stamping would keep sliding it into the current window for ever.
-            if row.status != "sent":
-                row.sent_at = datetime.now(UTC)
-            row.status = "sent"
-            if outcome is not None:
-                row.detail = outcome.detail
-            if m.arr_slug:  # keep an existing slug if this pass somehow didn't resolve one
-                row.arr_slug = m.arr_slug
-
-
 def _finalize_run(
     run: Run, report, status: str | None, error: str | None, ok: int, errors: int, skipped: int = 0
 ) -> None:
@@ -1714,36 +1472,6 @@ def _finalize_run(
         "shares_updated": len(report.filter_writes),
         "titles_added": titles_added,
         "titles_removed": titles_removed,
-        "titles_requested": report.requests.requested if report.requests else 0,
-        "requests_warnings": report.requests.warnings if report.requests else [],
-        # What "0 requested" was arrived at from — see RequestReport. Kept beside the count because a
-        # zero on its own is unreadable, and the run page is where it gets read.
-        # How many are WAITING for the owner. Without it "0 requested" reads as a failure even when
-        # the run worked perfectly and simply put five titles in the inbox for approval.
-        "requests_queued": len(report.requests.queued) if report.requests else 0,
-        "requests_wanted": report.requests.wanted if report.requests else 0,
-        # Per row, because the aggregates cannot answer the question the feature exists to make
-        # answerable: WHICH row was starved. Written only when there is something to say — a run with
-        # requests off, or one that never reached the request phase, records no empty dicts.
-        **(
-            {
-                "requests_by_row": {
-                    slug: {
-                        "pool": report.requests.pool_by_row.get(slug, 0),
-                        "examined": report.requests.examined_by_row.get(slug, 0),
-                        "considered": report.requests.considered_by_row.get(slug, 0),
-                        "claimed": report.requests.claimed_by_row.get(slug, 0),
-                        "sent": report.requests.sent_by_row.get(slug, 0),
-                    }
-                    for slug in report.requests.pool_by_row
-                }
-            }
-            if report.requests and report.requests.pool_by_row
-            else {}
-        ),
-        "requests_pool": report.requests.pool_size if report.requests else 0,
-        "requests_examined": report.requests.examined if report.requests else 0,
-        "requests_lookups": report.requests.lookups_spent if report.requests else 0,
         "llm_tokens": sum(u.llm_tokens for u in report.users),
         # The output share of that total, which the provider bills at a higher rate. Absent on runs
         # recorded before it was measured — the UI then shows the total alone.

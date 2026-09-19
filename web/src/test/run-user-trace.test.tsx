@@ -20,7 +20,6 @@ function okTrace(
     status: "ok",
     error: null,
     reason: null,
-    requests: {},
     trace: {
       history: {
         total: 20,
@@ -471,7 +470,9 @@ describe("TraceView", () => {
     expect(screen.getByText(/What we put in Movies/)).toBeTruthy();
   });
 
-  it("overlays the request outcome onto a 'not in your libraries' drop", async () => {
+  it("shows a 'not in your libraries' drop as a plain fate, with no request overlay", async () => {
+    // The owner's request inbox is gone — missing titles are each person's to request from their own
+    // picks page — so the trace no longer claims anything about what was asked of Sonarr/Radarr.
     const data = okTrace();
     const query = data.trace.gathers?.[0]?.sources?.[0]?.queries?.[0];
     if (!query) throw new Error("fixture must have a seed query");
@@ -479,20 +480,6 @@ describe("TraceView", () => {
       { tmdb_id: 1000, title: "Toy Story 5", fate: "not_in_your_libraries" },
       { tmdb_id: 1001, title: "Hoppers", fate: "not_in_your_libraries" },
     ];
-    data.requests = {
-      "1000:movie": {
-        status: "sent",
-        detail: "",
-        arr_slug: "toy-story-5",
-        excluded: false,
-      },
-      "1001:movie": {
-        status: "pending",
-        detail: "",
-        arr_slug: null,
-        excluded: false,
-      },
-    };
     render(<TraceView data={data} />);
     const searched = screen
       .getByText(/Where we searched/)
@@ -501,9 +488,9 @@ describe("TraceView", () => {
       within(searched).getByText(/Follow it title by title/),
     );
     expect(
-      within(searched).getByText(/requested from Sonarr\/Radarr/),
-    ).toBeTruthy();
-    expect(within(searched).getByText(/queued for your approval/)).toBeTruthy();
+      within(searched).getAllByText("not in your libraries").length,
+    ).toBe(2);
+    expect(within(searched).queryByText(/requested|approval/i)).toBeNull();
   });
 
   it("a skipped person sees the reason, not a 'predates tracing' excuse", () => {
@@ -973,7 +960,6 @@ describe("TraceView for a shared row", () => {
     status: "ok",
     error: null,
     reason: null,
-    requests: {},
     trace: { gathers: [{ library: "Movies", media: "movie", sources: [] }] },
     breakdown: [],
   } as unknown as RunUserTraceResponse;

@@ -47,7 +47,6 @@ function user(over: Partial<User>): User {
     cold_start: false,
     history_depth: 0,
     last_run_at: null,
-    request_tag: "",
     hit_rate: null,
     nickname: "",
     friendly_name: "",
