@@ -51,6 +51,7 @@ const SUBSET_ROW: Collection = {
   rewatch: false,
   rewatch_cooldown_days: 30,
   unstarted_only: false,
+  family: "include",
   refresh_days: null,
   idle_hold_days: null,
   recency: null,

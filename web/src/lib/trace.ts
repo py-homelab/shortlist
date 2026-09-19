@@ -205,6 +205,10 @@ export function buildLibraries(data: RunUserTraceResponse): LibraryView[] {
  * Trakt take each recent watch and return look-alikes; TMDB-discover takes the person's top genres
  * (not a title) and returns what's popular in them. */
 export function sourceRole(source: string): string {
+  if (source.startsWith("engine:")) {
+    const name = source.slice("engine:".length);
+    return `We sent their seeds and watch history to ${name ? `the ${name} engine` : "your engine"}, and took its titles in the order it gave them.`;
+  }
   switch (source) {
     case "tmdb_similar":
       return "We asked TMDB for titles similar to each recent watch above.";

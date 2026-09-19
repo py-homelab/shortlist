@@ -50,6 +50,7 @@ export const SOURCES: readonly SourceInfo[] = [
 
 /** The compact name for a source id — falls back to the raw id for a source the UI doesn't know. */
 export function sourceShortLabel(id: string): string {
+  if (id.startsWith("engine:")) return id.slice("engine:".length) || "engine";
   const source = SOURCES.find((s) => s.id === id);
   return source?.short ?? source?.label ?? id;
 }

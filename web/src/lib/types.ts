@@ -834,6 +834,8 @@ export interface TraceSelection {
   cooling?: number;
   rewatch_cooldown_days?: number;
   unstarted_only?: boolean;
+  /** Only when set away from the default: "exclude" | "only". */
+  family?: string;
 }
 
 // --- SSE payloads (GET /api/events) ---
@@ -874,6 +876,7 @@ export type TestableService =
   | "overseerr"
   | "mdblist"
   | "trakt"
+  | "engine"
   | "exa"
   | "searxng"
   | "native_search"
@@ -1002,6 +1005,7 @@ export interface SupportRowSetting {
   idle_hold_source: string;
   rewatch: boolean;
   unstarted_only: boolean;
+  family: string;
 }
 
 export interface SupportRows {

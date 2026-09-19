@@ -2,7 +2,7 @@
 title: Troubleshooting and backups
 description: The common failures and what causes them, plus what Shortlist backs up and what it can't restore.
 heading: Troubleshooting and backups
-nav_order: 7
+nav_order: 8
 ---
 
 ## Start here: "Have an issue?"

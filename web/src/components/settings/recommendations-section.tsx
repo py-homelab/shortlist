@@ -5,6 +5,7 @@ import { MAX_SEEDS_LABEL } from "@/components/max-seeds-field";
 import { RECENT_COUNT_LABEL } from "@/components/recent-count-field";
 import { SaveStatus } from "@/components/save-status";
 import { AiWebSearchCard } from "@/components/settings/ai-web-search-card";
+import { EngineCard, usesExternalEngine } from "@/components/settings/engine-card";
 import { RefreshDaysField } from "@/components/settings/refresh-days-field";
 import { IdleHoldField } from "@/components/settings/idle-hold-field";
 import { InlineKeyField } from "@/components/settings/inline-key-field";
@@ -197,6 +198,22 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
           separate sections rather than as the parts of this one. */}
       <div className="space-y-2">
         <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Engine
+        </h3>
+        <EngineCard settings={settings} />
+      </div>
+
+      {/* The sources and AI search are the BUILT-IN engine's; an external engine never reads them,
+          so offering their toggles alongside it would be controls that do nothing. */}
+      {usesExternalEngine(settings) ? (
+        <p className="text-sm text-muted-foreground">
+          Title sources and AI web search belong to Shortlist’s own engine.
+          They come back when it is chosen above.
+        </p>
+      ) : (
+      <>
+      <div className="space-y-2">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Title sources
         </h3>
         <Card>
@@ -262,6 +279,8 @@ export function RecommendationsSection({ settings }: { settings: Settings }) {
           onToggle={() => toggle("llm_web")}
         />
       </div>
+      </>
+      )}
 
       <div className="space-y-2">
         <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">

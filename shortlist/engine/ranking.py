@@ -156,7 +156,14 @@ def _sort_key(
     franchise: float = 0.0,
     cast: float = 0.0,
 ) -> tuple:
+    # A candidate an external engine placed sorts by that placement and nothing else: the engine's
+    # order is its answer, and scoring it again with the built-in formula would silently replace that
+    # answer with this one. A pool is all-external or all-built-in, so the leading 0/1 never actually
+    # interleaves the two; it only keeps the key well-typed if one ever did.
+    if candidate.external_rank is not None:
+        return (0, candidate.external_rank, candidate.title)
     return (
+        1,
         -score(
             candidate,
             recency=recency,
@@ -279,6 +286,10 @@ def diversify_by_seed(candidates: list[Candidate], keep: int) -> list[Candidate]
     """
     if len(candidates) <= keep:
         return candidates
+    # An external engine's order is final (see `Candidate.external_rank`): it spread the row across
+    # tastes its own way, or chose not to, and either is its call. The top `keep` in its order.
+    if all(c.external_rank is not None for c in candidates):
+        return candidates[:keep]
 
     queues: dict[int | None, list[Candidate]] = {}
     order: list[int | None] = []  # seeds in order of their strongest candidate's rank

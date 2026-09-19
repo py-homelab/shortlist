@@ -54,6 +54,7 @@ import {
   COLD_STARTS,
 } from "@/lib/cold-start";
 import { blankInput, hasUnsavedChanges, toInput } from "@/lib/collections";
+import { asFamily, FAMILY_HINTS, FAMILY_LABELS, FAMILY_MODES } from "@/lib/family";
 import {
   useCollectionEffectiveness,
   useLibraries,
@@ -1025,6 +1026,31 @@ export function RowEditor({
                   onChange={(pct) => set({ watched_pct: pct / 100 })}
                 />
               </InheritableField>
+            )}
+
+            {/* Children's and family titles, as the engine tags them (Animation + Family, or the TV
+                Kids genre; an external engine may know better). For a household watching under one
+                Plex account: the grown-ups' rows exclude them, and one row is the family's. Not on a
+                shared row, which is a count of what everyone watched rather than a ranked pool. */}
+            {!isSharedRow && (
+              <div className="space-y-2 border-t pt-4">
+                <Label htmlFor="row-family">Children&rsquo;s &amp; family titles</Label>
+                <select
+                  id="row-family"
+                  value={input.family}
+                  onChange={(e) => set({ family: asFamily(e.target.value) })}
+                  className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                >
+                  {FAMILY_MODES.map((choice) => (
+                    <option key={choice} value={choice}>
+                      {FAMILY_LABELS[choice]}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-sm text-muted-foreground">
+                  {FAMILY_HINTS[asFamily(input.family)]}
+                </p>
+              </div>
             )}
 
             {/* Every row EXCEPT a shared one, including one that follows a watch — unlike the cadence

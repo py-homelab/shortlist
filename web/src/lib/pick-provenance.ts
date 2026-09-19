@@ -13,6 +13,16 @@ const SOURCE_LABELS: Record<string, string> = {
   tmdb_both: "TMDB (similar + your genres)",
 };
 
+/** An external engine's source id is `engine:<its name>`; the name is the label. */
+export function isEngineSource(id: string): boolean {
+  return id.startsWith("engine:");
+}
+
+function engineLabel(id: string): string {
+  const name = id.slice("engine:".length);
+  return name ? `Your engine (${name})` : "Your engine";
+}
+
 /**
  * How confident the suggestion was. `affinity` is 0..1: how near the top of the suggesting source's
  * list the title sat, so 1.0 means "the closest match it had" and 0.4 means "it was mentioned".
@@ -35,6 +45,7 @@ export const STRENGTH_LABELS: Record<MatchStrength, string> = {
 };
 
 export function sourceLabel(source: string): string {
+  if (isEngineSource(source)) return engineLabel(source);
   return SOURCE_LABELS[source] ?? source;
 }
 

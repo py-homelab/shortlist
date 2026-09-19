@@ -71,6 +71,7 @@ function row(patch: Partial<Collection> = {}): Collection {
     rewatch: false,
     rewatch_cooldown_days: 30,
     unstarted_only: false,
+    family: "include",
     refresh_days: null,
     idle_hold_days: null,
     recency: null,
@@ -340,6 +341,37 @@ describe("RowEditor — already-watched titles", () => {
     const call = updateCollection.mock.calls.at(0);
     expect(call?.[0]).toBe(1);
     expect((call?.[1] as Collection).watched_pct).toBe(0);
+  });
+});
+
+describe("RowEditor — children's & family titles", () => {
+  beforeEach(() => {
+    updateCollection.mockClear();
+    settingsData.current = {};
+  });
+
+  it("defaults to mixing them in, and round-trips a change into the PATCH body", async () => {
+    renderEditor(row({ family: "include" }));
+    const select = screen.getByLabelText(/children.s & family titles/i);
+    expect(select).toHaveValue("include");
+
+    await userEvent.selectOptions(select, "exclude");
+    expect(screen.getByText(/for the grown-ups. rows/i)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: /Save changes/i }),
+    );
+
+    await waitFor(() => expect(updateCollection).toHaveBeenCalled());
+    expect(
+      (updateCollection.mock.calls.at(0)?.[1] as Collection).family,
+    ).toBe("exclude");
+  });
+
+  it("is not offered on a shared row, which has no ranked pool to filter", () => {
+    renderEditor(row({ build: "shared", placement: "both" }));
+    expect(
+      screen.queryByLabelText(/children.s & family titles/i),
+    ).not.toBeInTheDocument();
   });
 });
 

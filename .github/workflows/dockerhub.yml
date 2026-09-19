@@ -25,6 +25,7 @@ permissions:
 
 jobs:
   description:
+    if: github.repository_owner == 'stevezau'  # Docker Hub is upstream's; a fork has no token for it
     name: Sync the overview page
     runs-on: ubuntu-latest
     steps:
@@ -44,7 +45,7 @@ jobs:
 
   backfill:
     name: Copy existing release tags from GHCR
-    if: github.event_name == 'workflow_dispatch' && inputs.backfill
+    if: github.repository_owner == 'stevezau' && github.event_name == 'workflow_dispatch' && inputs.backfill
     runs-on: ubuntu-latest
     permissions:
       contents: read

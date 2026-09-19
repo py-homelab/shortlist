@@ -195,6 +195,9 @@ class Collection(Base):
     # Shows only: drop any series this person has STARTED, however little. Stricter than the normal
     # filter, which only drops FINISHED ones — so this is what makes "a series to start" true.
     unstarted_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, server_default="0")
+    # Children's / family titles: "include" (every row's behaviour before this existed), "exclude", or
+    # "only" — a family shelf for a household watching under one account. `engine.models.FAMILY_MODES`.
+    family: Mapped[str] = mapped_column(String(16), default="include", nullable=False, server_default="include")
     # Per-row refresh cadence in DAYS: 0 = never once built, 1 = nightly, N = every N days. NULL ->
     # inherit the global recommendations.refresh_days. Was `freshness`, a 0..1 fraction a curve
     # stretched onto 1..14 days; migration 0065 converted every value through that same curve.

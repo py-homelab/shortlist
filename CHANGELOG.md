@@ -6,6 +6,22 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+### Added
+
+- **Bring your own recommendation engine.** The step that decides which titles a person's rows draw
+  from, and in what order, is now behind one interface (`shortlist.engine.recommender`), with
+  Shortlist's own engine as the default and an out-of-process engine as a drop-in: **Settings →
+  Finding titles → Engine**, an address, an optional token, and a two-endpoint JSON protocol
+  (`GET /v1/info`, `POST /v1/recommend` — [docs](docs/guides/engines.md)). An external engine's order
+  is final; everything around the ranking (history, watched and genre rules, Plex restrictions,
+  per-library rows, privacy) stays Shortlist's. Falls back to the built-in engine per person when
+  the external one is down, and the run trace says which engine ranked each row. Settings
+  `engine.backend`, `engine.url`, `engine.token`, `engine.timeout_s`, `engine.fallback`.
+- **Children's & family titles per row** (`family`: `include` | `exclude` | `only`). For a household
+  watching under one Plex account: the grown-ups' rows leave children's titles out, and one row is
+  the family's. Shortlist's own engine tags them from TMDB's genres; an external engine can do
+  better. Existing rows are unchanged (`include`). Migration 0093.
+
 ## [1.9.1] - 2026-09-16
 
 ### Added

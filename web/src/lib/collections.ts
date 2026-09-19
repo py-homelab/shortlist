@@ -42,6 +42,7 @@ export function blankInput(): CollectionInput {
     // Mirrors the API default, so a row created as a rewatch row starts where the server would.
     rewatch_cooldown_days: 30,
     unstarted_only: false,
+    family: "include",
     refresh_days: null,
     idle_hold_days: null,
     recency: null,
@@ -108,6 +109,7 @@ export function toInput(collection: Collection): CollectionInput {
     watched_pct: collection.watched_pct ?? null,
     rewatch: collection.rewatch ?? false,
     unstarted_only: collection.unstarted_only ?? false,
+    family: collection.family ?? "include",
     refresh_days: collection.refresh_days ?? null,
     idle_hold_days: collection.idle_hold_days ?? null,
     rewatch_cooldown_days: collection.rewatch_cooldown_days ?? 30,
@@ -281,6 +283,12 @@ export function rowOverrides(
 
   if (collection.unstarted_only) {
     parts.push("Never started only");
+  }
+
+  if (collection.family === "only") {
+    parts.push("Family titles only");
+  } else if (collection.family === "exclude") {
+    parts.push("No family titles");
   }
 
   // null inherits the global cadence, so only badge a per-row override.

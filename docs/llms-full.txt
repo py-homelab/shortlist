@@ -227,7 +227,7 @@ Source: https://shortlistapp.dev/guides/
 
 How to do the things people actually want to do with Shortlist, from changing how often a row refreshes to sending missing films to Radarr.
 
-Eight short pages instead of one long one. If you know what you want to do, start here.
+Nine short pages instead of one long one. If you know what you want to do, start here.
 
 ## What do you want to do?
 
@@ -241,6 +241,8 @@ Eight short pages instead of one long one. If you know what you want to do, star
 | Give a row its own artwork                       | [Row posters](https://shortlistapp.dev/guides/rows/#row-posters)                               |
 | Give a row a description, or sort it in Collections | [Description and sort order](https://shortlistapp.dev/guides/rows/#description-and-sort-order) |
 | Change where the suggestions come from           | [What goes in a row](https://shortlistapp.dev/guides/picks/)                                   |
+| Use a recommendation engine of my own            | [Bring your own engine](https://shortlistapp.dev/guides/engines/)                              |
+| Keep the kids' cartoons off the grown-ups' rows  | [Children's and family titles](https://shortlistapp.dev/guides/rows/#childrens-and-family-titles) |
 | Stop one film skewing someone's picks            | [Blocking a seed](https://shortlistapp.dev/guides/picks/#blocking-a-seed)                      |
 | Change how often a row's picks CHANGE            | [What goes in a row](https://shortlistapp.dev/guides/picks/)                                   |
 | Change WHEN a row runs overnight                 | [Schedules and runs](https://shortlistapp.dev/guides/schedules/)                               |
@@ -258,6 +260,7 @@ Eight short pages instead of one long one. If you know what you want to do, star
 | [The web interface](https://shortlistapp.dev/guides/interface/)                 | What every page does, and what each dashboard figure means                  |
 | [Rows and templates](https://shortlistapp.dev/guides/rows/)                     | Starting from a template, naming, ordering, where a row shows, posters, descriptions |
 | [What goes in a row](https://shortlistapp.dev/guides/picks/)                    | Recommendation sources, rebuild cadence, per-row and per-person overrides   |
+| [Bring your own engine](https://shortlistapp.dev/guides/engines/)               | Plugging in a recommendation engine you run yourself, and its protocol      |
 | [Schedules and runs](https://shortlistapp.dev/guides/schedules/)                | Each row's own schedule, custom schedules, the jobs worth knowing about     |
 | [AI and cost](https://shortlistapp.dev/guides/ai/)                              | What AI does, which search backend to pick, how to keep the bill down       |
 | [Requests (Radarr, Sonarr, Overseerr)](https://shortlistapp.dev/guides/requests/) | Setting it up, the approval inbox, guardrails, why a title is still waiting |
@@ -798,6 +801,24 @@ finished in the last**, or set 0 to allow everything), titles they rated low (ag
 ratings are on), and genres you excluded for them. Someone with too little history still gets their
 finished titles first, with the server's top-rated titles filling any room left.
 
+## Children's and family titles
+
+A household that watches under one Plex account — the living-room TV signed in as the owner, with
+the kids' cartoons and the grown-ups' dramas in the same history — gets rows that are half Bluey.
+**Children's & family titles** in the row editor is the way out, without splitting the account:
+
+| Choice                             | What it does                                                                                         |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| **Mixed in with everything else**  | The default, and how every row has always behaved.                                                   |
+| **Left out of this row**           | Nothing tagged as children's or family viewing reaches the row — for the grown-ups' rows.            |
+| **This row is the family row**     | Only children's and family titles, still ranked for this person — one shelf for the kids.            |
+
+What counts as a children's title is the engine's call. Shortlist's own goes by TMDB's genres
+(Animation together with Family, or the TV "Kids" genre); an [engine of your own](https://shortlistapp.dev/guides/engines/) can
+tag by certification or anything else it knows. Changing the choice rebuilds the row on the next
+run. A person with too little history gets the server's top-rated titles on every row, untagged —
+set the family row's cold start to **Don't build their row** if that matters.
+
 ## Seasonal rows
 
 A seasonal row follows the calendar. In October it holds Halloween films and horror, in December
@@ -1322,6 +1343,131 @@ on but the account's ratings were ignored as tool-written, or how many titles a 
 lists the ones it dropped. That line reports the setting as it was **when the run happened**, so
 changing it later doesn't rewrite the history of a run you're reading a fortnight after the fact.
 Runs from before v1.2.1 don't carry it and show only the dropped titles, as they always did.
+
+---
+
+# Bring your own recommendation engine
+Source: https://shortlistapp.dev/guides/engines/
+
+Plug a recommendation engine you run yourself into Shortlist, and the small HTTP protocol it has to speak.
+
+Shortlist's own engine finds titles by asking TMDB (and optionally Trakt or the web) for things
+similar to what each person recently watched, then ranks them with a handful of dials. That is a
+good default and needs no setup. It is not the only way to do it — a collaborative-filtering model,
+an embedding index, a model trained on your own household's history — and if you have one, Shortlist
+can use it in place of its own, for every row, without giving up anything it does around the
+ranking: reading each person's history, keeping watched titles out, honouring their Plex restrictions,
+building per-library collections, and hiding every row from everyone it isn't for.
+
+## Switching engines
+
+**Settings → Finding titles → Engine.** Choose **An engine of your own (HTTP)**, enter its address,
+and press **Test** — it answers with the engine's name and whether it is ready. Choose what should
+happen when the engine is down or has nothing for someone: fall back to Shortlist's own engine for
+that person tonight (the default — the row still builds, and the run trace says which engine ranked
+it), or leave their rows as they are.
+
+The title sources and AI web search are Shortlist's own engine's; they disappear from the page while
+an external engine is chosen, and come back when you switch back. Switching back is the whole
+rollback: nothing else changes.
+
+What an engine can see: for each person, their **seeds** (the recent watches Shortlist would search
+from) and their **watched titles** — what, when, how many times, and their Plex rating if they gave
+one — plus the titles their libraries hold. That leaves Shortlist for the one address you configured
+and nowhere else. If the engine is on a different machine, put it behind TLS or a private network,
+and set a token.
+
+## The protocol
+
+Two JSON endpoints. Everything else about the engine — language, storage, how often it rebuilds —
+is its own business.
+
+### `GET /v1/info`
+
+```json
+{"name": "recommendarr", "version": "0.2.0", "surfaces": ["library"], "serves_cold": true, "ready": true}
+```
+
+`name` is what the run trace and the row provenance call it. `serves_cold` says whether the engine
+wants to be asked about people with fewer watches than **Enough watch history** — Shortlist's own
+cannot seed a search from a thin history, so it cold-starts those people up front; an engine that
+answers `true` is asked like anyone else, and only if it returns nothing do they get the cold-start
+row. `ready: false` means it has no build to serve from yet; the Test button says so.
+
+### `POST /v1/recommend`
+
+Once per person per distinct candidate pool (rows that share sources, media and libraries share one
+call). The request:
+
+```json
+{
+  "protocol": 1,
+  "plex_account_id": 12345678,
+  "surface": "library",
+  "media": ["movie", "show"],
+  "limit_per_media": 80,
+  "run_day": "2026-09-18",
+  "seeds": [{"tmdb_id": 1396, "media_type": "show", "title": "Breaking Bad", "weight": 0.93}],
+  "history": [
+    {"tmdb_id": 1396, "media_type": "show", "title": "Breaking Bad", "year": 2008,
+     "watched_at": "2026-09-10T21:14:00+00:00", "watch_count": 62,
+     "viewed_leaf_count": 62, "leaf_count": 62, "user_rating": null}
+  ],
+  "library": {"movie": [603, 604, 605], "show": [1396, 1399]},
+  "exclude": [[1396, "show"]],
+  "excluded_genres": ["Horror"],
+  "season": null
+}
+```
+
+- `library` is the candidate universe: the TMDB ids the row may recommend from, per media type,
+  already narrowed to the row's own libraries when it is pinned to some. An engine that knows the
+  library already may ignore it; anything it returns outside it is dropped anyway.
+- `exclude` is what the row's rules keep out — watched titles, started series, whatever the row's
+  already-watched setting says. `excluded_genres` are the person's own. Both are applied again to
+  the answer, so an engine that ignores them loses nothing but effort.
+- `limit_per_media` is how many titles per media type the row build will look at; more are cut,
+  never re-ranked.
+- `surface` is `library` for rows. `missing` (titles the libraries do **not** hold) is reserved.
+- `season` names a seasonal row's season, for an engine that wants to know; Shortlist filters to the
+  season's titles itself.
+
+The answer, best first:
+
+```json
+{
+  "engine": {"name": "recommendarr", "version": "0.2.0"},
+  "ordered": true,
+  "items": [
+    {"tmdb_id": 1399, "media_type": "show", "title": "Game of Thrones", "year": 2011,
+     "genres": ["Drama", "Sci-Fi & Fantasy"], "rating": 8.4, "vote_count": 24000,
+     "poster_path": "/…jpg", "overview": "…", "language": "en",
+     "reason": "Because you watched Breaking Bad", "kids": false,
+     "seed": {"tmdb_id": 1396, "title": "Breaking Bad", "media_type": "show"}}
+  ],
+  "trace": {"built_at": 1789000000}
+}
+```
+
+- The order of `items` **is** the ranking. Shortlist keeps it: its own scoring, and the spread across
+  seeds it applies to its own engine's pool, both step aside for an external order.
+- `reason` becomes the pick's "why you're seeing this" line as written. Without one, Shortlist says
+  the title was chosen by your engine.
+- `seed` names the watch the title follows from; it fills `{top_seed}` row names and the seed shown
+  beside the pick.
+- `kids` is what a row's **Children's & family titles** setting reads.
+- `trace` is free-form and shown on the person's run page next to Shortlist's own trace.
+
+Only `tmdb_id` and `media_type` (`movie` | `show`) are required per item; a malformed item is
+skipped, not fatal. Send a token as `Authorization: Bearer …` if you set one. Shortlist retries a
+timeout or a 5xx a few times, then treats the pool as failed and applies the fallback setting.
+
+## What the run trace shows
+
+Each person's run page lists the engine as a source: `engine:<name>`, how many titles it returned,
+how many survived the library and the row's rules, and how long it took. A person whose engine call
+failed shows that source as **failed** with the reason, followed by whichever engine actually built
+the row. A pick's provenance line reads *suggested by Your engine (name)*.
 
 ---
 
@@ -2332,6 +2478,11 @@ root, which on its own looks exactly like a proxy problem.
 | `recommendations.rating_source`                       | `tmdb`                             | which service's score a row ordered by **Highest rated** sorts on. `tmdb` is already carried on every candidate and costs no lookups; `imdb`/`trakt`/`tomatoes`/`metacritic` come from MDBList (one cached lookup per title, shared by every row and user) and need `requests.mdblist.apikey`. Without a key, or once the daily quota is spent, the row falls back to TMDB for its whole ordering rather than mixing two scales                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `privacy.hide_shared_from_disabled`                   | `true`                             | when on, disabling a user hides EVERY shared row from them too — even public "Popular on this server" rows. So a disabled user sees nothing from Shortlist. Off = disabled users still see public shared rows like any account with library access. Changing this setting, or re-enabling someone, rewrites the share filters straight away rather than waiting for a run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `candidates.sources`                                  | `["tmdb_similar","tmdb_discover"]` | sources to pool: `tmdb_similar`, `tmdb_discover`, `trakt`, `llm_web`. Each enabled source gets a fair share of the pooled candidates — a wide source can't crowd out a narrow one                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `engine.backend`                                      | `builtin`                          | which engine ranks each person's candidates. `builtin` is Shortlist's own (the sources above, TMDB similarity, the ranking dials); `http` is an engine you run yourself, speaking the [engine protocol](https://shortlistapp.dev/guides/engines/) at `engine.url`. Each person's seeds and watch history are sent to it, and nowhere else. The sources below are the built-in engine's and are ignored under `http` |
+| `engine.url`                                          | `—`                                | the external engine's address, e.g. `http://recommendarr:8090`. Refused for non-HTTP schemes and cloud metadata addresses like every other fetched URL |
+| `engine.token`                                        | `—`                                | optional bearer token the engine expects; encrypted. Never logged, never in an error |
+| `engine.timeout_s`                                    | `30`                               | per-call ceiling in seconds (1–600). An engine answers from a nightly build, so a few seconds is plenty; the ceiling keeps one hung engine from stalling every person's run |
+| `engine.fallback`                                     | `builtin`                          | when the external engine fails or answers with nothing for a person: `builtin` hands that pool to Shortlist's own engine (the row still builds, ranked the old way, and the run trace says so); `none` leaves the row as it is, exactly like a row whose every source is down |
 | `llm_web.search_provider`                             | `native`                           | which backend the `llm_web` source searches with — exactly one: `native` (the provider's own web-search tool, Claude/GPT/Gemini only), `exa` (the hosted Exa search API), or `searxng` (your own self-hosted SearXNG — no account, key or per-search bill; it still forwards each query on to real search engines). Either external works for every provider, including a local model that cannot search on its own. Naming a backend never falls back to another. A fourth value, `auto` (native unioned with an external), was removed in 1.3 — migration 0063 pins every existing install to the backend it was actually using                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `trakt.client_id`                                     | —                                  | Trakt API key; required for the `trakt` source; encrypted. Trakt now requires a paid **VIP** subscription to create an API key, so this source is unavailable on a free Trakt account — everything else in Shortlist works without it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `exa.apikey`                                          | —                                  | Exa web-search API key; powers the `llm_web` source for any provider, including a local model that cannot search on its own (`searxng.url` is the self-hosted alternative — you need only one); encrypted                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -2452,6 +2603,11 @@ writing one, putting the job back on the built-in cron `GET /api/schedule` repor
 restart. It is the only way back for `sync.check_cron`, where a stored `""` means OFF rather than
 "inherit"; writing the default expression itself would pin a copy of today's value instead. For the
 other five, `null` and `""` land in the same place, because a blank already means "inherit".
+
+Which **engine** ranks each person's pool is `engine.backend`: Shortlist's own (`builtin`, the
+default) or one you run yourself (`http`, at `engine.url`) — see [Bring your own engine](https://shortlistapp.dev/guides/engines/).
+Everything below in this paragraph describes the built-in engine; an external one ranks its own
+way and never reads these keys.
 
 Candidate sources are set globally (`candidates.sources`) and can be overridden per row
 (`collections.candidate_sources`, `[]` = inherit the global set; valid values: `tmdb_similar`,
@@ -2825,6 +2981,12 @@ GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first
      "What 'already watched' means for a show"), so the flag is a no-op. Refused for `media: "movie"`, where any view is already a finish.
      The finished bar itself is not configurable — it is `EngineConfig.watched_show_pct`, fixed at 0.8. Earlier revisions of this document cited a
      `recommendations.watched_show_pct` setting; no such key has ever existed.
+     `family` (`include` | `exclude` | `only`, default `include`) decides what the row does with children's and family titles — as the
+     engine tags them (`Candidate.kids`: the built-in engine reads TMDB's Animation + Family or Kids genres; an external engine may know
+     better). `include` is how every row behaved before the setting existed; `exclude` keeps them out; `only` builds the row from nothing
+     else. For a household watching under one Plex account: the grown-ups' rows `exclude`, one row is `only`. Recorded in the row's recipe
+     only when set away from the default, so upgrading rebuilds nothing. A cold-start row carries no tags, so a `family: only` row for
+     someone without enough history delivers the server's top-rated titles unfiltered — set that row's `cold_start` to `skip` if that matters.
      Both are refused (422) in combinations that cannot work: `rewatch` + `unstarted_only` together (they ask for opposite things — the row would fill
      with titles nobody has seen, under a "you've already seen" name), and `unstarted_only` on a `media: "movie"` row. PATCH validates the MERGED row,
      not just the fields sent, so neither invalid pair can be reached one field at a time.
@@ -3027,7 +3189,7 @@ anything reaches it, including from quoted exception messages.
 GET  /api/support/health -> {checks[{name, ok, detail}], text} (Plex, libraries, tokens, TMDB, curator, database, clocks, last run — each probed independently so one failure is content, not a 500)
 GET  /api/support/title?q= -> {rows[{user, watched_record, viewed_leaf_count, leaf_count, counts_as_watched, cap_pct, delivered[], problem}], flagged[], text}
 GET  /api/support/person/{slug} -> {user_type, watched_movies, watched_shows, libraries[{section_key, library, titles_known, ever_read}], never_read[], text}
-GET  /api/support/rows -> {rows[{slug, watched_pct, watched_pct_source, refresh_days, refresh_days_source, idle_hold_days, idle_hold_source, rewatch, unstarted_only}], global_watched_pct, text}
+GET  /api/support/rows -> {rows[{slug, watched_pct, watched_pct_source, refresh_days, refresh_days_source, idle_hold_days, idle_hold_source, rewatch, unstarted_only, family}], global_watched_pct, text}
 GET  /api/support/row-schedule -> {rows[{slug, refresh_days_source, rebuild_every_days, idle_hold_days, idle_hold_source, last_built_at, days_since_built, due}], text}
 GET  /api/support/libraries -> {libraries[{key, title, type, items}], error, text}
 GET  /api/support/connection -> {users[{user, has_token, libraries_read[], never_read[]}], problems[], text}

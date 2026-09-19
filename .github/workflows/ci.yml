@@ -405,7 +405,9 @@ jobs:
       # documented as the alternative for anyone avoiding Docker Hub's anonymous pull limits.
       # The namespace is `stevezzau` (two z's) — it is NOT the GitHub username, which is stevezau.
       # The old single-z account was lost; do not "correct" this to match GitHub.
+      # Upstream only: a fork has no Docker Hub token and publishes to its own GHCR namespace alone.
       - uses: docker/login-action@v4
+        if: github.repository_owner == 'stevezau'
         with:
           username: stevezzau
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -417,7 +419,7 @@ jobs:
           # holding different bytes for the same tag.
           images: |
             ghcr.io/${{ github.repository }}
-            docker.io/stevezzau/shortlist
+            name=docker.io/stevezzau/shortlist,enable=${{ github.repository_owner == 'stevezau' }}
           tags: |
             # `dev` on a dev push AND on a release tag. Tags are cut from master after a
             # dev -> master promotion PR, at which point the two branches are identical, so

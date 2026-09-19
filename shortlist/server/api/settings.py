@@ -371,6 +371,9 @@ VALIDATORS = {
     # discovered a fortnight later as a request that never arrived.
     "requests.sonarr.monitor": _one_of(*SONARR_MONITOR_MODES),
     "row.name_template": _non_blank_row_template,
+    "engine.backend": _one_of("builtin", "http"),
+    "engine.fallback": _one_of("builtin", "none"),
+    "engine.timeout_s": _bounded_int(1, 600),
 }
 
 
@@ -396,6 +399,7 @@ _FETCHED_URL_KEYS = (
     "curator.ollama_url",
     "curator.openai_base_url",
     "searxng.url",  # fetched by the Test button and by the llm_web source on every run
+    "engine.url",  # POSTed every person's seeds and history, every run
     # POSTed to by `notify.send` for every event the owner chose, and by the Send-a-test button. Being an
     # outbound alert rather than an integration does not change what it is: a URL the server fetches
     # because the owner typed it.
@@ -634,6 +638,7 @@ _TESTABLE_SERVICES = frozenset(
         "overseerr",
         "mdblist",
         "trakt",
+        "engine",
         "exa",
         "searxng",
         "native_search",
@@ -714,6 +719,17 @@ async def test_connection(service: str, request: Request) -> dict:
                 if not client_id:
                     raise RuntimeError("A Trakt API key (client id) is required")
                 return TraktClient(client_id).ping()
+            if service == "engine":
+                from shortlist.engine.clients.engine_http import EngineClient
+
+                url = (get("engine.url") or "").strip()
+                if not url:
+                    raise RuntimeError("An engine URL is required")
+                timeout = float(get("engine.timeout_s") or 30)
+                info = EngineClient(url, token=get("engine.token") or "", timeout=timeout).info()
+                ready = "ready" if info.get("ready", True) else "not ready yet (no build to serve from)"
+                version = f" {info['version']}" if isinstance(info.get("version"), str) else ""
+                return f"Connected to {info['name']}{version} — {ready}"
             if service == "exa":
                 from shortlist.engine.clients.search import ExaClient
 

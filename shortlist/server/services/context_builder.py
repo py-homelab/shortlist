@@ -16,6 +16,7 @@ from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session, sessionmaker
 
 from shortlist.engine import seasons as seasons_mod
+from shortlist.engine.clients.engine_http import EngineClient, EngineError
 from shortlist.engine.clients.mdblist import MdbListClient
 from shortlist.engine.clients.plex_pms import PlexClient
 from shortlist.engine.clients.plextv import PlexTvClient
@@ -52,6 +53,8 @@ from shortlist.engine.models import (
     row_languages_or_inherit,
     row_monitor_or_inherit,
 )
+from shortlist.engine.recommender import Recommender
+from shortlist.engine.recommenders import BuiltinRecommender, FallbackRecommender, HttpRecommender
 from shortlist.engine.rows import row_shown_today
 from shortlist.server.db.adapters import DbCache, DbSnapshotStore
 from shortlist.server.db.models import (
@@ -396,6 +399,7 @@ class ContextBuilder:
             # External web-search backend for the llm_web source; None when none is configured (the
             # native provider tools still work without it — only Ollama depends on it).
             search = make_search_client(store.get)
+            recommender = self._build_recommender(store)
             history = ShareTokenWatchSource(plex, plextv, owner_token=plex_token)
 
             def _pms_for_user(profile, _history=history, _url=plex_url):
@@ -480,6 +484,7 @@ class ContextBuilder:
                 plex=plex,
                 plextv=plextv,
                 tmdb=tmdb,
+                recommender=recommender,
                 trakt=trakt,
                 search=search,
                 poster_artist=poster_artist,
@@ -514,6 +519,37 @@ class ContextBuilder:
                 handled_requests=self._handled_requests(session),
                 progress=progress,
             )
+
+    @staticmethod
+    def _build_recommender(store: SettingsStore) -> Recommender:
+        """The engine this run ranks with (`engine.backend`): Shortlist's own, or an external one over
+        HTTP — behind the built-in as a fallback when `engine.fallback` says so.
+
+        The external engine's `/v1/info` is read HERE, once per run, for its name and whether it serves
+        thin-history people. An unreachable engine at this point is not a failed run: it is built
+        anyway, and every pool then fails over (or fails) per person, which is what the trace can
+        explain. Reading info at run start rather than per pool keeps a run from asking eight times.
+        """
+        builtin = BuiltinRecommender()
+        if store.get("engine.backend") != "http":
+            return builtin
+        url = (store.get("engine.url") or "").strip()
+        if not url:
+            logger.warning("engine.backend is 'http' but engine.url is empty — using the built-in engine")
+            return builtin
+        timeout = float(store.get("engine.timeout_s") or 30)
+        client = EngineClient(url, token=store.get("engine.token") or "", timeout=timeout)
+        name, serves_cold = "", False
+        try:
+            info = client.info()
+            name = str(info.get("name") or "")
+            serves_cold = bool(info.get("serves_cold", False))
+        except EngineError as e:
+            logger.warning("external engine not reachable at run start ({}) — each pool will retry it", e)
+        external = HttpRecommender(client, name=name, serves_cold=serves_cold)
+        if store.get("engine.fallback") == "none":
+            return external
+        return FallbackRecommender(external, builtin)
 
     def _build_mdblist(self, store: SettingsStore) -> MdbListClient | None:
         """A cache-backed MDBList client when any feature needs a non-TMDB rating, else None. Shares
@@ -1134,6 +1170,7 @@ class ContextBuilder:
                     rewatch=bool(collection.rewatch),
                     rewatch_cooldown_days=collection.rewatch_cooldown_days,
                     unstarted_only=bool(collection.unstarted_only),
+                    family=collection.family or "include",
                     refresh_days=collection.refresh_days,  # None -> inherit the global cadence
                     idle_hold_days=collection.idle_hold_days,  # None -> inherit the global idle ceiling
                     recency=collection.recency,  # None -> inherit the global recency
