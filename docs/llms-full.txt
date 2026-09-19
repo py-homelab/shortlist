@@ -1400,9 +1400,11 @@ happen when the engine is down or has nothing for someone: fall back to Shortlis
 that person tonight (the default — the row still builds, and the run trace says which engine ranked
 it), or leave their rows as they are.
 
-The title sources and AI web search are Shortlist's own engine's; they disappear from the page while
-an external engine is chosen, and come back when you switch back. Switching back is the whole
-rollback: nothing else changes.
+The title sources and AI web search are Shortlist's own engine's; they disappear from the settings
+page while an external engine is chosen, and come back when you switch back. A row can still name
+its own sources in its editor — that row is then built by Shortlist's own engine from them (see
+[How row settings work with an engine](#how-row-settings-work-with-an-engine)). Switching back is the
+whole rollback: nothing else changes.
 
 What an engine can see: for each person, their **seeds** (the recent watches Shortlist would search
 from) and their **watched titles** — what, when, how many times, and their Plex rating if they gave
@@ -1418,8 +1420,13 @@ is its own business.
 ### `GET /v1/info`
 
 ```json
-{"name": "recommendarr", "version": "0.2.0", "surfaces": ["library"], "serves_cold": true, "ready": true}
+{"name": "recommendarr", "version": "0.4.0", "surfaces": ["library", "missing"],
+ "features": ["season", "seed_focus"], "serves_cold": true, "ready": true}
 ```
+
+`features` lists which of the request's optional asks the engine acts on — `season` and
+`seed_focus`, described below. The Test button names any it lacks: those rows still build, from the
+engine's overall order, but only approximate what their settings ask for.
 
 `name` is what the run trace and the row provenance call it. `serves_cold` says whether the engine
 wants to be asked about people with fewer watches than **Enough watch history** — Shortlist's own
@@ -1462,6 +1469,7 @@ call). The request:
   "library": {"movie": [603, 604, 605], "show": [1396, 1399]},
   "exclude": [[1396, "show"]],
   "excluded_genres": ["Horror"],
+  "seed_focus": false,
   "season": null
 }
 ```
@@ -1475,8 +1483,14 @@ call). The request:
 - `limit_per_media` is how many titles per media type the row build will look at; more are cut,
   never re-ranked.
 - `surface` is `library` for rows. `missing` (titles the libraries do **not** hold) is reserved.
-- `season` is a seasonal row's title set (`{"movie": [...], "show": [...]}`, null otherwise), for
-  an engine that wants to rank within it; Shortlist filters the answer to the season's titles itself.
+- `season` is a seasonal row's title set (`{"movie": [...], "show": [...]}`, null otherwise). An
+  engine with the `season` feature narrows its candidates to it **before** its `limit_per_media` cut;
+  Shortlist filters the answer to the season's titles either way, but without the feature a seasonal
+  row only gets the season titles that happened to make the engine's head.
+- `seed_focus` is true when the row narrows its seeds on purpose — fewer watches than the server's
+  default, or a window it cycles through (a *Because you watched …* row). An engine with the
+  `seed_focus` feature then ranks by closeness to `seeds` rather than the person's whole taste, and
+  names the matching seed in `seed`.
 
 The answer, best first:
 
@@ -1512,6 +1526,29 @@ The answer, best first:
 Only `tmdb_id` and `media_type` (`movie` | `show`) are required per item; a malformed item is
 skipped, not fatal. Send a token as `Authorization: Bearer …` if you set one. Shortlist retries a
 timeout or a 5xx a few times, then treats the pool as failed and applies the fallback setting.
+
+## How row settings work with an engine
+
+Everything a row does around the ranking is Shortlist's and works the same with any engine. What the
+ranking itself is asked to do is sent to the engine, or applied to its answer:
+
+| Row setting | With an engine of your own |
+|---|---|
+| Size, films/shows, libraries, audience, placement, name, poster | Unchanged — Shortlist's. |
+| Already-watched percentage, *Only series they haven't started* | Sent as `exclude`, and applied again to the answer. |
+| Rebuild cadence, idle hold, pick order (best, rating, newest, shuffle, new first, rotate) | Unchanged — they decide when a row is rebuilt and how its titles are arranged. |
+| *Happy to see again* (rewatch) | Built from history as always; "close to what they watch now" reads the watches the engine says its best titles follow from. |
+| Children's & family titles | Reads each item's `kids`. |
+| Seasons | Sent as `season` (see above). |
+| Watches this row is built from (below the default), cycling | Sent as `seed_focus` with the row's own `seeds`. |
+| Recent releases | The server-wide value is left to the engine's own ranking. A row that sets its own re-weights the engine's order by release date with the same formula Shortlist's engine uses — the engine's position stands in for its score. |
+| Sources (the row names its own) | That row is built by Shortlist's own engine from those sources, as it would be with no engine. Rows on the server's sources go to your engine. |
+| *Popular on this server* (shared) | Built from what people watched, never by an engine. |
+
+Rows that share one engine answer — same libraries, media, exclusion rule and seeds — draw from it
+**without replacement**, in row order, per person: the first row takes the best titles, the next the
+best of what is left. Without that, rows differing only in size or cadence would each show the same
+head of one list. Shortlist's own engine keeps its own behaviour here.
 
 ## What the run trace shows
 

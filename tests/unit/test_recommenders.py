@@ -55,12 +55,14 @@ class FakeEngineClient:
         return {"name": self.name, "version": "0.1", "surfaces": ["library"], "serves_cold": False, "ready": True}
 
 
-def _item(tmdb_id: int, title: str, *, media="movie", rating=7.0, reason=None, kids=False, seed=None, genres=()):
+def _item(
+    tmdb_id: int, title: str, *, media="movie", rating=7.0, reason=None, kids=False, seed=None, genres=(), year=2020
+):
     return {
         "tmdb_id": tmdb_id,
         "media_type": media,
         "title": title,
-        "year": 2020,
+        "year": year,
         "genres": list(genres),
         "rating": rating,
         "vote_count": 1000,
@@ -444,6 +446,118 @@ class TestColdStartWithAnEngine:
         assert client.payloads == []
 
 
+class TestRowsDrawWithoutReplacement:
+    """An engine answers one ordered list per pool; a person's rows sharing it must not repeat it."""
+
+    def test_each_engine_row_takes_the_next_titles_not_the_same_head(self, ctx, mock_plextv):
+        client = FakeEngineClient([_item(10, "Ten"), _item(20, "Twenty"), _item(30, "Thirty")], name="e")
+        ctx.recommender = HttpRecommender(client, name="e")
+
+        report = _run(
+            ctx,
+            mock_plextv,
+            [
+                RowSpec(slug="first", name_template="First", size=1),
+                RowSpec(slug="second", name_template="Second", size=1),
+                RowSpec(slug="third", name_template="Third", size=5),
+            ],
+        )
+
+        by_row = {}
+        for p in report.picks:
+            by_row.setdefault(p.collection_slug, []).append(p.tmdb_id)
+        assert by_row == {"first": [10], "second": [20], "third": [30]}
+
+    def test_the_builtin_engine_keeps_its_upstream_behaviour(self, ctx, mock_plextv):
+        ctx.recommender = BuiltinRecommender()
+
+        report = _run(
+            ctx,
+            mock_plextv,
+            [
+                RowSpec(slug="first", name_template="First", size=5),
+                RowSpec(slug="second", name_template="Second", size=5),
+            ],
+        )
+
+        by_row = {}
+        for p in report.picks:
+            by_row.setdefault(p.collection_slug, []).append(p.tmdb_id)
+        assert by_row["first"] == by_row["second"] == [10, 20]
+
+
+def _rows(report) -> dict[str, list[int]]:
+    by_row: dict[str, list[int]] = {}
+    for p in report.picks:
+        by_row.setdefault(p.collection_slug, []).append(p.tmdb_id)
+    return by_row
+
+
+class TestRowSettingsUnderAnEngine:
+    """Every row setting in the admin keeps its meaning when an external engine ranks."""
+
+    def test_a_row_that_narrows_its_seeds_asks_the_engine_to_focus(self, ctx, mock_plextv):
+        client = FakeEngineClient([_item(10, "Ten"), _item(20, "Twenty")], name="e")
+        ctx.recommender = HttpRecommender(client, name="e")
+        _run(
+            ctx,
+            mock_plextv,
+            [
+                RowSpec(slug="picked", name_template="Picked", size=1),
+                RowSpec(slug="byw", name_template="Because you watched {top_seed}", size=1, max_seeds=1),
+            ],
+        )
+        library = [p for p in client.payloads if p["surface"] == "library"]
+        assert sorted(p["seed_focus"] for p in library) == [False, True]
+        focused = next(p for p in library if p["seed_focus"])
+        assert len(focused["seeds"]) == 1
+
+    def test_a_rows_own_release_date_weight_reorders_the_engines_answer(self, ctx, mock_plextv):
+        items = [_item(10, "Old", year=1980), _item(20, "New", year=2026)]
+        ctx.recommender = HttpRecommender(FakeEngineClient(items, name="e"), name="e")
+        newer = _run(ctx, mock_plextv, [RowSpec(slug="newer", name_template="Newer", size=2, recency=1.0)])
+        assert [p.tmdb_id for p in newer.picks] == [20, 10]
+
+    def test_without_a_row_weight_the_engines_order_stands(self, ctx, mock_plextv):
+        items = [_item(10, "Old", year=1980), _item(20, "New", year=2026)]
+        ctx.recommender = HttpRecommender(FakeEngineClient(items, name="e"), name="e")
+        plain = _run(ctx, mock_plextv, [RowSpec(slug="plain", name_template="Plain", size=2)])
+        assert [p.tmdb_id for p in plain.picks] == [10, 20]
+
+    def test_reweigh_external_multiplies_position_by_the_release_date_factor(self):
+        old = make_candidate(10, "Old", year=1980)
+        new = make_candidate(20, "New", year=2026)
+        old.external_rank, new.external_rank = 0, 1
+        assert [c.tmdb_id for c in ranking.reweigh_external([old, new], 1.0, 2026)] == [20, 10]
+        assert [c.tmdb_id for c in ranking.reweigh_external([old, new], 0.0, 2026)] == [10, 20]
+
+    def test_a_row_naming_its_own_sources_is_built_by_shortlists_engine(self, ctx, mock_plextv):
+        client = FakeEngineClient([_item(30, "Thirty")], name="e")
+        ctx.recommender = FallbackRecommender(HttpRecommender(client, name="e"), BuiltinRecommender())
+        report = _run(
+            ctx,
+            mock_plextv,
+            [
+                RowSpec(slug="engine", name_template="Engine", size=5),
+                RowSpec(slug="own", name_template="Own", size=5, candidate_sources=list(ctx.config.candidate_sources)),
+            ],
+        )
+        rows = _rows(report)
+        assert rows["engine"] == [30]
+        assert rows["own"] == [10, 20]  # the built-in ranking, although its sources equal the default
+        assert len([p for p in client.payloads if p["surface"] == "library"]) == 1
+
+    def test_a_rewatch_rows_taste_comes_from_the_watches_behind_the_engines_titles(self):
+        from shortlist.engine import rows as rows_mod
+
+        c = make_candidate(10, "Ten")
+        c.seeds = [Seed(tmdb_id=900, title="Fargo", media_type=MediaType.MOVIE)]
+        pools = MagicMock(gathered=[], ranked=[c])
+        assert rows_mod._taste(pools) == {(900, MediaType.MOVIE)}
+        pools = MagicMock(gathered=[make_candidate(5, "Five")], ranked=[c])
+        assert rows_mod._taste(pools) == {(5, MediaType.MOVIE)}
+
+
 class TestFamilyRows:
     def test_exclude_keeps_children_titles_out_and_only_keeps_nothing_else(self, ctx, mock_plextv):
         client = FakeEngineClient([_item(10, "Ten", kids=True), _item(20, "Twenty"), _item(30, "Thirty", kids=True)])
@@ -455,14 +569,13 @@ class TestFamilyRows:
             [
                 RowSpec(slug="grown", name_template="Grown-ups", size=5, family="exclude"),
                 RowSpec(slug="fam", name_template="Family", size=5, family="only"),
-                RowSpec(slug="all", name_template="Everyone", size=5),
             ],
         )
 
         by_row = {}
         for p in report.picks:
             by_row.setdefault(p.collection_slug, []).append(p.tmdb_id)
-        assert by_row == {"grown": [20], "fam": [10, 30], "all": [10, 20, 30]}
+        assert by_row == {"grown": [20], "fam": [10, 30]}
 
     def test_the_builtin_tags_kids_from_genres_too(self, ctx, mock_plextv):
         ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family", 18: "Drama"}
@@ -661,7 +774,10 @@ class TestHouseholds:
             "window_days": None,
             "engine_label": None,
         }
-        assert self._by_row(report) == {"picked": [10, 20, 30], "fam": [10, 30]}
+        # Nothing filtered: the personal row keeps the children's titles too, and the family row, which
+        # draws after it from the same engine list, finds them already on this person's Home.
+        assert self._by_row(report) == {"picked": [10, 20, 30]}
+        assert report.rows_considered["fam"] == "due"
 
 
 class TestClassify:

@@ -32,6 +32,7 @@ import { TemplateVarsHint } from "@/components/rows/template-vars-hint";
 import { Segmented } from "@/components/segmented";
 import { RefreshDaysField } from "@/components/settings/refresh-days-field";
 import { IdleHoldField } from "@/components/settings/idle-hold-field";
+import { usesExternalEngine } from "@/components/settings/engine-card";
 import { RecencySlider } from "@/components/settings/recency-slider";
 import { WatchedSlider } from "@/components/settings/watched-slider";
 import { Button } from "@/components/ui/button";
@@ -302,6 +303,11 @@ export function RowEditor({
   const saveSettings = useSaveSettings();
   // Read-only here: the editor never writes settings, it only names the globals a row inherits.
   const settings = useSettings();
+  // With an engine of the owner's own, some settings act differently (sources, recent releases, the
+  // seed budget) — said beside each one, so a setting never promises what the engine ignores.
+  const externalEngine = settings.data
+    ? usesExternalEngine(settings.data)
+    : false;
   const libraries = useLibraries();
   const effectiveness = useCollectionEffectiveness(collection?.id ?? null);
   const ratingSource = asRatingSource(
@@ -810,6 +816,14 @@ export function RowEditor({
                   value={input.candidate_sources}
                   onChange={(candidate_sources) => set({ candidate_sources })}
                 />
+                {externalEngine && (
+                  <p className="text-sm text-muted-foreground">
+                    Your own engine ranks rows that use the server’s sources.
+                    Choose sources for this row and Shortlist’s own engine
+                    builds it from them instead, as it would without an
+                    engine.
+                  </p>
+                )}
                 {/* The engine drops it on a seasonal row (`effective_row_sources`): its searches are
                     per watched title, not seasonal, so nearly all it found would be filtered out. */}
                 {isSeasonal && (
@@ -1055,7 +1069,11 @@ export function RowEditor({
               <InheritableField
                 label="Recent releases"
                 labelFor="row-recency"
-                description="How much a title’s release date counts for this row — up for “new and notable”, down for one that digs up older films. Older titles are never excluded, they just have to be a better match."
+                description={
+                  externalEngine
+                    ? "How much a title’s release date counts for this row. Your own engine’s order is used as it comes unless this row sets its own value, which then re-weights that order toward newer titles. Older titles are never excluded."
+                    : "How much a title’s release date counts for this row — up for “new and notable”, down for one that digs up older films. Older titles are never excluded, they just have to be a better match."
+                }
                 ariaLabel="Use the global recent-releases default"
                 inheriting={input.recency === null}
                 globalValue={recencyGlobal(settings.data)}
@@ -1100,6 +1118,8 @@ export function RowEditor({
                     How many recent watches this row is built from. High blends
                     someone&rsquo;s whole recent viewing; low makes the row
                     about one or two specific things they watched.
+                    {externalEngine &&
+                      " With your own engine, a row set below the default asks it to rank by closeness to those watches."}
                   </>
                 }
                 ariaLabel="Use the default number of watches every source builds from"

@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.3] - 2026-09-19 (py-homelab fork)
+
+### Fixed
+
+- **An external engine no longer puts the same titles in every row.** A person's rows that share one
+  engine answer now draw from it without replacement, in row order — before, rows differing only in
+  size or cadence each showed the head of the same list (97% overlap in a dry run).
+
+### Added
+
+- **Every row setting keeps its meaning with an external engine**
+  ([docs](docs/guides/engines.md#how-row-settings-work-with-an-engine)): seasonal rows send their
+  season for the engine to rank within (`season`); rows built from fewer watches or cycling them send
+  `seed_focus`, so *Because you watched …* is about that watch; a row's own **Recent releases** value
+  re-weights the engine's order by release date; a row naming its own sources is built by Shortlist's
+  own engine from them; a rewatch row reads its "close to what they watch now" from the watches the
+  engine's titles follow from. `/v1/info` gains `features`, and the engine card's **Test** names any
+  the engine lacks. The row editor says how sources, recent releases and the seed budget act with an
+  engine.
+
 ## [1.9.1-py.2] - 2026-09-19 (py-homelab fork)
 
 ### Added

@@ -74,6 +74,11 @@ class RecommendRequest:
     recent_count: int = 0
     recency: float = 0.0
     season: SeasonTitles | None = None
+    #: The row narrows its seeds on purpose — a smaller seed budget than the server's, or a window it
+    #: cycles through ("Because you watched X"). An engine that ranks from the person's whole taste
+    #: should then rank by closeness to ``seeds`` instead. The built-in engine always searches from
+    #: ``seeds``, so it needs no flag.
+    seed_focus: bool = False
 
 
 @dataclass
