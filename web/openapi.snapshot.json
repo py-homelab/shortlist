@@ -649,6 +649,11 @@
             "title": "Fallback Name",
             "type": "string"
           },
+          "family": {
+            "default": "include",
+            "title": "Family",
+            "type": "string"
+          },
           "hub_anchor": {
             "additionalProperties": {
               "$ref": "#/components/schemas/HubAnchorIn"
@@ -1222,6 +1227,10 @@
             "title": "Fallback Name",
             "type": "string"
           },
+          "family": {
+            "title": "Family",
+            "type": "string"
+          },
           "hub_anchor": {
             "additionalProperties": {
               "$ref": "#/components/schemas/HubAnchorOut"
@@ -1733,6 +1742,7 @@
           "rewatch",
           "rewatch_cooldown_days",
           "unstarted_only",
+          "family",
           "refresh_days",
           "idle_hold_days",
           "recency",

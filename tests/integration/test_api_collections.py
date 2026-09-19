@@ -44,6 +44,7 @@ COLLECTION_KEYS = {
     "rewatch",
     "rewatch_cooldown_days",
     "unstarted_only",
+    "family",
     "refresh_days",
     "idle_hold_days",
     "recency",

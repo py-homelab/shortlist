@@ -3071,6 +3071,11 @@ export interface components {
              * @default
              */
             fallback_name: string;
+            /**
+             * Family
+             * @default include
+             */
+            family: string;
             /** Hub Anchor */
             hub_anchor?: {
                 [key: string]: components["schemas"]["HubAnchorIn"];
@@ -3281,6 +3286,8 @@ export interface components {
             enabled: boolean;
             /** Fallback Name */
             fallback_name: string;
+            /** Family */
+            family: string;
             /** Hub Anchor */
             hub_anchor: {
                 [key: string]: components["schemas"]["HubAnchorOut"];

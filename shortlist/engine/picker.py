@@ -35,6 +35,9 @@ _SEEDLESS_REASON = {
 # `season` before the search sources: on a seasonal row, being right for the season is why a title is there.
 _SEEDLESS_SOURCE_PRECEDENCE = ("history", "season", "llm_web", "tmdb_discover", "cold_start")
 _SEEDLESS_REASON_DEFAULT = "Matched to your taste"
+#: A seedless, reasonless pick from an external engine ("engine:<name>" source). The engine had every
+#: chance to explain itself; when it did not, say where it came from rather than invent a match.
+_EXTERNAL_REASON = "Chosen for you by your recommendation engine"
 
 
 def reason_for(candidate: Candidate) -> str:
@@ -48,11 +51,17 @@ def reason_for(candidate: Candidate) -> str:
     recency. Ratings only ever REMOVE a seed (`history.disliked_seed_keys`) — nothing in the engine
     marks a title as liked, so claiming it would be a guess dressed up as a fact.
     """
+    if candidate.reason:
+        # The engine that placed this title said why, in its own words; it knows more about the match
+        # than the seed-and-genres template can (an external engine's reason, or a future built-in one).
+        return candidate.reason
     seed = candidate.top_seed
     if not seed:
         for source in _SEEDLESS_SOURCE_PRECEDENCE:
             if source in candidate.sources:
                 return _SEEDLESS_REASON[source]
+        if candidate.external_rank is not None:
+            return _EXTERNAL_REASON
         return _SEEDLESS_REASON_DEFAULT
     if candidate.genres:
         genres = ", ".join(candidate.genres[:2]).lower()

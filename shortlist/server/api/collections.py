@@ -23,6 +23,7 @@ from shortlist.engine.candidates import KNOWN_SOURCES
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.delivery import target_sections
 from shortlist.engine.models import (
+    FAMILY_MODES,
     LANGUAGE_MODES,
     MAX_REFRESH_DAYS,
     MAX_ROW_SIZE,
@@ -199,6 +200,8 @@ class CollectionIn(StrictRequestModel):
     rewatch_cooldown_days: int = Field(default=30, ge=0, le=MAX_REFRESH_DAYS)
     # Shows only: exclude every series this person has started, not just the ones they finished.
     unstarted_only: bool = False
+    # Children's / family titles: "include" | "exclude" | "only" (`engine.models.FAMILY_MODES`).
+    family: str = "include"
     refresh_days: int | None = Field(default=None, ge=0, le=MAX_REFRESH_DAYS)  # None -> inherit the global cadence
     # How long this row waits when its owner has watched nothing since it was built. 0 = never wait;
     # None -> inherit the global recommendations.idle_hold_days.
@@ -420,6 +423,7 @@ class CollectionOut(PassthroughModel):
     rewatch: bool
     rewatch_cooldown_days: int
     unstarted_only: bool
+    family: str
     refresh_days: int | None
     idle_hold_days: int | None
     recency: float | None
@@ -585,6 +589,8 @@ def _validate(body: CollectionIn) -> None:
         raise HTTPException(status_code=422, detail=f"pick_order must be one of {sorted(ORDERS)}")
     if body.cold_start is not None and body.cold_start not in COLD_STARTS:
         raise HTTPException(status_code=422, detail=f"cold_start must be null or one of {sorted(COLD_STARTS)}")
+    if body.family not in FAMILY_MODES:
+        raise HTTPException(status_code=422, detail=f"family must be one of {list(FAMILY_MODES)}")
     if body.req_sonarr_monitor is not None and body.req_sonarr_monitor not in SONARR_MONITOR_MODES:
         raise HTTPException(
             status_code=422,
@@ -855,6 +861,7 @@ def _serialize(session, collection: Collection, now: datetime | None = None) -> 
         "rewatch": bool(collection.rewatch),
         "rewatch_cooldown_days": collection.rewatch_cooldown_days,
         "unstarted_only": bool(collection.unstarted_only),
+        "family": collection.family or "include",
         "refresh_days": collection.refresh_days,
         "idle_hold_days": collection.idle_hold_days,
         "recency": collection.recency,
@@ -1147,6 +1154,7 @@ async def create_collection(body: CollectionIn, request: Request) -> dict:
             rewatch=body.rewatch,
             rewatch_cooldown_days=body.rewatch_cooldown_days,
             unstarted_only=body.unstarted_only,
+            family=body.family,
             refresh_days=body.refresh_days,
             idle_hold_days=body.idle_hold_days,
             recency=body.recency,
@@ -1223,6 +1231,7 @@ _PATCHABLE_COLUMNS = (
     "rewatch",
     "rewatch_cooldown_days",
     "unstarted_only",
+    "family",
     "refresh_days",
     "idle_hold_days",
     "recency",

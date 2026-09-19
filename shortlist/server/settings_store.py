@@ -123,7 +123,24 @@ DEFAULTS: dict[str, Any] = {
     "notify.webhook.auth_header_name": "Authorization",
     "notify.webhook.auth_header_value": "",
     # Which candidate sources feed recommendations (engine/candidates.py). More = wider recall.
+    # These are the BUILT-IN engine's sources; an external engine (`engine.backend = http`) ranks its
+    # own way and never reads them.
     "candidates.sources": ["tmdb_similar", "tmdb_discover"],
+    # Which engine ranks each person's candidates (engine/recommender.py):
+    #   'builtin' — Shortlist's own: the sources above, TMDB similarity, the ranking dials.
+    #   'http'    — an engine running elsewhere, speaking the /v1 engine protocol at `engine.url`.
+    #               Each person's seeds and watch history are sent to it, and to nowhere else.
+    "engine.backend": "builtin",
+    "engine.url": "",
+    # Optional bearer token the engine expects; a SECRET_KEY.
+    "engine.token": "",
+    # Per-call ceiling. An engine answers from a nightly build, so it should be well under this; the
+    # ceiling is what keeps one hung engine from stalling every person's run.
+    "engine.timeout_s": 30,
+    # When the external engine fails or answers with nothing for a person: 'builtin' hands that pool
+    # to Shortlist's own engine (the row still builds, ranked the old way, and the trace says so);
+    # 'none' leaves the row as it is, exactly like a row whose every source is down.
+    "engine.fallback": "builtin",
     # Which backend the web-search (llm_web) source searches with. Exactly one, always:
     #   'native'  — the curator provider's own web-search tool (Claude/GPT/Gemini only)
     #   'exa'     — the hosted Exa search API
@@ -277,6 +294,7 @@ SECRET_KEYS = {
     "requests.sonarr.apikey",
     "requests.mdblist.apikey",  # MDBList key for IMDb/Trakt/RT/Metacritic rating gating
     "trakt.client_id",
+    "engine.token",  # bearer token for an external recommendation engine
     "exa.apikey",  # Exa web-search API key for the llm_web source
     "searxng.password",  # reverse-proxy password guarding a self-hosted SearXNG
     "api.token",  # our own programmatic API token (encrypted at rest so the owner can reveal it)

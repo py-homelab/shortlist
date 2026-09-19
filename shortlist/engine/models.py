@@ -238,6 +238,17 @@ class Candidate:
     # Every signal that fired for this candidate, for the "why you're seeing this" line. Empty until
     # a signal beyond the plain seed match actually has something to add.
     attributions: list[Attribution] = field(default_factory=list)
+    # Set by an EXTERNAL engine (`recommenders/http.py`): its position in that engine's final order,
+    # 0 first. When set, `ranking._sort_key` orders by it and nothing else, and `diversify_by_seed`
+    # leaves the order alone — the engine decided, and re-scoring its answer with the built-in formula
+    # would hand back a row the engine never ranked. None for every built-in candidate.
+    external_rank: int | None = None
+    # A "why you're seeing this" line the engine wrote itself; `picker.reason_for` prefers it to its own
+    # template when set. None = build it from the seed and genres as always.
+    reason: str | None = None
+    # Children's / family title, as the engine judged it (certification, or Animation + Family genres).
+    # A row's `family` setting reads this; the built-in engine derives it from genres alone.
+    kids: bool = False
 
     @property
     def seed_frequency(self) -> int:
@@ -386,6 +397,10 @@ class RowSeason:
     anchor: date
 
 
+#: `RowSpec.family` values. "include" is the default and the pre-1.10 behaviour.
+FAMILY_MODES = ("include", "exclude", "only")
+
+
 @dataclass
 class RowSpec:
     """One curated-row definition the engine delivers, built by the adapter from a Collection row.
@@ -440,6 +455,11 @@ class RowSpec:
     # are three episodes into is otherwise still eligible. This is what makes "a series to start" true.
     # Meaningless for movies (a movie with any view is already finished), so it applies to shows only.
     unstarted_only: bool = False
+    # Children's / family titles (`Candidate.kids`): "include" keeps them with everything else — how
+    # every row has always behaved; "exclude" keeps them out; "only" builds the row from nothing else.
+    # For a household watching under one account: the grown-ups' rows exclude, and one row is the
+    # family's. Decided from what the engine tagged, never from the person's Plex restrictions.
+    family: str = "include"
     # How often this row re-picks its titles, in DAYS: 0 = never once built (frozen), 1 = nightly,
     # N = every N days. None -> inherit EngineConfig.refresh_days.
     refresh_days: int | None = None

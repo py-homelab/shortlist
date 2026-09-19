@@ -26,6 +26,8 @@ from shortlist.engine.curator import Curator
 from shortlist.engine.history import HistorySource
 from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport, WrittenDetails
 from shortlist.engine.privacy import SnapshotStore
+from shortlist.engine.recommender import Recommender
+from shortlist.engine.recommenders.builtin import BuiltinRecommender
 from shortlist.engine.seasons import SeasonTitles
 
 
@@ -40,6 +42,11 @@ class EngineContext:
     history_source: HistorySource
     curator: Curator
     snapshots: SnapshotStore
+    # The candidate engine every per-person pool is ranked by (`rows.RowPolicy.pools_for`). Shortlist's
+    # own by default; the server adapter substitutes an external one when `engine.backend` says so.
+    # Every client below that the built-in engine reads (tmdb, curator, trakt, search) is still here
+    # for it — an external engine simply never touches them.
+    recommender: Recommender = field(default_factory=BuiltinRecommender)
     # Optional 'related titles' candidate source; None when no Trakt key is configured.
     trakt: TraktClient | None = None
     # Optional external web-search backend for the llm_web source (Exa); None when no key is
