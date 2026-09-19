@@ -1,6 +1,6 @@
 ---
 title: Shortlist guides
-description: How to do the things people actually want to do with Shortlist, from changing how often a row refreshes to sending missing films to Radarr.
+description: How to do the things people actually want to do with Shortlist, from changing how often a row refreshes to letting everyone request what they want.
 heading: Guides
 ---
 
@@ -24,7 +24,7 @@ Nine short pages instead of one long one. If you know what you want to do, start
 | Change how often a row's picks CHANGE            | [What goes in a row](guides/picks.md)                                   |
 | Change WHEN a row runs overnight                 | [Schedules and runs](guides/schedules.md)                               |
 | Use AI, or keep it cheap                         | [AI and cost](guides/ai.md)                                             |
-| Send missing films and shows to Radarr, Sonarr or Overseerr | [Requests](guides/requests.md)                               |
+| Let people request what the library is missing   | [Requests](guides/requests.md)                                          |
 | Find out why a row didn't turn up                | [Troubleshooting](guides/troubleshooting.md)                            |
 | Work out what's wrong, or file a bug report      | [Have an issue?](guides/troubleshooting.md#start-here-have-an-issue)    |
 | Know what's in a backup                          | [Backups](guides/troubleshooting.md#backups)                            |
@@ -40,7 +40,7 @@ Nine short pages instead of one long one. If you know what you want to do, start
 | [Bring your own engine](guides/engines.md)               | Plugging in a recommendation engine you run yourself, and its protocol      |
 | [Schedules and runs](guides/schedules.md)                | Each row's own schedule, custom schedules, the jobs worth knowing about     |
 | [AI and cost](guides/ai.md)                              | What AI does, which search backend to pick, how to keep the bill down       |
-| [Requests (Radarr, Sonarr, Overseerr)](guides/requests.md) | Setting it up, the approval inbox, guardrails, why a title is still waiting |
+| [Requests](guides/requests.md)                           | Each person requests from their own picks page, through Overseerr/Jellyseerr/Seerr |
 | [Troubleshooting and backups](guides/troubleshooting.md) | The common failures, and what a backup does and doesn't hold                |
 | [Putting it on the internet](guides/security.md)         | TLS, proxies, the API token, and what's in `/config/backups`                |
 

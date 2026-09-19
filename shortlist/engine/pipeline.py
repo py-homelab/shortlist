@@ -1,7 +1,7 @@
 """Run orchestration: the leak-safe ordering of an engine run.
 
 ``run()`` reads top to bottom as the ordered sequence of phases it is: build the library indexes,
-sweep unhidable rows, deliver every row UNPROMOTED, merge every share filter, promote, then request.
+sweep unhidable rows, deliver every row UNPROMOTED, merge every share filter, promote, then order shelves.
 Row construction itself lives in ``rows.py``; this module owns only the ordering and the privacy
 guarantees that depend on it.
 """
@@ -19,7 +19,6 @@ from datetime import UTC, datetime
 from loguru import logger
 
 import shortlist.engine.rows as rows
-from shortlist.engine import requests as requests_mod
 from shortlist.engine import seasons as seasons_mod
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.clients.plex_pms import TOP, log_title
@@ -42,8 +41,6 @@ from shortlist.engine.models import (
     HubAnchor,
     MediaType,
     OwnedRow,
-    RequestOutcome,
-    RequestReport,
     RowSpec,
     RunReport,
     UserProfile,
@@ -63,7 +60,6 @@ from shortlist.engine.privacy import (
     unhidden_rows_visible_to,
     voids_owner_restriction,
 )
-from shortlist.engine.request_config import resolve_request_config
 
 #: How many accounts of one type the filter-enforcement spot-check may try before giving up.
 _ENFORCEMENT_SPOT_CHECK_ATTEMPTS = 3
@@ -71,18 +67,6 @@ _ENFORCEMENT_SPOT_CHECK_ATTEMPTS = 3
 #: Plex takes ~25s to apply a share-filter change (measured, pms_share_filter_boolean_semantics.json), so
 #: an account written more recently than this still shows its OLD filter to a spot-check.
 _FILTER_APPLY_S = 30.0
-
-
-def _distinct_wanted(demand: dict[str, dict]) -> int:
-    """How many titles the owner is actually missing across every row.
-
-    DISTINCT, matching what `RequestReport.wanted` records when the run finishes — not a sum over
-    rows. A title two rows both want is one title the owner does not have, and the allocator already
-    charges it one slot. Emitting the sum made the live progress line read 3,000 while the same run
-    recorded 1,000 on the way out, so the number appeared to move backwards as it ended (release
-    review 2026-08-18).
-    """
-    return len({key for row_demand in demand.values() for key in row_demand})
 
 
 def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
@@ -131,9 +115,6 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
     _emit(ctx, "Shortlist", "preparing", {})
     sections = ctx.plex.sections()
     seed_index, library_index = _build_indexes(ctx, users, sections)
-    # What the delivery libraries now hold — so the server can drop inbox candidates that have since
-    # arrived on the server (grabbed elsewhere) instead of leaving them to linger forever.
-    report.library_present = {(tmdb_id, media_type) for media_type, idx in library_index.items() for tmdb_id in idx}
 
     # BEFORE ANY USER WORK: delete every row on the server that Plex cannot hide. Fail closed.
     if not _sweep_phase(ctx, report):
@@ -142,11 +123,6 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
     # Preload label casing + collection ids from the PMS — the source of truth survives
     # restarts and covers users whose delivery fails this run.
     stored_labels = {slug: row.label for slug, row in ctx.plex.owned_collections(LABEL_PREFIX).items()}
-
-    # Missing-title demand, accumulated across users only when requests are on — the common case
-    # (feature off) pays nothing for it. None -> _run_user does no missing-title bookkeeping at all.
-    requests_on = bool(ctx.config.requests and ctx.config.requests.enabled)
-    demand: requests_mod.RowDemand = {}
 
     # Collection item-ordering is deferred to a best-effort pass AFTER promotion (see
     # _collection_order_phase): each (collection, ranked_keys) delivery records here, so the expensive
@@ -157,7 +133,7 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
 
     # Deliver every per-person and shared row UNPROMOTED — nothing is on anyone's Home yet.
     to_promote, shared_to_promote = _deliver_phase(
-        ctx, users, seed_index, library_index, stored_labels, report, demand if requests_on else None, order_work
+        ctx, users, seed_index, library_index, stored_labels, report, order_work
     )
 
     # The hinge of the whole run: after this line every per-user card is terminal, and everything
@@ -207,11 +183,6 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
     if filters_ok:
         _emit(ctx, "Shortlist", "shelves", {})
         _order_phase(ctx, report)
-
-    # Sonarr/Radarr requests, dead LAST — after every Plex write is done.
-    if requests_on:
-        _emit(ctx, "Shortlist", "requesting", {"wanted": _distinct_wanted(demand)})
-    _request_phase(ctx, requests_on, demand, report)
 
     report.finished_at = datetime.now(UTC)
     ok = sum(1 for u in report.users if u.status in ("ok", "cold_start"))
@@ -462,7 +433,6 @@ def _deliver_phase(
     library_index: dict[MediaType, dict[int, int]],
     stored_labels: dict[str, str],
     report: RunReport,
-    demand: requests_mod.RowDemand | None,
     order_work: list[tuple],
 ) -> tuple[list[UserProfile], list[tuple[RowSpec, UserProfile | None]]]:
     """Deliver every per-person and shared row, all UNPROMOTED. Returns the promotion candidates.
@@ -530,7 +500,6 @@ def _deliver_phase(
                 library_index,
                 stored_labels,
                 user_report,
-                demand,
                 order_work,
                 on_first_row=hide_first_row,
             )
@@ -2084,54 +2053,6 @@ def _apply_placement(ctx: EngineContext, report: RunReport, section, sequence: l
                 "reason": f"the shelf write failed part-way ({type(e).__name__}) — order left as Plex has it",
             }
         )
-
-
-def _rows_to_request(ctx: EngineContext, demand: requests_mod.RowDemand) -> list[requests_mod.RowRequest]:
-    """This run's rows that actually wanted something, each with its own effective request config.
-
-    In SPEC ORDER, not demand order — the order decides both the even-split remainder and which row
-    claims a title several rows want, and spec order is the owner's own row ordering, which they
-    control by dragging rows. A demand-ordered list would hand the tie-break to whichever row happened
-    to surface the most titles that night.
-
-    Rows the run did not build contribute no demand and are simply absent, so a per-row scheduled run
-    divides its slots between its own rows only.
-    """
-    rows: list[requests_mod.RowRequest] = []
-    for spec in ctx.config.per_person_rows():
-        row_demand = demand.get(spec.slug)
-        if not row_demand:
-            continue
-        cfg = resolve_request_config(ctx.config.requests, spec.request_overrides)
-        rows.append(requests_mod.RowRequest(spec.slug, cfg, row_demand))
-    return rows
-
-
-def _request_phase(ctx: EngineContext, requests_on: bool, demand: requests_mod.RowDemand, report: RunReport) -> None:
-    """Sonarr/Radarr requests for picks the library lacks — dead LAST, after every Plex write is done.
-
-    It touches no Plex object, and running it here (not before the privacy sync) keeps its "never
-    affects visibility" guarantee literally true: a slow or hung download app cannot delay the
-    share-filter merge that hides freshly-delivered rows. It runs only on real user runs — a
-    no-users run gathers no demand — and respects dry_run itself.
-    """
-    if requests_on and demand:
-        try:
-            report.requests = requests_mod.request_missing(
-                ctx.config.requests,
-                ctx.tmdb,
-                _rows_to_request(ctx, demand),
-                dry_run=ctx.config.dry_run,
-                already_handled=ctx.handled_requests,
-                mdblist=ctx.mdblist,
-            )
-        except Exception as e:
-            # A wholesale request-pass failure (e.g. building a client) is a footnote, never a run
-            # failure — every Plex write already completed above.
-            logger.exception("request pass failed — rows are unaffected")
-            report.requests = RequestReport(
-                outcomes=[RequestOutcome(0, "request pass", MediaType.MOVIE, "error", f"{type(e).__name__}: {e}")]
-            )
 
 
 def _server_audience(processed: list[UserProfile], roster: dict, known_slugs: dict[int, str]) -> list[UserProfile]:

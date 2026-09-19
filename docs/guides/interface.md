@@ -165,8 +165,8 @@ regardless of the console level in Settings → Advanced.
 
 ## Requests
 
-The approval inbox for titles your picks wanted but the library doesn't have yet. Approve to send to
-Radarr or Sonarr, or reject so they never come back. See [Requests](requests.md).
+Gone: requests are each person's own now, from their picks page (`/me`). The old address
+redirects there. See [Requests](requests.md).
 
 ## Jobs
 

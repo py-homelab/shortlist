@@ -73,7 +73,6 @@ function report(over: Partial<EffectivenessReport> = {}): EffectivenessReport {
     // but the API says 7, and the API is right.
     coverage: { users_with_picks: 10, users_watched: 4, users_idle: 7 },
     per_row: [],
-    requests: { sent: 0, pending: 0, watched_after_sent: 0 },
     // `overall` was absent entirely, though the fixture is cast to `EffectivenessReport`, which has
     // it. The card reads `overall.dropped`/`overall.bounced` to tell "nobody gave up" from "the only
     // give-ups were too short to list" — a distinction it cannot make against an undefined.
@@ -233,41 +232,6 @@ describe("NeedsALook", () => {
     expect(await screen.findByText(/no row came up empty/)).toBeInTheDocument();
     expect(document.querySelectorAll("li").length).toBe(0);
   });
-
-  it("flags titles fetched for people that nobody watched", async () => {
-    renderPanel(
-      report({
-        requests: { sent: 34, pending: 53, watched_after_sent: 0 },
-      } as never),
-    );
-
-    expect(
-      await screen.findByText(/titles were fetched for people and none/),
-    ).toBeInTheDocument();
-    expect(screen.getByText("34")).toBeInTheDocument();
-  });
-
-  it("stays quiet about requests once one has been watched", async () => {
-    renderPanel(
-      report({
-        requests: { sent: 34, pending: 0, watched_after_sent: 1 },
-      } as never),
-    );
-
-    await screen.findByText(/got picks and watched none/);
-    expect(screen.queryByText(/titles were fetched/)).toBeNull();
-  });
-
-  it("ignores a handful of requests, which prove nothing either way", async () => {
-    renderPanel(
-      report({
-        requests: { sent: 2, pending: 0, watched_after_sent: 0 },
-      } as never),
-    );
-
-    await screen.findByText(/got picks and watched none/);
-    expect(screen.queryByText(/titles were fetched/)).toBeNull();
-  });
 });
 
 describe("NeedsALook — saying why", () => {
@@ -382,17 +346,6 @@ describe("NeedsALook — the thresholds it acts on", () => {
     renderPanel(report({ coverage: coverage({ users_watched: 9, users_idle: 1 }) }));
 
     expect(await screen.findByText(/got picks and watched none/)).toBeTruthy();
-  });
-
-  it("needs five sent requests before calling them unwatched", async () => {
-    const requests = { sent: 5, pending: 0, watched_after_sent: 0 };
-    renderPanel(report({ requests }));
-    expect(await screen.findByText(/titles were fetched/)).toBeTruthy();
-
-    cleanup();
-    renderPanel(report({ coverage: coverage({ users_idle: 0 }), requests: { ...requests, sent: 4 } }));
-    expect(await screen.findByText(/no row came up empty/i)).toBeTruthy();
-    expect(screen.queryByText(/titles were fetched/)).toBeNull();
   });
 });
 

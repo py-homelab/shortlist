@@ -1,12 +1,10 @@
 /**
  * "Look it up" links for a title, by its TMDB id.
  *
- * Shared rather than rebuilt per page: the requests inbox has had these since it shipped, and the
- * run report grew the same need — the moment a row shows a year and a score, the next question is
- * "what IS this?". One builder means the two screens cannot disagree about where a title lives.
+ * Shared rather than rebuilt per page: the moment a row shows a year and a score, the next question
+ * is "what IS this?". One builder means no two screens can disagree about where a title lives.
  *
- * IMDb is a title SEARCH unless an IMDb id is known. Shortlist only resolves those for titles it
- * considers requesting (`MissingTitle.imdb_id`); a delivered pick carries a TMDB id and nothing
+ * IMDb is a title SEARCH unless an IMDb id is known. A delivered pick carries a TMDB id and nothing
  * else, and guessing an IMDb id from a title would be worse than searching for it.
  */
 export interface TitleLink {

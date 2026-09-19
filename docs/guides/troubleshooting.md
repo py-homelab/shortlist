@@ -132,7 +132,7 @@ Shortlist copies its whole database to `/config/backups` on a schedule (Jobs →
 3 AM by default), before every upgrade, and before any restore. It keeps the newest 10 by default.
 
 A backup holds everything Shortlist knows: settings and connections, your rows and their audiences,
-the people it tracks, run history and each run's picks, the request inbox, and most importantly the
+the people it tracks, run history and each run's picks, everyone's picks and what they did with them, and most importantly the
 copies of each user's original Plex share filters that an uninstall restores from.
 
 Restoring one takes effect when you restart the container: Shortlist saves a copy of the current

@@ -117,10 +117,6 @@ const EMPTY = {
     last_status: "ok",
     errors_last: 0,
   },
-  // Every one of these DISTINCT. They were `sent: 2, pending: 1, watched_after_sent: 1`, and with two
-  // of the three equal the requests line could put any figure in any slot with nothing to notice
-  // (mutation audit 2026-08-25). Distinct values are what make a swap show up as different text.
-  requests: { sent: 21, pending: 22, watched_after_sent: 23 },
   top_titles: [] as EffectivenessReport["top_titles"],
 };
 
@@ -225,22 +221,14 @@ describe("ImpactReport", () => {
     clearDeletedRows.mockClear();
   });
 
-  it("shows the headline metrics, breakdowns, requests, and recent-watches feed", async () => {
+  it("shows the headline metrics, breakdowns, and recent-watches feed", async () => {
     renderReport();
 
     expect(await screen.findByText(/watched · the last/i)).toBeTruthy();
     expect(screen.getByText("People who watched a pick")).toBeTruthy();
     expect(screen.getByText("1 of 2")).toBeTruthy();
-    // Each requests figure in its OWN slot. `/sent ·/` matched the label regardless of which number
-    // sat beside it, and the fixture had two of the three equal — so any figure could appear in any
-    // slot (mutation audit 2026-08-25). The three are now distinct and each is named.
-    expect(screen.getByTestId("requests-sent")).toHaveTextContent(/^21\s*sent$/);
-    expect(screen.getByTestId("requests-watched")).toHaveTextContent(/^23\s*watched since$/);
-    expect(screen.getByTestId("requests-pending")).toHaveTextContent(/^22\s*awaiting approval$/);
-    expect(screen.getByRole("link", { name: /Review 22 waiting/ })).toHaveAttribute("href", "/requests");
-    expect(
-      screen.getByRole("link", { name: /full send log/i }),
-    ).toHaveAttribute("href", "/requests?tab=sent"); // deep-links to the send-log tab
+    // No owner request card any more: requests are each person's own, from their picks page.
+    expect(screen.queryByText("Requests")).toBeNull();
     // The DISPLAY name, which is what the UI is supposed to render — `username` is "sarah".
     expect(screen.getAllByText("Sarah H").length).toBeGreaterThan(0);
     expect(screen.queryByText("sarah")).toBeNull();
@@ -257,7 +245,7 @@ describe("ImpactReport", () => {
     // delivered-in-window), so a fraction makes "4 of 0" reachable when delivery paused.
     // Counts, labelled — never "3 of 6". Two different sets (watched-in-window vs
     // delivered-in-window), so a fraction makes "4 of 0" reachable when delivery paused.
-    // "delivered", not "sent": the Requests card uses "sent" for Sonarr asks on this same page.
+    // "delivered", not "sent": "sent" reads as a download request.
     // More than one line matches (a person and a row), so assert on count rather than uniqueness.
     expect(screen.getAllByText(/· 61 delivered/).length).toBeGreaterThan(0);
     // The PERSON line's own figures. Only the per_row lines were ever asserted, so ByPerson could
@@ -771,7 +759,6 @@ describe("ImpactReport", () => {
         },
       },
       runs: { ...EMPTY.runs, total: 0, in_window: 0 },
-      requests: { sent: 0, pending: 0, watched_after_sent: 0 },
       trend: [],
       per_user: [],
       per_row: [],
@@ -1078,17 +1065,15 @@ describe("ImpactReport — titles shown as titles", () => {
     expect(within(line).getByRole("link", { name: "Dune: Part Two on TMDB" })).toBeTruthy();
   });
 
-  it("stacks Requests under Worth a look, and gives the two long lists the full width below", async () => {
-    // "Recently watched" runs to twenty lines, so a Requests card beside it floated over a column of
-    // empty space. Beside the tall By-person list, under Worth a look, it fills a gap instead.
+  it("puts Worth a look beside the people, and gives the two long lists the full width below", async () => {
     renderReport();
 
     await screen.findByRole("list", { name: "Recently watched from Shortlist" });
     const order = screen
       .getAllByRole("heading")
       .map((h) => h.textContent)
-      .filter((t) => ["Worth a look", "Requests", "Most watched", "Recently watched from Shortlist"].includes(t ?? ""));
-    expect(order).toEqual(["Worth a look", "Requests", "Most watched", "Recently watched from Shortlist"]);
+      .filter((t) => ["Worth a look", "Most watched", "Recently watched from Shortlist"].includes(t ?? ""));
+    expect(order).toEqual(["Worth a look", "Most watched", "Recently watched from Shortlist"]);
   });
 });
 

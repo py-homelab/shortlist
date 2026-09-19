@@ -29,12 +29,8 @@
 
 - group: Getting missing titles
   items:
-    - name: Radarr
-      note: optional, for films
-    - name: Sonarr
-      note: optional, for TV
-    - name: Overseerr, Jellyseerr
-      note: optional, hand the request to them instead and let them drive the download apps
+    - name: Overseerr, Jellyseerr, Seerr
+      note: optional, where each person's own requests are filed, as them
 
 - group: AI models
   items:

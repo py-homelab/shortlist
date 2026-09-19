@@ -33,52 +33,10 @@ DEFAULTS: dict[str, Any] = {
     "curator.openai_base_url": "",
     "row.name_template": "✨ {library_name} Picked for You",  # {library_name} -> each library's own name
     "row.size": 15,
-    # Requests (Sonarr/Radarr): ask for picks the library doesn't have yet. Off by default and
-    # gated so it can never balloon a library — a title must clear BOTH thresholds, and only the
-    # top N per run are ever requested. API keys live in SECRET_KEYS below (encrypted at rest).
-    "requests.enabled": False,
-    # WHERE a request is filed. "arr" posts to Radarr/Sonarr directly (the original route, and still
-    # the default so no existing install changes behaviour). "overseerr" hands the title to
-    # Overseerr/Jellyseerr and lets IT drive the download apps — its quality profile, its root
-    # folder, its approval. The two are exclusive; see `_build_requests`.
-    "requests.target": "arr",
-    "requests.overseerr.url": "",
-    # Which Overseerr account the request is filed as. 0 = the API key's own (admin) account, which
-    # normally auto-approves. Point it at an account without auto-approve to get a second approval
-    # gate inside Overseerr. Shortlist never creates the account — it is chosen from the ones there.
-    "requests.overseerr.request_as_user_id": 0,
-    "requests.radarr.url": "",
-    "requests.radarr.quality_profile_id": 0,
-    "requests.radarr.root_folder": "",
-    "requests.sonarr.url": "",
-    "requests.sonarr.quality_profile_id": 0,
-    "requests.sonarr.root_folder": "",
-    # How much of a show Sonarr monitors when Shortlist adds it — Sonarr's own Add Series "Monitor"
-    # choice, passed through. "all" is Sonarr's default and the only behaviour there used to be.
-    "requests.sonarr.monitor": "all",
-    "requests.rating_source": "tmdb",  # tmdb (no setup) | imdb | trakt | tomatoes | metacritic (via MDBList)
-    "requests.min_rating": 7.0,  # rating floor on the chosen source
-    # How the request gate treats a title's original language. "any" is what every build before this
-    # setting did and stays the default, so an upgrade changes nothing until an owner picks otherwise.
-    "requests.language_mode": "any",  # any | prefer | only
-    "requests.preferred_languages": ["en"],  # ISO 639-1 codes; the value "any" mode simply never reads
-    # None = follow `requests.min_rating` + 1.5 (engine `OTHER_LANGUAGE_BAR_GAP`). Deliberately not a
-    # number: a fixed default would encode OUR taste, where following the owner's own floor tracks
-    # theirs — a permissive 6.0 server starts at 7.5 and a strict 8.0 one at 9.5.
-    "requests.min_rating_other": None,
-    "requests.min_votes": 100,  # vote-count floor on the chosen source
-    "requests.min_demand": 1,  # a title must be wanted by at least this many distinct people
-    "requests.min_year": 0,  # 0 = no lower bound; else only titles from >= this year (shows: first-air year)
-    "requests.max_year": 0,  # 0 = no upper bound; else only titles from <= this year (shows: first-air year)
-    "requests.max_per_run": 5,  # hard cap on titles auto-requested per run, total
-    # Hybrid tier: titles clearing these higher bars auto-send; the rest queue for manual approval.
-    "requests.auto_send": True,  # False = fully manual (every qualifying title waits for approval)
-    "requests.auto_min_demand": 3,  # auto-send only titles wanted by at least this many people
-    "requests.auto_min_rating": 8.0,  # ...and rated at least this high on the chosen source
-    "requests.tag": "shortlist",  # tag applied to every title Shortlist adds ("" = no tag)
-    # Also tag each request with the WANTING PERSON'S slug, so the owner can tell in Sonarr/Radarr
-    # who a title was added for. Off by default; a row may override it either way.
-    "requests.auto_user_tag": False,
+    # Overseerr / Jellyseerr / Seerr: where each person's own picks page files THEIR requests, as
+    # them (`X-API-User`). The instance applies its own rules — profile, folder, approval, quota.
+    # Shortlist never files a request on its own; the api key is a SECRET_KEY below.
+    "seerr.url": "",
     # (per-row schedules replaced the old global `schedule.cron` — each row carries its own cron on
     # the collections table; see Collection.schedule and shortlist/server/scheduler.py)
     # Where Shortlist's rows sit in each library's Plex "Recommended" shelf, keyed by library (section)
@@ -219,7 +177,7 @@ DEFAULTS: dict[str, Any] = {
     "recommendations.max_seeds": 30,
     # Which service's score a row ordered by "Highest rated" sorts on. "tmdb" needs no setup and is
     # already on every candidate; the rest come from MDBList (one cached lookup per title, shared by
-    # every row and user) and need `requests.mdblist.apikey` — without it, ordering falls back to TMDB.
+    # every row and user) and need `recommendations.mdblist.apikey` — without it, ordering falls back to TMDB.
     "recommendations.rating_source": "tmdb",
     # How many watched titles someone needs before Shortlist recommends FROM their taste rather than
     # falling back to the server's top-rated titles. Was welded to the engine default (10) and
@@ -296,10 +254,8 @@ SECRET_KEYS = {
     "tautulli.apikey",
     "tmdb.apikey",  # was the ONE api key stored in the clear — and returned unredacted by all_public()
     "curator.api_key",
-    "requests.overseerr.apikey",
-    "requests.radarr.apikey",
-    "requests.sonarr.apikey",
-    "requests.mdblist.apikey",  # MDBList key for IMDb/Trakt/RT/Metacritic rating gating
+    "seerr.apikey",  # the *seerr key every person's own request is filed through (as them)
+    "recommendations.mdblist.apikey",  # MDBList key for IMDb/Trakt/RT/Metacritic row ordering
     "trakt.client_id",
     "engine.token",  # bearer token for an external recommendation engine
     "auth.proxy.secret",  # what proves a request came through the trusted reverse proxy
@@ -341,7 +297,6 @@ PRIVATE_KEYS = {
     # What the webhook sender remembers so it does not repeat itself (services/notify.py). A generic
     # write could re-arm or silence an alert, so nothing but the sender moves them.
     "notify.webhook.privacy_sent_at",
-    "notify.webhook.requests_seen",
     "notify.webhook.update_sent",
 }
 
@@ -365,6 +320,44 @@ LEGACY_KEYS = {
     "staleness_runs",
     "agregarr.url",
     "agregarr.apikey",
+    # The owner-only request inbox and its Radarr/Sonarr routing, retired for the per-person picks
+    # page (migration 0095). The three keys that survive were RENAMED by that migration —
+    # `requests.overseerr.url` -> `seerr.url`, `requests.overseerr.apikey` -> `seerr.apikey`,
+    # `requests.mdblist.apikey` -> `recommendations.mdblist.apikey` — and are purged here only under
+    # their old names, so a restored pre-0095 backup still gets them moved before this runs (the
+    # migration runs first on boot). Every other `requests.*` key is simply gone.
+    "requests.enabled",
+    "requests.target",
+    "requests.overseerr.url",
+    "requests.overseerr.apikey",
+    "requests.overseerr.request_as_user_id",
+    "requests.radarr.url",
+    "requests.radarr.apikey",
+    "requests.radarr.quality_profile_id",
+    "requests.radarr.root_folder",
+    "requests.sonarr.url",
+    "requests.sonarr.apikey",
+    "requests.sonarr.quality_profile_id",
+    "requests.sonarr.root_folder",
+    "requests.sonarr.monitor",
+    "requests.rating_source",
+    "requests.mdblist.apikey",
+    "requests.min_rating",
+    "requests.language_mode",
+    "requests.preferred_languages",
+    "requests.min_rating_other",
+    "requests.min_votes",
+    "requests.min_demand",
+    "requests.min_year",
+    "requests.max_year",
+    "requests.max_per_run",
+    "requests.auto_send",
+    "requests.auto_min_demand",
+    "requests.auto_min_rating",
+    "requests.tag",
+    "requests.auto_user_tag",
+    # The "requests queued" webhook's memory of what it had already announced.
+    "notify.webhook.requests_seen",
 }
 
 ENV_SEEDS = {

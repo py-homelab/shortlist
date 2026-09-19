@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 /**
  * The pass/fail line under a "Test connection" button: a green check + message when the test
  * resolved ok, a red cross + message when it failed or threw. One component so every connection
- * card, Arr card, OMDb field, and wizard step reports a test identically.
+ * card, OMDb field, and wizard step reports a test identically.
  *
  * Pass `result` for a resolved {@link ConnectionTestResult}, or `error` for a thrown error (with
  * `errorFallback` as its plain-English default). Nothing renders until one is supplied.

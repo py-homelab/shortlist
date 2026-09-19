@@ -39,8 +39,8 @@ def _seerr_cache(request: Request) -> picks.SeerrCache:
         def make_client() -> SeerrClient | None:
             with state.sessions() as session:
                 store = SettingsStore(session, state.secrets)
-                url = (store.get("requests.overseerr.url") or "").strip()
-                api_key = store.get("requests.overseerr.apikey") or ""
+                url = (store.get("seerr.url") or "").strip()
+                api_key = store.get("seerr.apikey") or ""
             if not url or not api_key:
                 return None
             return SeerrClient(SeerrTarget(url=url, api_key=api_key))

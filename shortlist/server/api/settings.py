@@ -15,12 +15,9 @@ from pydantic import BaseModel
 from shortlist.engine.clients.http_retry import redact
 from shortlist.engine.clients.search import EXA_SEARCH_TYPES
 from shortlist.engine.models import (
-    LANGUAGE_MODES,
     MAX_REFRESH_DAYS,
     MAX_ROW_SIZE,
     MIN_ROW_SIZE,
-    REQUEST_TARGETS,
-    SONARR_MONITOR_MODES,
 )
 from shortlist.engine.placeholders import refusal
 from shortlist.server.api.schemas import PassthroughModel
@@ -204,51 +201,6 @@ def _int_list(value: object) -> str | None:
     return None
 
 
-_MAX_PREFERRED_LANGUAGES = 50
-
-
-def _language_codes(value: object) -> str | None:
-    """A list of ISO 639-1 language codes, as TMDB reports `original_language`.
-
-    Two letters is the whole shape TMDB uses, so anything else is a typo that would silently classify
-    every title as "other" and quietly raise the bar on the entire library. An EMPTY list is legal and
-    meaningful — in "only" mode it means "request nothing" — so this checks the shape, not the length.
-    """
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        return "must be a list of language codes"
-    # Capped to match the per-row column's own `max_length=50`. Unbounded, this is a setting an owner
-    # can store megabytes into, and it is read on every run — the ceiling is cheaper than the audit.
-    if len(value) > _MAX_PREFERRED_LANGUAGES:
-        return f"too many languages (max {_MAX_PREFERRED_LANGUAGES})"
-    # `[a-z]{2}`, not `.isalpha()`: str.isalpha() is Unicode-aware, so a two-character CJK string
-    # passes — and worse, so does a Cyrillic homoglyph pair, which renders identically to its Latin
-    # spelling in the error message the owner reads back. Either matches no TMDB `original_language`,
-    # so "only" mode would silently stop requesting anything. (Ruff's RUF003 flags the homoglyph if
-    # you try to write one here, which is the same hazard from the other direction.)
-    bad = [v for v in value if not re.fullmatch(r"[a-z]{2}", v.strip().lower())]
-    # Only the first few are echoed: the message goes back in an error body, and repeating a large
-    # rejected list there just amplifies whatever was sent. The remainder is COUNTED, or an owner
-    # fixes the five they were shown and is rejected again for values the message implied were fine.
-    if not bad:
-        return None
-    more = f" (+{len(bad) - 5} more)" if len(bad) > 5 else ""
-    return f"not ISO 639-1 language codes: {bad[:5]}{more} (two letters, e.g. 'en', 'ja')"
-
-
-def _optional_bounded_float(low: float, high: float):
-    """A number in range, or None — where None is a MEANING, not an omission.
-
-    `requests.min_rating_other` uses this: None means "follow min_rating + 1.5", which is the shipped
-    default precisely so no fixed number of ours is imposed on anyone's server.
-    """
-    inner = _bounded_float(low, high)
-
-    def check(value: object) -> str | None:
-        return None if value is None else inner(value)
-
-    return check
-
-
 def _header_name(value: object) -> str | None:
     """An HTTP header name, or blank to switch trusted-proxy identity off."""
     if value in (None, ""):
@@ -317,9 +269,6 @@ VALIDATORS = {
     "plex.timeout_s": _bounded_int(5, 300),  # per-PMS-call timeout; read unguarded in build_context
     "run.concurrency": _bounded_int(1, 16),  # 1 = sequential; writes stay serial regardless
     "paused_all": _is_bool,
-    "requests.enabled": _is_bool,
-    "requests.target": _one_of(*REQUEST_TARGETS),
-    "requests.auto_send": _is_bool,
     "candidates.sources": _known_sources,
     "llm_web.search_provider": _one_of("native", "exa", "searxng"),
     # Validated here as well as clamped in the client: a typo saved through the API would otherwise
@@ -360,25 +309,6 @@ VALIDATORS = {
     # "ollama" stays accepted: it is the pre-merge name for openai_compatible, and an instance
     # configured before the merge still has it stored.
     "curator.provider": _one_of("anthropic", "openai", "openai_compatible", "google", "ollama", "none", ""),
-    "requests.rating_source": _one_of("tmdb", "imdb", "trakt", "tomatoes", "metacritic"),
-    "requests.min_rating": _bounded_float(0.0, 10.0),
-    "requests.auto_min_rating": _bounded_float(0.0, 10.0),
-    "requests.language_mode": _one_of(*LANGUAGE_MODES),
-    "requests.preferred_languages": _language_codes,
-    # Optional on purpose: None is "follow min_rating + 1.5", not "unset". See `_optional_bounded_float`.
-    "requests.min_rating_other": _optional_bounded_float(0.0, 10.0),
-    "requests.min_votes": _bounded_int(0, 1_000_000),
-    "requests.min_demand": _bounded_int(1, 1000),
-    "requests.auto_min_demand": _bounded_int(1, 1000),
-    "requests.min_year": _bounded_int(0, 2100),
-    "requests.max_year": _bounded_int(0, 2100),
-    "requests.max_per_run": _bounded_int(0, 100),
-    "requests.overseerr.request_as_user_id": _bounded_int(0, 1_000_000),
-    "requests.radarr.quality_profile_id": _bounded_int(0, 1_000_000),
-    "requests.sonarr.quality_profile_id": _bounded_int(0, 1_000_000),
-    # Sonarr 400s the whole add on a value outside its enum, so the typo is refused here rather than
-    # discovered a fortnight later as a request that never arrived.
-    "requests.sonarr.monitor": _one_of(*SONARR_MONITOR_MODES),
     "row.name_template": _non_blank_row_template,
     "auth.proxy.header": _header_name,
     "engine.backend": _one_of("builtin", "http"),
@@ -403,9 +333,7 @@ def _check(key: str, value: object) -> str | None:
 _FETCHED_URL_KEYS = (
     "plex.url",
     "tautulli.url",
-    "requests.overseerr.url",
-    "requests.radarr.url",
-    "requests.sonarr.url",
+    "seerr.url",  # fetched by the Test button and by every person's own picks page
     "curator.ollama_url",
     "curator.openai_base_url",
     "searxng.url",  # fetched by the Test button and by the llm_web source on every run
@@ -643,8 +571,6 @@ _TESTABLE_SERVICES = frozenset(
         "plex",
         "tautulli",
         "tmdb",
-        "radarr",
-        "sonarr",
         "overseerr",
         "mdblist",
         "trakt",
@@ -695,30 +621,19 @@ async def test_connection(service: str, request: Request) -> dict:
                 if not TmdbClient(get("tmdb.apikey")).ping():
                     raise RuntimeError("TMDB rejected the key")
                 return "TMDB key works"
-            if service in ("radarr", "sonarr"):
-                from shortlist.engine.clients.arr import make_arr_client
-                from shortlist.engine.models import ArrTarget
-
-                prefix = f"requests.{service}"
-                url = (get(f"{prefix}.url") or "").strip()
-                api_key = get(f"{prefix}.apikey") or ""
-                if not url or not api_key:
-                    raise RuntimeError(f"{service.title()} URL and API key are both required")
-                target = ArrTarget(url=url, api_key=api_key, quality_profile_id=0, root_folder="")
-                return make_arr_client(service, target).ping()
             if service == "overseerr":
                 from shortlist.engine.clients.seerr import SeerrClient
                 from shortlist.engine.models import SeerrTarget
 
-                url = (get("requests.overseerr.url") or "").strip()
-                api_key = get("requests.overseerr.apikey") or ""
+                url = (get("seerr.url") or "").strip()
+                api_key = get("seerr.apikey") or ""
                 if not url or not api_key:
                     raise RuntimeError("Overseerr URL and API key are both required")
                 return SeerrClient(SeerrTarget(url=url, api_key=api_key)).ping()
             if service == "mdblist":
                 from shortlist.engine.clients.mdblist import MdbListClient
 
-                api_key = get("requests.mdblist.apikey") or ""
+                api_key = get("recommendations.mdblist.apikey") or ""
                 if not api_key:
                     raise RuntimeError("An MDBList API key is required for IMDb/Trakt/RT/Metacritic ratings")
                 return MdbListClient(api_key).ping()
@@ -819,97 +734,6 @@ async def test_connection(service: str, request: Request) -> dict:
         # plexapi/PMS exceptions can embed the tokened request URL — redact before it reaches the
         # API response (plex-safety rule 9: tokens never leave the box, even in an error string).
         return {"ok": False, "message": redact(f"{type(e).__name__}: {e}")}
-
-
-class QualityProfileOut(PassthroughModel):
-    id: int
-    name: str
-
-
-class RootFolderOut(PassthroughModel):
-    id: int
-    path: str
-
-
-class ArrOptionsOut(PassthroughModel):
-    quality_profiles: list[QualityProfileOut]
-    root_folders: list[RootFolderOut]
-
-
-@router.get("/arr/{service}/options", response_model=ArrOptionsOut)
-async def arr_options(service: str, request: Request) -> dict:
-    """Quality profiles + root folders for a connected Sonarr/Radarr, so the UI offers dropdowns
-    rather than asking a non-technical owner to hunt down numeric profile ids and server paths."""
-    if service not in ("radarr", "sonarr"):
-        raise HTTPException(status_code=404, detail=f"unknown service {service!r}")
-    state = request.app.state
-    with state.sessions() as session:
-        store = SettingsStore(session, state.secrets)
-        url = (store.get(f"requests.{service}.url") or "").strip()
-        api_key = store.get(f"requests.{service}.apikey") or ""
-    if not url or not api_key:
-        raise HTTPException(status_code=409, detail=f"{service.title()} isn't connected yet")
-
-    def fetch() -> dict:
-        from shortlist.engine.clients.arr import make_arr_client
-        from shortlist.engine.models import ArrTarget
-
-        target = ArrTarget(url=url, api_key=api_key, quality_profile_id=0, root_folder="")
-        client = make_arr_client(service, target)
-        return {"quality_profiles": client.quality_profiles(), "root_folders": client.root_folders()}
-
-    try:
-        return await asyncio.get_running_loop().run_in_executor(None, fetch)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=redact(f"{type(e).__name__}: {e}")) from e
-
-
-class SeerrUserOut(PassthroughModel):
-    id: int
-    name: str
-    # Whether this account's requests skip Overseerr's own approval queue. The screen needs it to say
-    # what picking the account will actually DO, rather than leaving the owner to find out later.
-    auto_approve_movies: bool = False
-    auto_approve_tv: bool = False
-    # True for a real person on the server, false for a local account made inside Overseerr. Drives
-    # the grouping in the picker — see the note on `is_plex_user` in the client.
-    is_plex_user: bool = False
-
-
-class SeerrOptionsOut(PassthroughModel):
-    users: list[SeerrUserOut]
-    # Which of those accounts the API key itself is, so the UI can resolve "Server default" to a real
-    # row and say whether it approves. None when the instance would not say.
-    default_user_id: int | None = None
-
-
-@router.get("/overseerr/options", response_model=SeerrOptionsOut)
-async def overseerr_options(request: Request) -> dict:
-    """The instance's accounts, so the UI can offer a "request as" dropdown.
-
-    The *seerr equivalent of ``arr_options``, and deliberately much smaller: quality profiles and
-    root folders are Overseerr's business on this route, so the only choice left to Shortlist is
-    whose name the request goes out under.
-    """
-    state = request.app.state
-    with state.sessions() as session:
-        store = SettingsStore(session, state.secrets)
-        url = (store.get("requests.overseerr.url") or "").strip()
-        api_key = store.get("requests.overseerr.apikey") or ""
-    if not url or not api_key:
-        raise HTTPException(status_code=409, detail="Overseerr isn't connected yet")
-
-    def fetch() -> dict:
-        from shortlist.engine.clients.seerr import SeerrClient
-        from shortlist.engine.models import SeerrTarget
-
-        client = SeerrClient(SeerrTarget(url=url, api_key=api_key))
-        return {"users": client.users(), "default_user_id": client.whoami()}
-
-    try:
-        return await asyncio.get_running_loop().run_in_executor(None, fetch)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=redact(f"{type(e).__name__}: {e}")) from e
 
 
 class CuratorModelsOut(PassthroughModel):

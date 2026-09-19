@@ -594,9 +594,8 @@ function CountBar({
             </span>
           </>
         )}
-        {/* "delivered", not "sent" — the Requests card on this same page uses "sent" to mean asked of
-            Sonarr/Radarr, and two meanings of the word side by side is exactly the kind of quiet
-            ambiguity this rewrite is meant to remove. */}
+        {/* "delivered", not "sent" — "sent" reads as a download request, and two meanings of the word
+            is exactly the kind of quiet ambiguity this rewrite is meant to remove. */}
         {delivered > 0 && (
           <>
             {" "}
@@ -989,7 +988,7 @@ function ReportBody({
   reportWindow: ReportWindow;
   onWindowChange: (next: ReportWindow) => void;
 }) {
-  const { overall, coverage, runs, requests } = report;
+  const { overall, coverage, runs } = report;
 
   // On a young install every window already covers all the data, so the numbers are identical
   // whichever button you press — a control that visibly does nothing reads as broken. Say why.
@@ -1068,18 +1067,11 @@ function ReportBody({
       </div>
 
       {/* Beside the people, because its first line is about them: how many were given picks and
-          watched none. Every other line points at a row or a person elsewhere on this page.
-
-          Requests stacks UNDER it, in the same column. By person is the tallest list on the page, so
-          this column always had room to spare, and both cards are short summaries. Beside "Recently
-          watched" (twenty lines) the Requests card used to float over a column of empty space. */}
+          watched none. Every other line points at a row or a person elsewhere on this page. */}
       <div className="grid items-start gap-4 lg:grid-cols-2">
         <ByPerson people={report.per_user} reportWindow={reportWindow} />
         <div className="grid min-w-0 content-start gap-4">
           <NeedsALook report={report} reportWindow={reportWindow} />
-          {(requests.sent > 0 || requests.pending > 0) && (
-            <RequestsSummary requests={requests} reportWindow={reportWindow} />
-          )}
         </div>
       </div>
 
@@ -1095,54 +1087,6 @@ function ReportBody({
           report above is aggregate, and making the dashboard wait on both would delay the numbers
           that are ready. */}
     </div>
-  );
-}
-
-/** Sent, watched since, and waiting on you — each figure in its own tile, so none can sit in another's slot. */
-function RequestsSummary({
-  requests,
-  reportWindow,
-}: {
-  requests: EffectivenessReport["requests"];
-  reportWindow: ReportWindow;
-}) {
-  const tiles: { key: string; value: number; label: string; strong?: boolean }[] = [
-    { key: "sent", value: requests.sent, label: "sent" },
-    { key: "watched", value: requests.watched_after_sent, label: "watched since" },
-    { key: "pending", value: requests.pending, label: "awaiting approval", strong: requests.pending > 0 },
-  ];
-  return (
-    <Section
-      title="Requests"
-      // App-neutral on purpose — see run-stat-tiles: the route is a setting this card cannot see.
-      hint={`Sent to be downloaded in ${WINDOW_PHRASE[reportWindow]}.`}
-    >
-      <dl className="grid grid-cols-3 gap-2">
-        {tiles.map((tile) => (
-          <div key={tile.key} className="rounded-md bg-elevated px-3 py-2" data-testid={`requests-${tile.key}`}>
-            <dd
-              className={cn(
-                "text-xl font-semibold tabular-nums",
-                tile.strong ? "text-primary" : "text-foreground",
-              )}
-            >
-              {tile.value}
-            </dd>
-            <dt className="text-xs text-muted-foreground">{tile.label}</dt>
-          </div>
-        ))}
-      </dl>
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
-        {requests.pending > 0 && (
-          <Link to="/requests" className="text-primary underline-offset-4 hover:underline">
-            Review {requests.pending} waiting →
-          </Link>
-        )}
-        <Link to="/requests?tab=sent" className="text-primary underline-offset-4 hover:underline">
-          View the full send log →
-        </Link>
-      </div>
-    </Section>
   );
 }
 

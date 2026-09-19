@@ -64,7 +64,6 @@ function row(patch: Partial<Collection> = {}): Collection {
     description: "",
     sort_title_prefix: "",
     min_watchers: 2,
-    request_tag: "",
     candidate_sources: [],
     library_keys: [],
     watched_pct: null,
@@ -78,23 +77,6 @@ function row(patch: Partial<Collection> = {}): Collection {
     recent_count: null,
     max_seeds: null,
     cold_start: null,
-    req_min_rating: null,
-    req_min_votes: null,
-    req_min_demand: null,
-    req_min_year: null,
-    req_max_year: null,
-    req_auto_send: null,
-    req_auto_min_demand: null,
-    req_auto_min_rating: null,
-    req_max_per_row: null,
-    req_radarr_quality_profile_id: null,
-    req_radarr_root_folder: null,
-    req_sonarr_quality_profile_id: null,
-    req_sonarr_root_folder: null,
-    req_sonarr_monitor: null,
-    req_language_mode: null,
-    req_preferred_languages: null,
-    req_min_rating_other: null,
     seed_window: 1,
     pick_order: "best",
     placement: "both",
@@ -124,7 +106,6 @@ function user(patch: Partial<User> = {}): User {
     cold_start: false,
     history_depth: 10,
     last_run_at: null,
-    request_tag: "",
     hit_rate: null,
     nickname: "",
     friendly_name: "",
@@ -1404,7 +1385,7 @@ describe("RowEditor — rating source is answerable where the order is chosen", 
   });
 });
 
-describe("RowEditor — every group is on screen, only the optional ones fold", () => {
+describe("RowEditor — every group is on screen", () => {
   const groupNamed = (title: string) =>
     screen.getByText(title, { selector: "summary span span" }).closest("details");
   const GROUPS = [
@@ -1415,7 +1396,6 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
     "What goes in it",
     "When it updates",
     "Where people see it",
-    "Requests",
   ];
 
   it("leaves the groups that decide what a row does open", () => {
@@ -1427,15 +1407,9 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
 
     // Open, because a page has room for them. As a modal these were collapsed to fit inside the
     // viewport cap — which is how the movies-and-TV seed warning ended up somewhere nobody looks.
-    for (const group of GROUPS.slice(0, -1)) {
+    for (const group of GROUPS) {
       expect(groupNamed(group)).toHaveAttribute("open");
     }
-  });
-
-  it("folds only the group most people never touch", () => {
-    renderEditor(row());
-
-    expect(groupNamed("Requests")).not.toHaveAttribute("open");
   });
 
   it("asks its questions in order: how it looks, who gets it, its seasons, what's in it, when it updates, where it shows", () => {
@@ -1473,17 +1447,6 @@ describe("RowEditor — every group is on screen, only the optional ones fold", 
     expect(
       within(groupNamed("Where people see it")!).getByRole("button", { name: "Every day" }),
     ).toBeInTheDocument();
-  });
-
-  it("a folded group still says what is inside it", () => {
-    // A disclosure that hides its contents AND what they are set to is worse than no disclosure.
-    // Scoped to the group's own summary: the preview panel also reports the tag, so an unscoped
-    // match would pass on the panel alone even if the summary said nothing.
-    renderEditor(row({ request_tag: "family-picks" }));
-
-    const requests = screen.getByText("Requests").closest("details");
-    expect(requests).not.toHaveAttribute("open");
-    expect(requests).toHaveTextContent(/family-picks/);
   });
 
   it("shows a warning that used to be buried in a collapsed group", () => {

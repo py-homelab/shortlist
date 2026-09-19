@@ -2,7 +2,6 @@ import {
   AlertTriangle,
   Bell,
   Cable,
-  Inbox,
   KeyRound,
   ListOrdered,
   type LucideIcon,
@@ -11,14 +10,9 @@ import {
   Sparkles,
 } from "lucide-react";
 
-/** The clusters the sections fall into, in display order — so the 9-item list reads as four intents
- *  ("connect things → build the rows → optional add-ons → system") instead of one flat wall. */
-export const SETTINGS_GROUPS = [
-  "Connect",
-  "Rows",
-  "Add-ons",
-  "System",
-] as const;
+/** The clusters the sections fall into, in display order — so the 8-item list reads as three intents
+ *  ("connect things → build the rows → system") instead of one flat wall. */
+export const SETTINGS_GROUPS = ["Connect", "Rows", "System"] as const;
 export type SettingsGroup = (typeof SETTINGS_GROUPS)[number];
 
 export type NavSection = {
@@ -30,8 +24,8 @@ export type NavSection = {
 
 /**
  * The Settings page sections, in the order a new owner works down them: connect things → decide
- * where titles come from → row defaults → where rows sit → optional requests → advanced → API
- * access → danger. Each carries the `group` it renders under (headers in the sidebar sub-nav).
+ * where titles come from → row defaults → where rows sit → notifications → advanced → API access →
+ * danger. Each carries the `group` it renders under (headers in the sidebar sub-nav).
  * Schedules are per-row now (each row's editor), not a global Settings section. Shared by the page
  * (which renders each section's content, keyed by `id`) and the sidebar sub-nav (which lists them,
  * grouped, and jumps to `#id`). Keep entries contiguous by group — the sub-nav emits a group header
@@ -47,7 +41,6 @@ export const SETTINGS_SECTIONS: NavSection[] = [
   },
   { id: "defaults", label: "Row defaults", icon: Rows3, group: "Rows" },
   { id: "placement", label: "Row placement", icon: ListOrdered, group: "Rows" },
-  { id: "requests", label: "Requests", icon: Inbox, group: "Add-ons" },
   {
     id: "notifications",
     label: "Notifications",

@@ -36,7 +36,6 @@ const EVENT_GROUPS: {
     title: "Everything else",
     events: [
       { id: "privacy.exposure", label: "Someone can see a row that isn’t theirs" },
-      { id: "requests.waiting", label: "Titles are waiting for your approval" },
       { id: "update.available", label: "A new version of Shortlist is out" },
     ],
   },

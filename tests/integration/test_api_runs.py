@@ -59,8 +59,7 @@ RUN_SHARED_ROW_KEYS = (RUN_USER_KEYS - {"username", "display_name", "slug", "row
     "row_title",
 }
 PICK_KEYS = {"rank", "title", "reason", "rating_key", "seed_title", "sources", "affinity", "year", "rating"}
-TRACE_KEYS = {"username", "display_name", "status", "error", "reason", "trace", "breakdown", "requests"}
-TRACE_REQUEST_KEYS = {"status", "detail", "arr_slug", "excluded"}
+TRACE_KEYS = {"username", "display_name", "status", "error", "reason", "trace", "breakdown"}
 RUN_LOG_KEYS = {"seq", "ts", "run_id", "user", "stage", "counts", "reason"}
 RUNS_SUMMARY_KEYS = {"total", "ok", "error", "last_finished", "last_status"}
 
@@ -73,7 +72,6 @@ REPORT_KEYS = {
     "watch_sync",
     "coverage",
     "runs",
-    "requests",
     "trend",
     "per_user",
     "per_row",
@@ -506,46 +504,6 @@ class TestRunsApi:
         assert payload["breakdown"][0]["library_title"] == "Movies"
         assert payload["breakdown"][0]["picks"][0]["sources"] == ["tmdb_similar"]
 
-    def test_the_trace_only_carries_request_outcomes_for_titles_it_mentions(self, client: TestClient):
-        """The overlay used to be built from `SELECT * FROM request_candidates` — the WHOLE inbox,
-        for one person's page, on a table that only grows (every night adds the titles no library
-        held). Everything the overlay never looked up was then thrown away.
-
-        Scoped to the tmdb ids this trace actually mentions, so the page still gets every outcome it
-        can render and nothing else.
-        """
-        from shortlist.server.db.models import RequestCandidate, Run, RunUser
-
-        with client.app.state.sessions() as session:
-            user_id = session.query(User).first().id
-            run = Run(trigger="manual", status="ok")
-            session.add(run)
-            session.flush()
-            session.add(
-                RunUser(
-                    run_id=run.id,
-                    user_id=user_id,
-                    status="ok",
-                    # Nested two levels deep, which is where the real trace keeps its candidate
-                    # returns — the id walk must not depend on a hand-listed set of stage names.
-                    trace={"candidates": {"tmdb_similar": {"returns": [{"tmdb_id": 77, "title": "Wanted"}]}}},
-                )
-            )
-            for tmdb_id, title in ((77, "Wanted"), (88, "Somebody else's"), (99, "Nobody's")):
-                session.add(
-                    RequestCandidate(
-                        tmdb_id=tmdb_id, media_type="movie", title=title, status="sent", detail="sent to Radarr"
-                    )
-                )
-            session.commit()
-            run_id = run.id
-
-        payload = client.get(f"/api/runs/{run_id}/users/{user_id}/trace").json()
-
-        assert list(payload["requests"]) == ["77:movie"]
-        assert set(payload["requests"]["77:movie"]) == TRACE_REQUEST_KEYS
-        assert payload["requests"]["77:movie"]["status"] == "sent"
-
     def test_a_failed_run_exposes_why_not_just_that_it_failed(self, client: TestClient):
         """The reason lived only inside `stats`, which no client read — so a run that failed for a
         run-level reason (a share filter Plex refused) surfaced as a bare "Failed" and the operator
@@ -959,7 +917,6 @@ class TestRunsApi:
             "last_status",
             "errors_last",
         }
-        assert set(body["requests"]) == {"sent", "pending", "watched_after_sent"}
         assert set(body["trend"][0]) == {"week", "watched", "finished"}
         assert set(body["per_user"][0]) == {
             # The address, not a display field: the dashboard links each name to that person's page,
@@ -1132,249 +1089,6 @@ class TestRunsApi:
         per_user = client.get("/api/report?window=30").json()["per_user"]
         assert per_user[0]["watched"] == 3, "the person who watched most comes first"
         assert "hit_rate" not in per_user[0], "no per-person rate: at these sample sizes it is noise"
-
-    def test_report_does_not_credit_a_request_watched_before_it_was_sent(self, client: TestClient):
-        """`watched_after_sent` was a plain set intersection with no ordering check, so a title
-        watched, then deleted from the library, then re-requested, counted as a request that paid off."""
-        from shortlist.server.db.models import PickRow, RequestCandidate, Run
-
-        with client.app.state.sessions() as session:
-            uid = session.query(User).order_by(User.id).first().id
-            run = Run(trigger="manual", status="ok")
-            session.add(run)
-            session.flush()
-            now = datetime.now(UTC)
-            session.add_all(
-                [
-                    # Watched ten days ago...
-                    PickRow(
-                        run_id=run.id,
-                        user_id=uid,
-                        tmdb_id=77,
-                        media_type="movie",
-                        rating_key=77,
-                        rank=1,
-                        collection_slug="picked",
-                        title="Watched First",
-                        created_at=now - timedelta(days=12),
-                        watched_at=now - timedelta(days=10),
-                    ),
-                    PickRow(
-                        run_id=run.id,
-                        user_id=uid,
-                        tmdb_id=88,
-                        media_type="movie",
-                        rating_key=88,
-                        rank=2,
-                        collection_slug="picked",
-                        title="Watched After",
-                        created_at=now - timedelta(days=12),
-                        watched_at=now - timedelta(days=1),
-                    ),
-                ]
-            )
-            # ...but only requested five days ago, i.e. AFTER the watch. Not a request that paid off.
-            session.add(
-                RequestCandidate(
-                    tmdb_id=77,
-                    media_type="movie",
-                    title="Watched First",
-                    status="sent",
-                    updated_at=now - timedelta(days=5),
-                )
-            )
-            # Requested first, watched after — this one genuinely paid off.
-            session.add(
-                RequestCandidate(
-                    tmdb_id=88,
-                    media_type="movie",
-                    title="Watched After",
-                    status="sent",
-                    updated_at=now - timedelta(days=5),
-                )
-            )
-            session.commit()
-
-        requests = client.get("/api/report?window=30").json()["requests"]
-        assert requests["sent"] == 2
-        assert requests["watched_after_sent"] == 1
-
-    def test_a_request_watched_from_a_shared_row_still_counts_as_paid_off(self, client: TestClient):
-        """A shared row writes NO pick rows, so a title requested for the server and then watched off
-        the shared row credited nothing here — the one figure that answers "was asking for this worth
-        it" could not see the row most of the server actually watches from."""
-        from shortlist.server.db.models import RequestCandidate, SharedRowWatch
-
-        with client.app.state.sessions() as session:
-            uid = session.query(User).order_by(User.id).first().id
-            now = datetime.now(UTC)
-            session.add(
-                RequestCandidate(
-                    tmdb_id=4242,
-                    media_type="movie",
-                    title="Only On The Shared Row",
-                    status="sent",
-                    sent_at=now - timedelta(days=5),
-                )
-            )
-            # Watched AFTER it was sent, and only ever from the shared row — no PickRow exists.
-            session.add(
-                SharedRowWatch(
-                    user_id=uid,
-                    collection_slug="staff",
-                    tmdb_id=4242,
-                    media_type="movie",
-                    title="Only On The Shared Row",
-                    watched_at=now - timedelta(days=1),
-                )
-            )
-            session.commit()
-
-        requests = client.get("/api/report?window=30").json()["requests"]
-        assert requests["sent"] == 1
-        assert requests["watched_after_sent"] == 1, "a shared-row watch is still a watch"
-
-    def test_a_title_watched_before_AND_after_the_request_still_counts(self, client: TestClient):
-        """Merging the personal and shared watch times takes the LATEST of the two, not the earliest.
-
-        The question is "did asking for this lead to a watch", so any watch after the send answers
-        yes. Someone who saw it once before it was requested and again after — the ordinary case for
-        a title deleted and re-requested — is a request that paid off. Taking the earliest instead
-        reports the pre-request viewing and scores it zero. Both directions survived a mutation audit
-        of this merge, because no fixture had a title watched twice.
-        """
-        from shortlist.server.db.models import PickRow, RequestCandidate, Run, SharedRowWatch
-
-        with client.app.state.sessions() as session:
-            uid = session.query(User).order_by(User.id).first().id
-            run = Run(trigger="manual", status="ok")
-            session.add(run)
-            session.flush()
-            now = datetime.now(UTC)
-            # Watched on a personal row BEFORE the request...
-            session.add(
-                PickRow(
-                    run_id=run.id,
-                    user_id=uid,
-                    tmdb_id=6161,
-                    media_type="movie",
-                    rating_key=6161,
-                    rank=1,
-                    collection_slug="picked",
-                    title="Seen It Twice",
-                    created_at=now - timedelta(days=20),
-                    watched_at=now - timedelta(days=15),
-                )
-            )
-            # ...requested ten days ago...
-            session.add(
-                RequestCandidate(
-                    tmdb_id=6161,
-                    media_type="movie",
-                    title="Seen It Twice",
-                    status="sent",
-                    sent_at=now - timedelta(days=10),
-                )
-            )
-            # ...and watched again off the shared row AFTER it arrived.
-            session.add(
-                SharedRowWatch(
-                    user_id=uid,
-                    collection_slug="staff",
-                    tmdb_id=6161,
-                    media_type="movie",
-                    title="Seen It Twice",
-                    watched_at=now - timedelta(days=1),
-                )
-            )
-            session.commit()
-
-        requests = client.get("/api/report?window=30").json()["requests"]
-        assert requests["watched_after_sent"] == 1, "the later watch is the one that answers the question"
-
-    def test_report_uses_the_real_send_time_not_a_timestamp_that_drifts(self, client: TestClient):
-        """`updated_at` has `onupdate`, so clearing an old title from the Sent log bumped it and pulled
-        a months-old request into a recent window. `sent_at` is stamped once and cannot drift."""
-        from shortlist.server.db.models import PickRow, RequestCandidate, Run
-
-        with client.app.state.sessions() as session:
-            uid = session.query(User).order_by(User.id).first().id
-            run = Run(trigger="manual", status="ok")
-            session.add(run)
-            session.flush()
-            now = datetime.now(UTC)
-            session.add(
-                PickRow(
-                    run_id=run.id,
-                    user_id=uid,
-                    tmdb_id=55,
-                    media_type="movie",
-                    rating_key=55,
-                    rank=1,
-                    collection_slug="picked",
-                    title="Watched Before The Send",
-                    created_at=now - timedelta(days=200),
-                    watched_at=now - timedelta(days=190),
-                )
-            )
-            # Sent long ago, then TOUCHED recently (hidden from the Sent log) — `updated_at` is now
-            # inside the window while the real send is not.
-            session.add(
-                RequestCandidate(
-                    tmdb_id=55,
-                    media_type="movie",
-                    title="Watched Before The Send",
-                    status="sent",
-                    sent_at=now - timedelta(days=180),
-                    updated_at=now - timedelta(days=1),
-                )
-            )
-            session.commit()
-
-        requests = client.get("/api/report?window=30").json()["requests"]
-        assert requests["sent"] == 0, "a request sent 180 days ago is not a send in the last 30"
-        assert requests["watched_after_sent"] == 0
-
-    def test_report_still_reads_a_request_sent_before_sent_at_existed(self, client: TestClient):
-        """Back-compat: rows written before the column fall back to `updated_at`, which is exactly the
-        behaviour they already had — no backfill, nothing silently dropped."""
-        from shortlist.server.db.models import PickRow, RequestCandidate, Run
-
-        with client.app.state.sessions() as session:
-            uid = session.query(User).order_by(User.id).first().id
-            run = Run(trigger="manual", status="ok")
-            session.add(run)
-            session.flush()
-            now = datetime.now(UTC)
-            session.add(
-                PickRow(
-                    run_id=run.id,
-                    user_id=uid,
-                    tmdb_id=66,
-                    media_type="movie",
-                    rating_key=66,
-                    rank=1,
-                    collection_slug="picked",
-                    title="Legacy Sent",
-                    created_at=now - timedelta(days=20),
-                    watched_at=now - timedelta(days=2),
-                )
-            )
-            session.add(
-                RequestCandidate(
-                    tmdb_id=66,
-                    media_type="movie",
-                    title="Legacy Sent",
-                    status="sent",
-                    sent_at=None,  # predates the column
-                    updated_at=now - timedelta(days=10),
-                )
-            )
-            session.commit()
-
-        requests = client.get("/api/report?window=30").json()["requests"]
-        assert requests["sent"] == 1
-        assert requests["watched_after_sent"] == 1
 
     def test_report_falls_back_to_the_default_window_on_a_bogus_value(self, client: TestClient):
         body = client.get("/api/report?window=nonsense").json()
@@ -1783,7 +1497,7 @@ class TestRunsApi:
 class TestClosedSetFieldsMatchWhatTheCodeWrites:
     """Every value the producing code can write must survive its response model.
 
-    `trigger`, `window` and a trace request's `status` are now `Literal[...]` rather than `str`, so
+    `trigger` and `window` are now `Literal[...]` rather than `str`, so
     the OpenAPI schema carries the enum and the SPA stops re-declaring it by hand. That is only safe
     while the set is a superset of what the writers emit: a Literal is validated on the way OUT, and
     a value outside it does not degrade — it raises, and the endpoint 500s with real data in the
@@ -1862,30 +1576,3 @@ class TestClosedSetFieldsMatchWhatTheCodeWrites:
         """Why the Literal is safe despite `window` coming straight off the query string:
         `report_service.effectiveness` falls back to the default for anything it does not know."""
         assert client.get("/api/report?window=nonsense").json()["window"] == "30"
-
-    @pytest.mark.parametrize("status", ["pending", "sent", "rejected"])
-    def test_every_request_status_survives_the_trace_overlay(self, client: TestClient, status: str):
-        """The three `request_candidates.status` values, written by `api/requests.py` (rejected,
-        pending, sent) and `run_persistence` (pending, sent)."""
-        from shortlist.server.db.models import RequestCandidate, Run, RunUser
-
-        with client.app.state.sessions() as session:
-            user_id = session.query(User).first().id
-            run = Run(trigger="manual", status="ok")
-            session.add(run)
-            session.flush()
-            session.add(
-                RunUser(
-                    run_id=run.id,
-                    user_id=user_id,
-                    status="ok",
-                    trace={"candidates": {"tmdb_similar": {"returns": [{"tmdb_id": 4242, "title": "Wanted"}]}}},
-                )
-            )
-            session.add(RequestCandidate(tmdb_id=4242, media_type="movie", title="Wanted", status=status))
-            session.commit()
-            run_id = run.id
-
-        payload = client.get(f"/api/runs/{run_id}/users/{user_id}/trace").json()
-
-        assert payload["requests"]["4242:movie"]["status"] == status

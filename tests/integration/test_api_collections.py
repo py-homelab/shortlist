@@ -38,7 +38,6 @@ COLLECTION_KEYS = {
     "name_template",
     "fallback_name",
     "min_watchers",
-    "request_tag",
     "candidate_sources",
     "watched_pct",
     "rewatch",
@@ -52,25 +51,6 @@ COLLECTION_KEYS = {
     "max_seeds",
     "cold_start",
     "seed_window",
-    # This row's own request floors and Arr target; null on any of them means inherit the global.
-    "req_min_rating",
-    "req_min_votes",
-    "req_min_demand",
-    "req_min_year",
-    "req_max_year",
-    "req_auto_send",
-    "req_auto_min_demand",
-    "req_auto_min_rating",
-    "req_max_per_row",
-    "req_radarr_quality_profile_id",
-    "req_radarr_root_folder",
-    "req_sonarr_quality_profile_id",
-    "req_sonarr_root_folder",
-    "req_sonarr_monitor",
-    "req_language_mode",
-    "req_preferred_languages",
-    "req_min_rating_other",
-    "req_auto_user_tag",
     "pick_order",
     "placement",
     "placement_friends",
@@ -296,29 +276,6 @@ class TestCollectionsSeed:
         with client.app.state.sessions() as session:
             specs = builder._build_rows(session, SettingsStore(session, client.app.state.secrets))
         assert next(s for s in specs if s.slug == "rewatch_row").watched_pct == 0.5
-
-    def test_per_row_auto_user_tag_round_trips_and_reaches_the_spec(self, client: TestClient):
-        """The seam a typo would hide in: a row's tag-by-person override has to survive the PATCH,
-        the serializer AND the spec build, or it silently reads as "inherit the global" for ever."""
-        from shortlist.server.services.context_builder import ContextBuilder
-        from shortlist.server.services.sse import EventBus
-
-        created = client.post("/api/collections", json={"name": "Kids Row"})
-        assert created.status_code == 201
-        assert created.json()["req_auto_user_tag"] is None  # a new row inherits
-
-        row_id = created.json()["id"]
-        # False is a real answer ("never tag this row by person"), not "unset" — it must not be
-        # coerced back to None on the way through, or the global would switch it straight on again.
-        patched = client.patch(f"/api/collections/{row_id}", json={"name": "Kids Row", "req_auto_user_tag": False})
-        assert patched.status_code == 200 and patched.json()["req_auto_user_tag"] is False
-
-        builder = ContextBuilder(client.app.state.sessions, client.app.state.secrets, EventBus())
-        with client.app.state.sessions() as session:
-            specs = builder._build_rows(session, SettingsStore(session, client.app.state.secrets))
-        assert next(s for s in specs if s.slug == "kids_row").auto_user_tag is False
-        # ...and the untouched default row still inherits, so one row's override reaches no other.
-        assert next(s for s in specs if s.slug == "picked").auto_user_tag is None
 
     def test_per_row_cadence_round_trips_and_reaches_the_spec(self, client: TestClient):
         from shortlist.server.services.context_builder import ContextBuilder
@@ -2069,7 +2026,7 @@ class TestNoTwoRowsShareATitle:
 
 class TestADeletedRowsSlugIsNotHandedToANewRow:
     """A row's slug is its identity in every history table — last run's picks, the delivery ledger,
-    shared-row picks and watch credits, and which row a queued request belongs to. Deleting a row
+    shared-row picks and watch credits. Deleting a row
     frees the slug in `collections` only, so a new row with the same name took it over and inherited
     all of that: seen live on 2026-09-13, a re-created row's first run redelivered the deleted row's
     five picks as "not due to rebuild"."""
@@ -2079,7 +2036,6 @@ class TestADeletedRowsSlugIsNotHandedToANewRow:
             Delivery,
             Job,
             PickRow,
-            RequestCandidate,
             Run,
             RunSharedRow,
             SharedRowWatch,
@@ -2109,7 +2065,6 @@ class TestADeletedRowsSlugIsNotHandedToANewRow:
                 "shared_row_watches": lambda: SharedRowWatch(
                     user_id=user.id, collection_slug=slug, tmdb_id=1, media_type="movie"
                 ),
-                "request_candidates": lambda: RequestCandidate(tmdb_id=1, media_type="movie", title="T", row_slug=slug),
                 # Not history yet, but about to be: DELETE queues this before dropping the row, it cannot
                 # start while a run is in flight, and that run still holds the old row and persists its
                 # picks under the slug. When it does start, it removes by that slug's ledger keys.
@@ -2118,9 +2073,7 @@ class TestADeletedRowsSlugIsNotHandedToANewRow:
         )
         session.commit()
 
-    @pytest.mark.parametrize(
-        "kind", ["picks", "deliveries", "run_shared_rows", "shared_row_watches", "request_candidates", "reconcile_job"]
-    )
+    @pytest.mark.parametrize("kind", ["picks", "deliveries", "run_shared_rows", "shared_row_watches", "reconcile_job"])
     def test_a_slug_history_still_names_is_not_reused(self, client: TestClient, kind: str):
         from shortlist.server.db.models import Collection
 
@@ -2624,7 +2577,7 @@ class TestBlockedSeedsApi:
         self, client: TestClient, monkeypatch, media_type, found, expected
     ):
         tmdb = SimpleNamespace(search=lambda query, mt: found)
-        monkeypatch.setattr(client.app.state.run_service, "build_requests_context", lambda: (None, tmdb))
+        monkeypatch.setattr(client.app.state.run_service, "build_tmdb_client", lambda: tmdb)
 
         body = client.get(f"/api/users/search/titles?q=x&media_type={media_type}").json()
 
@@ -2970,213 +2923,6 @@ class TestRowEffectiveness:
         assert body["last_delivered_at"].startswith((datetime.now(UTC) - timedelta(days=3)).strftime("%Y-%m-%d"))
 
 
-class TestPerRowRequestSettingsApi:
-    """A row's own Sonarr/Radarr floors and target, over the API.
-
-    NULL is the "inherit the global" signal throughout, so the round-trip that matters is that a
-    value the caller never sent stays null rather than being defaulted to something concrete.
-    """
-
-    def test_a_new_row_inherits_everything_by_default(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Plain", "build": "per_person"}).json()
-        assert created["req_min_rating"] is None
-        assert created["req_radarr_root_folder"] is None
-        assert created["req_max_per_row"] is None
-
-    def test_overrides_round_trip(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        resp = client.patch(
-            f"/api/collections/{created['id']}",
-            json={
-                "name": "Kids",
-                "req_min_rating": 6.0,
-                "req_max_per_row": 2,
-                "req_radarr_root_folder": "/data/Kids",
-                "req_radarr_quality_profile_id": 9,
-                "req_auto_send": False,
-            },
-        )
-        assert resp.status_code == 200, resp.text
-        patched = resp.json()
-        assert patched["req_min_rating"] == 6.0
-        assert patched["req_max_per_row"] == 2
-        assert patched["req_radarr_root_folder"] == "/data/Kids"
-        assert patched["req_radarr_quality_profile_id"] == 9
-        assert patched["req_auto_send"] is False
-        # Untouched fields stay null — patching one override must not concrete the rest.
-        assert patched["req_min_year"] is None
-        assert patched["req_sonarr_root_folder"] is None
-
-    def test_an_override_can_be_cleared_back_to_inherit(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        client.patch(f"/api/collections/{created['id']}", json={"name": "Kids", "req_min_rating": 6.0})
-        cleared = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Kids", "req_min_rating": None}
-        ).json()
-        assert cleared["req_min_rating"] is None
-
-    def test_false_is_stored_rather_than_read_as_unset(self, client: TestClient):
-        """`auto_send=False` means "queue everything from this row", which is a real choice — it must
-        not be confused with "inherit". Only null inherits."""
-        created = client.post("/api/collections", json={"name": "Manual", "build": "per_person"}).json()
-        patched = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Manual", "req_auto_send": False}
-        ).json()
-        assert patched["req_auto_send"] is False
-
-    def test_zero_is_stored_rather_than_read_as_unset(self, client: TestClient):
-        """`req_max_per_row=0` means "never auto-send from this row" — also a real choice."""
-        created = client.post("/api/collections", json={"name": "Never", "build": "per_person"}).json()
-        patched = client.patch(f"/api/collections/{created['id']}", json={"name": "Never", "req_max_per_row": 0}).json()
-        assert patched["req_max_per_row"] == 0
-
-    def test_a_rows_sonarr_monitor_mode_round_trips_and_clears(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        assert created["req_sonarr_monitor"] is None
-
-        patched = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Kids", "req_sonarr_monitor": "firstSeason"}
-        ).json()
-        assert patched["req_sonarr_monitor"] == "firstSeason"
-
-        cleared = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Kids", "req_sonarr_monitor": None}
-        ).json()
-        assert cleared["req_sonarr_monitor"] is None
-
-    def test_a_rows_language_settings_round_trip_and_clear(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        assert (created["req_language_mode"], created["req_preferred_languages"], created["req_min_rating_other"]) == (
-            None,
-            None,
-            None,
-        )
-
-        patched = client.patch(
-            f"/api/collections/{created['id']}",
-            json={
-                "name": "Kids",
-                "req_language_mode": "only",
-                "req_preferred_languages": ["en"],
-                "req_min_rating_other": 9.0,
-            },
-        ).json()
-        assert patched["req_language_mode"] == "only"
-        assert patched["req_preferred_languages"] == ["en"]
-        assert patched["req_min_rating_other"] == 9.0
-
-        cleared = client.patch(
-            f"/api/collections/{created['id']}",
-            json={
-                "name": "Kids",
-                "req_language_mode": None,
-                "req_preferred_languages": None,
-                "req_min_rating_other": None,
-            },
-        ).json()
-        assert (cleared["req_language_mode"], cleared["req_preferred_languages"], cleared["req_min_rating_other"]) == (
-            None,
-            None,
-            None,
-        )
-
-    def test_an_empty_row_language_list_is_stored_rather_than_read_as_unset(self, client: TestClient):
-        """[] is a row that CLEARED its languages, which in "only" mode requests nothing. NULL is a
-        row that inherits the owner's list. Collapsing the two changes what the row asks Radarr for."""
-        created = client.post("/api/collections", json={"name": "None", "build": "per_person"}).json()
-        patched = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "None", "req_preferred_languages": []}
-        ).json()
-        assert patched["req_preferred_languages"] == []
-
-    def test_row_language_codes_are_normalised_and_deduped_on_the_way_in(self, client: TestClient):
-        """Asserted against the COLUMN, not the response.
-
-        `_serialize` normalises this field on the way out too, so a response-only assertion passes
-        with the write-side normalisation deleted — proving the reader works and nothing about the
-        writer. Reads normalising anyway is exactly why this has to look at what was stored.
-        """
-        from shortlist.server.db.models import Collection
-
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        resp = client.patch(
-            f"/api/collections/{created['id']}",
-            json={"name": "Kids", "req_preferred_languages": ["EN", "  ja  ", "en"]},
-        )
-        assert resp.status_code == 200, resp.text
-
-        with client.app.state.sessions() as session:
-            row = session.query(Collection).filter(Collection.id == created["id"]).one()
-            assert row.req_preferred_languages == ["en", "ja"], "lowercased, trimmed, deduped in the DB"
-
-    def test_a_long_list_of_bad_row_codes_says_how_many_it_did_not_show(self, client: TestClient):
-        """Truncating without a count means the owner fixes the five they were shown, resubmits, and
-        is rejected again for values the first message implied were fine."""
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        resp = client.patch(
-            f"/api/collections/{created['id']}",
-            json={"name": "Kids", "req_preferred_languages": [f"{c}1" for c in "abcdefg"]},
-        )
-        assert resp.status_code == 422
-        assert "(+2 more)" in resp.json()["detail"]
-
-    def test_a_row_language_mode_outside_the_offered_set_is_refused(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        resp = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Kids", "req_language_mode": "english_only"}
-        )
-        assert resp.status_code == 422
-        assert "req_language_mode" in resp.json()["detail"]
-
-    def test_a_row_language_code_that_is_not_iso_639_1_is_refused(self, client: TestClient):
-        """A typo here would silently reclassify a whole language as "other" and raise the bar on it,
-        which reads as the feature misbehaving rather than as bad input."""
-        created = client.post("/api/collections", json={"name": "Kids", "build": "per_person"}).json()
-        resp = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Kids", "req_preferred_languages": ["english"]}
-        )
-        assert resp.status_code == 422
-
-    def test_a_row_holding_a_retired_mode_can_still_be_saved(self, client: TestClient):
-        """`future`/`missing`/`existing`/`recent` were offered by an earlier build and then retired,
-        so a row can hold one. The editor PATCHes the whole row back, so serving the raw value made
-        the closed-set check refuse it — and the owner could not save that row at all, not even to
-        rename it. It reads as "inherits" instead, which is what the run does with it too."""
-        from shortlist.server.db.models import Collection
-
-        created = client.post("/api/collections", json={"name": "Legacy", "build": "per_person"}).json()
-        with client.app.state.sessions() as session:
-            row = session.query(Collection).filter_by(id=created["id"]).one()
-            row.req_sonarr_monitor = "recent"  # as written by the build that still offered it
-            session.commit()
-
-        served = next(c for c in client.get("/api/collections").json() if c["id"] == created["id"])
-        assert served["req_sonarr_monitor"] is None, "a retired mode reads as inherit, not as itself"
-
-        # The rename the owner actually wanted, carrying the field back exactly as the editor does.
-        resp = client.patch(
-            f"/api/collections/{created['id']}",
-            json={"name": "Legacy renamed", "req_sonarr_monitor": served["req_sonarr_monitor"]},
-        )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["name"] == "Legacy renamed"
-
-    def test_a_monitor_mode_sonarr_does_not_accept_is_refused(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Bad", "build": "per_person"}).json()
-        resp = client.patch(
-            f"/api/collections/{created['id']}", json={"name": "Bad", "req_sonarr_monitor": "seasonsIWant"}
-        )
-        assert resp.status_code == 422
-        assert "req_sonarr_monitor" in resp.text
-
-    def test_an_out_of_range_rating_is_refused(self, client: TestClient):
-        created = client.post("/api/collections", json={"name": "Bad", "build": "per_person"}).json()
-        assert (
-            client.patch(f"/api/collections/{created['id']}", json={"name": "Bad", "req_min_rating": 11.0}).status_code
-            == 422
-        )
-
-
 class TestRowShowDaysApi:
     """The API half of "When it appears" (issue #102): which days a row is on people's Home.
 
@@ -3278,22 +3024,6 @@ class TestAnUnknownFieldIsRefused:
         cid = client.post("/api/collections", json={"name": "Typo"}).json()["id"]
         r = client.patch(f"/api/collections/{cid}", json={"name": "Typo", "seasons_lead_days": 10})
         assert r.status_code == 422, r.text
-
-
-class TestANewRowsRequestSettings:
-    def test_a_new_row_keeps_the_request_settings_it_was_created_with(self, client: TestClient):
-        """The editor offers a row's own request floors before the row is first saved, and the create
-        constructor set none of them: they were dropped without a word, and only an edit after saving stuck."""
-        body = {"name": "Picky", "req_min_rating": 7.5, "req_max_per_row": 2, "req_auto_send": False}
-
-        created = client.post("/api/collections", json=body).json()
-
-        assert (created["req_min_rating"], created["req_max_per_row"], created["req_auto_send"]) == (7.5, 2, False)
-        from shortlist.server.db.models import Collection
-
-        with client.app.state.sessions() as session:
-            row = session.get(Collection, created["id"])
-            assert (row.req_min_rating, row.req_max_per_row, row.req_auto_send) == (7.5, 2, False)
 
 
 class TestSeasonalRowsApi:

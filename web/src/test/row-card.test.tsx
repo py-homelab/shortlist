@@ -44,7 +44,6 @@ function collection(patch: Partial<Collection> = {}): Collection {
     sort_order: 0,
     name_template: "",
     min_watchers: 2,
-    request_tag: "",
     candidate_sources: [],
     library_keys: [],
     watched_pct: null,

@@ -177,7 +177,6 @@ def test_capture_app_screenshots(shot_page: Page, app: ShortlistApp) -> None:
     _capture(shot_page, "/users", "users.webp", wait="sarah")
     _capture(shot_page, "/runs", "runs.webp", wait="succeeded|ok")
     _capture(shot_page, f"/runs/{run_id}", "run-detail.webp", wait="AI tokens")
-    _capture(shot_page, "/requests", "requests.webp", wait="request")
     _capture(shot_page, "/settings", "settings.webp", wait="Connections")
 
     # rows.png needs row VARIETY, and the seeded install has exactly one row, so it came out as one

@@ -1,6 +1,6 @@
 ---
 title: "Reference: the REST API"
-description: Every Shortlist REST endpoint — sign-in, users, rows, runs, requests, events, reports, the support checks and their responses.
+description: Every Shortlist REST endpoint — sign-in, users, rows, runs, a person's own picks, events, reports, the support checks and their responses.
 heading: API reference
 ---
 
@@ -21,7 +21,7 @@ POST /api/setup/probe · POST /api/setup/link · GET/PUT /api/setup/state
 ## Users
 
 ```
-GET  /api/users · PATCH /api/users/{id} {enabled?, manage_sharing?, request_tag?, prefs?} — a `prefs` key sent as `null` CLEARS that preference. Only the keys actually present are touched: an omitted key keeps its stored value, so a partial write cannot wipe the rest. · DELETE /api/users/{id} (only for someone plex.tv no longer lists: drops their picks and run history and hides them from the list; keeps the users row and their pre-Shortlist share-filter snapshot, which uninstall restores from — 409 for anyone still on the share) · POST /api/users/sync (shared + Home users from plex.tv, plus the server owner, whom that list never returns)
+GET  /api/users · PATCH /api/users/{id} {enabled?, manage_sharing?, prefs?} — a `prefs` key sent as `null` CLEARS that preference. Only the keys actually present are touched: an omitted key keeps its stored value, so a partial write cannot wipe the rest. · DELETE /api/users/{id} (only for someone plex.tv no longer lists: drops their picks and run history and hides them from the list; keeps the users row and their pre-Shortlist share-filter snapshot, which uninstall restores from — 409 for anyone still on the share) · POST /api/users/sync (shared + Home users from plex.tv, plus the server owner, whom that list never returns)
 POST /api/users/set-enabled {enabled} (bulk enable/disable every user at once)
 ```
 
@@ -167,7 +167,7 @@ GET  /api/picks/{rating_key}/poster -> image bytes
      `rating_key` and only one of the four construction sites carries a `poster_path`, so the PMS is the
      only source that covers all of them — no new column, no migration, no backfill gap. Owner-gated,
      and it refuses any thumb path that is not on this server.
-GET /api/collections/seasons (the seasons a row can follow: `slug`, `name`, `emoji`, `month`, `day`, `description`) · GET/POST /api/collections · PATCH/DELETE /api/collections/{id} (incl. `request_tag`, `candidate_sources`, `library_keys`, `max_seeds` — how many watched titles the row is built from (1–100; null inherits the engine default of 30), `recency` — how much a title's release date counts when ranking it for this row (0.0–1.0; null inherits the global `recommendations.recency`), `cold_start` — what the row does for someone below `recommendations.min_history` (`popular` | `skip`; null inherits the global `recommendations.cold_start`), `fallback_name` — what to call this row for someone whose name cannot be filled in, i.e. a `{top_seed}` row for a person with nothing watched. `""` (the default) means there is no such name and the row is simply not built for them — Shortlist never invents one, and a value containing `{top_seed}` is refused because it could not be filled in either, `seed_window` — how many recent watches a one-title row cycles between, one per run (1–20, default 1 = always their most recent; no global to inherit), `pick_order` — how the delivered collection is ordered (`best` | `rating` | `newest` | `shuffle` | `new_first` — titles that arrived this run lead | `rotate` — the front advances by one title a day, default `best`), `show_days` — which days the row appears, as ISO weekdays 1=Mon..7=Sun (`[]` = every day; values outside 1-7 are refused, and the list is stored sorted and de-duplicated), `seasons` — the seasons a seasonal row follows (`valentines` | `halloween` | `christmas`; `[]` = not seasonal; stored de-duplicated in calendar order, unknown slugs refused), `season_lead_days` (0–90, default 30) and `season_after_days` (0–30, default 0) — how many days before and after each season's day the row shows. A name using `{season}`/`{season_emoji}` is refused on a row with no seasons. The response also carries read-only `shown_today`, resolved on the SERVER's clock so a UI badge cannot disagree with what Plex is showing — it is false outside a seasonal row's seasons — and `season_status` (`{showing, next}`, each `{slug, name, emoji, starts, ends}` or null; null for a row with no seasons), `hub_anchor` — per-row shelf-placement override, and `poster` — custom row artwork {mode: ""|upload|generate, title, subtitle, style}. A top-level field the row body does not declare is refused with 422 rather than ignored, so a misspelt setting cannot save as a no-op (fields inside `poster` and `hub_anchor` are not yet checked this way))
+GET /api/collections/seasons (the seasons a row can follow: `slug`, `name`, `emoji`, `month`, `day`, `description`) · GET/POST /api/collections · PATCH/DELETE /api/collections/{id} (incl. `candidate_sources`, `library_keys`, `max_seeds` — how many watched titles the row is built from (1–100; null inherits the engine default of 30), `recency` — how much a title's release date counts when ranking it for this row (0.0–1.0; null inherits the global `recommendations.recency`), `cold_start` — what the row does for someone below `recommendations.min_history` (`popular` | `skip`; null inherits the global `recommendations.cold_start`), `fallback_name` — what to call this row for someone whose name cannot be filled in, i.e. a `{top_seed}` row for a person with nothing watched. `""` (the default) means there is no such name and the row is simply not built for them — Shortlist never invents one, and a value containing `{top_seed}` is refused because it could not be filled in either, `seed_window` — how many recent watches a one-title row cycles between, one per run (1–20, default 1 = always their most recent; no global to inherit), `pick_order` — how the delivered collection is ordered (`best` | `rating` | `newest` | `shuffle` | `new_first` — titles that arrived this run lead | `rotate` — the front advances by one title a day, default `best`), `show_days` — which days the row appears, as ISO weekdays 1=Mon..7=Sun (`[]` = every day; values outside 1-7 are refused, and the list is stored sorted and de-duplicated), `seasons` — the seasons a seasonal row follows (`valentines` | `halloween` | `christmas`; `[]` = not seasonal; stored de-duplicated in calendar order, unknown slugs refused), `season_lead_days` (0–90, default 30) and `season_after_days` (0–30, default 0) — how many days before and after each season's day the row shows. A name using `{season}`/`{season_emoji}` is refused on a row with no seasons. The response also carries read-only `shown_today`, resolved on the SERVER's clock so a UI badge cannot disagree with what Plex is showing — it is false outside a seasonal row's seasons — and `season_status` (`{showing, next}`, each `{slug, name, emoji, starts, ends}` or null; null for a row with no seasons), `hub_anchor` — per-row shelf-placement override, and `poster` — custom row artwork {mode: ""|upload|generate, title, subtitle, style}. A top-level field the row body does not declare is refused with 422 rather than ignored, so a misspelt setting cannot save as a no-op (fields inside `poster` and `hub_anchor` are not yet checked this way))
 GET  /api/collections/{id}/effectiveness -> {delivered, watched, finished, first_delivered_at, matured_days, matured, per_library} (has this row actually landed? `matured` is null until picks are old enough to judge — a pick counts as a hit only if watched while the row was still showing it, so a newer row is reported as "too early" rather than scored 0%)
      `finished` accompanies every `watched` here too, including per library. A row spanning Movies and TV can land the same share in
      both and finish almost none of the TV — that gap is the panel's most useful line, and it is invisible in `watched` alone.
@@ -231,7 +231,6 @@ GET  /api/runs?limit=&collection=&before_id= (newest first; `before_id` pages ba
 ## Requests
 
 ```
-GET  /api/requests?wanted_by=&wanted_by= (the inbox, pending first then sent then rejected, capped at 500 rows; `wanted_by` repeats one `wanters` username per value and keeps a title any of them wanted — applied BEFORE the cap, so picking a name searches the whole history rather than the 500 the page loaded; omitted = everyone) · GET /api/requests/status -> {statuses: {request_id: "downloaded"|"downloading"|"queued"|"unmonitored"|null}, radarr: "ok"|"unreachable"|"off", sonarr: same} (live Sonarr/Radarr status for WAITING and SENT items — rejected are skipped; null = the app is fine and doesn't track it, which is why `radarr`/`sonarr` report reachability separately: an app that never answered would otherwise be indistinguishable from one with nothing to say. Fetched separately so the list itself makes no Arr calls, and read from whole-library maps so the cost doesn't scale with inbox size — which is what makes the inbox's poll cheap — it runs every 10s only while a title is actually downloading, and every 30s while an app is unreachable so the badge clears itself when it comes back; a settled inbox does not poll at all) · POST /api/requests/send {ids, dry_run?} · POST /api/requests/reject {ids} (permanent) · POST /api/requests/restore {ids} (un-reject → back to Waiting) · POST /api/requests/delete {ids} (removable; can re-surface) · POST /api/requests/clear {ids} (hide SENT items from the log without un-sending — the tombstone stays so the title isn't re-requested)
 ```
 
 ## Events and notifications
@@ -267,14 +266,13 @@ Settings -> Connections -> Webhook (`notify.webhook.url` / `notify.webhook.auth_
      {source, version, id, severity, title, message, event, path, sent_at}, plus `content` and `text`
      carrying "title\nmessage" — the fields Discord and Slack each require — to one webhook.
      Events: run.started, run.finished, run.partial, run.failed, run.stopped, job.started,
-     job.finished, job.failed, privacy.exposure, requests.waiting, update.available ("test" for the
+     job.finished, job.failed, privacy.exposure, update.available ("test" for the
      button). Default ["run.failed", "privacy.exposure"]; an unknown name is a 422.
      Dry runs and dry-run jobs send nothing. job.started/job.finished skip routine jobs (watch.reconcile)
      and retries, a scheduled privacy.sync never sends job.started, and one that changed nothing never
      sends job.finished. job.failed means out of retries. notify.send never reports on itself.
      privacy.exposure is a count of accounts, never names, repeated at most once a day while true.
-     requests.waiting is sent after a run when more titles wait than last time; update.available once
-     per version. No message carries a person's name, a job's detail, or a job's error.
+     update.available once per version. No message carries a person's name, a job's detail, or a job's error.
      Delivery reuses the existing job queue, so retry, backoff and the dead-letter state are the ones
      already tested rather than a second mechanism.
      `notify.webhook.url` is a SECRET (a Discord or Slack webhook URL is a bearer token in a URL): Fernet
@@ -291,19 +289,15 @@ Settings -> Connections -> Webhook (`notify.webhook.url` / `notify.webhook.auth_
 ## Settings and connections
 
 ```
-GET/PUT /api/settings · POST /api/settings/test/{plex|tautulli|tmdb|llm|radarr|sonarr|overseerr|mdblist|trakt|exa|searxng|native_search|notify} (a PUT that changes anything also writes a `settings.change` audit event carrying `{changed: {key: {from, to}}, actor: {via, account_id, client}}` — `changed` covers the changed keys only (secrets record `<redacted>` on both sides, long object values are summarised), and `actor` says WHO: `via` is `browser` or `api_token`, `client` is a truncated User-Agent. No client IP is recorded, deliberately: these rows are immutable and the support bundle exports them. Read it back with `/api/events/log?scope=settings.change` to see which thresholds a past run actually used, and what changed them)
-GET  /api/settings/arr/{radarr|sonarr}/options -> {quality_profiles, root_folders}
-GET  /api/settings/overseerr/options -> {users[], default_user_id} (the instance's accounts, for the "request as" dropdown, each with whether it auto-approves films/shows and whether it belongs to a real person; `default_user_id` is the account the API key itself is, so the UI can resolve "Server default". No profiles or folders — those are Overseerr's own)
+GET/PUT /api/settings · POST /api/settings/test/{plex|tautulli|tmdb|llm|overseerr|mdblist|trakt|engine|exa|searxng|native_search|notify} (a PUT that changes anything also writes a `settings.change` audit event carrying `{changed: {key: {from, to}}, actor: {via, account_id, client}}` — `changed` covers the changed keys only (secrets record `<redacted>` on both sides, long object values are summarised), and `actor` says WHO: `via` is `browser` or `api_token`, `client` is a truncated User-Agent. No client IP is recorded, deliberately: these rows are immutable and the support bundle exports them. Read it back with `/api/events/log?scope=settings.change` to see which thresholds a past run actually used, and what changed them)
 POST /api/settings/curator/models {provider?, api_key?, ollama_url?} -> {provider, models[]} (models the provider offers; the body lets the picker list the provider being edited before it is saved — blank fields fall back to saved settings, a redacted key means "use the saved key"; [] = free-text fallback)
 ```
 
 ## Reports and the dashboard
 
 ```
-GET  /api/report?window=7|30|90|all -> {window, since, first_pick, overall, trend[], per_user[], per_row[], recent[], watch_sync, coverage, runs, requests, top_titles} (what got watched, from picks.watched_at; `overall.viewing_share` = `{watched, from_rows, rate}`, the share of titles enabled people watched in the window that a row of theirs was showing)
+GET  /api/report?window=7|30|90|all -> {window, since, first_pick, overall, trend[], per_user[], per_row[], recent[], watch_sync, coverage, runs, top_titles} (what got watched, from picks.watched_at; `overall.viewing_share` = `{watched, from_rows, rate}`, the share of titles enabled people watched in the window that a row of theirs was showing)
      Windowed, default 30 days, with each headline figure carried alongside its previous equal period so the UI can show a change.
-     `requests.watched_after_sent` compares a watch against `request_candidates.sent_at`, stamped once when the status flips
-     to "sent" (rows predating that column fall back to `updated_at`).
      `first_pick` is the oldest pick on record (null when there are none). On a young install every window already covers all the data, so 7/30/90/all
      return identical numbers and the selector looks broken; the UI compares `first_pick` against `since` to say why rather than leaving it a mystery.
      `first_pick` also gates the comparison itself: `watched_prev`, `watchers_prev` and every `*_delta` are **null** unless the previous period is one
@@ -328,7 +322,7 @@ GET  /api/report?window=7|30|90|all -> {window, since, first_pick, overall, tren
      Resuming later needs nothing special: progress is the furthest across ALL sittings and only ever moves up, so a second
      sitting extends the percentage, while the credit stays pinned to the first time they pressed play.
      Every figure that counts a WATCH includes them: `overall.watched`/`finished`/`watchers`, `bounced`/`dropped`, `trend`, `per_user`, `per_row`,
-     `top_titles`, `recent` and `requests.watched_after_sent`. The ones that do not are `delivered`, `landing` (a ratio of delivered to watched) and
+     `top_titles` and `recent`. The ones that do not are `delivered`, `landing` (a ratio of delivered to watched) and
      `avg_days_to_watch` (an interval that starts at a per-person delivery): a shared row is ONE
      collection for the whole server, so there is no per-person delivery to count and inventing one would be a number with no referent. A shared
      row's `per_user`/`per_row` line therefore shows watched and finished with no "delivered" clause, which the UI already omits when it is zero.

@@ -18,6 +18,7 @@ from hypothesis import strategies as st
 import shortlist.engine.picker as picker_mod
 import shortlist.engine.pipeline as pipeline_mod
 from shortlist.engine import rows as rows_mod
+from shortlist.engine.clients.mdblist import MdbListRateLimitError
 from shortlist.engine.clients.plex_pms import PlexClient
 from shortlist.engine.clients.plextv import FilterWriteRefused
 from shortlist.engine.clients.tmdb import NullCache
@@ -2750,242 +2751,6 @@ class TestPerRowOverrides:
         ctx.plex.create_collection.assert_not_called()
 
 
-class TestRequestsWiring:
-    """The request pass only runs when enabled, and it sees the titles the library lacks."""
-
-    def _suggest_a_missing_title(self, ctx: EngineContext) -> None:
-        # Candidate 30 is NOT in the library index (which holds only 10 and 20), so it's requestable.
-        ctx.tmdb.suggestions.return_value = _ranked(
-            [
-                {"id": 10, "title": "In Library", "genre_ids": [], "vote_average": 8.0, "vote_count": 900},
-                {"id": 30, "title": "Missing Title", "genre_ids": [], "vote_average": 8.4, "vote_count": 800},
-            ]
-        )
-
-    def test_disabled_by_default_never_calls_the_request_pass(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        sarah = make_profile("sarah", account_id=100)
-        mock_plextv.users = [plextv_user(100, "sarah")]
-        self._suggest_a_missing_title(ctx)
-        called = []
-        monkeypatch.setattr(pipeline_mod.requests_mod, "request_missing", lambda *a, **k: called.append(a))
-
-        report = pipeline_mod.run(ctx, [sarah])
-
-        assert called == []  # requests is None on the config -> no bookkeeping, no pass
-        assert report.requests is None
-
-    def test_enabled_run_feeds_missing_titles_to_the_request_pass(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        from shortlist.engine.models import ArrTarget, RequestConfig, RequestReport
-        from shortlist.engine.models import MediaType as MT
-
-        sarah = make_profile("sarah", account_id=100)
-        mock_plextv.users = [plextv_user(100, "sarah")]
-        self._suggest_a_missing_title(ctx)
-        ctx.config.requests = RequestConfig(
-            enabled=True,
-            radarr=ArrTarget(url="http://radarr.test", api_key="k", quality_profile_id=1, root_folder="/m"),
-        )
-
-        captured = {}
-        sentinel = RequestReport(considered=1)
-
-        def spy(cfg, tmdb, demand, *, dry_run, already_handled=None, **kw):
-            captured["demand"] = demand
-            captured["dry_run"] = dry_run
-            captured["already_handled"] = already_handled
-            return sentinel
-
-        monkeypatch.setattr(pipeline_mod.requests_mod, "request_missing", spy)
-
-        report = pipeline_mod.run(ctx, [sarah])
-
-        # One RowRequest per row that wanted something, carrying that row's OWN demand map.
-        rows = {row.slug: row.demand for row in captured["demand"]}
-        assert list(rows) == ["picked"]
-        # The missing title reached the request pass; the in-library one did not.
-        assert (30, MT.MOVIE) in rows["picked"]
-        assert (10, MT.MOVIE) not in rows["picked"]
-        assert rows["picked"][(30, MT.MOVIE)].demand == 1
-        # Its provenance names the row per library: a missing MOVIE renders {library_name} as the
-        # movie library ("Movies"), so the inbox shows the same name the row is actually called...
-        why = rows["picked"][(30, MT.MOVIE)].why
-        assert why and why[0].row == "✨ Movies Picked for You"
-        # ...and the SLUG beside it, which is the stable identity an approval months later needs to
-        # resolve this row's Sonarr/Radarr target. The rendered name cannot serve: it carries the
-        # person's display name and their own seed title.
-        assert why[0].row_slug == "picked"
-        assert report.requests is sentinel
-
-    def test_per_row_pool_attributes_tags_to_the_row_that_surfaced_the_title(
-        self, ctx: EngineContext, mock_plextv, monkeypatch
-    ):
-        from shortlist.engine.models import ArrTarget, RequestConfig, RequestReport, RowSpec
-        from shortlist.engine.models import MediaType as MT
-
-        # Two rows for one user: a default one on tmdb_similar (all in-library, nothing missing) and
-        # a "Hidden Gems" row on tmdb_discover that surfaces a MISSING title (id 30). The missing
-        # title must carry only the discover row's tag (plus the user's), not the default row's.
-        ctx.config.rows = [
-            RowSpec(slug="picked", name_template="", size=5),  # inherits global -> tmdb_similar
-            RowSpec(
-                slug="gems",
-                name_template="Hidden Gems",
-                size=5,
-                candidate_sources=["tmdb_discover"],
-                request_tag="gems",
-            ),
-        ]
-        sarah = make_profile("sarah", account_id=100, request_tag="sarah")
-        mock_plextv.users = [plextv_user(100, "sarah")]
-        ctx.tmdb.genre_ids_for.side_effect = lambda tid, mt: [18]
-        ctx.tmdb.discover.side_effect = lambda mt, gids, **kw: [
-            {"id": 30, "title": "Missing Gem", "genre_ids": [], "vote_average": 8.4}
-        ]
-        ctx.config.requests = RequestConfig(
-            enabled=True,
-            radarr=ArrTarget(url="http://radarr.test", api_key="k", quality_profile_id=1, root_folder="/m"),
-        )
-        captured = {}
-        monkeypatch.setattr(
-            pipeline_mod.requests_mod,
-            "request_missing",
-            lambda cfg, tmdb, demand, **kw: captured.setdefault("demand", demand) or RequestReport(),
-        )
-
-        report = pipeline_mod.run(ctx, [sarah])
-
-        rows = {row.slug: row.demand for row in captured["demand"]}
-        # Only the row whose pool actually surfaced a missing title is in the request pass at all.
-        assert list(rows) == ["gems"]
-        missing = rows["gems"][(30, MT.MOVIE)]
-        assert missing.tags == {"sarah", "gems"}  # user tag + the row whose pool surfaced it, not "picked"
-        assert missing.demand == 1  # counted once for this user despite multiple rows/pools
-        # Distinct-union candidate count spans both pools: {10,20} (similar) and {30} (discover).
-        assert report.users[0].counts.candidates == 3
-
-
-class TestAutoUserTag:
-    """The global "tag requests by person" switch and its per-row override.
-
-    Tagging each request with the wanting person's slug is how the owner sees, from inside
-    Sonarr/Radarr, WHO a title was added for — the inbox's why-line never reaches the Arr. Off by
-    default, so an upgrade tags nothing until it is switched on. A row's own `auto_user_tag`
-    overrides the global in either direction (None -> inherit), and an explicit per-user tag always
-    beats the automatic slug: someone with a hand-set tag keeps it.
-    """
-
-    def _missing_tags(
-        self,
-        ctx: EngineContext,
-        mock_plextv,
-        monkeypatch,
-        *,
-        global_on: bool,
-        row_override: bool | None,
-        user_tag: str = "",
-    ) -> set[str]:
-        """Tags on the one missing title, for a single "gems" row that surfaced it."""
-        from shortlist.engine.models import ArrTarget, RequestConfig, RequestReport, RowSpec
-        from shortlist.engine.models import MediaType as MT
-
-        ctx.config.rows = [
-            RowSpec(
-                slug="gems",
-                name_template="Hidden Gems",
-                size=5,
-                candidate_sources=["tmdb_discover"],
-                request_tag="gems",
-                auto_user_tag=row_override,
-            )
-        ]
-        sarah = make_profile("sarah", account_id=100, request_tag=user_tag)
-        mock_plextv.users = [plextv_user(100, "sarah")]
-        ctx.tmdb.genre_ids_for.side_effect = lambda tid, mt: [18]
-        ctx.tmdb.discover.side_effect = lambda mt, gids, **kw: [
-            {"id": 30, "title": "Missing Gem", "genre_ids": [], "vote_average": 8.4}
-        ]
-        ctx.config.requests = RequestConfig(
-            enabled=True,
-            radarr=ArrTarget(url="http://radarr.test", api_key="k", quality_profile_id=1, root_folder="/m"),
-            auto_user_tag=global_on,
-        )
-        captured = {}
-        monkeypatch.setattr(
-            pipeline_mod.requests_mod,
-            "request_missing",
-            lambda cfg, tmdb, demand, **kw: captured.setdefault("demand", demand) or RequestReport(),
-        )
-
-        pipeline_mod.run(ctx, [sarah])
-
-        rows = {row.slug: row.demand for row in captured["demand"]}
-        return rows["gems"][(30, MT.MOVIE)].tags
-
-    def test_off_by_default_tags_no_username(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        # The upgrade case: nobody has touched the setting, so the Arr sees only the row's own tag.
-        tags = self._missing_tags(ctx, mock_plextv, monkeypatch, global_on=False, row_override=None)
-        assert tags == {"gems"}
-
-    def test_global_switch_tags_the_users_slug(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        tags = self._missing_tags(ctx, mock_plextv, monkeypatch, global_on=True, row_override=None)
-        assert tags == {"gems", "sarah"}
-
-    def test_row_override_off_beats_the_global_switch(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        # A row opting out still keeps its OWN tag — only the person's slug is suppressed.
-        tags = self._missing_tags(ctx, mock_plextv, monkeypatch, global_on=True, row_override=False)
-        assert tags == {"gems"}
-
-    def test_row_override_on_beats_the_global_switch(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        tags = self._missing_tags(ctx, mock_plextv, monkeypatch, global_on=False, row_override=True)
-        assert tags == {"gems", "sarah"}
-
-    def test_an_explicit_user_tag_replaces_the_automatic_slug(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        # Not layered: someone who set "vip" by hand chose their tag, and getting "vip" AND "sarah"
-        # is the clutter the automatic tag was dropped for in the first place.
-        tags = self._missing_tags(ctx, mock_plextv, monkeypatch, global_on=True, row_override=None, user_tag="vip")
-        assert tags == {"gems", "vip"}
-
-    def test_the_slug_reaches_the_arr_client_as_a_real_tag(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        """The join nothing else covers: the switch is read at one end of the run and the tag is sent
-        at the other, and every test either side of this stops at `MissingTitle.tags`. Runs the REAL
-        request pass so a break anywhere in between shows up here."""
-        from shortlist.engine import requests as requests_mod
-        from shortlist.engine.models import ArrTarget, RequestConfig, RowSpec
-        from tests.unit.test_requests import FakeArr
-
-        radarr = FakeArr()
-        monkeypatch.setattr(requests_mod, "RadarrClient", lambda *a, **k: radarr)
-
-        ctx.config.rows = [
-            RowSpec(slug="gems", name_template="Hidden Gems", size=5, candidate_sources=["tmdb_discover"])
-        ]
-        # A slug with an underscore, because that is what a two-word Plex name produces. It reaches
-        # the client verbatim; turning it into `moo-house` for the Arr's charset is the CLIENT's job
-        # and is pinned separately (`test_arr.py::test_tags_are_sanitized_to_the_arr_charset`).
-        steve = make_profile("MooHouse", account_id=100, slug="moo_house")
-        mock_plextv.users = [plextv_user(100, "MooHouse")]
-        ctx.tmdb.genre_ids_for.side_effect = lambda tid, mt: [18]
-        ctx.tmdb.discover.side_effect = lambda mt, gids, **kw: [
-            {"id": 30, "title": "Missing Gem", "genre_ids": [], "vote_average": 9.0, "vote_count": 900}
-        ]
-        ctx.config.requests = RequestConfig(
-            enabled=True,
-            radarr=ArrTarget(url="http://radarr.test", api_key="k", quality_profile_id=1, root_folder="/m"),
-            auto_user_tag=True,
-            auto_min_demand=1,  # one person is enough, or nothing is SENT and there is no call to assert
-        )
-
-        pipeline_mod.run(ctx, [steve])
-
-        assert radarr.tag_calls == [{"moo_house"}], "the wanting person's slug never reached Radarr"
-
-    def test_an_explicit_user_tag_survives_a_row_opting_out(self, ctx: EngineContext, mock_plextv, monkeypatch):
-        # `auto_user_tag` governs the AUTOMATIC slug only. A tag the owner typed on a person is not
-        # Shortlist's to drop, or turning the switch off on one row would silently unpick it.
-        tags = self._missing_tags(ctx, mock_plextv, monkeypatch, global_on=True, row_override=False, user_tag="vip")
-        assert tags == {"gems", "vip"}
-
-
 class TestPlacement:
     """Per-row placement (Home / Library / Both) and pin-to-top reach promote() with the right flags."""
 
@@ -4712,11 +4477,36 @@ class TestOrphanDeletion:
         assert report.orphans_removed == ["Shortlist_ghost"]
 
 
+class FakeMdbList:
+    """Stand-in MDBList client returning preset (rating, votes) by TMDB id, counting lookups.
+
+    ``rate_limit_after`` raises MdbListRateLimitError once that many LIVE lookups have happened
+    (drives the TMDB fallback). Like the real client, a title's first lookup caches its whole rating
+    set, so a second read of the same title costs no quota.
+    """
+
+    def __init__(self, ratings: dict[int, tuple[float, int] | None], *, rate_limit_after: int | None = None):
+        self._ratings = ratings
+        self._rate_limit_after = rate_limit_after
+        self._cached: set[int] = set()
+        self.calls = 0  # every lookup asked for, cached or not
+        self.live_lookups = 0  # only those that cost an API call — what the daily quota actually sees
+
+    def rating(self, tmdb_id: int, media_type: MediaType, source: str) -> tuple[float, int] | None:
+        self.calls += 1
+        if tmdb_id not in self._cached:
+            self.live_lookups += 1
+            self._cached.add(tmdb_id)
+            if self._rate_limit_after is not None and self.live_lookups > self._rate_limit_after:
+                raise MdbListRateLimitError("quota spent")
+        return self._ratings.get(tmdb_id, (8.0, 500))
+
+
 class TestRatingSource:
     """Ordering by "Highest rated" when the owner picked a non-TMDB service (IMDb, Trakt, …).
 
-    The score comes from MDBList, which the request gate already uses. Only rows actually ordered by
-    rating pay for it, and only for the picks that survived into the row.
+    The score comes from MDBList. Only rows actually ordered by rating pay for it, and only for the
+    picks that survived into the row.
     """
 
     def _rating_ctx(self, ctx, source: str, mdblist):
@@ -4733,8 +4523,6 @@ class TestRatingSource:
     def test_a_rating_row_sorts_on_the_configured_service_not_tmdb(self, ctx: EngineContext, mock_plextv):
         """The whole point: TMDB rates 10 highest and 19 lowest in this fixture, so an IMDb order that
         reverses them cannot be TMDB's numbers by coincidence."""
-        from tests.unit.test_requests import FakeMdbList
-
         mdblist = FakeMdbList({tid: (float(tid), 5000) for tid in range(10, 20)})  # IMDb: 19 best, 10 worst
         self._rating_ctx(ctx, "imdb", mdblist)
         sarah = make_profile("sarah", account_id=100)
@@ -4748,8 +4536,6 @@ class TestRatingSource:
     def test_the_default_source_costs_no_lookups_at_all(self, ctx: EngineContext, mock_plextv):
         """TMDB is already on every candidate, so the default must not touch MDBList — otherwise every
         rating-ordered row on the server would spend quota for a number it already had."""
-        from tests.unit.test_requests import FakeMdbList
-
         mdblist = FakeMdbList({})
         self._rating_ctx(ctx, "tmdb", mdblist)
         sarah = make_profile("sarah", account_id=100)
@@ -4764,8 +4550,6 @@ class TestRatingSource:
         """A row must never be sorted on two services' scales at once. Falling back only for the
         titles AFTER the 429 would interleave IMDb scores with TMDB ones, which is worse than either.
         """
-        from tests.unit.test_requests import FakeMdbList
-
         # Reversed vs TMDB, so a partial application would be obvious in the delivered order.
         mdblist = FakeMdbList({tid: (float(tid), 5000) for tid in range(10, 20)}, rate_limit_after=2)
         self._rating_ctx(ctx, "imdb", mdblist)
@@ -4779,8 +4563,6 @@ class TestRatingSource:
     def test_a_title_the_service_cannot_score_sorts_last(self, ctx: EngineContext, mock_plextv):
         """An unrated title is not an error — IMDb simply has no score for some titles. It goes to the
         end of the row rather than dropping out of it or failing the run."""
-        from tests.unit.test_requests import FakeMdbList
-
         ratings: dict[int, tuple[float, int] | None] = {tid: (float(tid), 5000) for tid in range(10, 20)}
         # 12 is one of the five titles that actually reach this row (selection takes the top 5 by
         # ranking), and would otherwise sit mid-row on the IMDb scale — so "sorts last" is a real move.
@@ -4816,7 +4598,6 @@ class TestRatingSource:
         services' scales, which is worse than sorting it on either.
         """
         from shortlist.engine.rows import _apply_order, _rated_by_source
-        from tests.unit.test_requests import FakeMdbList
 
         picks = [
             Pick(tmdb_id=1, rating_key=1, title="A", rank=1, reason="", media_type=MediaType.MOVIE, rating=9.0),
@@ -4840,8 +4621,6 @@ class TestRatingSource:
         """Without a latch, every rating-ordered row for every user re-attempts after the first 429 —
         and each attempt is retried three times honouring Retry-After (up to 60s). On a 40-user server
         that is minutes of stall for results that are thrown away."""
-        from tests.unit.test_requests import FakeMdbList
-
         mdblist = FakeMdbList({tid: (float(tid), 5000) for tid in range(10, 20)}, rate_limit_after=0)
         self._rating_ctx(ctx, "imdb", mdblist)
         mock_plextv.users = [plextv_user(100, "sarah"), plextv_user(101, "mike")]

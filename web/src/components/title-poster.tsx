@@ -7,8 +7,8 @@ import { cn } from "@/lib/utils";
 /**
  * A title's artwork at a fixed size, with a same-size placeholder for everything that can go wrong.
  *
- * Two sources, because the two lists show different kinds of title. An INBOX title is not on the
- * server yet, so its only artwork is TMDB's. A delivered PICK is in the library by construction, so
+ * Two sources, because lists show different kinds of title. A MISSING title is not on the server
+ * yet, so its only artwork is TMDB's. A delivered PICK is in the library by construction, so
  * its artwork is the one the owner actually has in Plex — including whatever Kometa or TMM put
  * there. Passing a `ratingKey` uses the PMS proxy; passing a `posterPath` uses TMDB's CDN.
  *
@@ -22,7 +22,7 @@ export function TitlePoster({
 }: {
   /** A delivered pick's Plex ratingKey. `0` means the pipeline never matched it to a library item. */
   ratingKey?: number | null;
-  /** An inbox title's TMDB poster path. */
+  /** A missing title's TMDB poster path. */
   posterPath?: string | null;
   className?: string;
 }) {
@@ -36,12 +36,12 @@ export function TitlePoster({
     ? apiUrl(`/api/picks/${ratingKey}/poster`)
     : posterPath
       ? // `w154` is the smallest TMDB bucket that still looks sharp at this size on a 2x display, so
-        // a 40-title inbox costs a few hundred KB rather than megabytes.
+        // a 40-title list costs a few hundred KB rather than megabytes.
         `https://image.tmdb.org/t/p/w154${posterPath}`
       : null;
 
   const box = cn(
-    // 58x87 is 2:3, the size the request inbox already uses. 40x60 below `sm` is what makes 320px
+    // 58x87 is 2:3. 40x60 below `sm` is what makes 320px
     // work: it leaves a 236px text column once the card padding and gap are paid for.
     "h-[60px] w-[40px] shrink-0 rounded border sm:h-[87px] sm:w-[58px]",
     className,

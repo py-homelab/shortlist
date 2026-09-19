@@ -11,7 +11,6 @@ import {
   ArrowRight,
   Check,
   ChevronRight,
-  Clock,
   Globe,
   History,
   Filter,
@@ -21,7 +20,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode } from "react";
-import { createContext, useContext, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useParams } from "react-router";
 
 import { BackLink } from "@/components/back-link";
@@ -41,7 +40,6 @@ import {
   buildLibraries,
   fateLabel,
   orderingRows,
-  requestNote,
   shortlistBreakdown,
   mediaGroupLabel,
   mediaLabel,
@@ -56,7 +54,6 @@ import type {
   RunLibraryBreakdown,
   RunUserTraceResponse,
   TraceRatings,
-  TraceRequestOutcome,
   TraceReturn,
   TraceSeed,
   TraceSeedQuery,
@@ -66,18 +63,6 @@ import type {
   TraceSelection,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
-
-/** What the request subsystem did with each wanted-but-missing title, keyed "<tmdb_id>:<media>".
- *  Page-scoped (one run, one user) so a deep return row can overlay "→ requested from Radarr" onto a
- *  "not in your libraries" drop without threading the map through every source/query component. */
-const RequestsContext = createContext<Record<string, TraceRequestOutcome>>({});
-
-function useRequestOutcome(
-  tmdbId: number,
-  media: string,
-): TraceRequestOutcome | undefined {
-  return useContext(RequestsContext)[`${tmdbId}:${media}`];
-}
 
 export function RunUserTracePage() {
   // Serves BOTH traces. A shared row runs the same pipeline minus the per-person history stage and
@@ -195,8 +180,7 @@ export function TraceView({
   const current = libraries.find((l) => l.key === active) ?? libraries[0];
 
   return (
-    <RequestsContext.Provider value={data.requests ?? {}}>
-      <div className="space-y-6">
+    <div className="space-y-6">
         <header className="space-y-1">
           <h1 className="text-2xl font-semibold tracking-tight">
             How we picked for {name}
@@ -251,8 +235,7 @@ export function TraceView({
             )}
           </>
         )}
-      </div>
-    </RequestsContext.Provider>
+    </div>
   );
 }
 
@@ -287,7 +270,6 @@ function searchesSampled(lib: LibraryView): boolean {
  *  Long groups are collapsed behind a <details> — a filtered-out group can run to hundreds, and the
  *  step above it is the headline, not a list to scroll past. */
 function ShortlistTitles({ lib }: { lib: LibraryView }): ReactNode {
-  const requests = useContext(RequestsContext);
   const { total, sampled, groups } = shortlistBreakdown(lib);
   if (total === 0) return null;
   // The trace records a SAMPLE of each source's returns (12 seeds x 25 returns each), so "all N
@@ -347,19 +329,6 @@ function ShortlistTitles({ lib }: { lib: LibraryView }): ReactNode {
                       release date &times;{t.age_weight.toFixed(2)}
                     </span>
                   )}
-                  {/* This group IS the Radarr/Sonarr pool, so say what was asked for and what was
-                      not — the two halves of the product were never joined up on screen. */}
-                  {(() => {
-                    // Keyed "<tmdb_id>:<media>" — the pair, because a tmdb_id is NOT unique on
-                    // its own (`uq_request_candidate_title` is (tmdb_id, media_type)). Falling back
-                    // to the movie key would report a movie's request against a show of the same id.
-                    const note = requestNote(
-                      requests[`${t.tmdb_id}:${t.media}`],
-                    );
-                    return note ? (
-                      <span className="text-primary/80">{note}</span>
-                    ) : null;
-                  })()}
                 </li>
               ))}
             </ul>
@@ -1257,7 +1226,6 @@ function SeedQueryRow({
         <ReturnList
           returned={query.returned}
           total={query.total}
-          media={query.media}
         />
       ) : (
         <p className="mt-0.5 pl-5 text-xs text-muted-foreground">
@@ -1277,11 +1245,9 @@ const _RETURN_PREVIEW = 6; // titles shown before "show the rest" — enough to 
 function ReturnList({
   returned,
   total,
-  media,
 }: {
   returned: TraceReturn[];
   total: number;
-  media: string;
 }) {
   const preview = returned.slice(0, _RETURN_PREVIEW);
   const rest = returned.slice(_RETURN_PREVIEW);
@@ -1289,7 +1255,7 @@ function ReturnList({
   return (
     <ul className="mt-1.5 space-y-1 pl-5">
       {preview.map((r, i) => (
-        <ReturnRow key={`${r.tmdb_id}-${i}`} ret={r} media={media} />
+        <ReturnRow key={`${r.tmdb_id}-${i}`} ret={r} />
       ))}
       {rest.length > 0 && (
         <li>
@@ -1303,7 +1269,7 @@ function ReturnList({
             </summary>
             <ul className="mt-1 space-y-1">
               {rest.map((r, i) => (
-                <ReturnRow key={`${r.tmdb_id}-${i}`} ret={r} media={media} />
+                <ReturnRow key={`${r.tmdb_id}-${i}`} ret={r} />
               ))}
             </ul>
           </details>
@@ -1319,13 +1285,8 @@ function ReturnList({
   );
 }
 
-function ReturnRow({ ret, media }: { ret: TraceReturn; media: string }) {
+function ReturnRow({ ret }: { ret: TraceReturn }) {
   const kept = ret.fate === "kept";
-  // A title we couldn't show because no library held it may still have been requested from
-  // Sonarr/Radarr — overlay that outcome so the drop reads "→ requested from Radarr", not a dead end.
-  const request = useRequestOutcome(ret.tmdb_id, media);
-  const showRequest =
-    ret.fate === "not_in_your_libraries" && request !== undefined;
   return (
     <li className="flex items-center gap-2 text-xs">
       {ret.fate === undefined ? (
@@ -1377,43 +1338,7 @@ function ReturnRow({ ret, media }: { ret: TraceReturn; media: string }) {
           {fateLabel(ret.fate)}
         </span>
       )}
-      {showRequest && request && (
-        <span className="shrink-0 text-muted-foreground/80" aria-hidden="true">
-          →
-        </span>
-      )}
-      {showRequest && request && <RequestOutcomeTag request={request} />}
     </li>
-  );
-}
-
-/** The "→ requested from Radarr" tail on a not-in-your-libraries drop. Says what actually happened:
- *  sent = the request went to Sonarr/Radarr; pending = it's queued for the owner to approve;
- *  rejected = the owner dismissed it. `excluded` titles are flagged (approving is a no-op until the
- *  owner clears the arr's import-exclusion list). */
-function RequestOutcomeTag({ request }: { request: TraceRequestOutcome }) {
-  if (request.status === "sent") {
-    return (
-      <span className="inline-flex shrink-0 items-center gap-1 text-success">
-        <Check className="h-3 w-3" aria-hidden="true" />
-        requested from Sonarr/Radarr
-      </span>
-    );
-  }
-  if (request.status === "pending") {
-    return (
-      <span className="inline-flex shrink-0 items-center gap-1 text-muted-foreground">
-        <Clock className="h-3 w-3" aria-hidden="true" />
-        {request.excluded
-          ? "queued — but on the arr’s exclusion list"
-          : "queued for your approval"}
-      </span>
-    );
-  }
-  return (
-    <span className="shrink-0 text-muted-foreground/80">
-      you dismissed this request
-    </span>
   );
 }
 

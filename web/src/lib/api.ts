@@ -10,8 +10,6 @@ import type {
   ApiTokenStatus,
   NotificationsPage,
   WhatsNew,
-  ArrOptions,
-  SeerrOptions,
   Backup,
   PendingRestore,
   BlockedSeed,
@@ -40,9 +38,6 @@ import type {
   PlexServer,
   ProbeRequest,
   ProbeResult,
-  ArrStatus,
-  RequestCandidate,
-  RequestSendResult,
   Run,
   RunCreated,
   RunDetail,
@@ -506,15 +501,6 @@ export const api = {
   testConnection: (service: TestableService): Promise<ConnectionTestResult> =>
     request(`/api/settings/test/${service}`, { method: "POST" }),
 
-  /** Quality profiles + root folders for a connected Sonarr/Radarr (for the request-setup dropdowns). */
-  getArrOptions: (service: "radarr" | "sonarr"): Promise<ArrOptions> =>
-    request(`/api/settings/arr/${service}/options`),
-
-  /** Overseerr/Jellyseerr accounts, for the "request as" dropdown. No quality profiles or root
-   *  folders here — those are the *seerr's own business on that route. */
-  getSeerrOptions: (): Promise<SeerrOptions> =>
-    request("/api/settings/overseerr/options"),
-
   /** Model ids a provider offers, for the model picker. The body carries the (possibly unsaved)
    *  provider + key/URL being edited so the list reflects the current form; blank fields fall back to
    *  saved settings and a redacted key means "use the saved key" (empty result = free-text fallback). */
@@ -705,54 +691,6 @@ export const api = {
       throw new ApiError(response.status, await errorMessageFrom(response));
     return response.blob();
   },
-
-  // --- Requests (Sonarr/Radarr approval inbox) ---
-  /** The approval inbox. `wantedBy` names the people to keep (bare Plex usernames, as stored in
-   *  `wanters`); the server applies it BEFORE its 500-row cap, so a name reaches the whole history
-   *  rather than the page. Empty/omitted = everyone, the unfiltered inbox. */
-  listRequests: (wantedBy: string[] = []): Promise<RequestCandidate[]> => {
-    const params = new URLSearchParams();
-    for (const name of wantedBy) params.append("wanted_by", name);
-    const query = params.toString();
-    return request(query ? `/api/requests?${query}` : "/api/requests");
-  },
-
-  sendRequests: (ids: number[], dryRun = false): Promise<RequestSendResult> =>
-    request("/api/requests/send", {
-      method: "POST",
-      body: JSON.stringify({ ids, dry_run: dryRun }),
-    }),
-
-  rejectRequests: (ids: number[]): Promise<{ rejected: number }> =>
-    request("/api/requests/reject", {
-      method: "POST",
-      body: JSON.stringify({ ids }),
-    }),
-
-  // Un-reject: move rejected titles back to Waiting (pending) right now, metadata intact.
-  restoreRequests: (ids: number[]): Promise<{ restored: number }> =>
-    request("/api/requests/restore", {
-      method: "POST",
-      body: JSON.stringify({ ids }),
-    }),
-
-  // Hard-delete (no tombstone) — a later run can re-surface the title.
-  deleteRequests: (ids: number[]): Promise<{ deleted: number }> =>
-    request("/api/requests/delete", {
-      method: "POST",
-      body: JSON.stringify({ ids }),
-    }),
-
-  // Clear SENT titles from the send log — hides them (the sent tombstone stays, so they're not
-  // re-requested), never un-sends from Sonarr/Radarr.
-  clearRequests: (ids: number[]): Promise<{ cleared: number }> =>
-    request("/api/requests/clear", {
-      method: "POST",
-      body: JSON.stringify({ ids }),
-    }),
-
-  /** Live Sonarr/Radarr status for every waiting and sent title, plus whether each app answered. */
-  getArrStatus: (): Promise<ArrStatus> => request("/api/requests/status"),
 
   // --- System ---
   /**

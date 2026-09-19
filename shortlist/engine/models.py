@@ -197,18 +197,17 @@ class Candidate:
     year: int | None = None
     genres: list[str] = field(default_factory=list)
     rating: float = 0.0  # TMDB vote_average, 0..10
-    vote_count: int = 0  # TMDB vote_count — a 9.0 from 12 votes is noise; the request gate needs both
+    vote_count: int = 0  # TMDB vote_count — a 9.0 from 12 votes is noise
     # TMDB's own poster path ("/abc.jpg"), free in every list response. Only carried through to the
-    # request inbox, which shows the artwork — a delivered pick uses Plex's copy of the title.
+    # person's request surface, which shows the artwork — a delivered pick uses Plex's copy of the title.
     poster_path: str = ""
     # TMDB's synopsis, free in the same list response as the poster and carried the same way: only
-    # the request inbox reads it, so the owner can judge an unfamiliar title without leaving the page.
+    # the request surface reads it, so a person can judge an unfamiliar title without leaving the page.
     overview: str = ""
     # TMDB's `original_language` (ISO 639-1, lowercase: "en", "ja", "ko"), free in every TMDB list
-    # response and used only by the request gate. Empty means UNKNOWN, not English: `merge()` builds
+    # response and shown on the request surface. Empty means UNKNOWN, not English: `merge()` builds
     # candidates from a non-TMDB source's own fields and never sees a TMDB payload, so Trakt titles
-    # arrive without one. The gate treats unknown as preferred — see `is_preferred_language`
-    # in engine/requests.py (and `_language_allowed`, its base-gate wrapper).
+    # arrive without one.
     language: str = ""
     seeds: list[Seed] = field(default_factory=list)  # every seed that suggested it
     rating_key: int | None = None  # set once matched to the library
@@ -339,7 +338,6 @@ class UserProfile:
     excluded_genres: set[str] = field(default_factory=set)
     blocked_seeds: set[int] = field(default_factory=set)
     row_name_template: str | None = None
-    request_tag: str = ""  # tag added to titles requested for this user (layered onto global + row tags)
     # Per-row overrides keyed by collection slug; a slug absent here uses the row's own settings.
     row_overrides: dict[str, RowOverride] = field(default_factory=dict)
 
@@ -424,12 +422,6 @@ class RowSpec:
     # Shared rows only: a title must have been watched by at least this many distinct people to
     # qualify, so no one person's solo viewing can reach a public row (aggregate-privacy floor).
     min_watchers: int = 2
-    request_tag: str = ""  # tag added to titles requested because they surfaced in this row
-    # Whether requests from this row also carry the WANTING PERSON'S slug as a tag, so the owner
-    # can tell in Sonarr/Radarr who a title was added for. None -> inherit the global
-    # `requests.auto_user_tag`; True/False overrides it for this row alone. Governs only the
-    # automatic slug — a tag the owner typed on a person is theirs and is never dropped here.
-    auto_user_tag: bool | None = None
     # Per-row override of which discovery sources feed this row; empty -> inherit EngineConfig.candidate_sources.
     candidate_sources: list[str] = field(default_factory=list)
     # Per-row cap on already-watched titles, as a fraction of the row (0.0 = all fresh, 1.0 = no
@@ -504,12 +496,6 @@ class RowSpec:
     # Added LAST, deliberately: several call sites build a RowSpec positionally, so a new field in
     # the middle silently shifts every argument after it. The same hazard bit HubAnchor.anchor_row.
     fallback_name: str = ""
-    # This row's own Sonarr/Radarr target and request floors; None -> inherit the global RequestConfig
-    # entirely. Grouped into one dataclass rather than a dozen flat fields for the reason directly
-    # above. Only per-person rows can carry these: a shared row is built from titles people have
-    # already WATCHED, which are by definition already on the server, so it surfaces nothing missing
-    # to request (see `_shared_row`, and `_record_demand` being reached only from `_warm_start`).
-    request_overrides: RequestOverrides | None = None
     # How many of this person's most recent watches this row may be built from, of which ONE (per media
     # type) is chosen each run — the row cycles a step a day rather than sitting on their newest watch
     # for ever. 1 (the default) is the original behaviour: always the most recent.
@@ -629,453 +615,19 @@ class RowSpec:
         return f"{SHARED_LABEL_PREFIX}{self.slug}" if self.shared else None
 
 
-# How much of a show Sonarr takes, as `addOptions.monitor` (MonitorTypes in Sonarr's
-# src/NzbDrone.Core/Tv/MonitoringOptions.cs). A SUBSET of that enum, and the cuts are measured rather
-# than guessed — every mode below was added to a real Sonarr 4.0.19 and its resulting season/episode
-# monitoring read back:
-#
-#   all 156/162 episodes · firstSeason 26 (season 1) · lastSeason 26 (the last) · pilot 1 · none 0
-#
-# Left out: `unknown` and `skip` are internal, `latestSeason` is [Obsolete], the two Specials entries
-# only toggle season 0 (a Season Pass concern, not "how much of this show do I want"), and
-# `future`/`existing`/`recent` all measured 0/162 on a show nobody has yet — `existing` monitors what
-# is on disk, `future` what has not aired, `recent` a 90-day window an older show is nowhere near.
-# Meaningful in Sonarr's own Season Pass; on the only thing Shortlist ever does — a NEW add — they are
-# an obscure spelling of `none`, which says it plainly. `missing` goes the other way for the same
-# reason: with nothing on disk, every aired episode is missing, so it measured identically to `all`
-# (156/162) and is that mode under a name that suggests restraint it does not provide.
-SONARR_MONITOR_MODES = (
-    "all",
-    "firstSeason",
-    "lastSeason",
-    "pilot",
-    "none",
-)
-
-
-# How the request gate treats a title's ORIGINAL language (TMDB's `original_language`, an ISO 639-1
-# code like "en"/"ja"/"ko" — the language it was MADE in, not the audio tracks a release happens to
-# carry). "any" is what every build before this setting did, and stays the default: an upgrade
-# changes nothing until an owner picks otherwise.
-LANGUAGE_MODES = (
-    "any",  # one bar for everything — today's behaviour
-    "prefer",  # preferred languages keep the normal bars; everything else needs `min_rating_other` to auto-send
-    "only",  # never request anything outside the preferred list at all
-)
-
-# How far above the owner's own `min_rating` the other-language auto-send bar sits when they have not
-# set one themselves. Derived rather than a flat constant so the shipped default carries the OWNER's
-# taste, not ours: a permissive 6.0 server starts at 7.5 and a strict 8.0 one at 9.5, where a fixed
-# 8.5 would be a huge jump for the first and a no-op for the second.
-OTHER_LANGUAGE_BAR_GAP = 1.5
-
-
-def row_language_mode_or_inherit(stored: str | None) -> str | None:
-    """One row's stored language mode, or None when it is not a mode this build offers.
-
-    Same degrade-to-inherit contract as :func:`row_monitor_or_inherit`, and for the same reason: a
-    row holding a value the API's closed-set check refuses cannot be saved at all — not even renamed
-    — because the editor PATCHes the whole row back. See that function for the full account.
-    """
-    return stored if stored in LANGUAGE_MODES else None
-
-
-def normalise_languages(codes) -> tuple[str, ...]:
-    """Clean a list of language codes into lowercase ISO 639-1, deduplicated, order preserved.
-
-    TMDB reports `original_language` lowercase ("ja"), but a code typed into the settings UI or
-    seeded from an env var may not be — and a case mismatch here silently reclassifies every title in
-    that language as "other", which is a bar change the owner never asked for.
-
-    NEVER RAISES, whatever it is handed. The API validates this setting, but the context builder reads
-    it on every run and the value can reach here from places validation does not cover: a hand-edited
-    database, a future storage format, a downgrade. A `TypeError` there is a crash loop rather than
-    one broken setting — the failure mode `SettingsStore._unwrap` exists to prevent, and the shape of
-    a bug this codebase has already shipped once (`row.size: "abc"` crashed every run and 500'd two
-    endpoints). Anything unusable degrades to "no preferred languages", which the modes above treat
-    conservatively rather than silently.
-
-    A bare string is taken as ONE code, not iterated: `"en"` must not become `("e", "n")`, which is
-    two nonsense codes that match nothing and would quietly put every title on the higher bar.
-    """
-    if codes is None:
-        return ()
-    if isinstance(codes, str):
-        codes = [codes]
-    elif not isinstance(codes, (list, tuple, set, frozenset)):
-        return ()  # silently, like `row_monitor_or_inherit` — this module deliberately has no logger
-    # A SET for the membership test, not the list — `code not in seen` on a list is O(n) per item,
-    # so a pathological setting (a list of many thousands of distinct codes) made this quadratic on a
-    # path the context builder runs on every single run. Order is still the owner's, from the list.
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for raw in codes:
-        if not isinstance(raw, str):
-            continue  # a number or a nested object is not a language code; skip it, never crash
-        code = raw.strip().lower()
-        if code and code not in seen:
-            seen.add(code)
-            ordered.append(code)
-    return tuple(ordered)
-
-
-def row_languages_or_inherit(stored: object) -> tuple[str, ...] | None:
-    """One row's stored language list, or None when it inherits the owner's.
-
-    NULL inherits; a LIST is taken as given, including an EMPTY one — a row that cleared its languages
-    means it, and in "only" mode that row requests nothing at all. The two must not collapse into each
-    other (see the 0085 migration note), so this tests for None rather than for falsiness.
-    """
-    if stored is None:
-        return None
-    return normalise_languages(stored)
-
-
-def row_monitor_or_inherit(stored: str | None) -> str | None:
-    """One row's stored monitor mode, or None when it is not a mode this build offers.
-
-    A mode can be RETIRED — `future`, `missing`, `existing` and `recent` were, once measured — and a
-    row can then be holding a value the API will refuse. Left alone that bricks the row: the editor
-    PATCHes the whole row back, the closed-set check rejects the field, and the owner cannot save so
-    much as a rename until somebody clears it in SQLite.
-
-    Degrades to None (inherit) rather than to a concrete mode, so the screen and the run agree — the
-    editor shows "use the global", and the run sends the global. Falling back to "all" here would
-    instead pick the most expensive answer on the one setting whose purpose is not doing that.
-    """
-    return stored if stored in SONARR_MONITOR_MODES else None
-
-
-@dataclass(frozen=True)
-class ArrTarget:
-    """Where and how a Sonarr/Radarr instance should file a newly-requested title."""
-
-    url: str
-    api_key: str
-    quality_profile_id: int
-    root_folder: str
-    tag: str = ""  # if set, tag every title Shortlist adds (created in the app if it doesn't exist)
-
-
 @dataclass(frozen=True)
 class SeerrTarget:
-    """Which Overseerr/Jellyseerr instance to file requests with, and as whom.
+    """Which Overseerr/Jellyseerr instance the server talks to.
 
-    No quality profile, root folder or tag — that is the whole reason to route here rather than at
-    Radarr/Sonarr. The *seerr applies its own rules; Shortlist only says which title it wants.
+    No quality profile, root folder or tag: the *seerr applies its own rules, and each person files
+    their own requests through it (`SeerrPersonClient`). Shortlist only says which title is wanted.
     """
 
     url: str
     api_key: str
-    #: The instance's user id to file as. 0/None -> omit ``userId`` and let the api key's own account
-    #: own the request, which normally means auto-approved (that account is an admin). Pointing this
-    #: at a non-auto-approve account is how the owner gets a second approval gate in the *seerr.
+    #: Legacy field, kept so older callers constructing a target positionally still work. Nothing
+    #: reads it: requests are filed as the person themselves, never as a configured stand-in.
     request_as_user_id: int = 0
-
-
-#: The two places a request can be filed. ``arr`` posts to Radarr/Sonarr directly (the original, and
-#: still the default); ``overseerr`` hands the title to Overseerr/Jellyseerr and lets it drive them.
-REQUEST_TARGETS = ("arr", "overseerr")
-
-
-@dataclass
-class RequestConfig:
-    """Whether — and how conservatively — to ask Sonarr/Radarr for picks the library lacks.
-
-    Off by default and gated on several axes so an LLM's suggestions can never balloon a library.
-    A title must clear the rating/vote floors of the chosen ``rating_source`` (a high score from a
-    handful of votes is noise), be wanted by at least ``min_demand`` distinct people, fall inside the
-    ``min_year``..``max_year`` release window, and even then only the top ``max_per_run`` across the
-    whole run are requested.
-    """
-
-    enabled: bool = False
-    # Which route the owner CHOSE, independent of whether its target resolved. Carried separately
-    # because "no target" and "no target on the route you picked" need different explanations: with
-    # only the targets to go on, a half-configured Overseerr was indistinguishable from an
-    # unconfigured Radarr, and every title came back "Radarr not fully configured (check quality
-    # profile and root folder)" — naming an app the owner had deliberately stopped using and two
-    # settings that do not exist on their route.
-    target: str = "arr"  # one of REQUEST_TARGETS
-    radarr: ArrTarget | None = None  # None -> movie requests are skipped
-    sonarr: ArrTarget | None = None  # None -> show requests are skipped
-    # Set INSTEAD of radarr/sonarr, never alongside: the context builder reads `requests.target` and
-    # populates one side or the other. When this is set the Arr targets are ignored entirely, so the
-    # per-row quality-profile/root-folder/monitor overrides have nothing to act on — the *seerr owns
-    # those choices, which is the point of routing through it.
-    overseerr: SeerrTarget | None = None
-    # Which score gates a title. TMDB is always available (no setup); imdb/trakt/tomatoes/metacritic
-    # come from MDBList (needs a key). The min_rating/min_votes floors read from whichever is chosen;
-    # every non-TMDB score is normalised to 0..10 so one floor works across sources.
-    rating_source: str = "tmdb"  # tmdb | imdb | trakt | tomatoes | metacritic
-    mdblist_api_key: str = ""  # required for any non-TMDB source; else rating gating falls back to TMDB
-    min_rating: float = 7.0  # rating floor, 0..10, on the chosen source
-    min_votes: int = 100  # vote-count floor (audience-vote sources only: imdb/trakt/tmdb)
-    min_demand: int = 1  # a title must be wanted by at least this many distinct people
-    # Release-year window (a show's year is its first-air year). 0 disables that end of the range.
-    min_year: int = 0  # 0 -> no lower bound; else request only titles from >= this year
-    max_year: int = 0  # 0 -> no upper bound; else request only titles from <= this year
-    max_per_run: int = 5  # hard cap on how many titles a single run may auto-request, total
-    # Hybrid tier. A title that also clears these HIGHER bars (within max_per_run) is requested
-    # automatically each run; every other title that still cleared the base floors above is queued
-    # for the owner to approve by hand. Set auto_send False for a fully manual queue, or set these
-    # equal to the base floors for fully automatic requesting (nothing is ever queued).
-    auto_send: bool = True
-    auto_min_demand: int = 3  # auto-send only titles wanted by at least this many distinct people
-    auto_min_rating: float = 8.0  # ...and rated at least this high on the chosen source
-    # Language preference. `language_mode` is one of LANGUAGE_MODES; `preferred_languages` are the
-    # ISO 639-1 codes it treats as preferred. Defaults are "any" + ("en",) — the mode is what is off,
-    # so the language list is merely the value it would use, and an upgrade changes nothing.
-    #
-    # In "prefer" mode a non-preferred title keeps the same BASE floors as everything else and gains
-    # one extra AUTO-SEND bar, `min_rating_other`. That tier is deliberate: a title below a base floor
-    # is dropped and the owner never learns it existed, where a title held at the auto tier lands in
-    # the inbox with its reason on it. "Prefer" means "don't send this on its own, but tell me" —
-    # only "only" mode discards, and it does so at the base gate.
-    language_mode: str = "any"
-    preferred_languages: tuple[str, ...] = ("en",)
-    # None — not 0.0 — means "follow `min_rating` + OTHER_LANGUAGE_BAR_GAP". 0.0 is a real choice
-    # (a bar nothing can fail), so it cannot double as the unset sentinel; the same trap `max_per_row`
-    # above records. Resolved at gate time from the ROW's resolved `min_rating` — so a row that raises
-    # its own floor carries the bar up with it ONLY while this is None. Pin a number here and every
-    # inheriting row takes that number instead, exactly as the other overrides behave.
-    min_rating_other: float | None = None
-    # Tag every request with the wanting person's slug (`moo_house` -> `moo-house`, the Arr charset),
-    # so the owner can see IN Sonarr/Radarr who a title was added for — the Requests inbox why-line
-    # never reaches the Arr. Off by default. A row may override it either way (`RowSpec.auto_user_tag`),
-    # and an explicit per-user tag replaces the slug rather than stacking with it.
-    #
-    # The tag records who TRIGGERED the add, not everyone who has since wanted the title: a title the
-    # Arr already tracks is skipped whole (`clients/arr.py` `add_movie`/`add_series`), tags included.
-    auto_user_tag: bool = False
-    # Populated by the context builder when a target was connected (URL+key) but incomplete (no
-    # profile or folder selected). Surfaces in the run report so the UI can explain the skip.
-    incomplete_targets: list[str] = field(default_factory=list)
-    # This ROW's own ceiling on how many titles it may contribute to the run, for the allocator.
-    # Only ever <= `max_per_run`: the run ceiling is what protects the library from ballooning, so a
-    # row may make itself more restrictive and never less (`resolve_request_config` enforces it).
-    #
-    # None — not 0 — means "inherit the run ceiling". 0 is a REAL choice the UI offers and promises
-    # ("this row never asks for anything on its own"), so using it as the unset sentinel handed such
-    # a row the FULL run cap: the exact inverse of the control, on a path that adds titles to Radarr.
-    max_per_row: int | None = None
-    # Which episodes Sonarr monitors — and so searches for — when Shortlist adds a show. Passed
-    # straight through as `addOptions.monitor`. "all" is Sonarr's own default and what every add did
-    # before this setting existed, so an upgrade changes nothing until somebody picks another.
-    # A long-running show on "all" backfills every season the night it is added (issue #100), where a
-    # taster ("firstSeason") or a catch-up-from-here ("none", added unmonitored) is often what was meant.
-    sonarr_monitor: str = "all"
-
-    def __post_init__(self) -> None:
-        if self.max_per_row is None:
-            self.max_per_row = self.max_per_run
-        # A resolved *seerr target settles the route on its own. The reverse is a real state and must
-        # stay expressible — `target="overseerr"` with no target means "chosen, not connected yet",
-        # which is exactly what lets the run explain itself in the right app's words — but an
-        # `overseerr` target the route ignores is nothing but a way to send to the wrong app.
-        if self.overseerr is not None:
-            self.target = "overseerr"
-
-
-@dataclass(frozen=True)
-class RequestOverrides:
-    """One row's per-row request settings. Every field is optional; None/"" means inherit the global.
-
-    Kept as its own dataclass rather than ten more flat ``RowSpec`` fields because several call sites
-    build a ``RowSpec`` positionally, so a run of new fields in the middle silently shifts every
-    argument after it — the hazard ``RowSpec.fallback_name`` and ``HubAnchor.anchor_row`` both record.
-    One optional field appended at the end is safe; ten in the middle are not.
-
-    Deliberately absent: ``enabled``, ``rating_source``, ``mdblist_api_key``, ``max_per_run``, the
-    rating-lookup budget and ``tag``. Those are the run's ceilings and its single API account — a row
-    that could raise one would turn the owner's global setting into a suggestion.
-
-    The Arr overrides are the FILING choices — profile, root folder, and how much of a show Sonarr
-    monitors. URL and API key stay global: the case this serves is one Radarr filing a kids row into
-    ``/data/Kids`` at a lower profile, not a second Radarr. Overriding any of them on a row whose
-    global target is unconfigured does nothing at all, because there is no URL or key to send to.
-    """
-
-    min_rating: float | None = None
-    min_votes: int | None = None
-    min_demand: int | None = None
-    min_year: int | None = None
-    max_year: int | None = None
-    auto_send: bool | None = None
-    auto_min_demand: int | None = None
-    auto_min_rating: float | None = None
-    max_per_row: int | None = None
-    radarr_quality_profile_id: int | None = None
-    radarr_root_folder: str | None = None
-    sonarr_quality_profile_id: int | None = None
-    sonarr_root_folder: str | None = None
-    sonarr_monitor: str | None = None
-    language_mode: str | None = None
-    # None means inherit, as everywhere else here. An EMPTY tuple is therefore not the same thing:
-    # it is a row that has cleared its language list, which in "only" mode requests nothing at all.
-    preferred_languages: tuple[str, ...] | None = None
-    min_rating_other: float | None = None
-
-
-@dataclass(frozen=True)
-class RequestWhy:
-    """One reason a missing title is in the inbox: a person, the row that surfaced it, and what
-    suggested it — so the owner can see exactly how a request got here, not just a bare count.
-
-    ``seed`` is the history title behind it ("because you watched …"); empty for seedless sources
-    (tmdb_discover / llm_web). ``source`` is the candidate source that produced it.
-
-    ``row`` is the RENDERED name the user sees ("🎯 Because you watched Bluey"), which is why
-    ``row_slug`` exists beside it: the rendered name carries the person's own seed and display name,
-    so it identifies nothing stable. Resolving which row's Sonarr/Radarr target a title should be
-    sent under — months later, when the owner approves it from the inbox — needs the slug.
-    Empty for candidates queued before per-row settings existed; those fall back to the global config.
-    """
-
-    user: str
-    row: str
-    seed: str = ""
-    source: str = ""
-    row_slug: str = ""
-
-
-@dataclass
-class MissingTitle:
-    """A candidate the candidate pool surfaced that no delivery library actually holds yet."""
-
-    tmdb_id: int
-    title: str
-    media_type: MediaType
-    year: int | None
-    rating: float  # rating on the chosen source: TMDB vote_average, or the IMDb rating when rating_source="imdb"
-    vote_count: int  # vote count on that same source
-    demand: int = 1  # distinct users whose candidate pool contained it (multi-person demand ranks higher)
-    imdb_id: str = ""  # "tt…" when TMDB has one — lets the inbox deep-link to IMDb instead of a search
-    # TMDB poster path ("/abc.jpg") so the inbox can show the artwork. Free from the candidate's own
-    # TMDB list response; filled in for the gated shortlist when a non-TMDB source surfaced the title.
-    poster_path: str = ""
-    # TMDB's synopsis, on the same terms as the poster: free from the candidate's list response, and
-    # bought with a detail call only for the gated few a non-TMDB source surfaced. Empty is normal —
-    # TMDB has no synopsis for some titles, and the inbox simply omits the paragraph.
-    overview: str = ""
-    # The candidate's `Candidate.language` (ISO 639-1, lowercase), carried through so the request gate
-    # can pick a bar and the inbox can show which language it is. "" means unknown — see Candidate.
-    # Declared after the fields every positional caller stops at (`vote_count`), never among them:
-    # a new field in the middle silently shifts every argument after it, the hazard RequestOverrides
-    # records.
-    language: str = ""
-    # Per-user + per-row tags to apply on request, layered on top of the target's global tag. Unioned
-    # across every user who wanted the title and every row it surfaced in (deduplication merges them).
-    tags: set[str] = field(default_factory=set)
-    # The usernames whose taste surfaced this title (the "who" behind the demand count) — the inbox
-    # shows the names so an owner sees WHY a title is being requested. len(wanters) <= demand, equal
-    # when every wanting user has a distinct, non-empty username (the real run always passes one).
-    wanters: set[str] = field(default_factory=set)
-    # The full provenance: one entry per (person, row) that wanted this title, with the seed/source
-    # behind it. Richer than `wanters` (which is just the distinct names) — this answers "which row,
-    # and why". Accumulated across every user and row, deduplicated so one (person, row, seed) is
-    # listed once.
-    why: list[RequestWhy] = field(default_factory=list)
-    # Why this title is not on the server yet — either a real send failure ("Sonarr GET …/lookup
-    # returned HTTP 503"), so a FAILED auto-send is queued back to the inbox with the reason visible
-    # instead of vanishing and silently retrying every night, OR the threshold that kept it waiting
-    # ("rating below auto_min_rating (7.5)"). Both answer the inbox's one question; a failure detail
-    # outranks a threshold one when merging (`run_persistence._is_failure_detail`).
-    detail: str = ""
-    # A show's resolved TheTVDB id, cached once (Sonarr keys on TVDB) so the arr-presence check and
-    # the eventual send don't each pay a separate TMDB lookup. None until resolved / for movies.
-    tvdb_id: int | None = None
-    # The arr titleSlug of a sent title, captured at send time so the inbox links straight to its
-    # Sonarr/Radarr page. None until sent / for a title that never resolved on the arr.
-    arr_slug: str | None = None
-    # The row that CLAIMED this title, stamped by the request pass. Distinct from the slugs in `why`,
-    # which after `_merge_across_rows` list every row that WANTED it — only one row's target was
-    # actually used, and a later approval has to reuse that one.
-    row_slug: str | None = None
-    # True when the title sits on Sonarr/Radarr's import-exclusion list (from a past delete): it's
-    # surfaced for the owner but never auto-sent, since the Arr would refuse it until un-excluded.
-    excluded: bool = False
-
-
-@dataclass
-class RequestOutcome:
-    """What happened when a single missing title was (or would be) requested."""
-
-    tmdb_id: int
-    title: str
-    media_type: MediaType
-    # requested | would_request | skipped_present | skipped_no_tvdb | skipped_no_target | error
-    status: str
-    detail: str = ""
-    # The arr's own titleSlug (Sonarr/Radarr) for the resolved title, so the inbox can deep-link
-    # straight to the series/movie page: Sonarr has no id-based URL, only `/series/<slug>`. None when
-    # the arr didn't resolve it (error) or for a source that doesn't report one.
-    arr_slug: str | None = None
-
-
-@dataclass
-class RequestReport:
-    """Outcome of the whole request pass for one run."""
-
-    considered: int = 0  # titles that cleared the rating/vote thresholds
-    # How the run ARRIVED at `considered`, so that a zero can be read. "0 qualifying, 0 auto-sent, 0
-    # queued" is the same sentence whether the base floors emptied the pool, the rating gate rejected
-    # everything it rated, or the gate ran out of lookup budget before reaching anything good — and
-    # for five days in production (2026-08-13..18) it was the third, with nothing anywhere saying so.
-    # Reconstructing it afterwards meant diffing settings timestamps against the rating cache by hand.
-    wanted: int = 0  # missing titles the run collected at all, BEFORE any floor
-    pool_size: int = 0  # titles that cleared the base floors (demand, year, language) — what the gate was handed
-    # Titles the LANGUAGE mode alone removed from that pool ("only" mode). Kept apart from the other
-    # base floors so the "nothing qualified" alert can name the setting that actually bound.
-    dropped_by_language: int = 0
-    # The LOWEST `min_demand` any row gated on this run — the fewest distinct wanters a title needed
-    # to reach the rating gate through the most permissive row. Recorded so a zero can be told apart
-    # from a zero that was arithmetically GUARANTEED: demand counts distinct people, so a run covering
-    # fewer people than this floor can never fill the pool, whatever the owner's settings say. Six
-    # such events on the maintainer's server (2026-09-02..03, all `users_ok=1` manual runs) raised
-    # "loosen your floors" while the nightly 46-user run was requesting normally.
-    demand_floor: int = 0
-    examined: int = 0  # of those, how many the rating gate actually rated
-    lookups_spent: int = 0  # live rating-API calls that cost; cached ratings are free and are not counted
-    # The same three, per row slug, plus what each row actually got. A run-wide total cannot answer
-    # "why did the kids row send nothing" once every row gates on its own floors and its own share of
-    # the lookup budget — which row was starved is exactly the question these exist to answer.
-    pool_by_row: dict[str, int] = field(default_factory=dict)
-    examined_by_row: dict[str, int] = field(default_factory=dict)
-    considered_by_row: dict[str, int] = field(default_factory=dict)
-    sent_by_row: dict[str, int] = field(default_factory=dict)
-    # What each row CLAIMED, which is not what it sent: a claim can still be skipped at the send (no
-    # TheTVDB id, an Arr that refuses it). Claims are what the caps actually decide, so this is the
-    # figure that answers "did my row limit bind" — measured live on 2026-08-18, where sent_by_row
-    # read picked:3/because:0 while the caps had in fact allocated picked:4/because:1.
-    claimed_by_row: dict[str, int] = field(default_factory=dict)
-    outcomes: list[RequestOutcome] = field(default_factory=list)
-    # Titles handed back for the server to persist as pending so the owner can approve them by hand:
-    # those that cleared the base floors but not the auto-send bar (or overflowed max_per_run), PLUS
-    # any auto-send that was attempted and ERRORED (each carries its `.detail` so the inbox shows why).
-    queued: list[MissingTitle] = field(default_factory=list)
-    # The titles actually ASKED FOR this run. The server files these in the inbox as `sent`, which is
-    # what stops tomorrow's run re-requesting a title that is merely still downloading — and spending
-    # one of `max_per_run` on it every night, forever.
-    sent: list[MissingTitle] = field(default_factory=list)
-    # Every (tmdb_id, MediaType.value) an Arr already tracks, captured during the arr-state
-    # reconcile. The server uses it to drop stale PENDING inbox rows: a title added to an Arr by
-    # other means (manual add, another tool, an earlier send that predates the sent-ledger) is not
-    # in Plex while it downloads — or ever, if unaired — so the Plex-presence prune never catches
-    # it and the row would sit pending forever. Best-effort: empty when the reconcile skipped a
-    # media type (none in this run's pool) or an Arr fetch failed (fail-open) — no drops that run.
-    arr_present: set[tuple[int, str]] = field(default_factory=set)
-    # True when MDBList hit its daily request cap mid-run: the rating gate fell back to TMDB for the
-    # rest, and the server raises a notification so the owner knows some ratings weren't the chosen
-    # source tonight.
-    ratings_rate_limited: bool = False
-    # User-facing warnings about the request config itself (e.g. incomplete Arr setup). Surfaced in
-    # the run stats so the UI can explain WHY nothing was sent, not just that nothing was sent.
-    warnings: list[str] = field(default_factory=list)
-
-    @property
-    def requested(self) -> int:
-        return sum(1 for o in self.outcomes if o.status in ("requested", "would_request"))
 
 
 @dataclass(frozen=True)
@@ -1163,8 +715,7 @@ class EngineConfig:
     # Row-overridable via RowSpec.max_seeds.
     max_seeds: int = 30
     # Which service's score a row with `pick_order="rating"` sorts on: tmdb (free, already on every
-    # candidate) or imdb/trakt/tomatoes/metacritic via MDBList. Deliberately NOT `requests.rating_source`:
-    # ordering a row must not depend on whether the request feature is configured at all.
+    # candidate) or imdb/trakt/tomatoes/metacritic via MDBList.
     rating_source: str = "tmdb"
     # Titles that must never seed a SHARED row, server-wide.
     #
@@ -1269,9 +820,6 @@ class EngineConfig:
     # "off" that isn't gone). Each is removed like a mute on the next run. Static-titled rows only; a
     # {top_seed} row can't be re-titled without picks, so it's left until the row is re-enabled.
     retired_rows: list[RowSpec] = field(default_factory=list)
-    # Sonarr/Radarr requests for picks the library lacks. None -> the feature is entirely off, so
-    # no missing-title bookkeeping happens at all (the common case pays nothing for it).
-    requests: RequestConfig | None = None
     # Row slugs to actually (re)build this run — a per-row scheduled run only rebuilds its own rows.
     # None = build every row (a full run). Only the DELIVERY loop is scoped: privacy classification,
     # the leak-safe share-filter sync, the unhidable-row sweep, and shelf promotion all still see the
@@ -1491,12 +1039,6 @@ class RunReport:
     # row of ours, or when `manage_shelf_order` is off — NOT when no anchor is configured, which
     # falls back to moving every row to the top and so fills this normally.
     hub_orderings: list[dict] = field(default_factory=list)
-    # Sonarr/Radarr requests made (or, in dry-run, that would be made) for picks the library lacks.
-    # None when the feature is off — distinct from an empty report (on, but nothing qualified).
-    requests: RequestReport | None = None
-    # (tmdb_id, media_type) the delivery libraries now hold. Lets the server prune inbox candidates
-    # that have since arrived on the server (bought/grabbed elsewhere) so they stop lingering.
-    library_present: set[tuple[int, MediaType]] = field(default_factory=set)
     error: str | None = None  # a run-level failure (e.g. the sweep itself could not run)
     # Why promotion was blocked this run, one entry per account whose share filter could not be
     # written — the accounts a row would otherwise be visible to. Without these the operator sees

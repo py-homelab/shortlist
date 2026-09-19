@@ -1,13 +1,11 @@
 /**
  * The rating services Shortlist can read a score from, shared by every place that offers the choice.
  *
- * Two settings use this list and they are deliberately separate: `requests.rating_source` gates which
- * missing titles are worth requesting, while `recommendations.rating_source` decides what a row
- * ordered by "Highest rated" sorts on. An owner can reasonably want a strict IMDb floor for requests
- * and still sort rows by TMDB, so they are not one setting — but they are one list.
+ * `recommendations.rating_source` uses it to decide what a row ordered by "Highest rated" sorts on.
  *
- * Everything but TMDB comes from MDBList and needs its API key; TMDB's score is already carried on
- * every candidate, which is why it is the default and costs no lookups.
+ * Everything but TMDB comes from MDBList and needs its API key (`recommendations.mdblist.apikey`);
+ * TMDB's score is already carried on every candidate, which is why it is the default and costs no
+ * lookups.
  */
 export type RatingSource =
   "tmdb" | "imdb" | "tomatoes" | "metacritic" | "trakt";

@@ -1125,7 +1125,7 @@ class TestPerRowRequestSettings0074:
             con.close()
 
     def test_every_new_column_is_nullable_so_an_existing_row_inherits(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0074")
         collections = self._columns(tmp_path, "collections")
         for name in self._ROW_COLUMNS:
             assert name in collections, f"{name} missing after upgrade"
@@ -1134,7 +1134,7 @@ class TestPerRowRequestSettings0074:
     def test_the_seeded_default_row_reads_null_for_every_override(self, tmp_path: Path):
         """The upgrade must not opt the existing row into anything. A server that upgrades tonight
         keeps filing everything exactly where it filed it yesterday."""
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0074")
         con = sqlite3.connect(tmp_path / "shortlist.db")
         try:
             cols = ", ".join(self._ROW_COLUMNS)
@@ -1148,13 +1148,13 @@ class TestPerRowRequestSettings0074:
     def test_a_queued_request_carries_a_nullable_row_slug(self, tmp_path: Path):
         """NULL on everything queued before per-row settings existed; the approve path falls back to
         the global config for those, which is what they were queued under anyway."""
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0074")
         candidates = self._columns(tmp_path, "request_candidates")
         assert "row_slug" in candidates
         assert not candidates["row_slug"]
 
     def test_the_downgrade_removes_them_again(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0074")
         command.downgrade(_alembic(tmp_path), "0073")
         collections = self._columns(tmp_path, "collections")
         assert not [name for name in self._ROW_COLUMNS if name in collections]
@@ -1178,7 +1178,7 @@ class TestRowAutoUserTag0075:
             con.close()
 
     def test_the_column_is_nullable_and_the_seeded_row_inherits(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0075")
         columns = self._columns(tmp_path)
         assert "req_auto_user_tag" in columns
         assert not columns["req_auto_user_tag"], "NULL is how a row inherits the global switch"
@@ -1191,7 +1191,7 @@ class TestRowAutoUserTag0075:
         assert {r[0] for r in rows} == {None}
 
     def test_the_downgrade_removes_it_again(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0075")
         command.downgrade(_alembic(tmp_path), "0074")
         assert "req_auto_user_tag" not in self._columns(tmp_path)
 
@@ -1214,7 +1214,7 @@ class TestRowSonarrMonitor0084:
             con.close()
 
     def test_the_column_is_nullable_and_the_seeded_row_inherits(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0084")
         columns = self._columns(tmp_path)
         assert "req_sonarr_monitor" in columns
         assert not columns["req_sonarr_monitor"], "NULL is how a row inherits the global mode"
@@ -1229,12 +1229,12 @@ class TestRowSonarrMonitor0084:
     def test_running_it_again_over_an_already_migrated_database_is_a_no_op(self, tmp_path: Path):
         """The maintainer's server runs `dev` builds, so this migration lands on databases that may
         already carry the column from an earlier build of the same change."""
-        run_migrations(tmp_path)
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0084")
+        command.upgrade(_alembic(tmp_path), "0084")
         assert "req_sonarr_monitor" in self._columns(tmp_path)
 
     def test_the_downgrade_removes_it_again(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0084")
         command.downgrade(_alembic(tmp_path), "0083")
         assert "req_sonarr_monitor" not in self._columns(tmp_path)
 
@@ -1385,7 +1385,7 @@ class TestRequestLanguagePreference0085:
             con.close()
 
     def test_the_row_columns_are_nullable_and_the_seeded_row_inherits(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0085")
         columns = self._columns(tmp_path, "collections")
         for name in ("req_language_mode", "req_preferred_languages", "req_min_rating_other"):
             assert name in columns
@@ -1403,7 +1403,7 @@ class TestRequestLanguagePreference0085:
     def test_a_queued_title_gets_an_empty_language_not_a_null_one(self, tmp_path: Path):
         """`language` is NOT NULL with a "" default because "" is the unknown sentinel the gate and
         the inbox both test against — and a pre-0085 row genuinely IS unknown: nothing recorded it."""
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0085")
         columns = self._columns(tmp_path, "request_candidates")
         assert "language" in columns
         assert columns["language"], "NOT NULL — the code treats '' as unknown, never None"
@@ -1417,14 +1417,14 @@ class TestRequestLanguagePreference0085:
         every `if name not in existing` guard deleted. Winding the version back while LEAVING the
         columns in place is the actual shape of the problem: a database that already has them under a
         revision it no longer claims."""
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0085")
         command.stamp(_alembic(tmp_path), "0084")
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0085")
         assert "req_language_mode" in self._columns(tmp_path, "collections")
         assert "language" in self._columns(tmp_path, "request_candidates")
 
     def test_the_downgrade_removes_them_again(self, tmp_path: Path):
-        run_migrations(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0085")
         command.downgrade(_alembic(tmp_path), "0084")
         rows = self._columns(tmp_path, "collections")
         assert not ({"req_language_mode", "req_preferred_languages", "req_min_rating_other"} & set(rows))
@@ -1533,3 +1533,79 @@ class TestRowShowDaysDowngrade0088:
         finally:
             con.close()
         assert not ({"show_days", "shown_state"} & columns)
+
+
+class TestRetireRequestInbox0095:
+    """0095 retires the request inbox: three settings move to their new names with their values, the
+    inbox's webhook event leaves the subscription list, the inbox table is emptied (kept — earlier
+    frozen migrations alter it unguarded), and the per-row request columns and `users.request_tag` go."""
+
+    @staticmethod
+    def _at_0094(config_dir: Path) -> None:
+        command.upgrade(_alembic(config_dir), "0094")
+        _write_setting(config_dir, "requests.overseerr.url", "http://seerr:5055")
+        _write_setting(config_dir, "requests.overseerr.apikey", "gAAAA-encrypted-token")
+        _write_setting(config_dir, "requests.mdblist.apikey", "gAAAA-mdblist")
+        _write_setting(config_dir, "requests.min_rating", 7.0)
+        _write_setting(config_dir, "notify.webhook.events", ["run.failed", "requests.waiting", "privacy.exposure"])
+
+    @staticmethod
+    def _settings(config_dir: Path) -> dict[str, object]:
+        con = sqlite3.connect(config_dir / "shortlist.db")
+        try:
+            return {k: json.loads(v)["v"] for k, v in con.execute("SELECT key, value FROM settings")}
+        finally:
+            con.close()
+
+    def test_the_seerr_and_mdblist_settings_move_with_their_values(self, tmp_path: Path):
+        self._at_0094(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0095")
+        settings = self._settings(tmp_path)
+        assert settings["seerr.url"] == "http://seerr:5055"
+        assert settings["seerr.apikey"] == "gAAAA-encrypted-token"
+        assert settings["recommendations.mdblist.apikey"] == "gAAAA-mdblist"
+        assert "requests.overseerr.url" not in settings and "requests.mdblist.apikey" not in settings
+        # Everything else under requests.* is the boot-time purge's (LEGACY_KEYS), not the migration's.
+        assert settings["requests.min_rating"] == 7.0
+
+    def test_the_inbox_webhook_event_is_unsubscribed_and_the_rest_kept_in_order(self, tmp_path: Path):
+        self._at_0094(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0095")
+        assert self._settings(tmp_path)["notify.webhook.events"] == ["run.failed", "privacy.exposure"]
+
+    def test_a_new_key_already_present_is_never_overwritten(self, tmp_path: Path):
+        self._at_0094(tmp_path)
+        _write_setting(tmp_path, "seerr.url", "http://already-new:5055")
+        command.upgrade(_alembic(tmp_path), "0095")
+        assert self._settings(tmp_path)["seerr.url"] == "http://already-new:5055"
+
+    def test_the_inbox_is_emptied_and_the_request_columns_are_gone(self, tmp_path: Path):
+        self._at_0094(tmp_path)
+        con = sqlite3.connect(tmp_path / "shortlist.db")
+        try:
+            con.execute(
+                "INSERT INTO request_candidates (tmdb_id, media_type, title, imdb_id, rating, vote_count, demand,"
+                " tags, wanters, why, status, detail, excluded, created_at, updated_at)"
+                " VALUES (1, 'movie', 'T', '', 7, 1, 1, '[]', '[]', '[]', 'pending', '', 0, '2026-01-01', '2026-01-01')"
+            )
+            con.commit()
+        finally:
+            con.close()
+        command.upgrade(_alembic(tmp_path), "0095")
+        con = sqlite3.connect(tmp_path / "shortlist.db")
+        try:
+            assert con.execute("SELECT COUNT(*) FROM request_candidates").fetchone()[0] == 0
+            collection_cols = {r[1] for r in con.execute("PRAGMA table_info(collections)")}
+            user_cols = {r[1] for r in con.execute("PRAGMA table_info(users)")}
+        finally:
+            con.close()
+        assert not {c for c in collection_cols if c.startswith("req_")}
+        assert "request_tag" in collection_cols  # retired, kept for the frozen 0001 seed
+        assert "request_tag" not in user_cols
+
+    def test_re_running_it_is_a_no_op(self, tmp_path: Path):
+        self._at_0094(tmp_path)
+        command.upgrade(_alembic(tmp_path), "0095")
+        command.stamp(_alembic(tmp_path), "0094")
+        command.upgrade(_alembic(tmp_path), "0095")
+        assert self._settings(tmp_path)["seerr.url"] == "http://seerr:5055"

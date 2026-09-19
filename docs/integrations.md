@@ -1,6 +1,6 @@
 ---
 title: What Shortlist works with
-description: Every service Shortlist can talk to — Plex, TMDB, Sonarr, Radarr, Overseerr, Jellyseerr, Trakt, MDBList, Exa, SearXNG, Tautulli and the AI providers — what each one adds, and which are actually required.
+description: Every service Shortlist can talk to — Plex, TMDB, Overseerr, Jellyseerr, Seerr, Trakt, MDBList, Exa, SearXNG, Tautulli and the AI providers — what each one adds, and which are actually required.
 heading: What it works with
 ---
 
@@ -46,15 +46,9 @@ with nothing to sign up for.
 
 ## Getting missing titles
 
-When a row wants something the server doesn't have, Shortlist can ask for it. Pick one route:
-
-| Service                      | What it does                                                                   |
-| ---------------------------- | ------------------------------------------------------------------------------ |
-| **Radarr / Sonarr**          | Shortlist adds the title directly, using your quality profile and root folder    |
-| **Overseerr / Jellyseerr**   | Shortlist hands the request over and lets them decide — their profiles, their approvals |
-
-Overseerr and Jellyseerr are the same integration; Jellyseerr is a fork and speaks the same API.
-Use one route or the other, not both. [Set it up →](/guides/requests/)
+Each person asks for what they want from their own picks page, and Shortlist files it in
+**Overseerr, Jellyseerr or Seerr** as them — their account, quota and approval rules. The three share
+one API. Shortlist never talks to Radarr or Sonarr itself. [Set it up →](/guides/requests/)
 
 ## Everything else
 

@@ -65,11 +65,6 @@ export function hasTrakt(settings: Settings): boolean {
   return Boolean(settingString(settings, "trakt.client_id"));
 }
 
-/** Whether an MDBList API key is on file (needed by every non-TMDB request rating source). */
-export function hasMdblist(settings: Settings): boolean {
-  return Boolean(settingString(settings, "requests.mdblist.apikey"));
-}
-
 /** Which backend the llm_web source searches with: 'native' | 'exa' | 'searxng' (owner-chosen).
  *  There was an 'auto' (native unioned with an external); it was removed in 1.3 and migration 0063
  *  pins every install off it, so a stored 'auto' reads as the default. */

@@ -24,7 +24,7 @@ function renderTokenTile(stats: Record<string, unknown>): HTMLElement {
     shared_rows: [],
     error: null,
     promotion_blockers: [],
-    stats: { users_ok: 1, users_error: 0, titles_requested: 0, requests_queued: 0, ...stats },
+    stats: { users_ok: 1, users_error: 0, ...stats },
   } as unknown as RunDetail;
   render(<RunStatTiles run={run} />);
   const tile = screen.getByText("AI tokens").closest<HTMLElement>("[title]");

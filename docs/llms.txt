@@ -56,7 +56,7 @@ them as restored.
   llama.cpp, LM Studio, vLLM, LocalAI).
 - Every pick is verified to exist in the user's library before delivery — titles are never invented.
 - Every pick carries a reason: "Because you watched X".
-- Optional integrations: Tautulli, Radarr, Sonarr, Trakt, MDBList, Exa.
+- Optional integrations: Tautulli, Overseerr/Jellyseerr/Seerr, Trakt, MDBList, Exa.
 - Coexists with Kometa: only collections Shortlist created (labelled `shortlist_*`) are ever modified.
 - Plex-only. There is no Jellyfin or Emby support, because the privacy model depends on Plex's
   label-based share filters.

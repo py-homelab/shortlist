@@ -136,13 +136,9 @@ class EngineContext:
     # every user Shortlist has. Deleting on a partial picture would wipe live rows, so the default is
     # False and every other caller (direct engine runs, tests) only ever demotes.
     may_delete_orphans: bool = False
-    # (tmdb_id, media_type) the owner has already actioned in the Requests inbox — sent or rejected.
-    # Keeps a slow download from re-winning a request slot every night, and a "no" from being undone
-    # by a later auto-send. Empty for direct engine runs, which have no inbox.
-    handled_requests: set[tuple[int, str]] = field(default_factory=set)
-    # MDBList client (cache-backed) for the chosen non-TMDB rating source; None when neither the
-    # request gate nor row ordering asks for one, or no MDBList key is set. Built by the server
-    # adapter so it shares the persistent cache.
+    # MDBList client (cache-backed) for the chosen non-TMDB rating source; None when row ordering
+    # does not ask for one, or no MDBList key is set. Built by the server adapter so it shares the
+    # persistent cache.
     mdblist: MdbListClient | None = None
     # Latched by row ordering the first time MDBList answers 429, so the rest of the run orders on
     # TMDB instead of re-attempting once per rating-ordered row PER USER — each attempt is retried

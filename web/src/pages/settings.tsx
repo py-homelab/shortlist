@@ -10,7 +10,6 @@ import { DangerZoneSection } from "@/components/settings/danger-zone-section";
 import { DefaultsSection } from "@/components/settings/defaults-section";
 import { NotificationsSection } from "@/components/settings/notifications-section";
 import { RecommendationsSection } from "@/components/settings/recommendations-section";
-import { RequestsSection } from "@/components/settings/requests-section";
 import { RowPlacementSection } from "@/components/settings/row-placement-section";
 import { SETTINGS_SECTIONS } from "@/components/settings/sections";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -25,7 +24,6 @@ function sectionContent(settings: Settings): Record<string, ReactNode> {
     recommendations: <RecommendationsSection settings={settings} />,
     defaults: <DefaultsSection settings={settings} />,
     placement: <RowPlacementSection settings={settings} />,
-    requests: <RequestsSection settings={settings} />,
     notifications: <NotificationsSection settings={settings} />,
     advanced: <AdvancedSection settings={settings} />,
     "api-access": <ApiAccessCard />,

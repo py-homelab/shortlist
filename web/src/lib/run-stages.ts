@@ -29,7 +29,6 @@ export const STAGE_LABELS: Record<string, string> = {
   converged: "stranded rows corrected",
   ordering: "ordering rows",
   shelves: "positioning rows on shelves",
-  requesting: "asking Sonarr/Radarr for missing titles",
   finished: "run finished",
   done: "done",
   skipped: "skipped",
@@ -46,7 +45,6 @@ export const TAIL_STAGES = [
   "converging",
   "ordering",
   "shelves",
-  "requesting",
   "finished",
 ] as const;
 

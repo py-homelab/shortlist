@@ -141,9 +141,9 @@ class RunService:
             dry_run=dry_run, loop=loop, run_id=run_id, log_sink=log_sink, collection_ids=collection_ids
         )
 
-    def build_requests_context(self):
-        """Requests config + TMDB client for the approval inbox's manual send — no Plex/LLM I/O."""
-        return self._ctx.build_requests_only()
+    def build_tmdb_client(self):
+        """A cache-backed TMDB client for a title lookup — no Plex/LLM I/O."""
+        return self._ctx.build_tmdb_only()
 
     def enabled_profiles(self, session: Session, user_ids: list[int] | None = None):
         return self._ctx.enabled_profiles(session, user_ids)
@@ -550,6 +550,4 @@ class RunService:
         run_persistence.persist_report(self._sessions, run_id, report, status=status, error=error)
 
     # The retention prunes are NOT aliased here: everything that runs them — the `maintenance.prune`
-    # handler and the tests — calls `run_persistence` directly. The inbox write still is, because
-    # `tests/unit/test_request_queue.py` drives it through the class.
-    _persist_request_queue = staticmethod(run_persistence.persist_request_queue)
+    # handler and the tests — calls `run_persistence` directly.

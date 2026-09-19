@@ -90,7 +90,6 @@ class UserPatch(BaseModel):
     # name, then their Plex username. Never touches the slug, so their label (and every share filter
     # that excludes it) is unaffected.
     nickname: str | None = Field(default=None, max_length=255)
-    request_tag: str | None = Field(default=None, max_length=64)  # tag added to titles requested for this user
     prefs: UserPrefs | None = None
 
 
@@ -457,8 +456,6 @@ async def patch_user(user_id: int, patch: UserPatch, request: Request) -> dict:
             if nickname != (user.nickname or ""):
                 was_called[user.slug] = user.display_name  # captured BEFORE the write
             user.nickname = nickname
-        if patch.request_tag is not None:
-            user.request_tag = patch.request_tag.strip()
         if patch.prefs is not None:
             was_paused = bool((user.prefs or {}).get("paused"))
             prefs = merged_prefs(user.prefs or {}, patch.prefs)
@@ -564,7 +561,7 @@ async def search_titles(request: Request, q: str, media_type: str = "movie") -> 
         return []
     # The requests-only context: a TMDB client without connecting to the PMS or building the LLM
     # curator, neither of which a title lookup needs.
-    _config, tmdb = request.app.state.run_service.build_requests_context()
+    tmdb = request.app.state.run_service.build_tmdb_client()
     if tmdb is None:
         raise HTTPException(status_code=503, detail="TMDB is not configured — add an API key in Settings.")
 

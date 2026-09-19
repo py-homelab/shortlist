@@ -49,10 +49,11 @@
     everything shuffled again overnight.
   icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/></svg>
 
-- title: Ask Radarr or Sonarr for what's missing
+- title: Everyone asks for what they're missing
   body: >-
-    When a good suggestion isn't in your library, Shortlist can request it. This is off until you turn
-    it on. The best few send themselves each night and the rest wait for you to approve them.
+    Each person gets their own picks page of titles the library doesn't have yet, ranked for them —
+    swipe to request one in Overseerr, Jellyseerr or Seerr as themselves, with their own quota and
+    approval. Nothing downloads unless someone asks.
   icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
 
 - title: See whether anyone is watching them

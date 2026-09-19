@@ -298,7 +298,7 @@ async def debug_bundle(request: Request) -> str:
     is reported as a yes/no, never a token or key (plex-safety rule 9)."""
     from sqlalchemy import func, text
 
-    from shortlist.server.db.models import PickRow, RequestCandidate, Run
+    from shortlist.server.db.models import PickRow, Run
     from shortlist.server.settings_store import SettingsStore
     from shortlist.server.version_check import build_provenance
 
@@ -323,7 +323,6 @@ async def debug_bundle(request: Request) -> str:
             "rows": session.query(func.count(Collection.id)).scalar(),
             "runs": session.query(func.count(Run.id)).scalar(),
             "picks": session.query(func.count(PickRow.id)).scalar(),
-            "requests": session.query(func.count(RequestCandidate.id)).scalar(),
             "restriction snapshots": session.query(func.count(RestrictionSnapshotRow.user_id)).scalar(),
         }
         lines.append("counts: " + ", ".join(f"{k}={v}" for k, v in counts.items()))
@@ -336,11 +335,7 @@ async def debug_bundle(request: Request) -> str:
             "tautulli": bool(store.get("tautulli.url")),
             "tmdb": bool(store.get("tmdb.apikey")),
             "curator": store.get("curator.provider"),
-            "requests": bool(store.get("requests.enabled")),
-            "request_target": store.get("requests.target"),
-            "overseerr": bool(store.get("requests.overseerr.url")),
-            "radarr": bool(store.get("requests.radarr.url")),
-            "sonarr": bool(store.get("requests.sonarr.url")),
+            "seerr": bool(store.get("seerr.url")),
         }
         lines.append("connections: " + ", ".join(f"{k}={v}" for k, v in conns.items()))
         lines.append(f"paused: {bool(store.get('paused_all'))}  log level: {store.get('log.level')}")

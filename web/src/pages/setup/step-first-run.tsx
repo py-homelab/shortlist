@@ -362,8 +362,8 @@ export function StepFirstRun({ complete }: StepProps) {
           {!failed && (
             <p className="text-sm text-muted-foreground">
               Want more? In Settings you can add extra recommendation sources
-              (Trakt, AI web search), auto-request missing titles via
-              Sonarr/Radarr or Overseerr, and add more rows.
+              (Trakt, AI web search) and add more rows. Missing titles are
+              each person&rsquo;s to request, from their own picks page.
             </p>
           )}
           <Button onClick={() => void complete()}>

@@ -41,7 +41,6 @@ USER_KEYS = {
     "enabled",
     "manage_sharing",
     "cold_start",
-    "request_tag",
     "prefs",
     "history_depth",
     "last_run_at",

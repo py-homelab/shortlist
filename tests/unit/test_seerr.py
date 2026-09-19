@@ -15,11 +15,9 @@ import httpx
 import pytest
 import respx
 
-from shortlist.engine import requests as requests_mod
-from shortlist.engine.clients import http_retry
 from shortlist.engine.clients import seerr as seerr_mod
 from shortlist.engine.clients.seerr import SeerrClient, SeerrError
-from shortlist.engine.models import MediaType, MissingTitle, RequestConfig, SeerrTarget
+from shortlist.engine.models import SeerrTarget
 
 pytestmark = pytest.mark.integration
 
@@ -41,16 +39,6 @@ def _fixture_ids() -> dict[int, tuple[str, int]]:
     which is how a fixture quietly stops being re-recorded.
     """
     return {r["status"]: (r["mediaType"], r["tmdbId"]) for r in _media_page()["results"]}
-
-
-def _fixture_id(status: int, kind: str) -> int:
-    """The recorded tmdb id for one (status, mediaType) pair.
-
-    Keyed on BOTH, because several statuses appear as a movie AND a tv row and a status-only lookup
-    silently returns whichever came last — which is how this helper first handed a `tv` id to a
-    `MediaType.MOVIE` call and made a "skipped" test assert "requested" instead.
-    """
-    return next(r["tmdbId"] for r in _media_page()["results"] if r["status"] == status and r["mediaType"] == kind)
 
 
 def _users_page() -> dict:
@@ -288,142 +276,11 @@ class TestUsers:
         assert all(not u["auto_approve_movies"] and not u["auto_approve_tv"] for u in users)
 
 
-class TestRequestTitle:
-    def _mock_media(self, payload: dict | None = None):
-        return respx.get(f"{BASE}/media").mock(return_value=httpx.Response(200, json=payload or _media_page()))
-
-    def test_a_movie_request_sends_media_type_and_the_tmdb_id(self):
-        with respx.mock:
-            self._mock_media()
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            status, _, slug = _client().request_title(603, MediaType.MOVIE, dry_run=False)
-        assert status == "requested"
-        assert slug is None
-        assert json.loads(post.calls[0].request.content) == {"mediaType": "movie", "mediaId": 603}
-
-    def test_a_show_request_asks_for_all_seasons(self):
-        """Overseerr accepts a show request with no seasons and then never sends it to Sonarr —
-        the request sits approved forever with nothing behind it."""
-        with respx.mock:
-            self._mock_media()
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            _client().request_title(94997, MediaType.SHOW, dry_run=False)
-        assert json.loads(post.calls[0].request.content) == {
-            "mediaType": "tv",
-            "mediaId": 94997,
-            "seasons": "all",
-        }
-
-    def test_request_as_user_id_files_the_request_as_that_account(self):
-        """`X-API-User`, never a body `userId`. Overseerr, Seerr and Jellyseerr (`MediaRequest.request`)
-        take `userId` only for quota and request permission, and decide APPROVED or PENDING from the
-        CALLER's permissions. Filing for someone else needs Manage Requests, which is itself an
-        auto-approve permission, so every request filed "as" an account with auto-approve off was
-        approved anyway. `X-API-User` makes the API key act as that account (`middleware/auth.ts`),
-        so its permission, quota and approval all apply."""
-        target = SeerrTarget(url="http://overseerr.test", api_key="ok", request_as_user_id=4)
-        with respx.mock:
-            self._mock_media()
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            _client(target=target).request_title(603, MediaType.MOVIE, dry_run=False)
-        request = post.calls[0].request
-        assert request.headers["X-API-User"] == "4"
-        assert request.headers["X-Api-Key"] == "ok"
-        assert json.loads(request.content) == {"mediaType": "movie", "mediaId": 603}
-
-    def test_request_as_applies_only_to_filing_not_to_reading_what_the_instance_has(self):
-        """The media and blocklist reads need the key's own account: a requester account cannot list
-        every title on the server, and reading as one would fail the duplicate check."""
-        target = SeerrTarget(url="http://overseerr.test", api_key="ok", request_as_user_id=4)
-        with respx.mock:
-            media = self._mock_media()
-            respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            _client(target=target).request_title(603, MediaType.MOVIE, dry_run=False)
-        assert all("X-API-User" not in call.request.headers for call in media.calls)
-
-    def test_server_default_sends_no_account_at_all(self):
-        """Neither a header nor a null `userId`: "Server default" in the UI means the key's own account."""
-        with respx.mock:
-            self._mock_media()
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            _client().request_title(603, MediaType.MOVIE, dry_run=False)
-        request = post.calls[0].request
-        assert "X-API-User" not in request.headers
-        assert "userId" not in json.loads(request.content)
-
-    def test_a_refused_request_says_what_the_instance_said(self):
-        """A 403 on filing is the ACCOUNT's permission or quota, or a blocklisted title, and the instance
-        names which. Blaming Manage Requests sent owners after a permission filing no longer needs."""
-        target = SeerrTarget(url="http://overseerr.test", api_key="ok", request_as_user_id=4)
-        with respx.mock:
-            self._mock_media()
-            respx.post(f"{BASE}/request").mock(
-                return_value=httpx.Response(403, json={"message": "You do not have permission to make movie requests."})
-            )
-            with pytest.raises(SeerrError) as raised:
-                _client(target=target).request_title(603, MediaType.MOVIE, dry_run=False)
-        assert "You do not have permission to make movie requests." in str(raised.value)
-        assert "Manage Requests" not in str(raised.value)
-        assert "rejected the API key" not in str(raised.value)
-
-    def test_a_title_overseerr_already_knows_is_skipped_not_re_requested(self):
-        with respx.mock:
-            self._mock_media()
-            post = respx.post(f"{BASE}/request")
-            tmdb_id = _fixture_id(5, "movie")  # an AVAILABLE film from the recorded page
-            status, detail, _ = _client().request_title(tmdb_id, MediaType.MOVIE, dry_run=False)
-        assert status == "skipped_present"
-        assert "downloaded" in detail
-        assert not post.called
-
-    def test_dry_run_writes_nothing(self):
-        with respx.mock:
-            self._mock_media()
-            post = respx.post(f"{BASE}/request")
-            status, _, _ = _client().request_title(603, MediaType.MOVIE, dry_run=True)
-        assert status == "would_request"
-        assert not post.called
-
-    def test_a_refused_request_keeps_the_apps_own_message(self):
-        """Any non-2xx, whatever it means. Overseerr's code for a duplicate is deliberately NOT
-        special-cased: the API docs do not state it, and guessing one would turn a real failure
-        into a silent "already there". The app's own words reach the inbox instead."""
-        with respx.mock:
-            self._mock_media()
-            respx.post(f"{BASE}/request").mock(
-                return_value=httpx.Response(409, json={"message": "Request for this media already exists"})
-            )
-            with pytest.raises(SeerrError, match="already exists"):
-                _client().request_title(603, MediaType.MOVIE, dry_run=False)
-
-
 class TestFailingOpen:
-    """What happens when the media walk cannot be done — the contract the run path depends on."""
-
-    def test_a_request_still_goes_out_when_the_library_cannot_be_read(self):
-        """The bug this pins: `request_title` raised, so `_apply_seerr_state`'s fail-open was undone
-        one step later and EVERY title in the run became an error instead of being requested."""
-        with respx.mock:
-            respx.get(f"{BASE}/media").mock(side_effect=httpx.ConnectError("down"))
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            status, _, _ = _client().request_title(603, MediaType.MOVIE, dry_run=False)
-        assert status == "requested"
-        assert json.loads(post.calls[0].request.content) == {"mediaType": "movie", "mediaId": 603}
-
-    def test_a_failed_walk_is_attempted_once_per_client_not_once_per_title(self):
-        """Three HTTP retries live inside each attempt, so re-walking per title turns one outage
-        into a long stall on every send in the run."""
-        with respx.mock:
-            route = respx.get(f"{BASE}/media").mock(side_effect=httpx.ConnectError("down"))
-            respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 9}))
-            client = _client()
-            for tmdb_id in (603, 604, 605):
-                client.request_title(tmdb_id, MediaType.MOVIE, dry_run=False)
-        # One attempt, retried internally by http_retry — never a second walk.
-        assert route.call_count == http_retry.DEFAULT_ATTEMPTS
+    """What happens when the media walk cannot be done."""
 
     def test_the_status_endpoint_still_learns_the_walk_failed(self):
-        """`request_title` swallows it; `media_state` must NOT, or the inbox could not tell
+        """`media_state` must not swallow a failed walk, or a caller could not tell
         "Overseerr tracks none of these" from "Overseerr never answered"."""
         with respx.mock:
             respx.get(f"{BASE}/media").mock(side_effect=httpx.ConnectError("down"))
@@ -447,221 +304,6 @@ class TestNaming:
                 return_value=httpx.Response(200, json={"id": 1, "displayName": "   ", "username": "real"})
             )
             assert "real" in _client().ping()
-
-
-class TestTheEngineDrivesTheRealClient:
-    """`request_missing` against the REAL `SeerrClient`, with only HTTP faked.
-
-    Every other engine test uses `FakeSeerr`, and a fake can drift from the interface it stands in
-    for — it already did: `_send_claims` began keying its client cache by `client.target` and the
-    fake, lacking the attribute, AttributeError'd on a path the tests were meant to be covering.
-    This is the one case where nothing between the pipeline and the wire is a stand-in.
-    """
-
-    def _demand(self, *titles):
-        return {(t.tmdb_id, t.media_type): t for t in titles}
-
-    def _cfg(self):
-        return RequestConfig(
-            enabled=True,
-            overseerr=TARGET,
-            min_rating=7.0,
-            min_votes=100,
-            max_per_run=10,
-            auto_min_demand=1,
-            auto_min_rating=0.0,
-        )
-
-    def _mock_blocklist(self, rows=None):
-        return respx.get(f"{BASE}/blocklist").mock(
-            return_value=httpx.Response(200, json={"pageInfo": {"pages": 1}, "results": rows or []})
-        )
-
-    def _run(self, demand, *, dry_run=False):
-        cfg = self._cfg()
-        return requests_mod.request_missing(
-            cfg,
-            _EngineTmdb(),
-            [requests_mod.RowRequest("picked", cfg, demand)],
-            dry_run=dry_run,
-            min_write_interval=0.0,
-        )
-
-    def test_a_movie_and_a_show_reach_the_wire_correctly_shaped(self):
-        demand = self._demand(
-            MissingTitle(603, "a movie", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3),
-            MissingTitle(94997, "a show", MediaType.SHOW, 2022, rating=8.8, vote_count=900, demand=3),
-        )
-        with respx.mock:
-            self._mock_blocklist()
-            respx.get(f"{BASE}/media").mock(
-                return_value=httpx.Response(200, json={"pageInfo": {"pages": 1}, "results": []})
-            )
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 1}))
-            report = self._run(demand)
-
-        bodies = sorted((json.loads(c.request.content) for c in post.calls), key=lambda b: b["mediaId"])
-        assert bodies == [
-            {"mediaType": "movie", "mediaId": 603},
-            {"mediaType": "tv", "mediaId": 94997, "seasons": "all"},
-        ]
-        assert {o.status for o in report.outcomes} == {"requested"}
-        assert len(report.sent) == 2
-
-    def test_the_run_walks_media_once_for_the_reconcile_and_the_send_together(self):
-        demand = self._demand(
-            *(
-                MissingTitle(i, f"title {i}", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3)
-                for i in (603, 604, 605)
-            )
-        )
-        with respx.mock:
-            self._mock_blocklist()
-            media = respx.get(f"{BASE}/media").mock(
-                return_value=httpx.Response(200, json={"pageInfo": {"pages": 1}, "results": []})
-            )
-            respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 1}))
-            self._run(demand)
-        # The reconcile client is seeded into the send's cache, so three sends add no second walk.
-        assert media.call_count == 1
-
-    def test_a_title_overseerr_already_has_never_reaches_the_wire(self):
-        present_id = _fixture_id(5, "movie")  # an AVAILABLE film from the recorded page
-        demand = self._demand(
-            MissingTitle(present_id, "already there", MediaType.MOVIE, 2015, rating=8.7, vote_count=900, demand=3),
-        )
-        with respx.mock:
-            self._mock_blocklist()
-            respx.get(f"{BASE}/media").mock(return_value=httpx.Response(200, json=_media_page()))
-            post = respx.post(f"{BASE}/request")
-            report = self._run(demand)
-        assert not post.called
-        assert report.sent == []
-
-    def test_an_unreachable_overseerr_still_sends_rather_than_erroring_every_title(self):
-        """The fail-open contract, proved through the pipeline rather than at the client alone."""
-        demand = self._demand(
-            MissingTitle(603, "a movie", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3),
-        )
-        with respx.mock:
-            self._mock_blocklist()
-            respx.get(f"{BASE}/media").mock(side_effect=httpx.ConnectError("down"))
-            post = respx.post(f"{BASE}/request").mock(return_value=httpx.Response(201, json={"id": 1}))
-            report = self._run(demand)
-        assert post.called
-        assert [o.status for o in report.outcomes] == ["requested"]
-
-    def test_a_dry_run_reaches_no_write_at_all(self):
-        demand = self._demand(
-            MissingTitle(603, "a movie", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3),
-        )
-        with respx.mock:
-            self._mock_blocklist()
-            respx.get(f"{BASE}/media").mock(
-                return_value=httpx.Response(200, json={"pageInfo": {"pages": 1}, "results": []})
-            )
-            post = respx.post(f"{BASE}/request")
-            report = self._run(demand, dry_run=True)
-        assert not post.called
-        assert [o.status for o in report.outcomes] == ["would_request"]
-
-
-class _EngineTmdb:
-    """The TMDB surface `request_missing` touches on the Overseerr route.
-
-    A show's TVDB id IS read here, though it never goes on the wire: Seerr hands a show to Sonarr by
-    TVDB id and deletes a request it cannot map, so Shortlist holds back a show without one. This stub
-    used to raise on the lookup, pinning the assumption that the route never needs it."""
-
-    def tvdb_id(self, tmdb_id: int, media_type) -> int | None:
-        return 900_000 + tmdb_id
-
-    def imdb_id(self, tmdb_id: int, media_type) -> str | None:
-        return None
-
-    def poster_path(self, tmdb_id: int, media_type) -> str:
-        return ""
-
-    def overview(self, tmdb_id: int, media_type) -> str:
-        return ""
-
-
-class TestTheBlocklist:
-    """The exclusion list this route was wrongly documented as lacking."""
-
-    def test_blocklisted_titles_come_back_keyed_by_type_and_id(self):
-        rows = {
-            "pageInfo": {"pages": 1},
-            "results": [
-                {"tmdbId": 603, "title": "x", "media": {"mediaType": "movie", "tmdbId": 603}},
-                {"tmdbId": 1399, "title": "y", "media": {"mediaType": "tv", "tmdbId": 1399}},
-            ],
-        }
-        with respx.mock:
-            respx.get(f"{BASE}/blocklist").mock(return_value=httpx.Response(200, json=rows))
-            assert _client().blocklisted() == {("movie", 603), ("show", 1399)}
-
-    def test_a_row_with_no_media_object_blocks_both_types(self):
-        """Half-knowing that the owner said never is not a reason to ask."""
-        rows = {"pageInfo": {"pages": 1}, "results": [{"tmdbId": 603, "title": "x"}]}
-        with respx.mock:
-            respx.get(f"{BASE}/blocklist").mock(return_value=httpx.Response(200, json=rows))
-            assert _client().blocklisted() == {("movie", 603), ("show", 603)}
-
-    def test_it_falls_back_to_the_deprecated_alias(self):
-        with respx.mock:
-            respx.get(f"{BASE}/blocklist").mock(return_value=httpx.Response(404))
-            respx.get(f"{BASE}/blacklist").mock(
-                return_value=httpx.Response(
-                    200,
-                    json={"pageInfo": {"pages": 1}, "results": [{"tmdbId": 7, "media": {"mediaType": "movie"}}]},
-                )
-            )
-            assert _client().blocklisted() == {("movie", 7)}
-
-    def test_an_instance_serving_neither_simply_has_no_blocklist(self):
-        """Classic Overseerr. Fails OPEN — a redundant request, never a suppressed title."""
-        with respx.mock:
-            respx.get(f"{BASE}/blocklist").mock(return_value=httpx.Response(404))
-            respx.get(f"{BASE}/blacklist").mock(return_value=httpx.Response(404))
-            assert _client().blocklisted() == set()
-
-    def test_a_successful_empty_read_is_authoritative_and_does_not_try_the_alias(self):
-        """An empty blocklist is an answer, not a failure — the real server this was built against
-        has exactly that, and re-asking the deprecated alias would be a wasted round trip."""
-        with respx.mock:
-            respx.get(f"{BASE}/blocklist").mock(
-                return_value=httpx.Response(200, json={"pageInfo": {"pages": 1}, "results": []})
-            )
-            alias = respx.get(f"{BASE}/blacklist")
-            assert _client().blocklisted() == set()
-        assert not alias.called
-
-    def test_it_is_read_once_per_client(self):
-        with respx.mock:
-            route = respx.get(f"{BASE}/blocklist").mock(
-                return_value=httpx.Response(200, json={"pageInfo": {"pages": 1}, "results": []})
-            )
-            client = _client()
-            client.blocklisted()
-            client.blocklisted()
-        assert route.call_count == 1
-
-    def test_a_broken_blocklist_never_fails_the_reconcile(self):
-        """It sits inside the same guard as the media walk: a reconcile problem must cost a redundant
-        request, never the whole request pass."""
-        from shortlist.engine.requests import _apply_seerr_state
-
-        class Boom(SeerrClient):
-            def media_state(self):
-                return {}
-
-            def blocklisted(self):
-                raise SeerrError("Overseerr unreachable (ConnectError)")
-
-        pool = [MissingTitle(603, "a movie", MediaType.MOVIE, 1999, rating=8.7, vote_count=900, demand=3)]
-        kept, dropped, present = _apply_seerr_state(pool, Boom(TARGET))
-        assert kept == pool and dropped == 0 and present == set()
 
 
 class TestWhoAutoApproves:
@@ -728,18 +370,6 @@ class TestWhatTheReviewCaught:
             {"id": 3, "displayName": "local", "permissions": 32, "userType": 2},
         )
         assert [u["is_plex_user"] for u in rows] == [True, True, False]
-
-    def test_a_blocklist_row_naming_its_own_type_does_not_block_the_other_one(self):
-        """TMDB's movie and tv id spaces overlap. Reading the type only from the nested `media`
-        object sent a row shaped {tmdbId, mediaType, title} down the both-types fallback — so
-        blocklisting a FILM also held back the unrelated series sharing that id."""
-        rows = {
-            "pageInfo": {"pages": 1, "results": 1},
-            "results": [{"id": 1, "tmdbId": 438631, "mediaType": "movie", "title": "a film"}],
-        }
-        with respx.mock:
-            respx.get(f"{BASE}/blocklist").mock(return_value=httpx.Response(200, json=rows))
-            assert _client().blocklisted() == {("movie", 438631)}
 
     def test_a_server_that_caps_take_is_reported_rather_than_believed(self):
         """A capped page looks exactly like the end of the list — every row usable, nothing missing
