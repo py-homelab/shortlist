@@ -502,10 +502,22 @@ class TestSettingsApi:
 
     def test_engine_test_connection_says_when_its_lists_are_stale(self, client: TestClient, monkeypatch):
         client.put("/api/settings", json={"values": {"engine.backend": "http", "engine.url": "http://e:8090"}})
-        info = {"name": "recommendarr", "version": "0.3.1", "ready": True, "stale": False, "last_build_ok": True}
+        info = {
+            "name": "recommendarr",
+            "version": "0.4.0",
+            "ready": True,
+            "stale": False,
+            "last_build_ok": True,
+            "features": ["season", "seed_focus"],
+        }
         monkeypatch.setattr("shortlist.engine.clients.engine_http.EngineClient.info", lambda self: dict(info))
         ok = client.post("/api/settings/test/engine").json()
-        assert ok == {"ok": True, "message": "Connected to recommendarr 0.3.1 — ready"}
+        assert ok == {"ok": True, "message": "Connected to recommendarr 0.4.0 — ready"}
+
+        info["features"] = ["season"]
+        partial = client.post("/api/settings/test/engine").json()
+        assert partial["ok"] is True and "does not support rows about one watch" in partial["message"]
+        info["features"] = ["season", "seed_focus"]
 
         info.update(last_build_ok=False, last_build_error="OperationalError: disk I/O error")
         failed_build = client.post("/api/settings/test/engine").json()

@@ -214,6 +214,30 @@ def cut_for_recency(
     ]
 
 
+def reweigh_external(candidates: list[Candidate], recency: float, year_now: int) -> list[Candidate]:
+    """An external engine's order, re-weighted by release date at a row's own ``recency``.
+
+    The built-in engine multiplies each title's score by ``recency_factor``; an engine's answer has no
+    score, only an order, so its position stands in for one (1.0 for its first title, falling evenly to
+    its last) and the same factor multiplies it. At ``recency <= 0`` the engine's order is returned as
+    it came. The new order is stamped back into ``external_rank`` so everything downstream keeps
+    treating it as final.
+    """
+    if recency <= 0 or not candidates:
+        return list(candidates)
+    ordered = sorted(candidates, key=lambda c: c.external_rank if c.external_rank is not None else 0)
+    n = len(ordered)
+    weighed = sorted(
+        enumerate(ordered),
+        key=lambda pair: -((1.0 - pair[0] / n) * recency_factor(pair[1].year, year_now, recency)),
+    )
+    out = []
+    for rank, (_i, c) in enumerate(weighed):
+        c.external_rank = rank
+        out.append(c)
+    return out
+
+
 def pre_rank(
     candidates: list[Candidate],
     keep: int,

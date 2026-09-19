@@ -53,8 +53,9 @@ from shortlist.engine.models import (
     WrittenDetails,
 )
 from shortlist.engine.placeholders import names_a_seed
-from shortlist.engine.recommender import RecommendRequest, RecommendResult
+from shortlist.engine.recommender import RecommendRequest, RecommendResult, is_external
 from shortlist.engine.recommenders.builtin import (  # noqa: F401 — re-exported: tests and older callers import them from here
+    BuiltinRecommender,
     _candidate_pool,
     _media_filter,
     _run_year,
@@ -142,6 +143,15 @@ def row_shown_today(
     if not row_is_shown(show_days, now):
         return False
     return not season_slugs or seasons_mod.shown_on(season_slugs, lead_days, after_days, now.date()) is not None
+
+
+def _taste(pools) -> set[tuple[int, MediaType]]:
+    """What a rewatch row reads as "close to what they watch now": every title tonight's gather
+    turned up. An external engine gathers nothing Shortlist can see, but it says why it ranked each
+    title — the watch it is like — and the watches behind its best titles are exactly that."""
+    if pools.gathered:
+        return {(c.tmdb_id, c.media_type) for c in pools.gathered}
+    return {(s.tmdb_id, s.media_type) for c in pools.ranked for s in c.seeds}
 
 
 def effective_seed_window(spec: RowSpec) -> int:
@@ -1660,6 +1670,9 @@ class RowPolicy:
     # (pool_key, recency) -> that pool re-cut at a row's overridden release-date weight. Empty on a
     # server where every row inherits the global, which is the default shape.
     recency_cuts: dict[tuple, list[Candidate]] = field(default_factory=dict)
+    # Shortlist's own engine for rows that name their own sources while an external engine ranks the
+    # rest (`engine_for`) — made once per person, and only when no fallback already holds one.
+    _builtin: BuiltinRecommender | None = None
     pool_failures: dict[tuple, str] = field(default_factory=dict)  # pool key -> why every source for it failed
     seed_cache: dict[tuple, list] = field(default_factory=dict)
     # Set by the first failed TMDB genre lookup for a rewatch row; every later title is then kept out
@@ -1901,6 +1914,19 @@ class RowPolicy:
         the second row will silently get the first row's ranking.
         """
         key = (self.pool_key(spec), recency)
+        if key not in self.recency_cuts and any(is_external(c) for c in in_library):
+            # An engine's order is final — but a row that sets its own release-date weight asked for
+            # newer titles, so the weight re-orders that answer the way it re-scores the built-in one
+            # (`ranking.reweigh_external`). The server-wide weight is left to the engine's own ranking.
+            kinds = [MediaType.MOVIE, MediaType.SHOW] if spec.media == "both" else [MediaType(spec.media)]
+            year_now = _run_year(self.ctx.run_day)
+            self.recency_cuts[key] = [
+                c
+                for kind in kinds
+                for c in ranking.reweigh_external(
+                    [replace(x) for x in in_library if x.media_type is kind], recency, year_now
+                )[: self.cfg.candidates_pre_rank]
+            ]
         if key not in self.recency_cuts:
             kinds = [MediaType.MOVIE, MediaType.SHOW] if spec.media == "both" else [MediaType(spec.media)]
             year_now = _run_year(self.ctx.run_day)
@@ -2044,7 +2070,39 @@ class RowPolicy:
             # A seasonal row's pool is its season's titles and nothing else, so it shares a gather with no
             # other kind of row — nor with a row following a different season.
             spec.season.slug if spec.season is not None else "",
+            # Which engine answers: a row naming its own sources is built by Shortlist's own engine even
+            # when an external one ranks the rest, and must never be handed that engine's cached pool
+            # because its sources happen to equal the server default.
+            self.uses_builtin(spec),
+            # A focused row asks the engine a different question from the same seeds — on a thin
+            # history the two derive identical seeds, and sharing would hand one row the other's answer.
+            self.seed_focus(spec),
         )
+
+    def uses_builtin(self, spec: RowSpec) -> bool:
+        """Whether Shortlist's own engine builds this row although an external engine is configured.
+
+        A row that names its own ``candidate_sources`` (Trakt, an AI web search, TMDB discover …) asked
+        for those searches, and an external engine has none of them — it ranks from its own data. So
+        such a row keeps meaning what it says: the built-in engine gathers and ranks it, exactly as it
+        would with no external engine at all. Rows that inherit the server's sources go to the engine.
+        """
+        return bool(spec.candidate_sources) and not isinstance(self.ctx.recommender, BuiltinRecommender)
+
+    def engine_for(self, spec: RowSpec):
+        if not self.uses_builtin(spec):
+            return self.ctx.recommender
+        secondary = getattr(self.ctx.recommender, "secondary", None)
+        if isinstance(secondary, BuiltinRecommender):
+            return secondary
+        if self._builtin is None:
+            self._builtin = BuiltinRecommender()
+        return self._builtin
+
+    def seed_focus(self, spec: RowSpec) -> bool:
+        """The row narrows its seeds on purpose: a smaller budget than the server's, or a cycling
+        window. What an external engine needs told to rank by those watches rather than overall taste."""
+        return effective_max_seeds(spec, self.cfg) < self.cfg.max_seeds or effective_seed_window(spec) > 1
 
     def pools_for(self, spec: RowSpec) -> Pool | None:
         """This row's pool, or None when every source it uses is down.
@@ -2084,8 +2142,9 @@ class RowPolicy:
                     # overrides it re-cuts the cached `in_library` in `cut_at_recency`.
                     recency=self.cfg.recency,
                     season=season,
+                    seed_focus=self.seed_focus(spec),
                 )
-                result = self.ctx.recommender.recommend(self.ctx, request, visible=self.visible)
+                result = self.engine_for(spec).recommend(self.ctx, request, visible=self.visible)
                 self.pool_cache[key], gather_stats = result, result.stats
             except Exception as e:
                 self.pool_failures[key] = f"{type(e).__name__}: {e}"
@@ -3038,6 +3097,12 @@ def _run_user(
     # and it is visible to everyone (the leak we exist to fix).
     all_picks: list[Pick] = []
     delivered_any = False
+    # Titles this person's earlier rows already hold tonight. An external engine answers one ordered
+    # list per pool, and rows that differ only in size, cadence or watched rule share that pool — so
+    # without this every such row is the same list's head, and a person sees one title three times on
+    # their Home. Only engine-ranked pools draw without replacement: Shortlist's own engine keeps its
+    # upstream behaviour, and the rewatch row (built from history) is left alone.
+    placed: set[tuple[int, MediaType]] = set()
 
     for spec in specs:
         with _row_timer(user_report, spec.slug):
@@ -3057,7 +3122,7 @@ def _run_user(
                 if pools is None:
                     continue  # every source this row uses is down; its siblings still deliver
                 in_library, pool_for_row = pools.in_library, pools.ranked
-                taste = {(c.tmdb_id, c.media_type) for c in pools.gathered} if spec.rewatch else set()
+                taste = _taste(pools) if spec.rewatch else set()
                 # A row that overrides the server's release-date weight needs its OWN truncation, not
                 # just its own ordering: the cut decides which candidates a row may select from at all,
                 # so re-ordering what the global's cut left would cap the setting at whatever survived
@@ -3066,8 +3131,22 @@ def _run_user(
                 recency = policy.effective_recency(spec)
                 if recency != ctx.config.recency:
                     pool_for_row = policy.cut_at_recency(spec, in_library, recency)
+                elsewhere = 0
+                if not spec.rewatch and placed and any(is_external(c) for c in pool_for_row):
+                    kept = [c for c in pool_for_row if (c.tmdb_id, c.media_type) not in placed]
+                    elsewhere = len(pool_for_row) - len(kept)
+                    pool_for_row = kept
                 row_label = spec.name_template or spec.slug
-                _emit(ctx, user.slug, "curating", {"candidates": len(pool_for_row), "row": row_label})
+                _emit(
+                    ctx,
+                    user.slug,
+                    "curating",
+                    {
+                        "candidates": len(pool_for_row),
+                        "row": row_label,
+                        **({"in_other_rows": elsewhere} if elsewhere else {}),
+                    },
+                )
             section_picks = _build_section_picks(
                 policy, spec, targets, k, cold=cold, base_cold=base_cold, pool_for_row=pool_for_row, taste=taste
             )
@@ -3166,6 +3245,7 @@ def _run_user(
             # recommended, and a row a cancel stopped is not that.
             all_picks.extend(picks)
             delivered_any = delivered_any or bool(picks)
+            placed.update((p.tmdb_id, p.media_type) for p in picks)
 
     # Resolve the ratingKey of every pick before it is RECORDED, not just before it is delivered.
     #

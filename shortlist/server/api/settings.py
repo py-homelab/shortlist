@@ -680,7 +680,18 @@ async def test_connection(service: str, request: Request) -> dict:
                         f"build failed: {info.get('last_build_error')}"
                     )
                 ready = "ready" if info.get("ready", True) else "not ready yet (no build to serve from)"
-                return f"Connected to {info['name']}{version} — {ready}"
+                # Row settings the engine can only have approximated for it: a seasonal row is then cut
+                # from the engine's head, and a "Because you watched" row gets the person's overall list.
+                features = info.get("features") if isinstance(info.get("features"), list) else []
+                missing = [
+                    label
+                    for key, label in (("season", "seasonal rows"), ("seed_focus", "rows about one watch"))
+                    if key not in features
+                ]
+                caveat = (
+                    f"; it does not support {' or '.join(missing)}, so those rows are approximated" if missing else ""
+                )
+                return f"Connected to {info['name']}{version} — {ready}{caveat}"
             if service == "exa":
                 from shortlist.engine.clients.search import ExaClient
 
