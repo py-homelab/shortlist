@@ -667,8 +667,19 @@ async def test_connection(service: str, request: Request) -> dict:
                     raise RuntimeError("An engine URL is required")
                 timeout = float(get("engine.timeout_s") or 30)
                 info = EngineClient(url, token=get("engine.token") or "", timeout=timeout).info()
-                ready = "ready" if info.get("ready", True) else "not ready yet (no build to serve from)"
                 version = f" {info['version']}" if isinstance(info.get("version"), str) else ""
+                if info.get("stale"):
+                    error = f"; last build failed: {info['last_build_error']}" if info.get("last_build_error") else ""
+                    raise RuntimeError(
+                        f"Connected to {info['name']}{version}, but its lists are stale "
+                        f"({info.get('age_hours')} h old){error}"
+                    )
+                if info.get("last_build_ok") is False:
+                    return (
+                        f"Connected to {info['name']}{version} — serving its last good lists, but its latest "
+                        f"build failed: {info.get('last_build_error')}"
+                    )
+                ready = "ready" if info.get("ready", True) else "not ready yet (no build to serve from)"
                 return f"Connected to {info['name']}{version} — {ready}"
             if service == "exa":
                 from shortlist.engine.clients.search import ExaClient

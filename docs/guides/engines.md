@@ -48,6 +48,19 @@ cannot seed a search from a thin history, so it cold-starts those people up fron
 answers `true` is asked like anyone else, and only if it returns nothing do they get the cold-start
 row. `ready: false` means it has no build to serve from yet; the Test button says so.
 
+Optional health fields let Shortlist tell you when an engine is up but serving old lists — the one
+failure nothing else notices, because a stale engine still answers:
+
+| Field | Meaning |
+|---|---|
+| `stale` | `true` when the engine's lists are too old to pass off as current. |
+| `age_hours` | Hours since the lists being served were built. |
+| `last_build_ok` | `false` when the most recent rebuild failed (older lists are still served). |
+| `last_build_error` | One line on why, when it failed. |
+
+The Test button fails on a stale engine and names the age and the build error; a failed build with
+lists still fresh is a pass with a warning.
+
 ### `POST /v1/recommend`
 
 Once per person per distinct candidate pool (rows that share sources, media and libraries share one
@@ -127,3 +140,12 @@ Each person's run page lists the engine as a source: `engine:<name>`, how many t
 how many survived the library and the row's rules, and how long it took. A person whose engine call
 failed shows that source as **failed** with the reason, followed by whichever engine actually built
 the row. A pick's provenance line reads *suggested by Your engine (name)*.
+
+## When the engine needs attention
+
+Each run records the engine's health as it found it at the start (the fields above, or that it
+could not be reached) and how many people's rows fell back to Shortlist's own engine that night, and
+why. When the newest run found stale lists, a failed build, an unreachable engine or any fallback,
+the dashboard bell raises **"… is not serving fresh recommendations"** with the details. A later
+run that finds the engine healthy clears it; dismissing it hides it until a run finds trouble again.
+The record is an audit event under the `engine.status` scope, so the event log keeps the history.

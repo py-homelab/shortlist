@@ -42,7 +42,7 @@ from shortlist.server.db.models import (
     WatchSession,
 )
 from shortlist.server.services import jobs
-from shortlist.server.services.audit import RESTRICTION_RESTORED_SCOPE, add_audit
+from shortlist.server.services.audit import ENGINE_STATUS_SCOPE, RESTRICTION_RESTORED_SCOPE, add_audit
 from shortlist.server.services.watch_events import (
     RowMembership,
     _attribution_floor,
@@ -897,6 +897,18 @@ def persist_report(
     with sessions() as session:
         run = session.get(Run, run_id)
         users_by_slug = {u.slug: u for u in session.query(User).all()}
+        engine = getattr(report, "engine", None)
+        if engine is not None:
+            # Every run with an external engine, healthy or not: the newest one is what the dashboard
+            # reads, so a recovered engine clears its own alert.
+            _add_event(
+                session,
+                ENGINE_STATUS_SCOPE,
+                "warning" if engine.get("trouble") else "info",
+                run_id,
+                dry_run=report.dry_run,
+                **engine,
+            )
         # Skipped is its OWN outcome, not a success: a skipped user built nothing, and folding
         # them into `ok` made a run where every single person was skipped report "3 succeeded ·
         # all succeeded" above three rows badged "Skipped".

@@ -129,6 +129,56 @@ class Recommender(Protocol):
         ...
 
 
+def engine_status(recommender: object) -> dict | None:
+    """The external engine's health for a run report, or None for the built-in engine.
+
+    ``trouble`` is the one field a reader needs: a sentence when the engine's lists are stale, its last
+    build failed, it could not be reached, or anyone fell back to the built-in engine tonight; None
+    when all is well.
+    """
+    primary = getattr(recommender, "primary", recommender)
+    info = getattr(primary, "info", None)
+    if info is None and not hasattr(primary, "info"):
+        return None
+    info = info or {}
+    fell_back = dict(getattr(recommender, "fell_back", {}) or {})
+    reasons = sorted(set(fell_back.values()))
+    trouble = None
+    if info.get("unreachable"):
+        trouble = f"could not be reached at the start of the run ({info['unreachable']})"
+    elif info.get("stale"):
+        age = info.get("age_hours")
+        trouble = f"is serving lists {age} hours old" if age is not None else "has no usable lists"
+        if info.get("last_build_error"):
+            trouble += f" — its last build failed: {info['last_build_error']}"
+    elif info.get("last_build_ok") is False:
+        trouble = f"failed its last build ({info.get('last_build_error') or 'no reason given'}); its lists are older"
+    if fell_back:
+        extra = f"{len(fell_back)} {'person' if len(fell_back) == 1 else 'people'} got Shortlist's own picks instead"
+        trouble = f"{trouble}; {extra}" if trouble else f"answered with nothing usable for some people — {extra}"
+    return {
+        "name": getattr(primary, "name", "external"),
+        "info": {
+            k: info.get(k)
+            for k in (
+                "version",
+                "ready",
+                "stale",
+                "age_hours",
+                "built_at",
+                "last_build_at",
+                "last_build_ok",
+                "last_build_error",
+                "unreachable",
+            )
+            if k in info
+        },
+        "fell_back": len(fell_back),
+        "fallback_reasons": reasons[:3],
+        "trouble": trouble,
+    }
+
+
 def is_external(candidate: Candidate) -> bool:
     """Whether an external engine placed this candidate — i.e. its order is final."""
     return candidate.external_rank is not None

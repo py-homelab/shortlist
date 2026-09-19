@@ -1150,3 +1150,42 @@ class TestAFailedJobSaysOnlyWhatIsTrueOfIt:
         body = self._alert(session, "privacy.sync")
         assert "Plex may not reflect" in body
         assert "run it again" in body
+
+
+class TestEngineInTrouble:
+    def _status(self, session, *, trouble, days_ago=0):
+        session.add(
+            Event(
+                scope="engine.status",
+                level="warning" if trouble else "info",
+                ts=datetime.now(UTC) - timedelta(days=days_ago),
+                message={"name": "recommendarr", "trouble": trouble, "fell_back": 0},
+            )
+        )
+        session.commit()
+
+    def test_quiet_with_the_builtin_engine(self, session):
+        self._status(session, trouble="is serving lists 60 hours old")
+        assert notif._engine_in_trouble(session, SettingsStore(session)) is None
+
+    def test_fires_when_the_newest_run_found_trouble(self, session):
+        SettingsStore(session).set("engine.backend", "http")
+        self._status(session, trouble="is serving lists 60 hours old")
+
+        result = notif._engine_in_trouble(session, SettingsStore(session))
+
+        assert result["severity"] == "warning" and result["dismissable"] is True
+        assert result["id"].startswith("engine-trouble-")
+        assert "recommendarr is serving lists 60 hours old" in result["body"]
+        assert result["action_url"] == "/settings#recommendations"
+
+    def test_a_healthy_run_after_it_clears_it(self, session):
+        SettingsStore(session).set("engine.backend", "http")
+        self._status(session, trouble="is serving lists 60 hours old", days_ago=1)
+        self._status(session, trouble=None)
+        assert notif._engine_in_trouble(session, SettingsStore(session)) is None
+
+    def test_an_old_report_is_not_news(self, session):
+        SettingsStore(session).set("engine.backend", "http")
+        self._status(session, trouble="is serving lists 60 hours old", days_ago=5)
+        assert notif._engine_in_trouble(session, SettingsStore(session)) is None

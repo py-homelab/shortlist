@@ -60,6 +60,7 @@ from shortlist.engine.privacy import (
     unhidden_rows_visible_to,
     voids_owner_restriction,
 )
+from shortlist.engine.recommender import engine_status
 
 #: How many accounts of one type the filter-enforcement spot-check may try before giving up.
 _ENFORCEMENT_SPOT_CHECK_ATTEMPTS = 3
@@ -198,6 +199,7 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
         len(report.users) - ok - failed,
         ctx.config.dry_run,
     )
+    report.engine = engine_status(ctx.recommender)
     # The last line of the feed, so "is it still going?" is answerable without reading the header.
     _emit(
         ctx,

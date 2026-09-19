@@ -26,13 +26,16 @@ if TYPE_CHECKING:
 
 
 class HttpRecommender:
-    def __init__(self, client: EngineClient, *, name: str = "", serves_cold: bool = False):
+    def __init__(self, client: EngineClient, *, name: str = "", serves_cold: bool = False, info: dict | None = None):
         """``name`` and ``serves_cold`` come from the engine's ``/v1/info``; the server adapter reads it
         once at build time and passes them in, so a run never blocks on it. Unknown defaults are the
         conservative ones: an unnamed engine, and cold-start handled by Shortlist."""
         self._client = client
         self.name = name or "external"
         self.serves_cold = serves_cold
+        #: The engine's own `/v1/info` at run start, or an `{"unreachable": reason}` when it could not be
+        #: read. What `engine_status` reports; the rows never read it.
+        self.info = info
 
     @property
     def source(self) -> str:

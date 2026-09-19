@@ -233,3 +233,34 @@ class TestTheLedgerRecordsWhatWasWrittenToASummaryAndSortTitle:
             _record_deliveries(session, "sarah", [self._entry(summary_written="Hi", title_sort_written=None)])
             _record_deliveries(session, "sarah", [self._entry()])
             assert session.get(Delivery, ("gems", "sarah", "1")).summary_written == "Hi"
+
+
+class TestEngineStatusEvent:
+    def test_each_run_with_an_external_engine_records_its_health(self, sessions):
+        from datetime import UTC, datetime
+
+        from shortlist.engine.models import RunReport
+        from shortlist.server.db.models import Event, Run
+        from shortlist.server.services.run_persistence import persist_report
+
+        with sessions() as session:
+            run = Run(trigger="manual", status="running", dry_run=False, stats={})
+            session.add(run)
+            session.commit()
+            run_id = run.id
+
+        report = RunReport(started_at=datetime.now(UTC), dry_run=False)
+        report.engine = {"name": "e", "trouble": "is serving lists 60 hours old", "fell_back": 0}
+        persist_report(sessions, run_id, report)
+        report.engine = {"name": "e", "trouble": None, "fell_back": 0}
+        persist_report(sessions, run_id, report)
+        report.engine = None  # the built-in engine records nothing
+        persist_report(sessions, run_id, report)
+
+        with sessions() as session:
+            events = session.query(Event).filter(Event.scope == "engine.status").order_by(Event.id).all()
+            assert [(e.level, e.message["trouble"]) for e in events] == [
+                ("warning", "is serving lists 60 hours old"),
+                ("info", None),
+            ]
+            assert events[0].message["run_id"] == run_id

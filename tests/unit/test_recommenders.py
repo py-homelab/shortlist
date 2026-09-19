@@ -17,7 +17,7 @@ from shortlist.engine.clients.engine_http import EngineClient, EngineError, reco
 from shortlist.engine.context import EngineContext
 from shortlist.engine.models import EngineConfig, MediaType, RowSpec, Seed
 from shortlist.engine.picker import reason_for
-from shortlist.engine.recommender import RecommendRequest, RecommendResult
+from shortlist.engine.recommender import RecommendRequest, RecommendResult, engine_status
 from shortlist.engine.recommenders import BuiltinRecommender, FallbackRecommender, HttpRecommender
 from shortlist.engine.recommenders.builtin import is_kids
 from tests.conftest import MemorySnapshotStore, make_candidate, make_profile, make_watched, plextv_user
@@ -342,6 +342,59 @@ class TestFallbackRecommender:
         assert report.status == "error"
         assert "unreachable" in (report.error or "")
         assert report.picks == []
+
+
+class TestEngineStatus:
+    """What the run report says about the external engine — the dashboard alert is raised from it."""
+
+    def test_the_builtin_engine_reports_nothing(self):
+        assert engine_status(BuiltinRecommender()) is None
+
+    def test_a_healthy_engine_is_no_trouble(self):
+        info = {"name": "e", "version": "0.3.1", "stale": False, "age_hours": 3.0, "last_build_ok": True}
+        status = engine_status(
+            FallbackRecommender(HttpRecommender(FakeEngineClient([]), name="e", info=info), BuiltinRecommender())
+        )
+        assert status["trouble"] is None and status["fell_back"] == 0
+        assert status["info"]["age_hours"] == 3.0
+
+    def test_stale_lists_and_the_failed_build_behind_them_are_said(self):
+        info = {
+            "stale": True,
+            "age_hours": 60.2,
+            "last_build_ok": False,
+            "last_build_error": "OperationalError: disk I/O",
+        }
+        status = engine_status(HttpRecommender(FakeEngineClient([]), name="e", info=info))
+        assert "60.2 hours old" in status["trouble"] and "disk I/O" in status["trouble"]
+
+    def test_a_failed_build_with_lists_still_fresh_is_said(self):
+        info = {"stale": False, "age_hours": 26.0, "last_build_ok": False, "last_build_error": "boom"}
+        status = engine_status(HttpRecommender(FakeEngineClient([]), name="e", info=info))
+        assert "failed its last build (boom)" in status["trouble"]
+
+    def test_an_unreachable_engine_is_said(self):
+        status = engine_status(HttpRecommender(FakeEngineClient([]), name="e", info={"unreachable": "ConnectError"}))
+        assert "could not be reached" in status["trouble"]
+
+    def test_people_who_fell_back_are_counted_with_the_reason(self, ctx, mock_plextv):
+        client = FakeEngineClient(EngineError("engine unreachable (ConnectError)"), name="e")
+        ctx.recommender = FallbackRecommender(HttpRecommender(client, name="e", info={}), BuiltinRecommender())
+
+        _run(ctx, mock_plextv)
+        status = engine_status(ctx.recommender)
+
+        assert status["fell_back"] == 1
+        assert "1 person got Shortlist's own picks" in status["trouble"]
+        assert "unreachable" in status["fallback_reasons"][0]
+
+    def test_the_run_report_carries_it(self, ctx, mock_plextv):
+        info = {"stale": True, "age_hours": 60.0}
+        ctx.recommender = HttpRecommender(FakeEngineClient([_item(20, "Twenty")], name="e"), name="e", info=info)
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5)]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100)])
+        assert report.engine["name"] == "e" and "60.0 hours old" in report.engine["trouble"]
 
 
 class TestColdStartWithAnEngine:

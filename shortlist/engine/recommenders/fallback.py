@@ -8,6 +8,7 @@ down, and for the same reason.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,10 @@ class FallbackRecommender:
     def __init__(self, primary: Recommender, secondary: Recommender):
         self.primary = primary
         self.secondary = secondary
+        # This run's fallbacks (the recommender is built per run): who fell back, and why — for the
+        # run's engine status and the dashboard alert it raises.
+        self._lock = threading.Lock()
+        self.fell_back: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -61,6 +66,8 @@ class FallbackRecommender:
                 why,
                 self.secondary.name,
             )
+        with self._lock:
+            self.fell_back.setdefault(req.user.username, why)
         fallback = self.secondary.recommend(ctx, req, visible=visible)
         fallback.stats.trace.setdefault("sources", []).insert(
             0,
