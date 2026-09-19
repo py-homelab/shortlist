@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import httpx
 import pytest
 import respx
@@ -109,9 +111,10 @@ class TestAuthResponses:
     def test_a_signed_in_session_names_the_account(self, client: TestClient):
         body = client.get("/api/auth/session").json()
 
-        assert set(body) == {"authenticated", "login_required", "account_id", "username"}
+        assert set(body) == {"authenticated", "login_required", "account_id", "username", "role"}
         assert body["authenticated"] is True
         assert body["account_id"] == OWNER_ID
+        assert body["role"] == "owner"
         assert body["login_required"] is True  # a linked server means this instance demands a login
 
     def test_an_anonymous_session_keeps_the_same_shape(self, client: TestClient):
@@ -121,7 +124,7 @@ class TestAuthResponses:
         with anonymous:
             body = anonymous.get("/api/auth/session").json()
 
-        assert set(body) == {"authenticated", "login_required", "account_id", "username"}
+        assert set(body) == {"authenticated", "login_required", "account_id", "username", "role"}
         assert body["authenticated"] is False and body["login_required"] is True
         assert body["account_id"] is None and body["username"] is None
 
@@ -211,8 +214,8 @@ class TestAuthResponses:
             body = client.get("/api/auth/pin/42").json()
 
         # The identity fields are null until the owner approves in Plex; the token is never here.
-        assert set(body) == {"linked", "account_id", "username"}
-        assert body == {"linked": False, "account_id": None, "username": None}
+        assert set(body) == {"linked", "account_id", "username", "role"}
+        assert body == {"linked": False, "account_id": None, "username": None, "role": None}
 
     def test_polling_an_approved_pin_signs_the_owner_in(self, client: TestClient):
         with respx.mock:
@@ -223,10 +226,126 @@ class TestAuthResponses:
             r = client.get("/api/auth/pin/42")
 
         body = r.json()
-        assert set(body) == {"linked", "account_id", "username"}
-        assert body == {"linked": True, "account_id": OWNER_ID, "username": "steve"}
+        assert set(body) == {"linked", "account_id", "username", "role"}
+        assert body == {"linked": True, "account_id": OWNER_ID, "username": "steve", "role": "owner"}
         # The Plex auth token must never reach the browser — not in the body, not in the cookie jar.
         assert "plex-auth-token" not in r.text
+
+
+class TestPersonSignIn:
+    """One of this server's people signs in with their own Plex account and reaches their own
+    picks — and nothing of the owner's. Same PIN flow, same cookie; only the role differs."""
+
+    SARAH: ClassVar[dict] = {"id": 555000100, "username": "sarah", "title": "Sarah"}
+
+    def _sign_in(self, client: TestClient, account: dict) -> dict:
+        client.cookies.delete(SESSION_COOKIE)
+        with respx.mock:
+            respx.get("https://plex.tv/api/v2/pins/42").mock(
+                return_value=httpx.Response(200, json={"authToken": "plex-auth-token"})
+            )
+            respx.get("https://plex.tv/api/v2/user").mock(return_value=httpx.Response(200, json=dict(account)))
+            r = client.get("/api/auth/pin/42")
+        return r
+
+    def test_a_person_on_the_roster_signs_in_as_a_person(self, client: TestClient):
+        r = self._sign_in(client, self.SARAH)
+        assert r.status_code == 200
+        assert r.json() == {"linked": True, "account_id": 555000100, "username": "sarah", "role": "person"}
+        session = client.get("/api/auth/session").json()
+        assert session["authenticated"] is True and session["role"] == "person"
+        assert session["account_id"] == 555000100
+
+    def test_a_person_reaches_nothing_of_the_owners(self, client: TestClient):
+        self._sign_in(client, self.SARAH)
+        assert client.get("/api/users").status_code == 403
+        assert client.get("/api/settings").status_code == 403
+        assert client.get("/api/runs").status_code == 403
+        assert client.get("/api/setup/state").status_code == 403
+
+    def test_a_stranger_is_still_refused(self, client: TestClient):
+        r = self._sign_in(client, {"id": 999, "username": "intruder"})
+        assert r.status_code == 403
+        assert "not one of this server" in r.json()["detail"]
+        assert client.get("/api/auth/session").json()["authenticated"] is False
+
+    def test_a_person_the_owner_removed_loses_access_at_once(self, client: TestClient):
+        from datetime import UTC, datetime
+
+        from shortlist.server.db.models import User
+
+        self._sign_in(client, self.SARAH)
+        assert client.get("/api/auth/session").json()["role"] == "person"
+        with client.app.state.sessions() as session:
+            session.query(User).filter(User.plex_account_id == 555000100).update({"removed_at": datetime.now(UTC)})
+            session.commit()
+        # The cookie is still valid; the roster is what decides, on every request.
+        assert client.get("/api/auth/session").json()["authenticated"] is False
+
+    def test_a_person_forged_as_owner_in_the_cookie_is_still_a_person(self, client: TestClient):
+        # The cookie's `role` is advisory; the owner is whoever linked the server, re-checked live.
+        cookie = session_serializer(client.app.state.session_secret).dumps(
+            {"account_id": 555000100, "username": "sarah", "role": "owner"}
+        )
+        client.cookies.set(SESSION_COOKIE, cookie)
+        assert client.get("/api/auth/session").json()["role"] == "person"
+        assert client.get("/api/users").status_code == 403
+
+    def test_a_pre_role_owner_cookie_still_works(self, client: TestClient):
+        # The fixture's cookie has no `role` — exactly what every cookie issued before roles existed
+        # looks like. It is the owner's, and stays the owner's.
+        assert client.get("/api/auth/session").json()["role"] == "owner"
+        assert client.get("/api/users").status_code == 200
+
+
+class TestTrustedProxyIdentity:
+    """A reverse proxy that authenticated the visitor names them in a header — trusted only with the
+    shared secret beside it, because the client address is whatever the caller says it is."""
+
+    def _configure(self, client: TestClient, header="X-Plex-Account-Id", secret="pr0xy") -> None:
+        r = client.put("/api/settings", json={"values": {"auth.proxy.header": header, "auth.proxy.secret": secret}})
+        assert r.status_code == 200, r.text
+        client.cookies.delete(SESSION_COOKIE)
+
+    def test_the_header_with_the_secret_signs_a_person_in_without_a_cookie(self, client: TestClient):
+        self._configure(client)
+        headers = {"X-Plex-Account-Id": "555000100", "X-Shortlist-Proxy-Secret": "pr0xy"}
+        body = client.get("/api/auth/session", headers=headers).json()
+        assert body["authenticated"] is True and body["role"] == "person" and body["username"] == "sarah"
+        assert client.get("/api/users", headers=headers).status_code == 403
+
+    def test_the_owner_through_the_proxy_is_the_owner(self, client: TestClient):
+        self._configure(client)
+        headers = {"X-Plex-Account-Id": str(OWNER_ID), "X-Shortlist-Proxy-Secret": "pr0xy"}
+        assert client.get("/api/auth/session", headers=headers).json()["role"] == "owner"
+        assert client.get("/api/users", headers=headers).status_code == 200
+
+    def test_without_the_secret_the_header_is_ignored(self, client: TestClient):
+        self._configure(client)
+        for headers in (
+            {"X-Plex-Account-Id": "555000100"},
+            {"X-Plex-Account-Id": "555000100", "X-Shortlist-Proxy-Secret": "wrong"},
+            {"X-Plex-Account-Id": str(OWNER_ID), "X-Shortlist-Proxy-Secret": "wrong"},
+        ):
+            assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is False
+            assert client.get("/api/users", headers=headers).status_code == 401
+
+    def test_a_stranger_or_garbage_in_the_header_is_nobody(self, client: TestClient):
+        self._configure(client)
+        for claimed in ("999", "not-a-number"):
+            headers = {"X-Plex-Account-Id": claimed, "X-Shortlist-Proxy-Secret": "pr0xy"}
+            assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is False
+
+    def test_off_by_default_and_the_header_name_is_validated(self, client: TestClient):
+        headers = {"X-Plex-Account-Id": "555000100", "X-Shortlist-Proxy-Secret": "pr0xy"}
+        assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is True  # the owner cookie
+        client.cookies.delete(SESSION_COOKIE)
+        assert client.get("/api/auth/session", headers=headers).json()["authenticated"] is False
+        assert client.put("/api/settings", json={"values": {"auth.proxy.header": "no spaces here"}}).status_code == 401
+        # (401: the owner cookie was deleted above; the validation itself is what the next line checks.)
+        owner = {"account_id": OWNER_ID, "username": "owner"}
+        client.cookies.set(SESSION_COOKIE, session_serializer(client.app.state.session_secret).dumps(owner))
+        assert client.put("/api/settings", json={"values": {"auth.proxy.header": "no spaces here"}}).status_code == 422
 
 
 class TestApiToken:

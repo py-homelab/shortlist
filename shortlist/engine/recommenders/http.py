@@ -77,11 +77,31 @@ class HttpRecommender:
             in_season = [c for c in returned if req.season.contains(c.tmdb_id, c.media_type)]
             dropped.extend((c, "not_in_season") for c in returned if not req.season.contains(c.tmdb_id, c.media_type))
             returned = in_season
-        valid = candidates_mod.filter_candidates(
-            returned, req.library_index, watched_tmdb_ids=watched, excluded_genres=req.excluded_genres, dropped=dropped
-        )
+        if req.surface == "missing":
+            # The request surface: what no library holds. The same watched and genre rules, and the
+            # library as an EXCLUSION rather than the universe — an engine that lost track of what
+            # the server holds must not offer a title that is already there.
+            excluded = {g.lower() for g in req.excluded_genres}
+            valid = []
+            for c in returned:
+                if req.library_index.get(c.media_type, {}).get(c.tmdb_id) is not None:
+                    dropped.append((c, "in_your_libraries"))
+                elif (c.tmdb_id, c.media_type) in watched:
+                    dropped.append((c, "already_watched"))
+                elif excluded and any(g.lower() in excluded for g in c.genres):
+                    dropped.append((c, "excluded_genre"))
+                else:
+                    valid.append(c)
+        else:
+            valid = candidates_mod.filter_candidates(
+                returned,
+                req.library_index,
+                watched_tmdb_ids=watched,
+                excluded_genres=req.excluded_genres,
+                dropped=dropped,
+            )
         in_library = _media_filter(valid, req.media)
-        if visible is not None and in_library:
+        if visible is not None and in_library and req.surface != "missing":
             in_library, hidden = _visible_candidates(ctx, in_library, visible)
             dropped.extend((c, "hidden_by_their_restrictions") for c in hidden)
         # The engine's order, cut per media type — never re-sorted. `external_rank` is stamped over the

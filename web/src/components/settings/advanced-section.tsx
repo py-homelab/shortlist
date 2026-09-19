@@ -6,6 +6,7 @@ import { Segmented } from "@/components/segmented";
 import { Card, CardContent } from "@/components/ui/card";
 import { Switch } from "@/components/ui/switch";
 import { settingBool } from "@/lib/format";
+import { ProxySignInCard } from "@/components/settings/proxy-signin-card";
 import { CleanupAuditCard } from "@/components/settings/cleanup-audit-card";
 import { useSaveSettings } from "@/lib/queries";
 import type { Settings } from "@/lib/types";
@@ -66,6 +67,7 @@ export function AdvancedSection({ settings }: { settings: Settings }) {
       {/* Moved out of the Danger zone: it only READS Plex and reports what it finds, so filing it
           under a destructive heading made the safest control on the page look like the riskiest. */}
       <CleanupAuditCard />
+      <ProxySignInCard settings={settings} />
       <Card>
         <CardContent className="space-y-3 pt-6">
           <div>

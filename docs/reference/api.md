@@ -398,6 +398,12 @@ anything reaches it, including from quoted exception messages.
 GET  /api/support/health -> {checks[{name, ok, detail}], text} (Plex, libraries, tokens, TMDB, curator, database, clocks, last run — each probed independently so one failure is content, not a 500)
 GET  /api/support/title?q= -> {rows[{user, watched_record, viewed_leaf_count, leaf_count, counts_as_watched, cap_pct, delivered[], problem}], flagged[], text}
 GET  /api/support/person/{slug} -> {user_type, watched_movies, watched_shows, libraries[{section_key, library, titles_known, ever_read}], never_read[], text}
+# A person's own picks (any signed-in person on the server, or the owner as themselves; never the API token)
+GET  /api/me                                  -> {state, name, account_id, role, built_at, rows[], seerr{linked, user_id, quota, error, configured}, counts{}}
+GET  /api/me/suggestions?family=exclude|only|include -> {state, items[], queued[], hidden_available, family, has_family, genres[{name,count}], built_at, seerr}
+GET  /api/me/dismissed                        -> {never[], later[]}
+POST /api/me/act {action: request|never|later|skip|undo, tmdb_id, media_type, surface?, position?, last?, undone?}
+POST /api/me/seen {items[{tmdb_id, media_type, surface, position}]}   -> {ok, logged}   (impressions, one per title/surface/day)
 GET  /api/support/rows -> {rows[{slug, watched_pct, watched_pct_source, refresh_days, refresh_days_source, idle_hold_days, idle_hold_source, rewatch, unstarted_only, family}], global_watched_pct, text}
 GET  /api/support/row-schedule -> {rows[{slug, refresh_days_source, rebuild_every_days, idle_hold_days, idle_hold_source, last_built_at, days_since_built, due}], text}
 GET  /api/support/libraries -> {libraries[{key, title, type, items}], error, text}

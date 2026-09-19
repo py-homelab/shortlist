@@ -341,6 +341,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Me */
+        get: operations["me_api_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/act": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Act */
+        post: operations["act_api_me_act_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/dismissed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Dismissed */
+        get: operations["dismissed_api_me_dismissed_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Seen */
+        post: operations["seen_api_me_seen_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Suggestions */
+        get: operations["suggestions_api_me_suggestions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/notifications": {
         parameters: {
             query?: never;
@@ -4033,6 +4118,77 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** MeOut */
+        MeOut: {
+            /** Account Id */
+            account_id: number;
+            /** Built At */
+            built_at?: string | null;
+            /** Counts */
+            counts: {
+                [key: string]: unknown;
+            };
+            /** Name */
+            name: string;
+            /** Role */
+            role: string;
+            /** Rows */
+            rows: {
+                [key: string]: unknown;
+            }[];
+            /** Seerr */
+            seerr: {
+                [key: string]: unknown;
+            };
+            /** State */
+            state: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** MyDismissedOut */
+        MyDismissedOut: {
+            /** Later */
+            later: {
+                [key: string]: unknown;
+            }[];
+            /** Never */
+            never: {
+                [key: string]: unknown;
+            }[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** MySuggestionsOut */
+        MySuggestionsOut: {
+            /** Built At */
+            built_at?: string | null;
+            /** Family */
+            family: string;
+            /** Genres */
+            genres: {
+                [key: string]: unknown;
+            }[];
+            /** Has Family */
+            has_family: boolean;
+            /** Hidden Available */
+            hidden_available: number;
+            /** Items */
+            items: {
+                [key: string]: unknown;
+            }[];
+            /** Queued */
+            queued: {
+                [key: string]: unknown;
+            }[];
+            /** Seerr */
+            seerr: {
+                [key: string]: unknown;
+            };
+            /** State */
+            state: string;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * NotificationOut
          * @description One alert as the React bell renders it — plain text throughout, no HTML.
@@ -4193,6 +4349,47 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** PickActionIn */
+        PickActionIn: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "request" | "never" | "later" | "skip" | "undo";
+            /**
+             * Last
+             * @default false
+             */
+            last: boolean;
+            /**
+             * Media Type
+             * @default
+             * @enum {string}
+             */
+            media_type: "movie" | "show" | "";
+            /** Position */
+            position?: number | null;
+            /** Surface */
+            surface?: ("deck" | "grid") | null;
+            /**
+             * Tmdb Id
+             * @default 0
+             */
+            tmdb_id: number;
+            /** Undone */
+            undone?: ("never" | "later" | "skip") | null;
+        };
+        /** PickActionOut */
+        PickActionOut: {
+            /** Code */
+            code?: string | null;
+            /** Message */
+            message?: string | null;
+            /** Ok */
+            ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * PickOut
          * @description One delivered recommendation, as the run detail lists it.
@@ -4219,6 +4416,37 @@ export interface components {
             title: string;
             /** Year */
             year?: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** PickSeenIn */
+        PickSeenIn: {
+            /** Items */
+            items: components["schemas"]["PickSeenItemIn"][];
+        };
+        /** PickSeenItemIn */
+        PickSeenItemIn: {
+            /**
+             * Media Type
+             * @enum {string}
+             */
+            media_type: "movie" | "show";
+            /** Position */
+            position?: number | null;
+            /**
+             * Surface
+             * @enum {string}
+             */
+            surface: "deck" | "grid";
+            /** Tmdb Id */
+            tmdb_id: number;
+        };
+        /** PickSeenOut */
+        PickSeenOut: {
+            /** Logged */
+            logged: number;
+            /** Ok */
+            ok: boolean;
         } & {
             [key: string]: unknown;
         };
@@ -4252,6 +4480,8 @@ export interface components {
             account_id?: number | null;
             /** Linked */
             linked: boolean;
+            /** Role */
+            role?: string | null;
             /** Username */
             username?: string | null;
         } & {
@@ -5351,6 +5581,8 @@ export interface components {
             authenticated: boolean;
             /** Login Required */
             login_required: boolean;
+            /** Role */
+            role?: string | null;
             /** Username */
             username?: string | null;
         } & {
@@ -6710,6 +6942,143 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     }[];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    me_api_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeOut"];
+                };
+            };
+        };
+    };
+    act_api_me_act_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PickActionIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PickActionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dismissed_api_me_dismissed_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyDismissedOut"];
+                };
+            };
+        };
+    };
+    seen_api_me_seen_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PickSeenIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PickSeenOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    suggestions_api_me_suggestions_get: {
+        parameters: {
+            query?: {
+                family?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MySuggestionsOut"];
                 };
             };
             /** @description Validation Error */

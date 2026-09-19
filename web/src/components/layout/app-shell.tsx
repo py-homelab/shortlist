@@ -16,6 +16,7 @@ import {
   Settings as SettingsIcon,
   Star,
   Users as UsersIcon,
+  Sparkles,
   Wrench,
   X,
 } from "lucide-react";
@@ -46,6 +47,8 @@ const NAV_ITEMS = [
   { to: "/requests", label: "Requests", icon: Inbox, end: false },
   { to: "/jobs", label: "Jobs", icon: Wrench, end: false },
   { to: "/settings", label: "Settings", icon: SettingsIcon, end: false },
+  // The owner's OWN picks page — what every other person on the server sees as the whole app.
+  { to: "/me", label: "My picks", icon: Sparkles, end: false },
 ];
 
 /** Help, and one door for everything that goes wrong.

@@ -3122,6 +3122,167 @@
         "title": "LosingTitleOut",
         "type": "object"
       },
+      "MeOut": {
+        "additionalProperties": true,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "integer"
+          },
+          "built_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Built At"
+          },
+          "counts": {
+            "additionalProperties": true,
+            "title": "Counts",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "seerr": {
+            "additionalProperties": true,
+            "title": "Seerr",
+            "type": "object"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "name",
+          "account_id",
+          "role",
+          "rows",
+          "seerr",
+          "counts"
+        ],
+        "title": "MeOut",
+        "type": "object"
+      },
+      "MyDismissedOut": {
+        "additionalProperties": true,
+        "properties": {
+          "later": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Later",
+            "type": "array"
+          },
+          "never": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Never",
+            "type": "array"
+          }
+        },
+        "required": [
+          "never",
+          "later"
+        ],
+        "title": "MyDismissedOut",
+        "type": "object"
+      },
+      "MySuggestionsOut": {
+        "additionalProperties": true,
+        "properties": {
+          "built_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Built At"
+          },
+          "family": {
+            "title": "Family",
+            "type": "string"
+          },
+          "genres": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Genres",
+            "type": "array"
+          },
+          "has_family": {
+            "title": "Has Family",
+            "type": "boolean"
+          },
+          "hidden_available": {
+            "title": "Hidden Available",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "queued": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Queued",
+            "type": "array"
+          },
+          "seerr": {
+            "additionalProperties": true,
+            "title": "Seerr",
+            "type": "object"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "items",
+          "queued",
+          "hidden_available",
+          "family",
+          "has_family",
+          "genres",
+          "seerr"
+        ],
+        "title": "MySuggestionsOut",
+        "type": "object"
+      },
       "NotificationOut": {
         "additionalProperties": true,
         "description": "One alert as the React bell renders it \u2014 plain text throughout, no HTML.\n\n``extra=\"allow\"`` (here and on the wrapper) is not optional: a strict Pydantic response model\nsilently DROPS any key it does not declare, so a field missed here would vanish from the payload\ninstead of failing loudly.",
@@ -3503,6 +3664,126 @@
         "title": "PerUserOut",
         "type": "object"
       },
+      "PickActionIn": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "request",
+              "never",
+              "later",
+              "skip",
+              "undo"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "last": {
+            "default": false,
+            "title": "Last",
+            "type": "boolean"
+          },
+          "media_type": {
+            "default": "",
+            "enum": [
+              "movie",
+              "show",
+              ""
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Position"
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "enum": [
+                  "deck",
+                  "grid"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surface"
+          },
+          "tmdb_id": {
+            "default": 0,
+            "title": "Tmdb Id",
+            "type": "integer"
+          },
+          "undone": {
+            "anyOf": [
+              {
+                "enum": [
+                  "never",
+                  "later",
+                  "skip"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Undone"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "PickActionIn",
+        "type": "object"
+      },
+      "PickActionOut": {
+        "additionalProperties": true,
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "PickActionOut",
+        "type": "object"
+      },
       "PickOut": {
         "additionalProperties": true,
         "description": "One delivered recommendation, as the run detail lists it.",
@@ -3587,6 +3868,87 @@
         "title": "PickOut",
         "type": "object"
       },
+      "PickSeenIn": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/PickSeenItemIn"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "PickSeenIn",
+        "type": "object"
+      },
+      "PickSeenItemIn": {
+        "additionalProperties": false,
+        "properties": {
+          "media_type": {
+            "enum": [
+              "movie",
+              "show"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Position"
+          },
+          "surface": {
+            "enum": [
+              "deck",
+              "grid"
+            ],
+            "title": "Surface",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "media_type",
+          "surface"
+        ],
+        "title": "PickSeenItemIn",
+        "type": "object"
+      },
+      "PickSeenOut": {
+        "additionalProperties": true,
+        "properties": {
+          "logged": {
+            "title": "Logged",
+            "type": "integer"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "logged"
+        ],
+        "title": "PickSeenOut",
+        "type": "object"
+      },
       "PinOut": {
         "additionalProperties": true,
         "description": "A freshly created plex.tv PIN. The `code` is what the owner types into plex.tv/link \u2014 it is\nshort-lived and useless without the same `client_id`, and it is not a Shortlist credential.\n\n``extra=\"allow\"`` is on every response model in this file: a strict Pydantic response model\nsilently DROPS any key it does not declare, so a field missed here would vanish from the payload\nrather than fail loudly. The model documents the shape; it never filters it.",
@@ -3630,6 +3992,17 @@
           "linked": {
             "title": "Linked",
             "type": "boolean"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "username": {
             "anyOf": [
@@ -6162,6 +6535,17 @@
           "login_required": {
             "title": "Login Required",
             "type": "boolean"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "username": {
             "anyOf": [
@@ -9009,6 +9393,173 @@
         "summary": "Audit Log",
         "tags": [
           "events"
+        ]
+      }
+    },
+    "/api/me": {
+      "get": {
+        "operationId": "me_api_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Me",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/act": {
+      "post": {
+        "operationId": "act_api_me_act_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickActionIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickActionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Act",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/dismissed": {
+      "get": {
+        "operationId": "dismissed_api_me_dismissed_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MyDismissedOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Dismissed",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/seen": {
+      "post": {
+        "operationId": "seen_api_me_seen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PickSeenIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PickSeenOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Seen",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/suggestions": {
+      "get": {
+        "operationId": "suggestions_api_me_suggestions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "family",
+            "required": false,
+            "schema": {
+              "default": "exclude",
+              "title": "Family",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MySuggestionsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Suggestions",
+        "tags": [
+          "me"
         ]
       }
     },

@@ -18,8 +18,21 @@ That is convenient when your proxy is on another host, but it means the client I
 the caller claims. Set it to your proxy's address if you publish the container port directly.
 
 **Only `/api/system/health` answers without a login**, and it returns nothing but `{"status": "ok"}`.
-Everything else requires the owner's Plex account, re-checked on every request. Login is rate-limited,
-and so are failed API-token attempts.
+Everything else requires a Plex sign-in, re-checked on every request. The owner's account reaches
+Shortlist; any other person on the server reaches **their own picks page** (`/me`) and nothing
+else — see [Everyone's own picks](picks.md#everyones-own-picks). Login is rate-limited, and so are
+failed API-token attempts.
+
+**Signing people in through your own proxy.** If a reverse proxy in front of Shortlist already
+authenticates visitors (authentik, Authelia, oauth2-proxy), it can name them to Shortlist instead
+of each person signing in with Plex twice: **Settings → Advanced → Trusted proxy sign-in**. The proxy
+sends the visitor's Plex account id in the header you name there, and proves it is the proxy with a
+shared secret in `X-Shortlist-Proxy-Secret`. The secret is what makes the header trustworthy — with
+`FORWARDED_ALLOW_IPS` at `*`, a client address alone proves nothing, and anyone could send the id
+header. A request without the secret is simply anonymous, never refused, so a misconfigured proxy
+degrades to the login screen. Keep the admin pages for yourself with the proxy's own rules
+(everything but `/me`, `/api/me/*` and `/api/auth/*`), or rely on Shortlist's own check — a person
+named by the proxy is still only a person here.
 
 **The API token is owner-level access.** Anything holding it can do anything you can, including
 deleting rows and rewriting share filters. Rotate it from Settings → API access if it leaks; the old

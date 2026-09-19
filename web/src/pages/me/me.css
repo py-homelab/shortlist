@@ -1,0 +1,130 @@
+/* The picks deck owns the viewport: no page scroll, no rubber-banding, so a vertical drag is a swipe
+   and never a scroll. The synopsis opens in a sheet instead of expanding in place for the same reason. */
+html.picks-deck,
+html.picks-deck body {
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+html.picks-deck body {
+  display: flex;
+  flex-direction: column;
+}
+html.picks-deck #root {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.picks-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 12px;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--card));
+}
+.picks-card .picks-poster {
+  display: block;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  object-fit: cover;
+  background: hsl(var(--muted));
+}
+.picks-card .picks-noposter {
+  display: flex;
+  width: 100%;
+  aspect-ratio: 2 / 3;
+  align-items: center;
+  justify-content: center;
+  background: hsl(var(--muted));
+  color: hsl(var(--muted-foreground));
+}
+.picks-card .picks-overview {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  cursor: pointer;
+}
+
+.picks-stack {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  width: min(100vw - 1.6rem, 440px);
+}
+.picks-stack .picks-card {
+  position: absolute;
+  inset: 0;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  will-change: transform;
+}
+.picks-stack .picks-card.next {
+  transform: scale(0.96) translateY(10px);
+  opacity: 0.7;
+  pointer-events: none;
+}
+.picks-stack .picks-card.gone {
+  transition:
+    transform 0.25s ease,
+    opacity 0.25s ease;
+  opacity: 0;
+}
+.picks-stack .picks-card.snap {
+  transition: transform 0.2s ease;
+}
+.picks-stack .picks-card .picks-poster,
+.picks-stack .picks-card .picks-noposter {
+  aspect-ratio: auto;
+  height: 50%;
+  flex: 0 0 50%;
+}
+.picks-stack .picks-card .picks-overview {
+  -webkit-line-clamp: 4;
+}
+
+.picks-label {
+  position: absolute;
+  top: 1rem;
+  padding: 0.3rem 0.7rem;
+  border: 3px solid;
+  border-radius: 8px;
+  font-weight: 800;
+  font-size: 1.3rem;
+  opacity: 0;
+  transform: rotate(-12deg);
+  pointer-events: none;
+  text-transform: uppercase;
+}
+.picks-label.never {
+  left: 1rem;
+  color: #ff5c5c;
+  border-color: #ff5c5c;
+}
+.picks-label.request {
+  right: 1rem;
+  color: #3ddc84;
+  border-color: #3ddc84;
+  transform: rotate(12deg);
+}
+.picks-label.later {
+  left: 50%;
+  translate: -50% 0;
+  transform: none;
+  color: #5aa9e6;
+  border-color: #5aa9e6;
+}
+.picks-label.skip {
+  top: auto;
+  bottom: 1rem;
+  left: 50%;
+  translate: -50% 0;
+  transform: none;
+  color: #c9c9d6;
+  border-color: #8a8a99;
+}

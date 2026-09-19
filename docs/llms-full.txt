@@ -1344,6 +1344,29 @@ lists the ones it dropped. That line reports the setting as it was **when the ru
 changing it later doesn't rewrite the history of a run you're reading a fortnight after the fact.
 Runs from before v1.2.1 don't carry it and show only the dropped titles, as they always did.
 
+## Everyone's own picks
+
+Every person on the server can sign in to Shortlist with their **own** Plex account and land on
+`/me`: the titles their watch history points at that the library does not hold yet — ranked for
+them by whichever engine Shortlist uses, swiped through on a phone or browsed as a grid, and
+requested **as them** in Overseerr, Seerr or Jellyseerr with their own quota and approval. Nothing
+downloads on its own. They see their own list and nothing of anyone else's; the owner sees their
+own under **My picks**.
+
+- **Swipe right** (♥ Request) files the request. A show asks for its first regular season; more
+  can be added in the request app.
+- **Swipe left** (✕ Not for me) hides the title for good; **swipe up** (⏰ Later) snoozes it for 30
+  days; **swipe down** (↓ Skip) sends it to the back of the deck and keeps it. Undo takes back the
+  last one; **hidden** lists what they said no to, with a restore.
+- The **Family** toggle shows the children's and family titles instead — kept out by default, for a
+  household watching under one account (see [Children's and family titles](https://shortlistapp.dev/guides/rows/#childrens-and-family-titles)).
+- A request needs a *seerr account linked to the same Plex account (Manage Users on the key, so
+  Shortlist can match them); without one the page says so and requests are simply off.
+
+The list is rebuilt with the rows, once a night, from the same engine — and what people see and do
+on it (`pick_events`) is recorded for an engine to learn from. Add the page to a phone's home
+screen: it installs as an app and the deck owns the screen.
+
 ---
 
 # Bring your own recommendation engine
@@ -1429,8 +1452,8 @@ call). The request:
 - `limit_per_media` is how many titles per media type the row build will look at; more are cut,
   never re-ranked.
 - `surface` is `library` for rows. `missing` (titles the libraries do **not** hold) is reserved.
-- `season` names a seasonal row's season, for an engine that wants to know; Shortlist filters to the
-  season's titles itself.
+- `season` is a seasonal row's title set (`{"movie": [...], "show": [...]}`, null otherwise), for
+  an engine that wants to rank within it; Shortlist filters the answer to the season's titles itself.
 
 The answer, best first:
 
@@ -2197,8 +2220,21 @@ That is convenient when your proxy is on another host, but it means the client I
 the caller claims. Set it to your proxy's address if you publish the container port directly.
 
 **Only `/api/system/health` answers without a login**, and it returns nothing but `{"status": "ok"}`.
-Everything else requires the owner's Plex account, re-checked on every request. Login is rate-limited,
-and so are failed API-token attempts.
+Everything else requires a Plex sign-in, re-checked on every request. The owner's account reaches
+Shortlist; any other person on the server reaches **their own picks page** (`/me`) and nothing
+else — see [Everyone's own picks](https://shortlistapp.dev/guides/picks/#everyones-own-picks). Login is rate-limited, and so are
+failed API-token attempts.
+
+**Signing people in through your own proxy.** If a reverse proxy in front of Shortlist already
+authenticates visitors (authentik, Authelia, oauth2-proxy), it can name them to Shortlist instead
+of each person signing in with Plex twice: **Settings → Advanced → Trusted proxy sign-in**. The proxy
+sends the visitor's Plex account id in the header you name there, and proves it is the proxy with a
+shared secret in `X-Shortlist-Proxy-Secret`. The secret is what makes the header trustworthy — with
+`FORWARDED_ALLOW_IPS` at `*`, a client address alone proves nothing, and anyone could send the id
+header. A request without the secret is simply anonymous, never refused, so a misconfigured proxy
+degrades to the login screen. Keep the admin pages for yourself with the proxy's own rules
+(everything but `/me`, `/api/me/*` and `/api/auth/*`), or rely on Shortlist's own check — a person
+named by the proxy is still only a person here.
 
 **The API token is owner-level access.** Anything holding it can do anything you can, including
 deleting rows and rewriting share filters. Rotate it from Settings → API access if it leaks; the old
@@ -2478,6 +2514,8 @@ root, which on its own looks exactly like a proxy problem.
 | `recommendations.rating_source`                       | `tmdb`                             | which service's score a row ordered by **Highest rated** sorts on. `tmdb` is already carried on every candidate and costs no lookups; `imdb`/`trakt`/`tomatoes`/`metacritic` come from MDBList (one cached lookup per title, shared by every row and user) and need `requests.mdblist.apikey`. Without a key, or once the daily quota is spent, the row falls back to TMDB for its whole ordering rather than mixing two scales                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `privacy.hide_shared_from_disabled`                   | `true`                             | when on, disabling a user hides EVERY shared row from them too — even public "Popular on this server" rows. So a disabled user sees nothing from Shortlist. Off = disabled users still see public shared rows like any account with library access. Changing this setting, or re-enabling someone, rewrites the share filters straight away rather than waiting for a run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `candidates.sources`                                  | `["tmdb_similar","tmdb_discover"]` | sources to pool: `tmdb_similar`, `tmdb_discover`, `trakt`, `llm_web`. Each enabled source gets a fair share of the pooled candidates — a wide source can't crowd out a narrow one                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `auth.proxy.header`                                   | `—`                                | trusted-proxy sign-in: the header a reverse proxy that already authenticated the visitor names their Plex account id in (e.g. `X-Plex-Account-Id`). Off when blank. Only honoured beside the secret below |
+| `auth.proxy.secret`                                   | `—`                                | the shared secret the proxy sends in `X-Shortlist-Proxy-Secret`; encrypted. Without it the id header is ignored (anonymous, not refused). See [Putting it on the internet](https://shortlistapp.dev/guides/security/) |
 | `engine.backend`                                      | `builtin`                          | which engine ranks each person's candidates. `builtin` is Shortlist's own (the sources above, TMDB similarity, the ranking dials); `http` is an engine you run yourself, speaking the [engine protocol](https://shortlistapp.dev/guides/engines/) at `engine.url`. Each person's seeds and watch history are sent to it, and nowhere else. The sources below are the built-in engine's and are ignored under `http` |
 | `engine.url`                                          | `—`                                | the external engine's address, e.g. `http://recommendarr:8090`. Refused for non-HTTP schemes and cloud metadata addresses like every other fetched URL |
 | `engine.token`                                        | `—`                                | optional bearer token the engine expects; encrypted. Never logged, never in an error |
@@ -3189,6 +3227,12 @@ anything reaches it, including from quoted exception messages.
 GET  /api/support/health -> {checks[{name, ok, detail}], text} (Plex, libraries, tokens, TMDB, curator, database, clocks, last run — each probed independently so one failure is content, not a 500)
 GET  /api/support/title?q= -> {rows[{user, watched_record, viewed_leaf_count, leaf_count, counts_as_watched, cap_pct, delivered[], problem}], flagged[], text}
 GET  /api/support/person/{slug} -> {user_type, watched_movies, watched_shows, libraries[{section_key, library, titles_known, ever_read}], never_read[], text}
+# A person's own picks (any signed-in person on the server, or the owner as themselves; never the API token)
+GET  /api/me                                  -> {state, name, account_id, role, built_at, rows[], seerr{linked, user_id, quota, error, configured}, counts{}}
+GET  /api/me/suggestions?family=exclude|only|include -> {state, items[], queued[], hidden_available, family, has_family, genres[{name,count}], built_at, seerr}
+GET  /api/me/dismissed                        -> {never[], later[]}
+POST /api/me/act {action: request|never|later|skip|undo, tmdb_id, media_type, surface?, position?, last?, undone?}
+POST /api/me/seen {items[{tmdb_id, media_type, surface, position}]}   -> {ok, logged}   (impressions, one per title/surface/day)
 GET  /api/support/rows -> {rows[{slug, watched_pct, watched_pct_source, refresh_days, refresh_days_source, idle_hold_days, idle_hold_source, rewatch, unstarted_only, family}], global_watched_pct, text}
 GET  /api/support/row-schedule -> {rows[{slug, refresh_days_source, rebuild_every_days, idle_hold_days, idle_hold_source, last_built_at, days_since_built, due}], text}
 GET  /api/support/libraries -> {libraries[{key, title, type, items}], error, text}

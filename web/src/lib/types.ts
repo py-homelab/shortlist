@@ -382,6 +382,62 @@ export type PinStatus = Schemas["PinStatusOut"];
  *  protecting yet" — if not, the wizard opens without a login and connecting Plex claims it. */
 export type Session = Schemas["SessionOut"];
 
+// --- A person's own picks (GET/POST /api/me/*) ---
+export type Me = Schemas["MeOut"];
+export type MySuggestions = Schemas["MySuggestionsOut"];
+export type MyDismissed = Schemas["MyDismissedOut"];
+/** POST /api/me/act. Hand-typed rather than the schema: every field but `action` has a server
+ *  default, and the generated type marks them required anyway. */
+export interface ActBody {
+  action: "request" | "never" | "later" | "skip" | "undo";
+  tmdb_id?: number;
+  media_type?: "movie" | "show" | "";
+  surface?: "deck" | "grid" | null;
+  position?: number | null;
+  last?: boolean;
+  undone?: "never" | "later" | "skip" | null;
+}
+export type ActResult = Schemas["PickActionOut"] & {
+  restored?: { tmdb_id: number; media_type: string; kind: string; title: string } | null;
+  dismissed?: { kind: string; until: string | null };
+  skipped?: boolean;
+  status?: string | null;
+  request_id?: number | null;
+};
+export type SeenBody = Schemas["PickSeenIn"];
+export type FamilyLane = "exclude" | "only" | "include";
+
+/** One title on a person's picks page, as `/api/me/suggestions` serves it. Hand-typed: the server
+ *  passes the item through as a plain dict, so the schema says only `object`. */
+export interface PickItem {
+  tmdb_id: number;
+  media_type: "movie" | "show";
+  title: string;
+  year: number | null;
+  rating: number | null;
+  vote_count: number | null;
+  overview: string;
+  language: string;
+  poster_path: string | null;
+  genres: string[];
+  reason: string;
+  seed_title: string | null;
+  kids: boolean;
+  rank: number;
+  source: string;
+  seerr: { status: string | null; request_id: number | null };
+  requestable: boolean;
+  reason_not_requestable: string | null;
+}
+export interface DismissedItem {
+  tmdb_id: number;
+  media_type: "movie" | "show";
+  title: string;
+  year: number | null;
+  until: string | null;
+  created_at: string;
+}
+
 /** Owner API-token status. The token is revealable (stored encrypted at rest), so the owner-gated
  *  endpoint returns it in plaintext for the owner to unhide/copy — like Sonarr/Radarr's key. */
 export type ApiTokenStatus = Schemas["ApiTokenStatusOut"];

@@ -249,6 +249,15 @@ def _optional_bounded_float(low: float, high: float):
     return check
 
 
+def _header_name(value: object) -> str | None:
+    """An HTTP header name, or blank to switch trusted-proxy identity off."""
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,80}", value.strip()):
+        return "must be an HTTP header name (letters, digits and dashes)"
+    return None
+
+
 def _known_sources(value: object) -> str | None:
     from shortlist.engine.candidates import KNOWN_SOURCES
 
@@ -371,6 +380,7 @@ VALIDATORS = {
     # discovered a fortnight later as a request that never arrived.
     "requests.sonarr.monitor": _one_of(*SONARR_MONITOR_MODES),
     "row.name_template": _non_blank_row_template,
+    "auth.proxy.header": _header_name,
     "engine.backend": _one_of("builtin", "http"),
     "engine.fallback": _one_of("builtin", "none"),
     "engine.timeout_s": _bounded_int(1, 600),

@@ -244,6 +244,7 @@ class TestUsers:
             {
                 "id": 1,
                 "name": "serverowner",
+                "plex_id": 111111,
                 "auto_approve_movies": True,
                 "auto_approve_tv": True,
                 "is_plex_user": True,
@@ -251,6 +252,7 @@ class TestUsers:
             {
                 "id": 4,
                 "name": "Shortlist",
+                "plex_id": None,  # a local account: nobody on the server can sign in as it
                 "auto_approve_movies": False,
                 "auto_approve_tv": False,
                 # userType 2 — a local account made inside Overseerr, not a person on the server.
@@ -259,6 +261,7 @@ class TestUsers:
             {
                 "id": 7,
                 "name": "MooHouse",
+                "plex_id": 222222,
                 "auto_approve_movies": False,
                 "auto_approve_tv": False,
                 "is_plex_user": True,

@@ -1041,3 +1041,110 @@ class WatchSession(Base):
         if not self.duration_ms:
             return None
         return min(100, round(100 * self.max_offset_ms / self.duration_ms))
+
+
+class UserSuggestion(Base):
+    """One title on a person's request surface — what the engine would suggest that no library holds,
+    ranked for THEM. Rewritten whole per person on every run that produces one (`persist_report`);
+    a run that produces nothing for them leaves last night's list in place rather than blanking it.
+
+    The per-person picks page reads this and nothing upstream, so a page load costs one query. What
+    the person then does with a title lives in `dismissals` and `pick_events`, not here.
+    """
+
+    __tablename__ = "user_suggestions"
+    __table_args__ = (UniqueConstraint("user_id", "tmdb_id", "media_type", name="uq_user_suggestion"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    tmdb_id: Mapped[int] = mapped_column(Integer)
+    media_type: Mapped[str] = mapped_column(String(16))
+    title: Mapped[str] = mapped_column(String(512))
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    genres: Mapped[list] = mapped_column(JSON, default=list)
+    rating: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vote_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    poster_path: Mapped[str] = mapped_column(String(256), default="")
+    overview: Mapped[str] = mapped_column(Text, default="")
+    language: Mapped[str] = mapped_column(String(16), default="")
+    reason: Mapped[str] = mapped_column(String(512), default="")
+    kids: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    seed_tmdb_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    seed_title: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    #: Comma-joined source ids ("engine:recommendarr", "tmdb_similar"), as `picks.sources`.
+    sources: Mapped[str] = mapped_column(String(256), default="")
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    built_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Dismissal(Base):
+    """A person's standing answer to one suggested title: `never` (durable) or `later` (until a date).
+
+    STATE, not history — an undo deletes the row; `pick_events` keeps what happened. One row per
+    person and title; a second answer replaces the first.
+    """
+
+    __tablename__ = "dismissals"
+    __table_args__ = (UniqueConstraint("user_id", "tmdb_id", "media_type", name="uq_dismissal"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    tmdb_id: Mapped[int] = mapped_column(Integer)
+    media_type: Mapped[str] = mapped_column(String(16))
+    #: never | later
+    kind: Mapped[str] = mapped_column(String(16))
+    #: `later` only: when the title may come back. NULL for `never`.
+    until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    title: Mapped[str] = mapped_column(String(512), default="")
+    year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PickEvent(Base):
+    """Append-only: what each person SAW and DID on their picks page, for an engine to learn from.
+
+    `shown` means actually on screen (the top card, a tile in the viewport), never merely served; one
+    per person, title, surface and UTC day (`shown_day`), so re-renders cost nothing. `source` names
+    the ranker that produced the item; `meta` is free JSON (the Seerr request id, what an undo undid).
+    """
+
+    __tablename__ = "pick_events"
+    __table_args__ = (
+        Index("ix_pick_events_user_created", "user_id", "created_at"),
+        Index("ix_pick_events_title", "tmdb_id", "media_type"),
+        # The dedupe for impressions: `shown_day` is NULL for every other event, and NULLs are distinct
+        # in a UNIQUE constraint on every backend we run on, so only `shown` rows collide.
+        UniqueConstraint("user_id", "tmdb_id", "media_type", "surface", "shown_day", name="uq_pick_event_shown"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    tmdb_id: Mapped[int] = mapped_column(Integer)
+    media_type: Mapped[str] = mapped_column(String(16))
+    #: shown | request | never | later | skip | undo
+    event: Mapped[str] = mapped_column(String(16))
+    #: deck | grid, or NULL when the page did not say.
+    surface: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source: Mapped[str] = mapped_column(String(64), default="")
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    #: YYYY-MM-DD (UTC) for `shown` events only — the impression dedupe key. NULL otherwise.
+    shown_day: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RequestLog(Base):
+    """Every request a person filed through their picks page, and what Seerr answered."""
+
+    __tablename__ = "request_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    tmdb_id: Mapped[int] = mapped_column(Integer)
+    media_type: Mapped[str] = mapped_column(String(16))
+    seerr_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    seerr_request_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    #: pending | approved | declined, as Seerr answered at filing time.
+    seerr_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

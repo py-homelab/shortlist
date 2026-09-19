@@ -80,7 +80,10 @@ def recommend_payload(req: RecommendRequest, run_day: int) -> dict:
             )
         ),
         "excluded_genres": sorted(req.excluded_genres),
-        "season": req.season.slug if req.season is not None else None,
+        # A seasonal row: the season's titles, per media type, so the engine can rank within them.
+        "season": (
+            {kind.value: sorted(ids) for kind, ids in req.season.ids.items()} if req.season is not None else None
+        ),
     }
 
 

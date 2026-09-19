@@ -114,6 +114,11 @@ def run(ctx: EngineContext, users: list[UserProfile]) -> RunReport:
         # The same instant `run_day` is derived from, so the cadence and the idle hold cannot
         # disagree about which night this is.
         ctx.run_at = report.started_at
+    # A run is the unit an engine may remember anything across (the built-in one memoises its
+    # gathers per person for the night). A context reused for a second run starts it clean.
+    begin_run = getattr(ctx.recommender, "begin_run", None)
+    if begin_run is not None:
+        begin_run()
 
     # Tell the UI the full queue up front — cards can say "queued (3rd in line)"
     # instead of a bare "waiting…" while the indexes build.

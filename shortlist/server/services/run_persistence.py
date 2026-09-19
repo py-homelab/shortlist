@@ -39,6 +39,7 @@ from shortlist.server.db.models import (
     RunUser,
     SharedRowWatch,
     User,
+    UserSuggestion,
     WatchEvent,
     WatchSession,
 )
@@ -1357,6 +1358,43 @@ def _cost_blob(user_report) -> dict | None:
     }
 
 
+def _replace_suggestions(session: Session, run_id: int, user: User, missing: list[dict]) -> None:
+    """This person's request surface, rewritten whole — only when the run produced one.
+
+    An empty list is left alone on purpose: a cold start, an engine that failed the call, or a night
+    every source was quiet is not "they want nothing now", and blanking the page over it would make
+    an upstream hiccup look like a decision. Last night's list stays until a run replaces it.
+    """
+    if not missing:
+        return
+    session.query(UserSuggestion).filter(UserSuggestion.user_id == user.id).delete(synchronize_session=False)
+    now = datetime.now(UTC)
+    for m in missing:
+        session.add(
+            UserSuggestion(
+                user_id=user.id,
+                rank=int(m["rank"]),
+                tmdb_id=int(m["tmdb_id"]),
+                media_type=str(m["media_type"]),
+                title=str(m.get("title") or ""),
+                year=m.get("year"),
+                genres=list(m.get("genres") or []),
+                rating=m.get("rating"),
+                vote_count=m.get("vote_count"),
+                poster_path=str(m.get("poster_path") or ""),
+                overview=str(m.get("overview") or ""),
+                language=str(m.get("language") or ""),
+                reason=str(m.get("reason") or ""),
+                kids=bool(m.get("kids")),
+                seed_tmdb_id=m.get("seed_tmdb_id"),
+                seed_title=m.get("seed_title"),
+                sources=",".join(m.get("sources") or []),
+                run_id=run_id,
+                built_at=now,
+            )
+        )
+
+
 def _persist_user_report(session: Session, run_id: int, user: User, user_report, dry_run: bool) -> None:
     """One user's RunUser row, their picks (non-dry-run only), and their run.user audit event."""
     user.cold_start = user_report.status == "cold_start"
@@ -1383,6 +1421,7 @@ def _persist_user_report(session: Session, run_id: int, user: User, user_report,
         # recreates it) must end up with the entry the delivery just wrote, not without one.
         _forget_removed_deliveries(session, user.slug, user_report.removed_deliveries)
         _record_deliveries(session, user.slug, user_report.breakdown)
+        _replace_suggestions(session, run_id, user, user_report.missing)
         for pick in user_report.picks:
             session.add(
                 PickRow(

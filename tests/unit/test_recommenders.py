@@ -164,7 +164,9 @@ class TestHttpRecommender:
 
         _run(ctx, mock_plextv)
 
-        [payload] = client.payloads
+        # The library surface for the rows, then the missing surface for their request page.
+        payload, missing = client.payloads
+        assert missing["surface"] == "missing" and missing["plex_account_id"] == 100
         assert payload["protocol"] == 1
         assert payload["plex_account_id"] == 100
         assert payload["surface"] == "library"
@@ -247,6 +249,52 @@ class TestHttpRecommender:
         assert report.trace["gathers"][0]["engine"] == {"built_at": 123}
 
 
+class TestMissingSurface:
+    def test_the_builtin_ranks_what_no_library_holds_from_the_same_gather(self, ctx, mock_plextv):
+        # 10 and 20 are in the library; 99 is not. One gather serves both surfaces (suggestions once).
+        ctx.tmdb.suggestions.return_value = [
+            ({"id": 10, "title": "Ten", "genre_ids": [], "vote_average": 8.0}, 1.0),
+            ({"id": 99, "title": "Not Here", "genre_ids": [], "vote_average": 7.0}, 1.0),
+            ({"id": 98, "title": "Nor This", "genre_ids": [], "vote_average": 9.0}, 1.0),
+        ]
+        report = _run(ctx, mock_plextv)
+        assert [p.tmdb_id for p in report.picks] == [10]
+        assert [m["tmdb_id"] for m in report.missing] == [98, 99]  # by score, best first
+        assert report.missing[0]["rank"] == 1
+        assert report.missing[0]["reason"].startswith("Because you watched")
+        assert report.missing[0]["seed_tmdb_id"] == 900
+        assert ctx.tmdb.suggestions.call_count == 1
+
+    def test_the_http_engine_is_asked_for_the_missing_surface_and_its_order_kept(self, ctx, mock_plextv):
+        items = [_item(20, "Twenty"), _item(99, "Not Here", reason="Trust me"), _item(98, "Nor")]
+        client = FakeEngineClient(items, name="e")
+        ctx.recommender = HttpRecommender(client, name="e")
+        report = _run(ctx, mock_plextv)
+        assert [m["tmdb_id"] for m in report.missing] == [99, 98]  # 20 is in the library: never a request
+        assert report.missing[0]["reason"] == "Trust me"
+        assert report.missing[0]["sources"] == ["engine:e"]
+
+    def test_a_failing_missing_call_leaves_the_surface_empty_not_the_run_failed(self, ctx, mock_plextv):
+        calls = {"n": 0}
+
+        class Flaky(FakeEngineClient):
+            def recommend(self, payload):
+                calls["n"] += 1
+                if payload["surface"] == "missing":
+                    raise EngineError("engine unreachable")
+                return super().recommend(payload)
+
+        ctx.recommender = HttpRecommender(Flaky([_item(20, "Twenty")], name="e"))
+        report = _run(ctx, mock_plextv)
+        assert report.status == "ok" and [p.tmdb_id for p in report.picks] == [20]
+        assert report.missing == []
+
+    def test_a_cold_person_has_no_missing_surface(self, ctx, mock_plextv):
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        report = _run(ctx, mock_plextv)
+        assert report.status == "cold_start" and report.missing == []
+
+
 class TestFallbackRecommender:
     def test_a_failing_engine_falls_back_to_the_builtin_and_says_so(self, ctx, mock_plextv):
         client = FakeEngineClient(EngineError("engine unreachable (ConnectError)"), name="e")
@@ -302,7 +350,7 @@ class TestColdStartWithAnEngine:
 
         assert report.status == "ok"
         assert [p.tmdb_id for p in report.picks] == [20]
-        assert len(client.payloads) == 1
+        assert [p["surface"] for p in client.payloads] == ["library", "missing"]
 
     def test_an_engine_that_serves_cold_but_answers_nothing_yields_a_cold_start(self, ctx, mock_plextv):
         ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]

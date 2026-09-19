@@ -14,6 +14,7 @@ import { resolveArea } from "@/lib/auth";
 import { queryKeys, useSession, useSetupState } from "@/lib/queries";
 import { DashboardPage } from "@/pages/dashboard";
 import { LoginPage } from "@/pages/login";
+import MePage from "@/pages/me";
 import { NotFoundPage } from "@/pages/not-found";
 import { RequestsPage } from "@/pages/requests";
 import { RowEditPage } from "@/pages/row-edit";
@@ -70,9 +71,11 @@ function RequireApp() {
   const session = useSession();
   const authenticated = session.data?.authenticated ?? false;
   const loginRequired = session.data?.login_required ?? true;
+  const person = session.data?.role === "person";
   // Setup state is owner-only once the instance is claimed: asking for it before we know who this
-  // is just 401s, and the visitor would sit behind a skeleton instead of the login screen.
-  const setup = useSetupState({ enabled: authenticated || !loginRequired });
+  // is just 401s, and the visitor would sit behind a skeleton instead of the login screen. A
+  // PERSON never gets it either (403) — their whole app is /me, so they go there before it is asked.
+  const setup = useSetupState({ enabled: (authenticated && !person) || !loginRequired });
 
   if (session.isPending) {
     return (
@@ -92,6 +95,7 @@ function RequireApp() {
     );
   }
   if (!authenticated && loginRequired) return <Navigate to="/login" replace />;
+  if (person) return <Navigate to="/me" replace />;
   if (setup.isPending) {
     return (
       <div className="mx-auto mt-16 w-full max-w-4xl px-4">
@@ -110,6 +114,34 @@ function RequireApp() {
   return <AppShell />;
 }
 
+/**
+ * The per-person gate. Anyone signed in — a person or the owner — sees their own picks; nobody
+ * else sees anything. Outside `RequireApp` on purpose: that gate is the OWNER's app and asks for
+ * setup state, which a person is refused.
+ */
+function RequirePerson() {
+  const session = useSession();
+  if (session.isPending) {
+    return (
+      <div className="mx-auto mt-16 w-full max-w-4xl px-4">
+        <Skeleton className="h-96 w-full" />
+      </div>
+    );
+  }
+  if (session.isError) {
+    return (
+      <div className="mx-auto mt-16 max-w-2xl px-4">
+        <ErrorState
+          error={session.error}
+          onRetry={() => void session.refetch()}
+        />
+      </div>
+    );
+  }
+  if (!session.data?.authenticated) return <Navigate to="/login" replace />;
+  return <MePage />;
+}
+
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
@@ -117,6 +149,7 @@ export default function App() {
         <Routes>
           <Route path="login" element={<LoginPage />} />
           <Route path="setup" element={<SetupPage />} />
+          <Route path="me" element={<RequirePerson />} />
           <Route element={<RequireApp />}>
             <Route index element={<DashboardPage />} />
             <Route path="rows" element={<RowsPage />} />
