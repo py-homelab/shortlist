@@ -500,6 +500,22 @@ class TestSettingsApi:
         assert ok["ok"] is True and "serverowner" in ok["message"]
         assert set(half) == {"ok", "message"} and set(ok) == {"ok", "message"}
 
+    def test_engine_test_connection_says_when_its_lists_are_stale(self, client: TestClient, monkeypatch):
+        client.put("/api/settings", json={"values": {"engine.backend": "http", "engine.url": "http://e:8090"}})
+        info = {"name": "recommendarr", "version": "0.3.1", "ready": True, "stale": False, "last_build_ok": True}
+        monkeypatch.setattr("shortlist.engine.clients.engine_http.EngineClient.info", lambda self: dict(info))
+        ok = client.post("/api/settings/test/engine").json()
+        assert ok == {"ok": True, "message": "Connected to recommendarr 0.3.1 — ready"}
+
+        info.update(last_build_ok=False, last_build_error="OperationalError: disk I/O error")
+        failed_build = client.post("/api/settings/test/engine").json()
+        assert failed_build["ok"] is True and "latest build failed: OperationalError" in failed_build["message"]
+
+        info.update(stale=True, ready=False, age_hours=60.2)
+        stale = client.post("/api/settings/test/engine").json()
+        assert stale["ok"] is False
+        assert "stale (60.2 h old)" in stale["message"] and "disk I/O error" in stale["message"]
+
     def test_the_removed_agregarr_connection_is_gone_from_every_surface(self, client: TestClient):
         """The Agregarr connection was removed. Three surfaces had to stop knowing about it, and a
         miss on any one leaves a half-removed feature that looks configurable and does nothing.

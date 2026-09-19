@@ -6,6 +6,17 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.2] - 2026-09-19 (py-homelab fork)
+
+### Added
+
+- **An engine that is up but serving old lists is no longer silent.** Each run records the external
+  engine's health (stale lists, a failed rebuild, unreachable) and how many people fell back to
+  Shortlist's own engine and why; the dashboard bell raises a warning when the newest run found any
+  of that, and clears itself when a run finds the engine healthy. The engine card's **Test** button
+  fails on stale lists and names their age and the build error
+  ([docs](docs/guides/engines.md#when-the-engine-needs-attention)).
+
 ## [1.9.1-py.1] - 2026-09-19 (py-homelab fork)
 
 ### Added

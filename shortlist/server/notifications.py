@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from shortlist.engine.placeholders import names_a_seed
 from shortlist.server.db.models import Event, Run
-from shortlist.server.services.audit import RESTRICTION_RESTORED_SCOPE
+from shortlist.server.services.audit import ENGINE_STATUS_SCOPE, RESTRICTION_RESTORED_SCOPE
 from shortlist.server.services.watch_stream import STREAM_DOWN_ALERT_MINUTES, STREAM_DOWN_SINCE_KEY
 from shortlist.server.settings_store import SettingsStore
 from shortlist.server.version_check import check_for_update
@@ -905,6 +905,40 @@ def _restrictions_restored(session: Session) -> dict | None:
     }
 
 
+def _engine_in_trouble(session: Session, store: SettingsStore) -> dict | None:
+    """The external engine is up but its lists are old, its last build failed, or it could not be
+    reached — as the NEWEST run with that engine found it. A stale engine still answers, so nothing
+    else surfaces it: rows quietly rank from days-old viewing, or fall back to Shortlist's own engine.
+
+    Read from the newest `engine.status` event only, so a run that finds the engine healthy clears it.
+    Dismissable, keyed to that event: the next run that still finds trouble brings it back.
+    """
+    if store.get("engine.backend") != "http":
+        return None
+    newest = (
+        session.query(Event)
+        .filter(Event.scope == ENGINE_STATUS_SCOPE, Event.ts >= datetime.now(UTC) - timedelta(days=3))
+        .order_by(Event.id.desc())
+        .first()
+    )
+    message = (newest.message or {}) if newest else {}
+    if not message.get("trouble"):
+        return None
+    name = message.get("name") or "Your recommendation engine"
+    return {
+        "id": f"engine-trouble-{newest.id}",
+        "severity": "warning",
+        "title": f"{name} is not serving fresh recommendations",
+        "body": (
+            f"At the last run, {name} {message['trouble']}. Rows built from it may be based on old viewing. "
+            "Check the engine's container log; its /healthz says when it last built and why it failed."
+        ),
+        "action_url": "/settings#recommendations",
+        "action_label": "Engine settings",
+        "dismissable": True,
+    }
+
+
 def build_notifications(session: Session, store: SettingsStore, current_version: str) -> list[dict]:
     """Every currently-firing notification the owner hasn't dismissed, most severe first. Dismissal is
     by id, and each dismissable id encodes its state (the run id, the version), so a NEW failure or a
@@ -924,6 +958,7 @@ def build_notifications(session: Session, store: SettingsStore, current_version:
         _owner_sees_all_rows(session),
         _shelf_contention(session),
         _playback_listener_down(store),
+        _engine_in_trouble(session, store),
     ]
     dismissed = set(store.get(DISMISSED_KEY) or [])
     order = {"error": 0, "warning": 1, "info": 2}

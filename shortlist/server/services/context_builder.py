@@ -488,7 +488,14 @@ class ContextBuilder:
             serves_cold = bool(info.get("serves_cold", False))
         except EngineError as e:
             logger.warning("external engine not reachable at run start ({}) — each pool will retry it", e)
-        external = HttpRecommender(client, name=name, serves_cold=serves_cold)
+            info = {"unreachable": str(e)}
+        if info.get("stale") or info.get("last_build_ok") is False:
+            logger.warning(
+                "external engine '{}' reports stale lists or a failed build ({}) — its answers may be old",
+                name or url,
+                info.get("last_build_error") or f"{info.get('age_hours')} h old",
+            )
+        external = HttpRecommender(client, name=name, serves_cold=serves_cold, info=info)
         if store.get("engine.fallback") == "none":
             return external
         return FallbackRecommender(external, builtin)

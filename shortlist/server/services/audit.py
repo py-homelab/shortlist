@@ -72,6 +72,10 @@ def actor_of(auth: dict | None, request) -> dict:
 #: run persister and by every job that runs the privacy pass without persisting a run; read by the bell.
 RESTRICTION_RESTORED_SCOPE = "privacy.restriction_restored"
 
+# Each run's external-engine health (`shortlist.engine.recommender.engine_status`); the newest one
+# drives the dashboard's engine alert.
+ENGINE_STATUS_SCOPE = "engine.status"
+
 
 def audit_restored_restrictions(state, report) -> None:
     """Record each account a run-less privacy pass repaired, so the bell hears about it (#116)."""

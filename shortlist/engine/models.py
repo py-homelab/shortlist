@@ -1051,6 +1051,11 @@ class RunReport:
     # any run's user list — so without this, "what changed on whose share at 03:31" would have no
     # answer for them at all (plex-safety rule 10).
     filter_writes: dict[int, dict] = field(default_factory=dict)
+    # The external engine's health for this run (`recommender.engine_status`): its own report at run
+    # start (`/v1/info`: stale lists, last build error) and how many people's pools fell back to the
+    # built-in engine tonight, and why. None with the built-in engine. Surfaced as a dashboard alert —
+    # an engine that is up but serving old lists is otherwise invisible.
+    engine: dict | None = None
     # Managed-recommendation shelf outcomes for this run — a run-level audit of a server-wide Plex
     # write (plex-safety rule 10). TWO kinds of entry, and a consumer has to branch on them:
     #   * a MOVE — `moved` (the row titles) and `verified` (did the shelf actually end up that way);
