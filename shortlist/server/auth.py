@@ -8,6 +8,7 @@ stored encrypted; it is never logged.
 
 from __future__ import annotations
 
+import hmac
 import time
 from collections import deque
 
@@ -22,6 +23,15 @@ PRODUCT = "Shortlist"
 SESSION_COOKIE = "shortlist_session"
 SESSION_MAX_AGE_S = 14 * 24 * 3600
 CSRF_HEADER = "x-shortlist-csrf"
+# Who a signed-in caller is. The owner runs Shortlist; a PERSON is someone with a row on this server,
+# signed in with their own Plex account, who may see and act on their own picks and nothing else.
+ROLE_OWNER = "owner"
+ROLE_PERSON = "person"
+# Trusted-proxy identity (`auth.proxy.header`): the proxy that authenticated the visitor names their
+# Plex account id in that header AND proves it is the proxy with this one. The secret is what makes
+# the header trustworthy — `FORWARDED_ALLOW_IPS` is `*` by default, so a client address alone can be
+# whatever the caller says it is.
+PROXY_SECRET_HEADER = "x-shortlist-proxy-secret"
 
 # Programmatic API access: an owner-generated Bearer token. Stored ENCRYPTED at rest (Fernet, same as
 # the Plex/curator keys) so the owner can reveal it later — like Sonarr/Radarr's API key — while a bare
@@ -219,6 +229,77 @@ def read_session(request: Request) -> dict | None:
         return None
 
 
+def _proxy_identity(request: Request) -> dict | None:
+    """Who the reverse proxy says this is, when trusted-proxy identity is configured — else None.
+
+    Two headers: the configured one carrying a Plex account id, and `PROXY_SECRET_HEADER` carrying the
+    shared secret. A request with the id but a missing or wrong secret is treated as anonymous, not
+    refused — so a misconfigured proxy degrades to the login screen rather than locking everyone out,
+    and a stranger who guesses the header name learns nothing. A wrong secret is logged once per
+    request, since the only way it happens is a proxy misconfiguration or someone probing.
+    """
+    state = request.app.state
+    # A state without the hook (a bare test app, an embedding that never wired it) has the feature off.
+    proxy_auth = getattr(state, "proxy_auth", None)
+    header, secret = proxy_auth() if proxy_auth is not None else ("", "")
+    if not header or not secret:
+        return None
+    claimed = request.headers.get(header)
+    if not claimed:
+        return None
+    proof = request.headers.get(PROXY_SECRET_HEADER, "")
+    if not hmac.compare_digest(proof, secret):
+        logger.warning("proxy identity header present without the proxy secret — ignored")
+        return None
+    try:
+        account_id = int(claimed)
+    except ValueError:
+        logger.warning("proxy identity header is not a Plex account id — ignored")
+        return None
+    owner_id = state.owner_account_id()
+    if owner_id is not None and account_id == owner_id:
+        return {"account_id": account_id, "username": "", "role": ROLE_OWNER, "via": "proxy"}
+    person = _person_account(state, account_id)
+    if person is None:
+        return None
+    return {"account_id": account_id, "username": person["username"], "role": ROLE_PERSON, "via": "proxy"}
+
+
+def _person_account(state, account_id: int) -> dict | None:
+    """`state.person_account`, or nobody on a state that never wired a roster."""
+    lookup = getattr(state, "person_account", None)
+    return lookup(account_id) if lookup is not None else None
+
+
+def read_identity(request: Request) -> dict | None:
+    """The signed-in caller with their `role` resolved against TODAY's state, or None.
+
+    The cookie only says who signed in; whether that account is the owner or one of this server's
+    people is re-decided on every request, so a person the owner removed since loses access at once,
+    and a session issued during the pre-link window is nobody once a different account links a
+    server. A cookie written before roles existed (no `role` field) is the owner's or nothing — that
+    is the only kind that was ever issued.
+    """
+    session = read_session(request) or _proxy_identity(request)
+    if session is None:
+        return None
+    if session.get("via") == "proxy":
+        return session
+    state = request.app.state
+    owner_id = state.owner_account_id()
+    account_id = session.get("account_id")
+    if owner_id is not None and account_id == owner_id:
+        return {**session, "role": ROLE_OWNER}
+    # Not the owner. Whatever the cookie claims, the roster decides — and a cookie that claims
+    # nothing (issued before roles existed) belongs to nobody on this side: only the owner ever
+    # signed in then, and the owner was handled above.
+    if owner_id is not None and session.get("role") is not None and isinstance(account_id, int):
+        person = _person_account(state, account_id)
+        if person is not None:
+            return {**session, "role": ROLE_PERSON, "username": person["username"]}
+    return None
+
+
 def _cookie_path(request: Request) -> str:
     """The path to scope the session cookie to.
 
@@ -311,12 +392,29 @@ def require_owner(request: Request) -> dict:
         _rate_limit_token_failures()
         raise HTTPException(status_code=401, detail="invalid or revoked API token")
     _check_csrf(request)
-    session = read_session(request)
+    session = read_session(request) or _proxy_identity(request)
     if session is None:
         raise HTTPException(status_code=401, detail="not signed in — use Login with Plex")
     if owner_id is None or session.get("account_id") != owner_id:
         raise HTTPException(status_code=403, detail="only the server owner can use Shortlist")
-    return session
+    return {**session, "role": ROLE_OWNER}
+
+
+def require_person(request: Request) -> dict:
+    """Someone with a row on this server, signed in as themselves — or the owner. The gate for the
+    per-person pages (`/api/me`), and for nothing the owner alone should reach.
+
+    Deliberately NOT the API token: that token is owner-level programmatic access, and a script
+    holding it has `require_owner` for everything it could want. Identity here is a person's own
+    Plex sign-in (or the trusted proxy's word), so acting "as" someone is never a bearer away.
+    """
+    _check_csrf(request)
+    identity = read_identity(request)
+    if identity is None:
+        if read_session(request) is None:
+            raise HTTPException(status_code=401, detail="not signed in — use Login with Plex")
+        raise HTTPException(status_code=403, detail="this Plex account has no place on this server")
+    return identity
 
 
 def require_setup_access(request: Request) -> dict:
@@ -396,6 +494,8 @@ class PinStatusOut(BaseModel):
     linked: bool
     account_id: int | None = None
     username: str | None = None
+    # `owner` or `person` once linked — which tells the SPA where to send them.
+    role: str | None = None
 
 
 @router.get("/pin/{pin_id}", response_model=PinStatusOut)
@@ -427,10 +527,20 @@ async def poll_pin(pin_id: int, request: Request, response: Response) -> dict:
         ) from e
 
     owner_id = state.owner_account_id()
+    role = ROLE_OWNER
     if owner_id is not None:
         if account_id != owner_id:
-            logger.warning("login rejected: Plex account {} is not the owner of the linked server", account_id)
-            raise HTTPException(status_code=403, detail="only the server owner can sign in to Shortlist")
+            # Not the owner: one of this server's people may still sign in, to their own picks and
+            # nothing else. Only on a CLAIMED instance — before a server is linked there is no roster
+            # to be on, and the bars below decide who may claim it.
+            person = _person_account(state, account_id)
+            if person is None:
+                logger.warning("login rejected: Plex account {} has no place on the linked server", account_id)
+                raise HTTPException(
+                    status_code=403,
+                    detail="This Plex account is not one of this server's people, so it cannot sign in to Shortlist.",
+                )
+            role = ROLE_PERSON
     else:
         # Unclaimed instance: there is no stored owner to compare against, so who may claim it is
         # decided here. Two bars, strongest first.
@@ -472,7 +582,7 @@ async def poll_pin(pin_id: int, request: Request, response: Response) -> dict:
                     ),
                 )
 
-    payload = {"account_id": account_id, "username": info.get("username") or info.get("title") or ""}
+    payload = {"account_id": account_id, "username": info.get("username") or info.get("title") or "", "role": role}
     cookie = session_serializer(state.session_secret).dumps(payload)
     response.set_cookie(
         SESSION_COOKIE,
@@ -488,7 +598,7 @@ async def poll_pin(pin_id: int, request: Request, response: Response) -> dict:
     # touching it (an XSS anywhere in the UI must not be able to steal the owner's Plex token).
     if owner_id is None:
         state.pending_plex_tokens[account_id] = token
-    return {"linked": True, "account_id": account_id, "username": payload["username"]}
+    return {"linked": True, "account_id": account_id, "username": payload["username"], "role": role}
 
 
 class SessionOut(BaseModel):
@@ -507,6 +617,8 @@ class SessionOut(BaseModel):
     login_required: bool
     account_id: int | None = None
     username: str | None = None
+    # `owner` or `person` (see ROLE_*), resolved against today's state; absent when not signed in.
+    role: str | None = None
 
 
 @router.get("/session", response_model=SessionOut)
@@ -515,7 +627,9 @@ async def get_session(request: Request) -> dict:
     # NOT "has someone claimed it" — an instance with a secret seeded from the environment has no
     # owner and still holds something worth stealing, so it demands a sign-in too.
     login_required = request.app.state.owner_account_id() is not None or request.app.state.holds_secrets()
-    session = read_session(request)
+    # An unclaimed instance has no roles yet: whoever holds a session is the prospective owner driving
+    # the wizard, and `read_identity` (which needs an owner to compare against) would call them nobody.
+    session = read_identity(request) if request.app.state.owner_account_id() is not None else read_session(request)
     if session is None:
         return {"authenticated": False, "login_required": login_required}
     return {"authenticated": True, "login_required": login_required, **session}

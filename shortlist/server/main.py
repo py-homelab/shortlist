@@ -41,7 +41,7 @@ from shortlist.server.api import (
 )
 from shortlist.server.api import settings as settings_api
 from shortlist.server.base_path import BasePathMiddleware, base_path_from_env, render_shell
-from shortlist.server.db.models import Event, Run, Server
+from shortlist.server.db.models import Event, Run, Server, User
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
 from shortlist.server.scheduler import build_scheduler
 from shortlist.server.services import backup as backups
@@ -211,9 +211,33 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
                 return False
             return bool(stored) and hmac.compare_digest(str(stored), token)
 
+        def person_account(account_id: int) -> dict | None:
+            """The roster entry for a Plex account that may sign in as a PERSON, or None.
+
+            Anyone Shortlist still knows on this server: not removed by the owner, not gone from
+            plex.tv. `enabled` is deliberately not required — that flag says whether they get a
+            ROW, and someone the owner paused from rows still has a library to request from.
+            """
+            with sessions() as session:
+                user = (
+                    session.query(User)
+                    .filter(User.plex_account_id == account_id, User.removed_at.is_(None), User.departed_at.is_(None))
+                    .first()
+                )
+                return {"user_id": user.id, "username": user.username, "slug": user.slug} if user else None
+
+        def proxy_auth() -> tuple[str, str]:
+            """(header name, shared secret) for trusted-proxy identity; either empty = off."""
+            with sessions() as session:
+                store = SettingsStore(session, secret_box)
+                header = str(store.get("auth.proxy.header") or "").strip().lower()
+                return header, str(store.get("auth.proxy.secret") or "")
+
         app.state.owner_account_id = owner_account_id
         app.state.holds_secrets = holds_secrets
         app.state.verify_api_token = verify_api_token
+        app.state.person_account = person_account
+        app.state.proxy_auth = proxy_auth
 
         with sessions() as session:
             store = SettingsStore(session, secret_box)

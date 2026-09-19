@@ -3631,6 +3631,17 @@
             "title": "Linked",
             "type": "boolean"
           },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          },
           "username": {
             "anyOf": [
               {
@@ -6162,6 +6173,17 @@
           "login_required": {
             "title": "Login Required",
             "type": "boolean"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "username": {
             "anyOf": [

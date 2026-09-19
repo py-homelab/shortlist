@@ -126,6 +126,13 @@ DEFAULTS: dict[str, Any] = {
     # These are the BUILT-IN engine's sources; an external engine (`engine.backend = http`) ranks its
     # own way and never reads them.
     "candidates.sources": ["tmdb_similar", "tmdb_discover"],
+    # Trusted-proxy identity for people signing in through a reverse proxy that has already
+    # authenticated them (authentik, Authelia, oauth2-proxy). The proxy sends the visitor's Plex
+    # account id in `auth.proxy.header` AND the shared secret in `X-Shortlist-Proxy-Secret`; the
+    # secret is what makes the header trustworthy, since a client address can be forged whenever
+    # FORWARDED_ALLOW_IPS is `*`. Both empty (the default) = off; Plex sign-in always works too.
+    "auth.proxy.header": "",
+    "auth.proxy.secret": "",
     # Which engine ranks each person's candidates (engine/recommender.py):
     #   'builtin' — Shortlist's own: the sources above, TMDB similarity, the ranking dials.
     #   'http'    — an engine running elsewhere, speaking the /v1 engine protocol at `engine.url`.
@@ -295,6 +302,7 @@ SECRET_KEYS = {
     "requests.mdblist.apikey",  # MDBList key for IMDb/Trakt/RT/Metacritic rating gating
     "trakt.client_id",
     "engine.token",  # bearer token for an external recommendation engine
+    "auth.proxy.secret",  # what proves a request came through the trusted reverse proxy
     "exa.apikey",  # Exa web-search API key for the llm_web source
     "searxng.password",  # reverse-proxy password guarding a self-hosted SearXNG
     "api.token",  # our own programmatic API token (encrypted at rest so the owner can reveal it)
