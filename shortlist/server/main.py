@@ -25,6 +25,7 @@ from shortlist.server import auth, whats_new
 from shortlist.server.api import (
     collections,
     events,
+    me,
     notifications,
     picks,
     privacy,
@@ -427,6 +428,7 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
         users,
         user_rows,
         picks,
+        me,
         privacy,
         runs,
         collections,

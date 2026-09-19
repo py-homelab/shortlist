@@ -95,6 +95,126 @@
         "title": "AccountPrivacyOut",
         "type": "object"
       },
+      "ActIn": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "request",
+              "never",
+              "later",
+              "skip",
+              "undo"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "last": {
+            "default": false,
+            "title": "Last",
+            "type": "boolean"
+          },
+          "media_type": {
+            "default": "",
+            "enum": [
+              "movie",
+              "show",
+              ""
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Position"
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "enum": [
+                  "deck",
+                  "grid"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Surface"
+          },
+          "tmdb_id": {
+            "default": 0,
+            "title": "Tmdb Id",
+            "type": "integer"
+          },
+          "undone": {
+            "anyOf": [
+              {
+                "enum": [
+                  "never",
+                  "later",
+                  "skip"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Undone"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ActIn",
+        "type": "object"
+      },
+      "ActOut": {
+        "additionalProperties": true,
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "ActOut",
+        "type": "object"
+      },
       "ApiTokenCreatedOut": {
         "additionalProperties": true,
         "properties": {
@@ -1993,20 +2113,6 @@
         "title": "Dismiss",
         "type": "object"
       },
-      "DismissedOut": {
-        "additionalProperties": true,
-        "properties": {
-          "ok": {
-            "title": "Ok",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "ok"
-        ],
-        "title": "DismissedOut",
-        "type": "object"
-      },
       "EffectivenessReportOut": {
         "additionalProperties": true,
         "description": "The dashboard tracking report for one window.",
@@ -3120,6 +3226,67 @@
           "stops_at"
         ],
         "title": "LosingTitleOut",
+        "type": "object"
+      },
+      "MeOut": {
+        "additionalProperties": true,
+        "properties": {
+          "account_id": {
+            "title": "Account Id",
+            "type": "integer"
+          },
+          "built_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Built At"
+          },
+          "counts": {
+            "additionalProperties": true,
+            "title": "Counts",
+            "type": "object"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Rows",
+            "type": "array"
+          },
+          "seerr": {
+            "additionalProperties": true,
+            "title": "Seerr",
+            "type": "object"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "name",
+          "account_id",
+          "role",
+          "rows",
+          "seerr",
+          "counts"
+        ],
+        "title": "MeOut",
         "type": "object"
       },
       "NotificationOut": {
@@ -5989,6 +6156,87 @@
         "title": "SeasonWindowOut",
         "type": "object"
       },
+      "SeenIn": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SeenItemIn"
+            },
+            "maxItems": 200,
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "SeenIn",
+        "type": "object"
+      },
+      "SeenItemIn": {
+        "additionalProperties": false,
+        "properties": {
+          "media_type": {
+            "enum": [
+              "movie",
+              "show"
+            ],
+            "title": "Media Type",
+            "type": "string"
+          },
+          "position": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Position"
+          },
+          "surface": {
+            "enum": [
+              "deck",
+              "grid"
+            ],
+            "title": "Surface",
+            "type": "string"
+          },
+          "tmdb_id": {
+            "title": "Tmdb Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tmdb_id",
+          "media_type",
+          "surface"
+        ],
+        "title": "SeenItemIn",
+        "type": "object"
+      },
+      "SeenOut": {
+        "additionalProperties": true,
+        "properties": {
+          "logged": {
+            "title": "Logged",
+            "type": "integer"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "logged"
+        ],
+        "title": "SeenOut",
+        "type": "object"
+      },
       "SeenRelease": {
         "properties": {
           "version": {
@@ -6320,6 +6568,79 @@
           "count"
         ],
         "title": "StopPointOut",
+        "type": "object"
+      },
+      "SuggestionsOut": {
+        "additionalProperties": true,
+        "properties": {
+          "built_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Built At"
+          },
+          "family": {
+            "title": "Family",
+            "type": "string"
+          },
+          "genres": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Genres",
+            "type": "array"
+          },
+          "has_family": {
+            "title": "Has Family",
+            "type": "boolean"
+          },
+          "hidden_available": {
+            "title": "Hidden Available",
+            "type": "integer"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "queued": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Queued",
+            "type": "array"
+          },
+          "seerr": {
+            "additionalProperties": true,
+            "title": "Seerr",
+            "type": "object"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "items",
+          "queued",
+          "hidden_available",
+          "family",
+          "has_family",
+          "genres",
+          "seerr"
+        ],
+        "title": "SuggestionsOut",
         "type": "object"
       },
       "SyncFinishedEvent": {
@@ -8271,6 +8592,47 @@
         ],
         "title": "WizardStateSavedOut",
         "type": "object"
+      },
+      "shortlist__server__api__me__DismissedOut": {
+        "additionalProperties": true,
+        "properties": {
+          "later": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Later",
+            "type": "array"
+          },
+          "never": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "title": "Never",
+            "type": "array"
+          }
+        },
+        "required": [
+          "never",
+          "later"
+        ],
+        "title": "DismissedOut",
+        "type": "object"
+      },
+      "shortlist__server__api__notifications__DismissedOut": {
+        "additionalProperties": true,
+        "properties": {
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "title": "DismissedOut",
+        "type": "object"
       }
     }
   },
@@ -9034,6 +9396,173 @@
         ]
       }
     },
+    "/api/me": {
+      "get": {
+        "operationId": "me_api_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Me",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/act": {
+      "post": {
+        "operationId": "act_api_me_act_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Act",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/dismissed": {
+      "get": {
+        "operationId": "dismissed_api_me_dismissed_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/shortlist__server__api__me__DismissedOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Dismissed",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/seen": {
+      "post": {
+        "operationId": "seen_api_me_seen_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SeenIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeenOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Seen",
+        "tags": [
+          "me"
+        ]
+      }
+    },
+    "/api/me/suggestions": {
+      "get": {
+        "operationId": "suggestions_api_me_suggestions_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "family",
+            "required": false,
+            "schema": {
+              "default": "exclude",
+              "title": "Family",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestionsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Suggestions",
+        "tags": [
+          "me"
+        ]
+      }
+    },
     "/api/notifications": {
       "get": {
         "description": "Every currently-firing notification (update available, failed/partial run, paused, errors),\nplus the ids already dismissed so inline surfaces reporting the same fact can hide themselves.",
@@ -9075,7 +9604,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DismissedOut"
+                  "$ref": "#/components/schemas/shortlist__server__api__notifications__DismissedOut"
                 }
               }
             },
@@ -9139,7 +9668,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DismissedOut"
+                  "$ref": "#/components/schemas/shortlist__server__api__notifications__DismissedOut"
                 }
               }
             },

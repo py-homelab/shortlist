@@ -206,6 +206,27 @@ class SeerrClient:
         except ValueError:
             return {}
 
+    def _post_status(self, path: str, body: dict, *, as_user: int = 0) -> tuple[int, object]:
+        """A POST whose non-2xx answers are the caller's to read: ``(status code, JSON body or {})``.
+        Raises only when the app cannot be reached or rejects the KEY — those are ours, not theirs."""
+        self._throttle()
+        try:
+            r = http_retry.request(
+                "POST",
+                f"{self._base}/api/v1{path}",
+                headers=self._headers(as_user=as_user),
+                json=body,
+                timeout=self._timeout,
+            )
+        except httpx.HTTPError as e:
+            raise SeerrError(f"{self.app_name} unreachable ({type(e).__name__})") from e
+        if r.status_code == 401:
+            raise SeerrError(f"{self.app_name} rejected the API key")
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, {}
+
     def _throttle(self) -> None:
         """At most one write per ``min_write_interval`` seconds — be a polite client (rule 6 spirit)."""
         self._write_clock[0] = http_retry.throttle(self._write_clock[0], self._min_write_interval)
@@ -245,6 +266,10 @@ class SeerrClient:
                 {
                     "id": int(row["id"]),
                     "name": _name_of(row) or f"User {row['id']}",
+                    # The Plex account behind a Plex-linked user, so a person signed in to Shortlist
+                    # can be matched to their own *seerr account and request as themselves. None for
+                    # a local account, and for keys without Manage Users (the field is hidden then).
+                    "plex_id": _int_or_none(row.get("plexId")),
                     # Whether THIS account's requests skip Overseerr's approval queue. Surfaced so the
                     # owner can see it when picking, instead of discovering it from where their
                     # titles ended up — the difference between "filed" and "already downloading".
@@ -326,7 +351,7 @@ class SeerrClient:
             )
         return state
 
-    def _paged(self, path: str, *, permission: str = _MANAGE_REQUESTS) -> list[object]:
+    def _paged(self, path: str, *, permission: str = _MANAGE_REQUESTS, **params: object) -> list[object]:
         """Walk a ``{pageInfo, results}`` endpoint to the end.
 
         ``pageInfo`` is believed over the size of the batch, because a server or proxy that CAPS
@@ -337,7 +362,7 @@ class SeerrClient:
         out: list[object] = []
         expected: int | None = None
         for _page in range(self._MAX_PAGES):
-            payload = self._get(path, permission=permission, take=self._PAGE_SIZE, skip=len(out))
+            payload = self._get(path, permission=permission, take=self._PAGE_SIZE, skip=len(out), **params)
             results = payload.get("results") if isinstance(payload, dict) else None
             batch = results if isinstance(results, list) else []
             info = payload.get("pageInfo") if isinstance(payload, dict) else None
@@ -461,6 +486,120 @@ class SeerrClient:
         # Whether it lands as pending or auto-approved is the chosen account's permission, not ours —
         # so the detail says what happened here and lets the *seerr own the rest.
         return "requested", f"requested from {self.app_name}", None
+
+
+#: What a person's own request page needs to know about one of their requests, by Overseerr's
+#: request `status` (`MediaRequestStatus`): PENDING, APPROVED, DECLINED.
+_REQUEST_STATUS = {1: "pending", 2: "approved", 3: "declined"}
+
+
+class SeerrPersonClient:
+    """The *seerr calls a PERSON's own picks page makes, on top of a `SeerrClient`.
+
+    Separate from the client the run uses so the run's memoised `media_state` (one walk per run) is
+    untouched by page loads, and so what a page may do is exactly this list: read who they are there,
+    their quota, their own requests, and file ONE request as them. Every write goes out with
+    `X-API-User`, so it lands under that person's permissions, quota and approval — never the key's.
+    """
+
+    def __init__(self, client: SeerrClient):
+        self._c = client
+
+    @property
+    def app_name(self) -> str:
+        return self._c.app_name
+
+    def user_for_plex(self, plex_account_id: int) -> dict | None:
+        """The *seerr account linked to this Plex account, or None (needs Manage Users on the key)."""
+        return next((u for u in self._c.users() if u.get("plex_id") == plex_account_id), None)
+
+    def quota(self, user_id: int) -> dict:
+        """``{"movie": {limit, used, remaining, days, restricted}, "tv": {...}}`` — limit 0 = unlimited."""
+        raw = self._c._get(f"/user/{user_id}/quota")
+        out: dict[str, dict] = {}
+        for kind in ("movie", "tv"):
+            part = (raw.get(kind) if isinstance(raw, dict) else None) or {}
+            limit = _int_or_none(part.get("limit")) or 0
+            out[kind] = {
+                "limit": limit,
+                "used": _int_or_none(part.get("used")) or 0,
+                "days": _int_or_none(part.get("days")),
+                "remaining": None if not limit else (_int_or_none(part.get("remaining")) or 0),
+                "restricted": bool(part.get("restricted")),
+            }
+        return out
+
+    def requests_by(self, user_id: int) -> dict[tuple[str, int], dict]:
+        """This person's own requests, ``{(media_type, tmdb_id): {status, media_status, request_id}}``
+        keyed on Shortlist's media words (movie / show), like `media_state`."""
+        out: dict[tuple[str, int], dict] = {}
+        for row in self._c._paged("/request", requestedBy=user_id, filter="all", sort="added"):
+            if not isinstance(row, dict):
+                continue
+            media = row.get("media") if isinstance(row.get("media"), dict) else {}
+            kind = _media_type_of(media)
+            tmdb_id = _int_or_none(media.get("tmdbId"))
+            if kind is None or tmdb_id is None:
+                continue
+            out[(kind, tmdb_id)] = {
+                "status": _REQUEST_STATUS.get(_int_or_none(row.get("status")) or 0, "pending"),
+                "media_status": _STATUS_BY_CODE.get(_int_or_none(media.get("status")) or 0),
+                "request_id": _int_or_none(row.get("id")),
+            }
+        return out
+
+    def first_regular_season(self, tmdb_id: int) -> int | None:
+        """The lowest non-specials season number of a show, or None if the app lists none."""
+        payload = self._c._get(f"/tv/{tmdb_id}")
+        seasons = payload.get("seasons") if isinstance(payload, dict) else None
+        listed = (_int_or_none(s.get("seasonNumber")) for s in seasons or [] if isinstance(s, dict))
+        numbers = sorted(n for n in listed if n and n > 0)
+        return numbers[0] if numbers else None
+
+    def request_as(self, user_id: int, tmdb_id: int, media_type: MediaType) -> dict:
+        """File ONE request as this person. Never raises for an answer the app gave on purpose.
+
+        Returns ``{"ok", "code", "message", "request_id", "status"}``: code is ``ok``, or why not —
+        ``duplicate`` (already requested or present), ``quota``, ``blocklisted``, ``permission``,
+        ``no_seasons`` (a show the app lists no seasons for yet) or ``upstream``. A show asks for its
+        FIRST regular season only — the person can ask for more in the app — rather than every
+        season, which is the run's choice for a title nobody is watching yet.
+        """
+        kind = _MEDIA_TYPE.get(media_type)
+        if kind is None:
+            return {"ok": False, "code": "upstream", "message": f"unsupported media type {media_type!r}"}
+        body: dict[str, object] = {"mediaType": kind, "mediaId": int(tmdb_id)}
+        if kind == "tv":
+            season = self.first_regular_season(tmdb_id)
+            if season is None:
+                message = f"{self.app_name} lists no seasons for this show yet."
+                return {"ok": False, "code": "no_seasons", "message": message}
+            body["seasons"] = [season]
+        status, payload = self._c._post_status("/request", body, as_user=user_id)
+        message = str(payload.get("message", "")) if isinstance(payload, dict) else ""
+        if status in (200, 201):
+            return {
+                "ok": True,
+                "code": "ok",
+                "message": "",
+                "request_id": _int_or_none(payload.get("id")) if isinstance(payload, dict) else None,
+                "status": _REQUEST_STATUS.get(_int_or_none(payload.get("status")) or 0, "pending")
+                if isinstance(payload, dict)
+                else "pending",
+            }
+        if status == 409:
+            return {"ok": False, "code": "duplicate", "message": "Already requested."}
+        if status == 202:
+            return {"ok": False, "code": "duplicate", "message": "That season is already requested or available."}
+        if status == 403:
+            lowered = message.lower()
+            if "quota" in lowered:
+                return {"ok": False, "code": "quota", "message": "Your request quota is used up for now."}
+            if "blocklist" in lowered or "blacklist" in lowered:
+                return {"ok": False, "code": "blocklisted", "message": f"This title is blocklisted in {self.app_name}."}
+            return {"ok": False, "code": "permission", "message": "Your account is not allowed to request this."}
+        fallback = f"{self.app_name} answered {status}"
+        return {"ok": False, "code": "upstream", "message": http_retry.redact(message) or fallback}
 
 
 def _approves(permissions: int, specific: int) -> bool:

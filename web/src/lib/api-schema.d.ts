@@ -341,6 +341,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Me */
+        get: operations["me_api_me_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/act": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Act */
+        post: operations["act_api_me_act_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/dismissed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Dismissed */
+        get: operations["dismissed_api_me_dismissed_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/seen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Seen */
+        post: operations["seen_api_me_seen_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/me/suggestions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Suggestions */
+        get: operations["suggestions_api_me_suggestions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/notifications": {
         parameters: {
             query?: never;
@@ -2790,6 +2875,47 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** ActIn */
+        ActIn: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "request" | "never" | "later" | "skip" | "undo";
+            /**
+             * Last
+             * @default false
+             */
+            last: boolean;
+            /**
+             * Media Type
+             * @default
+             * @enum {string}
+             */
+            media_type: "movie" | "show" | "";
+            /** Position */
+            position?: number | null;
+            /** Surface */
+            surface?: ("deck" | "grid") | null;
+            /**
+             * Tmdb Id
+             * @default 0
+             */
+            tmdb_id: number;
+            /** Undone */
+            undone?: ("never" | "later" | "skip") | null;
+        };
+        /** ActOut */
+        ActOut: {
+            /** Code */
+            code?: string | null;
+            /** Message */
+            message?: string | null;
+            /** Ok */
+            ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         /** ApiTokenCreatedOut */
         ApiTokenCreatedOut: {
             /** Created At */
@@ -3541,13 +3667,6 @@ export interface components {
             /** Id */
             id: string;
         };
-        /** DismissedOut */
-        DismissedOut: {
-            /** Ok */
-            ok: boolean;
-        } & {
-            [key: string]: unknown;
-        };
         /**
          * EffectivenessReportOut
          * @description The dashboard tracking report for one window.
@@ -4033,6 +4152,33 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** MeOut */
+        MeOut: {
+            /** Account Id */
+            account_id: number;
+            /** Built At */
+            built_at?: string | null;
+            /** Counts */
+            counts: {
+                [key: string]: unknown;
+            };
+            /** Name */
+            name: string;
+            /** Role */
+            role: string;
+            /** Rows */
+            rows: {
+                [key: string]: unknown;
+            }[];
+            /** Seerr */
+            seerr: {
+                [key: string]: unknown;
+            };
+            /** State */
+            state: string;
+        } & {
+            [key: string]: unknown;
+        };
         /**
          * NotificationOut
          * @description One alert as the React bell renders it — plain text throughout, no HTML.
@@ -4252,6 +4398,8 @@ export interface components {
             account_id?: number | null;
             /** Linked */
             linked: boolean;
+            /** Role */
+            role?: string | null;
             /** Username */
             username?: string | null;
         } & {
@@ -5254,6 +5402,37 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** SeenIn */
+        SeenIn: {
+            /** Items */
+            items: components["schemas"]["SeenItemIn"][];
+        };
+        /** SeenItemIn */
+        SeenItemIn: {
+            /**
+             * Media Type
+             * @enum {string}
+             */
+            media_type: "movie" | "show";
+            /** Position */
+            position?: number | null;
+            /**
+             * Surface
+             * @enum {string}
+             */
+            surface: "deck" | "grid";
+            /** Tmdb Id */
+            tmdb_id: number;
+        };
+        /** SeenOut */
+        SeenOut: {
+            /** Logged */
+            logged: number;
+            /** Ok */
+            ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         /** SeenRelease */
         SeenRelease: {
             /** Version */
@@ -5351,6 +5530,8 @@ export interface components {
             authenticated: boolean;
             /** Login Required */
             login_required: boolean;
+            /** Role */
+            role?: string | null;
             /** Username */
             username?: string | null;
         } & {
@@ -5414,6 +5595,37 @@ export interface components {
             count: number;
             /** Label */
             label: string;
+        } & {
+            [key: string]: unknown;
+        };
+        /** SuggestionsOut */
+        SuggestionsOut: {
+            /** Built At */
+            built_at?: string | null;
+            /** Family */
+            family: string;
+            /** Genres */
+            genres: {
+                [key: string]: unknown;
+            }[];
+            /** Has Family */
+            has_family: boolean;
+            /** Hidden Available */
+            hidden_available: number;
+            /** Items */
+            items: {
+                [key: string]: unknown;
+            }[];
+            /** Queued */
+            queued: {
+                [key: string]: unknown;
+            }[];
+            /** Seerr */
+            seerr: {
+                [key: string]: unknown;
+            };
+            /** State */
+            state: string;
         } & {
             [key: string]: unknown;
         };
@@ -6189,6 +6401,26 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** DismissedOut */
+        shortlist__server__api__me__DismissedOut: {
+            /** Later */
+            later: {
+                [key: string]: unknown;
+            }[];
+            /** Never */
+            never: {
+                [key: string]: unknown;
+            }[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** DismissedOut */
+        shortlist__server__api__notifications__DismissedOut: {
+            /** Ok */
+            ok: boolean;
+        } & {
+            [key: string]: unknown;
+        };
     };
     responses: never;
     parameters: never;
@@ -6723,6 +6955,143 @@ export interface operations {
             };
         };
     };
+    me_api_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeOut"];
+                };
+            };
+        };
+    };
+    act_api_me_act_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ActIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dismissed_api_me_dismissed_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["shortlist__server__api__me__DismissedOut"];
+                };
+            };
+        };
+    };
+    seen_api_me_seen_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SeenIn"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeenOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    suggestions_api_me_suggestions_get: {
+        parameters: {
+            query?: {
+                family?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SuggestionsOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_notifications_api_notifications_get: {
         parameters: {
             query?: never;
@@ -6762,7 +7131,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DismissedOut"];
+                    "application/json": components["schemas"]["shortlist__server__api__notifications__DismissedOut"];
                 };
             };
             /** @description Validation Error */
@@ -6815,7 +7184,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["DismissedOut"];
+                    "application/json": components["schemas"]["shortlist__server__api__notifications__DismissedOut"];
                 };
             };
             /** @description Validation Error */

@@ -220,6 +220,66 @@ class TestPicksCarryTheBuiltAtStamp:
             assert stored.built_at.replace(tzinfo=stored.built_at.tzinfo or UTC) == built
 
 
+class TestTheRequestSurfaceIsPersisted:
+    """A person's missing titles are rewritten whole per run — and left alone by a run that produced
+    none, so an engine hiccup never blanks their page."""
+
+    def _missing(self, *ids: int) -> list[dict]:
+        return [
+            {
+                "rank": i + 1,
+                "tmdb_id": t,
+                "media_type": "movie",
+                "title": f"T{t}",
+                "genres": ["Drama"],
+                "reason": "Because",
+                "kids": t == 3,
+                "sources": ["engine:e"],
+                "seed_tmdb_id": 9,
+                "seed_title": "S",
+            }
+            for i, t in enumerate(ids)
+        ]
+
+    def test_written_whole_replaced_whole_and_kept_when_a_run_has_none(self, sessions):
+        from shortlist.engine.models import UserRunReport
+        from shortlist.server.db.models import Run, User, UserSuggestion
+        from shortlist.server.services.run_persistence import _persist_user_report
+
+        with sessions() as session:
+            user = User(plex_account_id=1, username="sarah", slug="sarah", enabled=True)
+            runs = [Run(trigger="manual", status="ok", dry_run=False, stats={}) for _ in range(4)]
+            session.add_all([user, *runs])
+            session.commit()
+            run = runs[0]
+
+            report = UserRunReport(username="sarah", slug="sarah", status="ok", missing=self._missing(1, 2, 3))
+            _persist_user_report(session, run.id, user, report, dry_run=False)
+            session.commit()
+            rows = session.query(UserSuggestion).order_by(UserSuggestion.rank).all()
+            assert [(r.tmdb_id, r.rank, r.kids, r.sources) for r in rows] == [
+                (1, 1, False, "engine:e"),
+                (2, 2, False, "engine:e"),
+                (3, 3, True, "engine:e"),
+            ]
+            assert rows[0].run_id == run.id and rows[0].genres == ["Drama"]
+
+            report = UserRunReport(username="sarah", slug="sarah", status="ok", missing=self._missing(5))
+            _persist_user_report(session, runs[1].id, user, report, dry_run=False)
+            session.commit()
+            assert [r.tmdb_id for r in session.query(UserSuggestion).all()] == [5]
+
+            report = UserRunReport(username="sarah", slug="sarah", status="cold_start", missing=[])
+            _persist_user_report(session, runs[2].id, user, report, dry_run=False)
+            session.commit()
+            assert [r.tmdb_id for r in session.query(UserSuggestion).all()] == [5]
+
+            report = UserRunReport(username="sarah", slug="sarah", status="ok", missing=self._missing(7))
+            _persist_user_report(session, runs[3].id, user, report, dry_run=True)
+            session.commit()
+            assert [r.tmdb_id for r in session.query(UserSuggestion).all()] == [5]  # a dry run writes nothing
+
+
 class TestTheLedgerRecordsWhatWasWrittenToASummaryAndSortTitle:
     """Issue #120. The ledger's record is what lets clearing a row's field hand back ONLY what Shortlist
     wrote — so the persist must forget a record the run cleared, and must keep one a run never reached."""
