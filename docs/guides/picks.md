@@ -232,3 +232,26 @@ on but the account's ratings were ignored as tool-written, or how many titles a 
 lists the ones it dropped. That line reports the setting as it was **when the run happened**, so
 changing it later doesn't rewrite the history of a run you're reading a fortnight after the fact.
 Runs from before v1.2.1 don't carry it and show only the dropped titles, as they always did.
+
+## Everyone's own picks
+
+Every person on the server can sign in to Shortlist with their **own** Plex account and land on
+`/me`: the titles their watch history points at that the library does not hold yet — ranked for
+them by whichever engine Shortlist uses, swiped through on a phone or browsed as a grid, and
+requested **as them** in Overseerr, Seerr or Jellyseerr with their own quota and approval. Nothing
+downloads on its own. They see their own list and nothing of anyone else's; the owner sees their
+own under **My picks**.
+
+- **Swipe right** (♥ Request) files the request. A show asks for its first regular season; more
+  can be added in the request app.
+- **Swipe left** (✕ Not for me) hides the title for good; **swipe up** (⏰ Later) snoozes it for 30
+  days; **swipe down** (↓ Skip) sends it to the back of the deck and keeps it. Undo takes back the
+  last one; **hidden** lists what they said no to, with a restore.
+- The **Family** toggle shows the children's and family titles instead — kept out by default, for a
+  household watching under one account (see [Children's and family titles](rows.md#childrens-and-family-titles)).
+- A request needs a *seerr account linked to the same Plex account (Manage Users on the key, so
+  Shortlist can match them); without one the page says so and requests are simply off.
+
+The list is rebuilt with the rows, once a night, from the same engine — and what people see and do
+on it (`pick_events`) is recorded for an engine to learn from. Add the page to a phone's home
+screen: it installs as an app and the deck owns the screen.

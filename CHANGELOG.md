@@ -21,6 +21,17 @@ All notable changes to this project are documented here. This project follows
   watching under one Plex account: the grown-ups' rows leave children's titles out, and one row is
   the family's. Shortlist's own engine tags them from TMDB's genres; an external engine can do
   better. Existing rows are unchanged (`include`). Migration 0093.
+- **Everyone's own picks.** Any person on the server signs in with their own Plex account and lands
+  on `/me`: the titles their history points at that no library holds, ranked for them by the
+  engine, as a swipe deck on a phone or a grid on a wide screen, requested as *them* in the
+  *seerr (their quota, their approval, first season for a show). Never / later / skip / undo, a
+  family lane, the hidden list; what they see and do is recorded (`pick_events`) for an engine
+  to learn from. Installable as a home-screen app. The owner has **My picks**. Sessions carry a
+  `role` (`owner` | `person`), re-resolved against the roster on every request; a person reaches
+  `/api/me/*` and nothing else. Migration 0094.
+- **Trusted-proxy sign-in** (`auth.proxy.header` + `auth.proxy.secret`): a reverse proxy that
+  already authenticated the visitor names their Plex account id in a header and proves itself with
+  a shared secret; without the secret the header is ignored.
 
 ## [1.9.1] - 2026-09-16
 
