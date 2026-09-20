@@ -133,7 +133,22 @@ class _AccessNoiseFilter(logging.Filter):
         return not any(path in message for path in self._NOISY)
 
 
-def _check_proxy_jwks(sessions, secret_box) -> None:
+def _proxy_jwks_to_check(sessions, secret_box) -> str | None:
+    """The JWKS URL worth probing at boot, or None — read inline, since it is one indexed read and
+    almost always answers None. Nothing is spawned and nothing is awaited for a feature that is off:
+    an extra await point here reorders the rest of the startup sequence, which is a real effect on a
+    single-threaded loop and showed up first as a flaky test about something else entirely.
+    """
+    with sessions() as session:
+        store = SettingsStore(session, secret_box)
+        url = str(store.get("auth.proxy.jwks_url") or "").strip()
+        header = str(store.get("auth.proxy.jwt_header") or "").strip()
+        claim = str(store.get("auth.proxy.jwt_claim") or "").strip()
+    # Only when JWT mode is ON: the URL on its own signs nobody in or out.
+    return url if (url and header and claim) else None
+
+
+def _check_proxy_jwks(sessions, url: str) -> None:
     """Say — in the log and on the dashboard — when verified proxy sign-in cannot verify anything.
 
     Verified mode checks every token against the keys that URL publishes. An authentik PROXY provider
@@ -143,13 +158,6 @@ def _check_proxy_jwks(sessions, secret_box) -> None:
 
     Never fatal, and never fetched on the event loop — see the caller.
     """
-    with sessions() as session:
-        store = SettingsStore(session, secret_box)
-        url = str(store.get("auth.proxy.jwks_url") or "").strip()
-        header = str(store.get("auth.proxy.jwt_header") or "").strip()
-        claim = str(store.get("auth.proxy.jwt_claim") or "").strip()
-    if not (url and header and claim):
-        return
     try:
         check_jwks(url)
     except UnusableJwks as e:
@@ -445,7 +453,8 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
         # loop — writing to Plex each time. The owner signs in with Plex, which this cannot break, and
         # fixes it from the page that is still there. Checked only when JWT mode is actually on: the
         # URL alone signs nobody in or out.
-        await asyncio.to_thread(_check_proxy_jwks, sessions, secret_box)
+        if (jwks_url := _proxy_jwks_to_check(sessions, secret_box)) is not None:
+            await asyncio.to_thread(_check_proxy_jwks, sessions, jwks_url)
         logger.info("shortlist server up (config: {})", config_dir)
         try:
             yield
