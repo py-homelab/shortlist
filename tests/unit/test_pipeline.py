@@ -5673,6 +5673,43 @@ class TestIdleHoldInARun:
             "Their rows were due to rebuild tonight, but they haven't watched anything since those rows "
             "were built — so last run's titles were redelivered unchanged."
         )
+        # A row held because its children's-title classification could not be read is a row that did
+        # not move: leaving it out of this list silenced the sentence entirely for anyone who had one.
+        assert why([{"row": "fam", "decision": "held_unbuilt"}]) == (
+            "1 row was left on last run's titles: their genres could not be read from TMDB tonight, and "
+            "a row that needs them holds what it has rather than guess."
+        )
+        # Plural, and named as the genre check rather than the children's-title setting: this hold
+        # fires for the excluded-genre lookup too, on a row with no family setting at all.
+        assert why(
+            [
+                {"row": "fam", "decision": "held_unbuilt"},
+                {"row": "rew", "decision": "held_unbuilt"},
+            ]
+        ) == (
+            "2 rows were left on last run's titles: their genres could not be read from TMDB tonight, "
+            "and a row that needs them holds what it has rather than guess."
+        )
+        assert why(
+            [
+                {"row": "picked", "decision": "carried_forward"},
+                {"row": "fam", "decision": "held_unbuilt"},
+            ]
+        ) == (
+            "Nothing was re-picked for them tonight, and 1 row could not be rebuilt because their "
+            "genres could not be read from TMDB."
+        )
+        # Mixed with an idle hold: the same clause, and still only the rows that could not be built.
+        assert why(
+            [
+                {"row": "gems", "decision": "held_idle"},
+                {"row": "fam", "decision": "held_unbuilt"},
+                {"row": "rew", "decision": "held_unbuilt"},
+            ]
+        ) == (
+            "Nothing was re-picked for them tonight, and 2 rows could not be rebuilt because their "
+            "genres could not be read from TMDB."
+        )
         assert why(
             [
                 {"row": "picked", "decision": "carried_forward"},

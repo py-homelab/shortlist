@@ -150,10 +150,10 @@ describe("MePage", () => {
     act.mockResolvedValue({ ok: true, dismissed: { kind: "never", until: null } });
     renderPage();
     await screen.findByText("Ten (2020)");
-    await user.click(screen.getByRole("button", { name: "Not for me: Twenty" }));
+    await user.click(screen.getByRole("button", { name: "Reject: Twenty" }));
     await waitFor(() => expect(screen.queryByText("Twenty (2020)")).not.toBeInTheDocument());
     expect(act).toHaveBeenCalledWith({ action: "never", tmdb_id: 20, media_type: "show", surface: "grid", position: 1 });
-    expect(toastFn).toHaveBeenCalledWith("Hidden — not for you");
+    expect(toastFn).toHaveBeenCalledWith("Rejected — hidden from your picks");
   });
 
   it("a request goes out as the person and moves the title to queued", async () => {

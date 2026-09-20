@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { HelpCircle, LayoutGrid, LogOut, Undo2 } from "lucide-react";
+import { ChevronDown, Clock, Heart, HelpCircle, LayoutGrid, LogOut, Undo2, X } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -178,42 +178,50 @@ function Card({
           </div>
         )}
         {withButtons && onAct && (
-          <div className="mt-auto flex gap-1">
+          // A card in the grid is ~150px wide: three labelled buttons cannot fit, and labelling only
+          // one of them made the odd one out look like the only action. So all three are icons of the
+          // same weight, named to screen readers and on hover, and Request carries the emphasis.
+          <div className="mt-auto flex gap-1.5">
             <Button
               size="sm"
               variant="outline"
               className="flex-1 border-red-400/60 text-red-300"
               onClick={() => onAct(item, "never")}
-              aria-label={`Not for me: ${item.title}`}
+              title={`Reject ${item.title}`}
+              aria-label={`Reject: ${item.title}`}
             >
-              ✕
+              <X aria-hidden="true" />
             </Button>
             <Button
               size="sm"
               variant="outline"
               className="flex-1 border-sky-400/60 text-sky-200"
               onClick={() => onAct(item, "later")}
+              title={`Watch later: ${item.title}`}
               aria-label={`Later: ${item.title}`}
             >
-              ⏰
+              <Clock aria-hidden="true" />
             </Button>
             <Button
               size="sm"
-              variant="outline"
-              className="flex-1 border-emerald-400/60 font-semibold text-emerald-200"
+              className="flex-1 bg-emerald-600 text-white hover:bg-emerald-500"
               disabled={!item.requestable}
-              title={REASONS[item.reason_not_requestable ?? ""] ?? ""}
+              title={
+                item.requestable
+                  ? `Request ${item.title}`
+                  : (REASONS[item.reason_not_requestable ?? ""] ?? "not requestable")
+              }
               onClick={() => onAct(item, "request")}
               aria-label={`Request: ${item.title}`}
             >
-              ♥ Request
+              <Heart aria-hidden="true" />
             </Button>
           </div>
         )}
       </div>
       {(["never", "request", "later", "skip"] as const).map((k) => (
         <div key={k} className={`picks-label ${k}`} data-label={k}>
-          {k === "never" ? "nope" : k}
+          {k === "never" ? "reject" : k}
         </div>
       ))}
     </article>
@@ -501,7 +509,7 @@ export default function MePage() {
           setHistory((h) => [...h, { item, action }]);
           const r = await api.act({ action, tmdb_id: item.tmdb_id, media_type: item.media_type, ...where });
           if (!r.ok) throw new Error(r.message ?? "could not save that");
-          toast(action === "never" ? "Hidden — not for you" : `Snoozed for ${SNOOZE_DAYS} days`);
+          toast(action === "never" ? "Rejected — hidden from your picks" : `Watch later — back in ${SNOOZE_DAYS} days`);
         } else {
           const r = await api.act({ action: "request", tmdb_id: item.tmdb_id, media_type: item.media_type, ...where });
           if (r.ok) {
@@ -815,24 +823,52 @@ export default function MePage() {
               </>
             )}
           </div>
+          {/* Four actions across a phone: the labels are what overflowed, so they appear only once
+              there is room for them (~380px up) and the icons carry the row below that. Request is
+              filled and wider — it is the one action people came here to take. */}
           <div className="flex w-[min(100vw-1.6rem,440px)] gap-1.5">
-            <Button variant="outline" className="flex-1 border-red-400/60 text-red-300" disabled={!items[0] || busy} onClick={() => items[0] && void act(items[0], "never", deckEl())} title="Not interested (←)">
-              ✕ Not for me
-            </Button>
-            <Button variant="outline" className="flex-1 border-slate-400/60" disabled={!items[0] || busy} onClick={() => items[0] && void act(items[0], "skip", deckEl())} title="Skip for now (↓)">
-              ↓ Skip
-            </Button>
-            <Button variant="outline" className="flex-1 border-sky-400/60 text-sky-200" disabled={!items[0] || busy} onClick={() => items[0] && void act(items[0], "later", deckEl())} title="Maybe later (↑)">
-              ⏰ Later
+            <Button
+              variant="outline"
+              className="min-w-0 flex-1 border-red-400/60 px-2 text-red-300"
+              disabled={!items[0] || busy}
+              onClick={() => items[0] && void act(items[0], "never", deckEl())}
+              title="Reject (←)"
+              aria-label="Reject"
+            >
+              <X aria-hidden="true" />
+              <span className="hidden min-[380px]:inline">Reject</span>
             </Button>
             <Button
               variant="outline"
-              className="flex-1 border-emerald-400/60 font-semibold text-emerald-200"
+              className="min-w-0 flex-1 border-slate-400/60 px-2"
+              disabled={!items[0] || busy}
+              onClick={() => items[0] && void act(items[0], "skip", deckEl())}
+              title="Skip for now (↓)"
+              aria-label="Skip"
+            >
+              <ChevronDown aria-hidden="true" />
+              <span className="hidden min-[380px]:inline">Skip</span>
+            </Button>
+            <Button
+              variant="outline"
+              className="min-w-0 flex-1 border-sky-400/60 px-2 text-sky-200"
+              disabled={!items[0] || busy}
+              onClick={() => items[0] && void act(items[0], "later", deckEl())}
+              title="Watch later (↑)"
+              aria-label="Later"
+            >
+              <Clock aria-hidden="true" />
+              <span className="hidden min-[380px]:inline">Later</span>
+            </Button>
+            <Button
+              className="min-w-0 flex-[1.4] bg-emerald-600 px-2 text-white hover:bg-emerald-500"
               disabled={!items[0] || busy || !items[0].requestable}
               title={items[0] && !items[0].requestable ? (REASONS[items[0].reason_not_requestable ?? ""] ?? "") : "Request (→)"}
               onClick={() => items[0] && void act(items[0], "request", deckEl())}
+              aria-label="Request"
             >
-              ♥ Request
+              <Heart aria-hidden="true" />
+              <span className="hidden min-[380px]:inline">Request</span>
             </Button>
           </div>
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
@@ -860,7 +896,7 @@ export default function MePage() {
               if (!list.length) return null;
               return (
                 <div key={kind}>
-                  <h3 className="mt-2 text-sm font-semibold">{kind === "never" ? "Not for me" : "Maybe later"}</h3>
+                  <h3 className="mt-2 text-sm font-semibold">{kind === "never" ? "Rejected" : "Watch later"}</h3>
                   <ul>
                     {list.map((d) => (
                       <li key={`${d.tmdb_id}:${d.media_type}`} className="flex items-center justify-between gap-2 border-b py-1.5 text-sm">
@@ -926,11 +962,11 @@ export default function MePage() {
             </DialogDescription>
           </DialogHeader>
           <ul className="space-y-2 text-sm">
-            <li><b>Swipe right</b> (or ♥ Request) — request it. Shows request their first season; add more later.</li>
-            <li><b>Swipe left</b> (or ✕ Not for me) — hide it for good. Restore any time from <em>hidden</em>.</li>
-            <li><b>Swipe up</b> (or ⏰ Later) — snooze it; it comes back in {SNOOZE_DAYS} days.</li>
-            <li><b>Swipe down</b> (or ↓ Skip) — not now; it goes to the back of the deck and stays in your picks.</li>
-            <li><b>Undo</b> takes back your last hide, snooze or skip. A request is taken back in the request app.</li>
+            <li><b>Swipe right</b> (or <b>Request</b>) — request it. Shows request their first season; add more later.</li>
+            <li><b>Swipe left</b> (or <b>Reject</b>) — hide it for good. Restore any time from <em>hidden</em>.</li>
+            <li><b>Swipe up</b> (or <b>Later</b>) — it comes back in {SNOOZE_DAYS} days.</li>
+            <li><b>Swipe down</b> (or <b>Skip</b>) — not now; it goes to the back of the deck and stays in your picks.</li>
+            <li><b>Undo</b> takes back your last reject, later or skip. A request is taken back in the request app.</li>
           </ul>
           <p className="text-xs text-muted-foreground">
             Filter by type and genre above the cards; tap a synopsis to read all of it. On a keyboard:

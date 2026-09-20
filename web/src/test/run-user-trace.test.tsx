@@ -818,6 +818,53 @@ describe("TraceView — the flow explains freshness, the cut and release date", 
     ).toBeInTheDocument();
   });
 
+  it("says a held row kept what it had, and never calls it freshly built", () => {
+    // The row is knowingly stale: TMDB could not say which watched titles are children's viewing.
+    // Rendering it through the default branch called it "built fresh" — the opposite of the truth —
+    // and described a ranking that never ran.
+    render(
+      <TraceView
+        data={withSelection({
+          decision: "held_unbuilt",
+          delivered: 0,
+          family_dropped: 2,
+          cut_cap: undefined,
+          recency: undefined,
+        })}
+      />,
+    );
+    expect(screen.getByText(/holds what it has rather than guess/i)).toBeInTheDocument();
+    // The row still SHOWS those titles: this path writes nothing to Plex, so the page must not claim
+    // they were taken out of it.
+    expect(
+      screen.getByText(/2 of the titles it is still showing are no longer allowed/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/minus 2 titles/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/built fresh/i)).not.toBeInTheDocument();
+    // Nothing was ranked, so neither the cut nor the release-date weight may be described.
+    expect(screen.queryByText(/candidates survived filtering/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Release date was ignored/i)).not.toBeInTheDocument();
+  });
+
+  it("makes no claim about a library nothing was written to", () => {
+    // The cell that actually happens: a held row abandons its section, so its library has NO
+    // delivery at all. An earlier attempt printed the row's line here anyway, which made every other
+    // decision read "built fresh. Nothing was written to this library" — a claim about a write that
+    // did not happen, beside a claim that it did.
+    const data = okTrace({
+      trace: { ...okTrace().trace, selection: [entry({ decision: "held_unbuilt", delivered: 0 })] },
+      breakdown: [],
+    } as Partial<RunUserTraceResponse>);
+    render(<TraceView data={data} />);
+
+    expect(screen.getByText(/Nothing was delivered to this library this run/i)).toBeInTheDocument();
+    expect(screen.queryByText(/Nothing was written to this library/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/built fresh/i)).not.toBeInTheDocument();
+    // Nothing was ranked here, so neither the shortlist step nor the ordering step may claim one.
+    expect(screen.queryByText(/candidates survived filtering/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/How we ordered the shortlist/i)).not.toBeInTheDocument();
+  });
+
   it("has a shortlisted step showing the cut", () => {
     // Between search and order, because that is where it happens: the cut decides what can be
     // ordered at all, so explaining ordering without it describes half the mechanism.

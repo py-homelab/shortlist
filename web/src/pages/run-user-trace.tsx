@@ -401,7 +401,8 @@ function deliveryNote(
           <span
             className={
               entry.decision === "carried_forward" ||
-              entry.decision === "held_idle"
+              entry.decision === "held_idle" ||
+              entry.decision === "held_unbuilt"
                 ? "text-muted-foreground"
                 : "text-foreground"
             }
@@ -452,6 +453,16 @@ function cadenceLine(entry: TraceSelection): string {
       return entry.rewatch
         ? "— too little watch history to search from, so the server's top-rated titles stand in for new suggestions."
         : "— too little watch history, so it was filled from the server's top-rated titles.";
+    case "held_unbuilt":
+      // Nothing is written on this path — the section is abandoned — so the row on Plex still holds
+      // every title it held, including any this run found it should not. Saying "minus N" would
+      // describe a removal that has not happened. The hold itself can come from either genre check
+      // (the excluded-genre one or the children's-title one), so the cause is named as what both are.
+      return `— left exactly as it was: its genres could not be read from TMDB tonight, so it holds what it has rather than guess.${
+        entry.family_dropped
+          ? ` ${entry.family_dropped} of the titles it is still showing ${entry.family_dropped === 1 ? "is" : "are"} no longer allowed by its children's-title setting, and will go when it next rebuilds.`
+          : ""
+      }`;
     default:
       return "— built fresh.";
   }
@@ -574,6 +585,8 @@ function LibraryFlow({
    *  records no per-person history stage at all, by design. */
   sharedRow?: boolean;
 }) {
+  // A held row was never ranked, so it takes no part in the shortlist step's prose or its count.
+  const ranked = selection.filter((entry) => entry.decision !== "held_unbuilt");
   const searchNoun = mediaLabel(lib.media).toLowerCase();
   const hasWeb = Boolean(lib.web || lib.webSource);
   const placesSearched = lib.sources.length + (hasWeb ? 1 : 0);
@@ -655,28 +668,35 @@ function LibraryFlow({
     },
     // What SURVIVED, and what the release-date weight did to it. Between search and order because
     // that is where it happens: filtering and the pool cut decide what can be ordered at all.
-    ...(isCold || selection.length === 0
+    // A held row was never ranked: it must not supply this step's candidate count, and a library whose
+    // only entry is held has no shortlist to show at all.
+    ...(isCold || ranked.length === 0
       ? []
       : [
           {
             id: `${lib.key}-shortlisted`,
             icon: Filter,
             rail: "Shortlisted",
-            count: selection[0]?.candidates,
+            count: ranked[0]?.candidates,
             title: "What survived, and what release date did to it",
             subtitle:
               "Everything found above is filtered (already watched, wrong library, excluded genres) and then cut to the strongest few per media type. Release date is part of that cut, not applied after it.",
             body: (
               <>
-                {shortlistBody(selection, rowNames)}
+                {shortlistBody(ranked, rowNames)}
                 <ShortlistTitles lib={lib} />
               </>
             ),
           },
         ]),
     // How the shortlist was ORDERED — the step that used to be missing entirely. Not shown for cold
-    // start (no taste ranking runs; the picks are just the top-rated titles, in rating order).
-    ...(isCold
+    // start (no taste ranking runs; the picks are just the top-rated titles, in rating order), nor
+    // where nothing was ranked at all: the step's own text points at a shortlist step that is then
+    // not there either.
+    // `selection.length > 0 &&`: a run from before the selection trace existed carries none at
+    // all, which is not the same as "nothing was ranked" — gating on that alone would drop this
+    // step for every old run.
+    ...(isCold || (selection.length > 0 && ranked.length === 0)
       ? []
       : [
           {
