@@ -43,8 +43,10 @@ from shortlist.server.api import settings as settings_api
 from shortlist.server.base_path import BasePathMiddleware, base_path_from_env, render_shell
 from shortlist.server.db.models import Event, Run, Server, User
 from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
+from shortlist.server.proxy_jwt import UnusableJwks, check_jwks
 from shortlist.server.scheduler import build_scheduler
 from shortlist.server.services import backup as backups
+from shortlist.server.services.audit import PROXY_JWKS_SCOPE, add_audit
 from shortlist.server.services.run_service import RunService, missed_by_restart
 from shortlist.server.services.secrets import SecretBox
 from shortlist.server.services.sse import EventBus
@@ -129,6 +131,44 @@ class _AccessNoiseFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
         return not any(path in message for path in self._NOISY)
+
+
+def _check_proxy_jwks(sessions, secret_box) -> None:
+    """Say — in the log and on the dashboard — when verified proxy sign-in cannot verify anything.
+
+    Verified mode checks every token against the keys that URL publishes. An authentik PROXY provider
+    cannot hold a signing key, so its key set is permanently empty, and pointing verified mode at one
+    means the next request from every person resolves to nobody, all at once, with nothing failing
+    beforehand. Only when JWT mode is ON: the URL on its own signs nobody in or out.
+
+    Never fatal, and never fetched on the event loop — see the caller.
+    """
+    with sessions() as session:
+        store = SettingsStore(session, secret_box)
+        url = str(store.get("auth.proxy.jwks_url") or "").strip()
+        header = str(store.get("auth.proxy.jwt_header") or "").strip()
+        claim = str(store.get("auth.proxy.jwt_claim") or "").strip()
+    if not (url and header and claim):
+        return
+    try:
+        check_jwks(url)
+    except UnusableJwks as e:
+        logger.error(
+            "proxy sign-in cannot verify anything: {} — every person's next request will resolve to "
+            "nobody. Clear auth.proxy.jwks_url (Settings -> Advanced) to fall back to trusting the "
+            "proxy, or point it at a provider that publishes signing keys. You can still sign in with "
+            "Plex.",
+            e,
+        )
+        with sessions() as session:
+            add_audit(session, PROXY_JWKS_SCOPE, "error", url=url, detail=str(e))
+            session.commit()
+    except Exception as e:
+        # A fault of the moment — the proxy may be starting up beside us. Sign-in fails while it lasts,
+        # and the hot path logs its own warning per request, so this does not raise an alert.
+        logger.warning(
+            "could not read the proxy JWKS at {} ({}) — sign-in fails until it answers", url, type(e).__name__
+        )
 
 
 def create_app(config_dir: Path | None = None) -> FastAPI:
@@ -396,6 +436,16 @@ def create_app(config_dir: Path | None = None) -> FastAPI:
             logger.warning(
                 "SHORTLIST_DRY_RUN={!r} is not a recognized value (use 1/true/yes/on) — safe mode is OFF", bad
             )
+        # Verified JWT sign-in refuses every token when its key set is empty, and does it silently —
+        # nothing fails until each person's next request resolves to nobody. So it is checked at boot
+        # and said loudly, in the log and on the owner's dashboard.
+        #
+        # Deliberately NOT fatal. Refusing to start takes away the only UI that can clear the setting,
+        # and a container that exits under a restart policy re-aborts and re-resumes runs on every
+        # loop — writing to Plex each time. The owner signs in with Plex, which this cannot break, and
+        # fixes it from the page that is still there. Checked only when JWT mode is actually on: the
+        # URL alone signs nobody in or out.
+        await asyncio.to_thread(_check_proxy_jwks, sessions, secret_box)
         logger.info("shortlist server up (config: {})", config_dir)
         try:
             yield

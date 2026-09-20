@@ -6,6 +6,28 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.6] - 2026-09-20 (py-homelab fork)
+
+### Fixed
+
+- **The picks page confirms what it just did.** It renders outside the admin shell, which owns the
+  app's only toast area — so every confirmation it tried to show was dropped. A request filed from
+  the grid said nothing at all, and the deck only looked right because the card flies away. It now
+  has its own, from the top of the screen so the deck's buttons stay clear.
+- **A row's drop count survives a settings change.** The children's-title rule runs before a recipe
+  change discards the rest of a row, so clearing the counters there reported nothing while the log
+  named four titles the rule had taken — two instruments disagreeing about one run. Both facts are
+  kept; `carried: 0` beside them says the rebuild took the remainder.
+
+### Security
+
+- **An unusable `auth.proxy.jwks_url` is refused, at the settings write and at startup.** Verified
+  JWT sign-in checks every token against the keys that URL publishes, and an authentik *proxy*
+  provider cannot hold a signing key — its key set is permanently empty. Pointing verified mode at
+  one signs every person out at once, at their next request, with nothing failing before that. A URL
+  that merely cannot be reached is still saved and only logged: the proxy may be down while its
+  address is being typed.
+
 ## [1.9.1-py.5] - 2026-09-19 (py-homelab fork)
 
 ### Fixed

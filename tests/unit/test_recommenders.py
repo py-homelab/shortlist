@@ -853,6 +853,35 @@ class TestCarriedPicksAndTheFamilyRule:
         assert len(rows["fam"]) == 2, rows  # a full row, not one shrunk by what the first row took
         assert "unconfirmed_dropped" not in report.trace["selection"][1]
 
+    def test_a_settings_change_does_not_hide_what_the_rule_took(self, ctx, mock_plextv):
+        """Found live: a row whose recipe changed logged four titles dropped by the children's-title
+        rule while its trace reported none, because the settings-change branch cleared the counters.
+        Both are true at once — the rule ran first, and `carried: 0` says the rebuild took the rest."""
+        self._prior(ctx, 10, 20)
+        ctx.previous_recipes = {("sarah", "fam", "1"): "a different recipe than tonight's"}
+        self._engine(ctx, self._kid(10, "Ten"), self._grown_up(20, "Twenty"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only")])
+
+        selection = report.trace["selection"][0]
+        assert selection["decision"] == "settings_changed"
+        assert selection["family_dropped"] == 1
+        assert selection["carried"] == 0
+
+    def test_a_settings_change_does_not_hide_an_unconfirmed_drop_either(self, ctx, mock_plextv):
+        """The removed line cleared BOTH counters, so the other one needs the same row: a rebuild
+        night, a recipe change, and a carried pick tonight's answer does not mention."""
+        self._prior(ctx, 10, 20)
+        ctx.previous_recipes = {("sarah", "fam", "1"): "a different recipe than tonight's"}
+        self._engine(ctx, self._kid(10, "Ten"))  # 20 is simply absent tonight
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", refresh_days=1)])
+
+        selection = report.trace["selection"][0]
+        assert selection["decision"] == "settings_changed"
+        assert selection["unconfirmed_dropped"] == 1
+        assert selection["carried"] == 0
+
     def test_an_unconstrained_row_keeps_what_it_carried(self, ctx, mock_plextv):
         """The common case: no family rule in play, so nothing is re-checked and nothing churns."""
         self._prior(ctx, 10, 20, row="picked")

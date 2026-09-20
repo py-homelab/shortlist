@@ -24,10 +24,14 @@ from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.auth import require_owner
 from shortlist.server.db.models import DEFAULT_SLUG, Collection, Server
 from shortlist.server.net_guard import BlockedUrl, check_url
+from shortlist.server.proxy_jwt import UnusableJwks, check_jwks
 from shortlist.server.services import collection_reconcile as reconcile
 from shortlist.server.services import jobs
 from shortlist.server.services.audit import actor_of, add_audit
 from shortlist.server.settings_store import DEFAULTS, PRIVATE_KEYS, SECRET_KEYS, SettingsStore
+
+#: Wall clock for a JWKS probe, so a dribbling endpoint cannot hold a Save open (or the event loop).
+_JWKS_PROBE_S = 5.0
 
 router = APIRouter(prefix="/settings", tags=["settings"], dependencies=[Depends(require_owner)])
 
@@ -386,6 +390,40 @@ def _reject_blocked_urls(values: dict[str, object]) -> None:
             raise HTTPException(status_code=422, detail=str(e)) from e
 
 
+async def _reject_unusable_jwks(state, values: dict[str, object]) -> None:
+    """Refuse a `auth.proxy.jwks_url` that serves no keys — the setting whose mistake signs everyone
+    out at once, at their next request, with nothing failing beforehand.
+
+    Verified JWT sign-in checks each token against the keys that URL publishes. An authentik PROXY
+    provider cannot hold a signing key, so its `/jwks/` is permanently `{}` and its tokens are signed
+    symmetrically. Refused HERE, where the owner is looking at the page and can fix it, rather than by
+    refusing to boot, which would take away the only UI that can clear it.
+
+    Only when JWT sign-in is ON — the header and the claim, as this save will leave them. The URL on
+    its own signs nobody in or out, and refusing a save over a setting that does nothing is its own bug.
+
+    Unreachable is NOT refused, for the same reason `_reject_a_different_server` does not refuse one:
+    the proxy may be down while its address is being typed, and a URL that cannot be saved until it
+    answers is a URL that cannot be fixed. A SLOW one is treated the same way rather than holding the
+    event loop: `timeout=10` in httpx is per-operation, so a server dribbling one byte at a time can
+    hold a request open indefinitely. The fetch runs in a thread, on a wall-clock deadline.
+    """
+    value = values.get("auth.proxy.jwks_url")
+    if not value or not isinstance(value, str) or not value.strip():
+        return
+    with state.sessions() as session:
+        store = SettingsStore(session, state.secrets)
+        after = {key: values.get(key, store.get(key)) for key in ("auth.proxy.jwt_header", "auth.proxy.jwt_claim")}
+    if not all(isinstance(v, str) and v.strip() for v in after.values()):
+        return  # JWT mode is off after this save: the URL is inert
+    try:
+        await asyncio.wait_for(asyncio.to_thread(check_jwks, value.strip()), timeout=_JWKS_PROBE_S)
+    except UnusableJwks as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    except Exception as e:  # unreachable, slow, TLS, a 500 — a fault of the moment, not of the setting
+        logger.warning("could not read the proxy JWKS at save time ({}) — saving it anyway", type(e).__name__)
+
+
 async def _reject_a_different_server(state, values: dict[str, object]) -> None:
     """Refuse a `plex.url`/`plex.token` edit that points at a DIFFERENT Plex server.
 
@@ -464,6 +502,7 @@ async def put_settings(
         raise HTTPException(status_code=422, detail=f"unknown settings: {sorted(unknown)}")
     _validate_values(update.values)
     _reject_blocked_urls(update.values)
+    await _reject_unusable_jwks(request.app.state, update.values)
     await _reject_a_different_server(request.app.state, update.values)
     from shortlist.server.api.system import invalidate_plex_reads
     from shortlist.server.scheduler import DEFAULT_CRONS

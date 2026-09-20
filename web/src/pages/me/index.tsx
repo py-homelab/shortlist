@@ -11,6 +11,7 @@ import {
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
+import { AppToaster } from "@/components/app-toaster";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -667,6 +668,10 @@ export default function MePage() {
 
   return (
     <div className={cn("flex flex-col", mode === "deck" ? "h-full min-h-0" : "min-h-screen")}>
+      {/* This page lives outside the admin shell, so it needs its own: without one, every toast here
+          was dropped and a request filed from the GRID gave no sign it had been filed at all. From
+          the top, because the deck's action row owns the bottom of the viewport. */}
+      <AppToaster position="top-center" />
       <header className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b bg-card px-3 py-2">
         <div className="text-base font-bold text-amber-400">
           Picks{" "}

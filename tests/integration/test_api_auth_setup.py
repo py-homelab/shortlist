@@ -741,3 +741,87 @@ class TestUninstall:
     def test_owned_collections_audit_409_when_plex_not_connected(self, client: TestClient):
         # No plex.url/token configured on a fresh app -> a clear 409, not a crash.
         assert client.get("/api/system/owned-collections").status_code == 409
+
+
+class TestAnUnusableJwksIsSaidOutLoud:
+    """`auth.proxy.jwks_url` with an empty key set refuses every token, and nothing fails until each
+    person's next request. Said at boot — in the log and on the owner's dashboard — but never fatal:
+    refusing to start would take away the only UI that can clear the setting, and a container exiting
+    under a restart policy re-aborts and re-resumes runs on every loop. The owner signs in with Plex,
+    which this cannot break."""
+
+    URL = "https://auth.example/jwks/"
+    JWT_ON: ClassVar[dict[str, str]] = {
+        "auth.proxy.jwt_header": "X-authentik-jwt",
+        "auth.proxy.jwt_claim": "ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id",
+    }
+
+    def _app(self, tmp_path, **settings):
+        from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
+        from shortlist.server.main import create_app
+        from shortlist.server.services.secrets import SecretBox
+        from shortlist.server.settings_store import SettingsStore
+
+        config = tmp_path / "config"
+        config.mkdir(exist_ok=True)
+        run_migrations(config)
+        with make_session_factory(make_engine(config))() as session:
+            store = SettingsStore(session, SecretBox(config))
+            for key, value in settings.items():
+                store.set(key, value)
+            session.commit()
+        return create_app(config), config
+
+    def _events(self, config, scope):
+        from shortlist.server.db.models import Event
+        from shortlist.server.db.session import make_engine, make_session_factory
+
+        with make_session_factory(make_engine(config))() as session:
+            return session.query(Event).filter(Event.scope == scope).all()
+
+    def test_the_server_starts_and_raises_an_alert(self, tmp_path):
+        import httpx
+        import respx
+        from fastapi.testclient import TestClient as Client
+
+        from shortlist.server.services.audit import PROXY_JWKS_SCOPE
+
+        app, config = self._app(tmp_path, **{"auth.proxy.jwks_url": self.URL, **self.JWT_ON})
+        with respx.mock:
+            respx.get(self.URL).mock(return_value=httpx.Response(200, json={"keys": []}))
+            with Client(app) as client:
+                assert client.get("/api/system/health").status_code == 200  # still serving
+        events = self._events(config, PROXY_JWKS_SCOPE)
+        assert len(events) == 1 and events[0].level == "error"
+        assert events[0].message["url"] == self.URL
+
+    def test_nothing_is_said_when_jwt_sign_in_is_off(self, tmp_path):
+        """The URL alone verifies nothing, because nothing reads it: an alert about a setting that is
+        not in play is an alert the owner learns to ignore."""
+        import httpx
+        import respx
+        from fastapi.testclient import TestClient as Client
+
+        from shortlist.server.services.audit import PROXY_JWKS_SCOPE
+
+        app, config = self._app(tmp_path, **{"auth.proxy.jwks_url": self.URL})
+        with respx.mock:
+            route = respx.get(self.URL).mock(return_value=httpx.Response(200, json={"keys": []}))
+            with Client(app) as client:
+                assert client.get("/api/system/health").status_code == 200
+        assert not route.called
+        assert self._events(config, PROXY_JWKS_SCOPE) == []
+
+    def test_an_unreachable_proxy_is_a_warning_not_an_alert(self, tmp_path):
+        import httpx
+        import respx
+        from fastapi.testclient import TestClient as Client
+
+        from shortlist.server.services.audit import PROXY_JWKS_SCOPE
+
+        app, config = self._app(tmp_path, **{"auth.proxy.jwks_url": self.URL, **self.JWT_ON})
+        with respx.mock:
+            respx.get(self.URL).mock(side_effect=httpx.ConnectError("refused"))
+            with Client(app) as client:
+                assert client.get("/api/system/health").status_code == 200
+        assert self._events(config, PROXY_JWKS_SCOPE) == []

@@ -52,18 +52,53 @@ def _claim(payload: dict, path: str) -> object:
     return node
 
 
-def _jwks(url: str) -> dict:
+def _jwks(url: str, *, fresh: bool = False) -> dict:
+    """The proxy's keys by `kid`. `fresh` skips the READ, not the write: a check that asks "can this
+    URL verify anything" must not be answered from an hour-old copy — in either direction."""
     now = time.monotonic()
-    with _jwks_lock:
-        hit = _jwks_cache.get(url)
-        if hit and now - hit[0] < JWKS_TTL_S:
-            return hit[1]
+    if not fresh:
+        with _jwks_lock:
+            hit = _jwks_cache.get(url)
+            if hit and now - hit[0] < JWKS_TTL_S:
+                return hit[1]
     r = httpx.get(url, timeout=10)
     r.raise_for_status()
-    keys = {k.get("kid"): k for k in r.json().get("keys", []) if isinstance(k, dict)}
+    keys = {k.get("kid"): k for k in _key_list(r.json()) if isinstance(k, dict)}
     with _jwks_lock:
         _jwks_cache[url] = (now, keys)
     return keys
+
+
+def _key_list(body: object) -> list:
+    """The `keys` array of a JWKS document, or a raise for anything that is not one.
+
+    A body that is not a key set at all — an SSO login page, a proxy error page that happens to be
+    JSON, `{"keys": {...}}` — is a fault of the moment dressed as a document. Reading it as "this
+    provider publishes no keys" would call a transient outage a permanent misconfiguration, and the
+    caller treats those two very differently.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("keys"), list):
+        raise ValueError("not a JWKS document")
+    return body["keys"]
+
+
+class UnusableJwks(Exception):
+    """The JWKS URL answered, and carries no key that could verify anything."""
+
+
+def check_jwks(url: str) -> None:
+    """Raise `UnusableJwks` if that URL serves an empty key set, reading it FRESH.
+
+    An empty key set is not a transient fault, it is a permanent misconfiguration: an authentik PROXY
+    provider cannot hold a signing key at all, so its `/jwks/` is `{}` for ever and its tokens are
+    signed symmetrically. Point verified mode at one and every person loses their session at the next
+    request — all at once, and only on a path nobody exercises until they try to sign in.
+
+    A URL that cannot be REACHED raises whatever httpx raised: unreachable is a fault of the moment
+    and belongs to the caller to weigh, which is why the two cases are not collapsed here.
+    """
+    if not _jwks(url, fresh=True):
+        raise UnusableJwks(f"{url} serves no keys, so no token could ever be verified against it")
 
 
 def _verify(signing_input: bytes, signature: bytes, header: dict, jwks_url: str) -> bool:

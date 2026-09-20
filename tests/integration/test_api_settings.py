@@ -4,6 +4,7 @@ and repointing at another server."""
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 from fastapi.testclient import TestClient
@@ -527,6 +528,88 @@ class TestSettingsApi:
         stale = client.post("/api/settings/test/engine").json()
         assert stale["ok"] is False
         assert "stale (60.2 h old)" in stale["message"] and "disk I/O error" in stale["message"]
+
+    JWT_ON: ClassVar[dict[str, str]] = {
+        "auth.proxy.jwt_header": "X-authentik-jwt",
+        "auth.proxy.jwt_claim": "ak_proxy.user_attributes.additionalHeaders.X-Plex-Account-Id",
+    }
+
+    def test_a_jwks_url_that_serves_no_keys_is_refused(self, client: TestClient):
+        """The setting whose mistake signs EVERYONE out at once, and silently: verified sign-in checks
+        each token against the keys that URL publishes, and an authentik proxy provider cannot hold a
+        signing key, so its JWKS is permanently `{}`. Nothing would fail until each person's next
+        request resolved to nobody."""
+        import httpx
+        import respx
+
+        url = "https://auth.example/application/o/picks/jwks/"
+        assert client.put("/api/settings", json={"values": self.JWT_ON}).status_code == 200
+        with respx.mock:
+            respx.get(url).mock(return_value=httpx.Response(200, json={"keys": []}))
+            refused = client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}})
+        assert refused.status_code == 422
+        assert "no keys" in refused.json()["detail"]
+        assert client.get("/api/settings").json()["auth.proxy.jwks_url"] == ""
+
+        with respx.mock:
+            respx.get(url).mock(return_value=httpx.Response(200, json={"keys": [{"kid": "a", "kty": "RSA"}]}))
+            ok = client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}})
+        assert ok.status_code == 200 and ok.json()["auth.proxy.jwks_url"] == url
+
+    def test_the_key_set_is_read_fresh_every_time_it_is_checked(self, client: TestClient):
+        """The verifier caches keys for an hour, which is right for the hot path and wrong for this
+        question: a provider fixed a minute ago would stay unsaveable, and one that has since stopped
+        publishing keys would be waved through. Note there is no cache clearing in this test."""
+        import httpx
+        import respx
+
+        url = "https://auth.example/application/o/cached/jwks/"
+        assert client.put("/api/settings", json={"values": self.JWT_ON}).status_code == 200
+        with respx.mock:
+            respx.get(url).mock(return_value=httpx.Response(200, json={"keys": [{"kid": "a", "kty": "RSA"}]}))
+            assert client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}}).status_code == 200
+        with respx.mock:  # the provider stopped publishing keys; the answer must change with it
+            respx.get(url).mock(return_value=httpx.Response(200, json={"keys": []}))
+            assert client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}}).status_code == 422
+        with respx.mock:  # ... and back, with no hour-long wait for a fix to take
+            respx.get(url).mock(return_value=httpx.Response(200, json={"keys": [{"kid": "b", "kty": "RSA"}]}))
+            assert client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}}).status_code == 200
+
+    def test_a_jwks_url_is_not_checked_while_jwt_sign_in_is_off(self, client: TestClient):
+        """The URL alone signs nobody in or out — the header and claim are what turn verified mode on.
+        Refusing a save over a setting that does nothing is its own bug, and it would block someone
+        typing the URL before the header."""
+        import httpx
+        import respx
+
+        url = "https://auth.example/application/o/inert/jwks/"
+        with respx.mock:
+            route = respx.get(url).mock(return_value=httpx.Response(200, json={"keys": []}))
+            saved = client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}})
+        assert saved.status_code == 200
+        assert not route.called, "nothing should be fetched for a setting that is not in play"
+
+    def test_a_jwks_url_that_cannot_be_read_is_still_saved(self, client: TestClient):
+        """Unreachable is a fault of the moment; so is a proxy error page, whatever it is served as.
+        Refusing to save a URL until it answers is how a broken connection becomes unfixable — the
+        same reasoning `plex.url` already follows."""
+        import httpx
+        import respx
+
+        assert client.put("/api/settings", json={"values": self.JWT_ON}).status_code == 200
+        for name, response in (
+            ("unreachable", httpx.ConnectError("refused")),
+            ("an HTML error page", httpx.Response(200, text="<html>bad gateway</html>")),
+            ("a JSON error body", httpx.Response(200, json={"detail": "forbidden"})),
+        ):
+            url = f"https://auth.example/application/o/{name.replace(' ', '-')}/jwks/"
+            with respx.mock:
+                if isinstance(response, Exception):
+                    respx.get(url).mock(side_effect=response)
+                else:
+                    respx.get(url).mock(return_value=response)
+                saved = client.put("/api/settings", json={"values": {"auth.proxy.jwks_url": url}})
+            assert saved.status_code == 200, f"{name} is transient, not a permanent misconfiguration"
 
     def test_the_removed_agregarr_connection_is_gone_from_every_surface(self, client: TestClient):
         """The Agregarr connection was removed. Three surfaces had to stop knowing about it, and a
