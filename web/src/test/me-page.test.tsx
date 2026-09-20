@@ -9,7 +9,10 @@ import type { PickItem } from "@/lib/types";
 import MePage from "@/pages/me";
 
 const { toastFn } = vi.hoisted(() => ({ toastFn: vi.fn() }));
-vi.mock("sonner", () => ({ toast: toastFn }));
+// `Toaster` too: the page mounts one of its own (it is outside the admin shell), and a mock without
+// it renders nothing at all. These tests assert the toast was CALLED; `me-page-toast.test.tsx` uses
+// the real sonner to assert one is actually SHOWN, which is the half a mock cannot check.
+vi.mock("sonner", () => ({ toast: toastFn, Toaster: () => null }));
 
 const { getMe, getMySuggestions, getMyDismissed, act, seen, getSession } =
   vi.hoisted(() => ({

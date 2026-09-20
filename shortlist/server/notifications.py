@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 
 from shortlist.engine.placeholders import names_a_seed
 from shortlist.server.db.models import Event, Run
-from shortlist.server.services.audit import ENGINE_STATUS_SCOPE, RESTRICTION_RESTORED_SCOPE
+from shortlist.server.services.audit import ENGINE_STATUS_SCOPE, PROXY_JWKS_SCOPE, RESTRICTION_RESTORED_SCOPE
 from shortlist.server.services.watch_stream import STREAM_DOWN_ALERT_MINUTES, STREAM_DOWN_SINCE_KEY
 from shortlist.server.settings_store import SettingsStore
 from shortlist.server.version_check import check_for_update
@@ -939,6 +939,38 @@ def _engine_in_trouble(session: Session, store: SettingsStore) -> dict | None:
     }
 
 
+def _proxy_sign_in_unverifiable(session: Session, store: SettingsStore) -> dict | None:
+    """Verified proxy sign-in is pointed at a key set that can verify nothing, so nobody signing in
+    through the proxy gets a session — and nothing else says so: the owner's own Plex sign-in still
+    works, so the first sign they have is people telling them the page is empty.
+
+    Written at startup (`main._check_proxy_jwks`), read here, and dismissable: the next start after
+    the setting is fixed writes no event, and the old one ages out of the window.
+    """
+    newest = (
+        session.query(Event)
+        .filter(Event.scope == PROXY_JWKS_SCOPE, Event.ts >= datetime.now(UTC) - timedelta(days=7))
+        .order_by(Event.id.desc())
+        .first()
+    )
+    if newest is None or not store.get("auth.proxy.jwks_url"):
+        return None
+    return {
+        "id": f"proxy-jwks-{newest.id}",
+        "severity": "warning",
+        "title": "Nobody can sign in through your proxy",
+        "body": (
+            "The signing keys URL for trusted-proxy sign-in serves no keys, so every token it is given "
+            "is refused and anyone arriving through the proxy gets no session. Clear it in Settings → "
+            "Advanced to go back to trusting the proxy itself, or point it at a provider that publishes "
+            "keys. Your own Plex sign-in is unaffected, which is why this may be the first you hear of it."
+        ),
+        "action_url": "/settings",
+        "action_label": "Open settings",
+        "dismissable": True,
+    }
+
+
 def build_notifications(session: Session, store: SettingsStore, current_version: str) -> list[dict]:
     """Every currently-firing notification the owner hasn't dismissed, most severe first. Dismissal is
     by id, and each dismissable id encodes its state (the run id, the version), so a NEW failure or a
@@ -959,6 +991,7 @@ def build_notifications(session: Session, store: SettingsStore, current_version:
         _shelf_contention(session),
         _playback_listener_down(store),
         _engine_in_trouble(session, store),
+        _proxy_sign_in_unverifiable(session, store),
     ]
     dismissed = set(store.get(DISMISSED_KEY) or [])
     order = {"error": 0, "warning": 1, "info": 2}

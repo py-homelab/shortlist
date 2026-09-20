@@ -47,6 +47,13 @@ are checked. Without it the token is trusted only because nothing but the proxy 
 publish no port, and let the proxy's forward-auth replace the header on every request. The keys URL
 is always Shortlist's own setting — never taken from a request, where a forger chooses it.
 
+Only set it if that provider actually publishes keys. Shortlist refuses a key set that comes back
+EMPTY — when you save it, and again at startup — because verifying against no keys means every token
+fails and nobody can sign in, and nothing would go wrong until each person's next request. (An
+authentik *proxy* provider cannot hold a signing key at all, so its JWKS is always empty; its tokens
+are signed with the client secret instead.) A URL that merely cannot be reached is still saved, and
+only logged: your proxy may be down while you are typing its address.
+
 **The API token is owner-level access.** Anything holding it can do anything you can, including
 deleting rows and rewriting share filters. Rotate it from Settings → API access if it leaks; the old
 one stops working immediately.

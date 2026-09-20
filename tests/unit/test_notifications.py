@@ -1189,3 +1189,31 @@ class TestEngineInTrouble:
         SettingsStore(session).set("engine.backend", "http")
         self._status(session, trouble="is serving lists 60 hours old", days_ago=5)
         assert notif._engine_in_trouble(session, SettingsStore(session)) is None
+
+
+class TestProxySignInUnverifiable:
+    def _event(self, session, url="https://auth.example/jwks/"):
+        session.add(Event(scope="auth.jwks_unusable", level="error", message={"url": url, "detail": "no keys"}))
+        session.commit()
+
+    def test_fires_when_startup_found_an_empty_key_set(self, session):
+        store = SettingsStore(session)
+        store.set("auth.proxy.jwks_url", "https://auth.example/jwks/")
+        self._event(session)
+
+        result = notif._proxy_sign_in_unverifiable(session, store)
+
+        assert result["severity"] == "warning" and result["dismissable"] is True
+        assert "no keys" in result["body"] or "serves no keys" in result["body"]
+        assert result["action_url"] == "/settings"
+
+    def test_quiet_once_the_setting_is_cleared(self, session):
+        """The event stays in the log — it happened — but the alert is about a live misconfiguration."""
+        store = SettingsStore(session)
+        self._event(session)
+        assert notif._proxy_sign_in_unverifiable(session, store) is None
+
+    def test_quiet_with_no_event(self, session):
+        store = SettingsStore(session)
+        store.set("auth.proxy.jwks_url", "https://auth.example/jwks/")
+        assert notif._proxy_sign_in_unverifiable(session, store) is None

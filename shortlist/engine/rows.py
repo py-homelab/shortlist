@@ -2908,8 +2908,13 @@ def _build_section_picks(
             # two-thirds of the OLD row, so a row switched to "prefer recent releases" would carry
             # most of its old titles forward and look like the change half-worked.
             prior_valid = []
-            family_dropped = unconfirmed_dropped = 0  # the recipe change took the row, not the rule
             prior_ids = set()
+            # The drop counters are NOT cleared here. They were, on the argument that the recipe
+            # change took the row rather than the rule — but the rule runs first, so on the night
+            # this shipped a live row logged four titles dropped by the children's-title rule while
+            # its trace said nothing at all, and the two instruments disagreed about the same run.
+            # Both facts are true together: the rule took those, then the settings change took what
+            # was left, which `carried: 0` beside them already says.
 
         if prior_valid and not refresh:
             # Not this row's refresh night: redeliver last run's picks unchanged, so delivery's
