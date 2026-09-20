@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from functools import cached_property
+from typing import NamedTuple
 
 from loguru import logger
 
@@ -61,6 +62,7 @@ from shortlist.engine.recommenders.builtin import (  # noqa: F401 — re-exporte
     _run_year,
     _stamp_disposition,
     _visible_candidates,
+    is_kids,
 )
 
 
@@ -491,6 +493,38 @@ def _in_excluded_genre(policy: RowPolicy, tmdb_id: int, kind: MediaType) -> bool
     return bool(genres & excluded)
 
 
+def _finished_genres(policy: RowPolicy, tmdb_id: int, kind: MediaType) -> list[str] | None:
+    """A finished title's TMDB genre names, or None when they could not be read.
+
+    A pool candidate carries its genres from the search that found it; a title from history carries
+    none, so whatever wants to classify one has to look it up (the same cached detail call
+    `_in_excluded_genre` makes). None holds the rows that NEEDED the answer — guessing a
+    children's-title answer is exactly what that hold exists to avoid.
+
+    Its own flag, not `genres_unreadable`: that one belongs to the excluded-genre check, which a person
+    with no excluded genres never reaches, and a failure here must not freeze the rewatch rows that
+    asked no children's-title question.
+    """
+    if policy.kids_genres_unreadable:
+        return None
+    try:
+        names = policy.ctx.tmdb.genre_names(kind)
+        # Empty is not an answer: TMDB caches a 404 genre map as `{}` for a week, and a detail payload
+        # can carry no genres at all. Reading either as "not a children's title" would refuse a real one
+        # — the same mistake `_engine_view` refuses to make about an unclassified candidate.
+        found = [names.get(gid, "") for gid in policy.ctx.tmdb.genre_ids_for(tmdb_id, kind)]
+        return [name for name in found if name] or None
+    except Exception as e:
+        policy.kids_genres_unreadable = True
+        logger.warning(
+            "{}: couldn't read genres from TMDB ({}) — holding their rewatch rows tonight rather than "
+            "guess which finished titles are children's viewing",
+            policy.user.username,
+            type(e).__name__,
+        )
+        return None
+
+
 def _rewatch_reason(f: _Finished, taste: bool) -> str:
     if f.rating is not None and f.rating >= _FAVOURITE_RATING:
         return f"You rated it {f.rating / 2:g} stars"
@@ -511,7 +545,8 @@ def _rewatch_candidates(
     taste: set[tuple[int, MediaType]],
     limit: int,
     season: seasons_mod.SeasonTitles | None = None,
-) -> tuple[list[Candidate], dict[tuple[int, MediaType], str]]:
+    spec: RowSpec | None = None,
+) -> tuple[list[Candidate], dict[tuple[int, MediaType], str], set[tuple[int, MediaType]]]:
     """What a rewatch row is made of: this library's finished titles, best first, plus each one's reason.
 
     On a seasonal row, only the finished titles in its ``season``: Christmas films they have seen.
@@ -522,8 +557,23 @@ def _rewatch_candidates(
     `derive_seeds` gives: an old film rewatched 18 times years ago would crowd out everything else.
 
     Out: titles finished inside the row's cooldown (``cooling``), titles they rated low, their excluded
-    genres, and anything this library does not hold. Sorted BEFORE the genre check and stopped at
-    ``limit``, because that check costs a TMDB call per title and a row only ever uses a few.
+    genres, and anything this library does not hold. Sorted BEFORE the genre checks and stopped at
+    ``limit`` — or, on a row whose family setting makes every candidate cost a lookup, at a few times
+    ``limit`` examined, because those checks cost a TMDB call each and a row only ever uses a few.
+
+    KNOWN LIMIT: these titles are classified from their TMDB genres, which is not necessarily the rule
+    the engine uses — recommendarr decides on the content RATING first, precisely because TMDB tags King
+    of the Hill (TV-14) "Animation, Family". The engine cannot be asked about them: it answers about
+    titles it would recommend, and this row's pool excludes everything the person has finished, so a
+    finished title never appears in its answer. A cartoon rated for teenagers can therefore still lead a
+    children's-titles-only rewatch row. Closing that needs the classification carried per title with its
+    own "unknown" state; until then this errs the same way on every such row rather than per engine.
+
+    ``spec`` brings the row's children's-title setting, applied HERE rather than to the returned list:
+    these titles come from what the person finished, not from the pool, so they meet no other family
+    filter on the way in — a "children's titles only" row served whatever they last rewatched. Filtering
+    after the ``limit`` cut would be worse than not filtering: the cut would fill with titles the rule
+    then threw away. A row the setting does not constrain pays for no extra lookups.
 
     Each candidate is its own seed, for two reasons. It is a title they watched, so "Because you watched
     {top_seed}" stays true on a rewatch row — a seedless pick renders no name for that template, which
@@ -551,24 +601,84 @@ def _rewatch_candidates(
 
     out: list[Candidate] = []
     reasons: dict[tuple[int, MediaType], str] = {}
+    # What the family rule refused, so the caller can drop the same title where it is CARRIED. These
+    # never reach the pool (a rewatch row's pool excludes finished titles), so the pool-based
+    # contradiction check cannot see them.
+    refused: set[tuple[int, MediaType]] = set()
+    constrained = spec is not None and _family_constrains(spec, policy.household)
+    # A refused title takes no slot, so on a constrained row `limit` alone would let the scan walk the
+    # person's whole history, one TMDB detail call each (measured: 100 lookups for a 3-slot row).
+    # Carried picks are re-checked directly (`_refused_carried`), so this scan only has to find tonight's
+    # leads: give it a few times the room it needs and let the row come up short rather than trawl.
+    budget = _KIDS_LOOKUPS_PER_SLOT * limit
     for _order, (tid, media), f in eligible:
-        if len(out) >= limit:
+        if len(out) >= limit or budget <= 0:
             break
         if _in_excluded_genre(policy, tid, kind):
             continue
-        out.append(
-            Candidate(
-                tmdb_id=tid,
-                title=f.title,
-                media_type=media,
-                year=f.year,
-                rating_key=sec_idx[tid],
-                seeds=[Seed(tmdb_id=tid, title=f.title, media_type=media)],
-                sources={"history"},
-            )
+        genres: list[str] = []
+        kids = False
+        if constrained:
+            budget -= 1
+            names = _finished_genres(policy, tid, kind)
+            if names is None:
+                continue  # unreadable: the hold above keeps this row as it is rather than guess
+            genres, kids = names, is_kids(names)
+        candidate = Candidate(
+            tmdb_id=tid,
+            title=f.title,
+            media_type=media,
+            year=f.year,
+            rating_key=sec_idx[tid],
+            seeds=[Seed(tmdb_id=tid, title=f.title, media_type=media)],
+            sources={"history"},
+            genres=genres,
+            kids=kids,
         )
+        if constrained and not _family_admits(spec, candidate, policy.household):
+            refused.add((tid, media))
+            continue
+        out.append(candidate)
         reasons[(tid, media)] = _rewatch_reason(f, (tid, media) in taste)
-    return out, reasons
+    return out, reasons, refused
+
+
+def _refused_carried(
+    policy: RowPolicy,
+    spec: RowSpec,
+    prior: list[Pick],
+    finished: dict[tuple[int, MediaType], _Finished],
+    kind: MediaType,
+) -> set[tuple[int, MediaType]]:
+    """Carried picks on a rewatch row that this row's family setting refuses tonight.
+
+    The lead scan above stops once it has enough leads, so a carried pick further down the person's
+    history is never examined by it — and a rewatch row's pool holds no finished title, so the pool
+    cannot answer for it either. Left to those two, whether a stale pick is caught depended on where it
+    happened to sit in the order. These are asked about directly: at most one lookup per pick a row is
+    already carrying (a handful, and usually cached), and a title whose classification cannot be read
+    is left alone rather than guessed at.
+    """
+    if not (spec.rewatch and _family_constrains(spec, policy.household)):
+        return set()
+    refused: set[tuple[int, MediaType]] = set()
+    for pick in prior:
+        key = (pick.tmdb_id, pick.media_type)
+        if key not in finished:
+            continue  # not one of their finished titles: the pool speaks for it
+        names = _finished_genres(policy, pick.tmdb_id, kind)
+        if names is None:
+            continue  # unreadable or unclassifiable — the hold and `_engine_view` both leave these alone
+        candidate = Candidate(
+            tmdb_id=pick.tmdb_id,
+            title=pick.title,
+            media_type=pick.media_type,
+            genres=names,
+            kids=is_kids(names),
+        )
+        if not _family_admits(spec, candidate, policy.household):
+            refused.add(key)
+    return refused
 
 
 def _started_shows(watched_shows: dict[int, tuple[int, int | None]]) -> set[tuple[int, MediaType]]:
@@ -579,6 +689,9 @@ def _started_shows(watched_shows: dict[int, tuple[int, int | None]]) -> set[tupl
     """
     return {(tid, MediaType.SHOW) for tid, (viewed, _total) in watched_shows.items() if viewed and viewed > 0}
 
+
+#: How many finished titles a constrained rewatch row may look up per slot it is trying to fill.
+_KIDS_LOOKUPS_PER_SLOT = 4
 
 _KEEP_FRACTION = 2 / 3  # on a refresh night, keep the strongest ~two-thirds; swap the weakest third
 
@@ -998,6 +1111,43 @@ def _family_admits(spec: RowSpec, candidate: Candidate, household: Household | N
     return True
 
 
+def _family_constrains(spec: RowSpec, household: Household | None) -> bool:
+    """Whether this row's `family` setting actually keeps anything out for THIS person — the case
+    where a pick carried over from an earlier run has to be re-checked rather than trusted."""
+    if spec.family in ("only", "exclude"):
+        return True
+    return spec.family == "auto" and household is not None and household.is_family
+
+
+class _EngineView(NamedTuple):
+    """What tonight's answer says about the titles a family-constrained row may hold.
+
+    ``contradicted`` is the titles the answer returned and the rule refuses — the only positive reason
+    to drop a pick this row CARRIED, since a `Pick` records no classification of its own and the
+    engine's can change under it (King of the Hill, re-rated TV-14, sat in a live family row).
+    ``mentioned`` is every title the answer contained, before the pre-rank cut and before
+    draw-without-replacement took what earlier rows used: those narrowings are about what this row may
+    show tonight, not about what a title IS, so neither belongs in a classification question.
+    Empty for a row the setting does not constrain — such a row re-checks nothing and never churns.
+    """
+
+    contradicted: frozenset[tuple[int, MediaType]]
+    mentioned: frozenset[tuple[int, MediaType]]
+
+
+def _engine_view(in_library: list[Candidate], spec: RowSpec, household: Household | None) -> _EngineView:
+    if not _family_constrains(spec, household):
+        return _EngineView(frozenset(), frozenset())
+    contradicted = {
+        (c.tmdb_id, c.media_type)
+        for c in in_library
+        # No genres and no flag is not an answer: an engine that omits the field, or a genre lookup that
+        # failed. Reading that as "not a children's title" would empty an `only` row.
+        if (c.genres or c.kids) and not _family_admits(spec, c, household)
+    }
+    return _EngineView(frozenset(contradicted), frozenset((c.tmdb_id, c.media_type) for c in in_library))
+
+
 def _rank_against_pool(picks: list[Pick], sub: list[Candidate]) -> list[Pick]:
     """Re-rank a refresh night's survivors and newcomers together, by the pool's CURRENT order.
 
@@ -1380,7 +1530,10 @@ def _why_nothing_rebuilt(selection: list[dict]) -> str | None:
 
     None as soon as anything was actually rebuilt: there is then a change on the page to look at, and
     a sentence about the rows that did not move is noise. A cold-start row is `cold_start` here, not
-    one of these two, so it returns None as well.
+    one of these, so it returns None as well. A row held because its genres could not be read from TMDB
+    (`held_unbuilt` — either genre check can cause it) is a row that did not move, so it belongs here:
+    leaving it out silenced the whole sentence for anyone who had one, which is the very complaint
+    this answers.
 
     Args:
         selection: The user's `trace["selection"]` entries, one per (row, library).
@@ -1389,7 +1542,8 @@ def _why_nothing_rebuilt(selection: list[dict]) -> str | None:
         The sentence, or None when this person had something rebuilt.
     """
     decisions = [str(entry.get("decision") or "") for entry in selection]
-    if not decisions or any(decision not in ("held_idle", "carried_forward") for decision in decisions):
+    quiet = ("held_idle", "carried_forward", "held_unbuilt")
+    if not decisions or any(decision not in quiet for decision in decisions):
         return None
     # Counted as ROWS, which is the word the sentence uses. `selection` holds one entry per
     # (row, library), so one row spanning a movie and a TV library is two entries — counting those
@@ -1399,6 +1553,22 @@ def _why_nothing_rebuilt(selection: list[dict]) -> str | None:
         by_decision.setdefault(str(entry.get("decision") or ""), set()).add(str(entry.get("row") or ""))
     held = len(by_decision.get("held_idle", set()))
     waiting = len(by_decision.get("carried_forward", set()))
+    unreadable = len(by_decision.get("held_unbuilt", set()))
+    # Named as what BOTH genre checks are: this hold fires for the excluded-genre lookup as well as
+    # the children's-title one, and sending someone to a children's-title setting their row may not
+    # even have is worse than saying less.
+    if unreadable and not (held or waiting):
+        return (
+            f"{unreadable} {'row was' if unreadable == 1 else 'rows were'} left on last run's titles: "
+            "their genres could not be read from TMDB tonight, and a row that needs them holds what it "
+            "has rather than guess."
+        )
+    if unreadable:
+        return (
+            f"Nothing was re-picked for them tonight, and {unreadable} "
+            f"{'row' if unreadable == 1 else 'rows'} could not be rebuilt because their genres could "
+            "not be read from TMDB."
+        )
     if not waiting:
         return (
             "Their rows were due to rebuild tonight, but they haven't watched anything since those rows "
@@ -1678,6 +1848,9 @@ class RowPolicy:
     # Set by the first failed TMDB genre lookup for a rewatch row; every later title is then kept out
     # without asking (`_in_excluded_genre`).
     genres_unreadable: bool = False
+    #: The children's-title lookup failed for this person tonight (`_finished_genres`). Separate from
+    #: `genres_unreadable` so it holds only the rows whose family setting needed that answer.
+    kids_genres_unreadable: bool = False
     # Who watches under this account tonight (`household.resolve_household`), set once the pools are in.
     household: Household | None = None
     # ratingKey -> can this person see it (`visible`). Memoised across their rows: one read per title.
@@ -2393,6 +2566,7 @@ def _build_section_picks(
     base_cold: list[Pick],
     pool_for_row: list[Candidate],
     taste: set[tuple[int, MediaType]] | None = None,
+    engine_view: _EngineView | None = None,
 ) -> dict[str, list[Pick]]:
     """This row's picks for each library it targets — carried forward, refreshed, or built fresh.
 
@@ -2406,6 +2580,8 @@ def _build_section_picks(
     the pool dropped anything — what a rewatch row reads as "close to what they watch now".
     """
     ctx, user = policy.ctx, policy.user
+    engine_view = engine_view or _EngineView(frozenset(), frozenset())
+    family_out: set[tuple[int, MediaType]] = set(engine_view.contradicted)
     section_picks: dict[str, list[Pick]] = {}
     refresh_days = policy.effective_refresh_days(spec)
     hold_days = effective_idle_hold_days(spec, policy.cfg)
@@ -2467,6 +2643,15 @@ def _build_section_picks(
             cold_seen = policy.visible([cold_copy.get(p.tmdb_id, p.rating_key) for p in cands])
             if cold_seen is not None:
                 cands = [p for p in cands if cold_copy.get(p.tmdb_id, p.rating_key) in cold_seen]
+            if spec.family == "only":
+                # The server's top-rated titles carry no classification, and a cold start has no history
+                # to read one from — so on the one setting where "unclassified" means "refused", a short
+                # row beats one padded with titles nobody vetted. A rewatch row's `led`, built below, is
+                # classified and is prepended after this; a non-rewatch `only` row ships empty tonight.
+                # `exclude` and `auto` admit an unclassified title (as `_family_admits` does), so they
+                # fill as before — and `auto` cannot constrain here at all, the household being settled
+                # only on the warm path.
+                cands = []
             cands = cands[:k]
             rewatches = library_cooling = 0
             if spec.rewatch:
@@ -2474,8 +2659,16 @@ def _build_section_picks(
                 # top-rated titles under a "you've already seen" name are mostly things they haven't,
                 # so what they did finish leads and the popular titles only fill what's left.
                 cold_idx = ctx.section_index.get(section.key, {})
-                history, reasons = _rewatch_candidates(
-                    policy, finished, cooling, kind, cold_idx, taste=set(), limit=k, season=policy.season_titles(spec)
+                history, reasons, _refused = _rewatch_candidates(
+                    policy,
+                    finished,
+                    cooling,
+                    kind,
+                    cold_idx,
+                    taste=set(),
+                    limit=k,
+                    season=policy.season_titles(spec),
+                    spec=spec,
                 )
                 library_cooling = sum(1 for tid, media in cooling if media is kind and tid in cold_idx)
                 led = [
@@ -2539,10 +2732,11 @@ def _build_section_picks(
             if c.media_type is kind and c.tmdb_id in sec_idx and _family_admits(spec, c, policy.household)
         ]
         rewatch_reasons: dict[tuple[int, MediaType], str] = {}
+        mentioned = set(engine_view.mentioned)
         if spec.rewatch:
             # History first, then the pool's unseen titles as the top-up. The pool holds no finished
             # title for a rewatch row (`excludes_watched`), so the two never overlap in practice.
-            history, rewatch_reasons = _rewatch_candidates(
+            history, rewatch_reasons, refused_rewatches = _rewatch_candidates(
                 policy,
                 finished,
                 cooling,
@@ -2551,8 +2745,16 @@ def _build_section_picks(
                 taste=taste or set(),
                 limit=_REWATCH_SPARES_PER_SLOT * k,
                 season=policy.season_titles(spec),
+                spec=spec,
             )
+            # A finished title the rule refuses is a contradiction wherever it sits, including where
+            # this row is still CARRYING it: the pool never holds finished titles, so the pool-based
+            # check above cannot reach them.
+            family_out = family_out | refused_rewatches
             history_keys = {(c.tmdb_id, c.media_type) for c in history}
+            # A rewatch row's picks come from history, which the pool never holds: without this every
+            # carried pick would read as "not mentioned tonight" on a rebuild night.
+            mentioned = mentioned | history_keys
             sub = [*history, *(c for c in sub if (c.tmdb_id, c.media_type) not in history_keys)]
         # str(section.key): previous_picks is keyed by the PickRow.section_key STRING column, so the
         # live section key (which may not be a str) must be coerced or carry-forward silently misses.
@@ -2576,6 +2778,19 @@ def _build_section_picks(
             recently_finished=cooling,
             season=policy.season_titles(spec),
         )
+        # A children's-title rule is the engine's classification, which can change under a carried pick.
+        family_out = family_out | _refused_carried(policy, spec, prior_valid, finished, kind)
+        kept_prior = [p for p in prior_valid if (p.tmdb_id, p.media_type) not in family_out]
+        family_dropped = len(prior_valid) - len(kept_prior)
+        if family_dropped:
+            logger.info(
+                "{}: row '{}' dropped {} carried pick(s) the children's-title rule no longer allows: {}",
+                user.username,
+                spec.slug,
+                family_dropped,
+                ", ".join(p.title for p in prior_valid if (p.tmdb_id, p.media_type) in family_out),
+            )
+        prior_valid = kept_prior
         # Per library, as delivered: a candidate's pool ratingKey can belong to a different library than
         # this one, and a pick carried forward from before restrictions were checked has never been.
         seen = policy.visible([sec_idx[c.tmdb_id] for c in sub] + [sec_idx[p.tmdb_id] for p in prior_valid])
@@ -2603,7 +2818,9 @@ def _build_section_picks(
             and _held_for_idle(prior_valid, policy.last_watch_at, ctx.run_at, hold_days)
         )
         refresh = due and not held
-        genre_hold = spec.rewatch and policy.genres_unreadable
+        genre_hold = spec.rewatch and (
+            policy.genres_unreadable or (policy.kids_genres_unreadable and _family_constrains(spec, policy.household))
+        )
         if genre_hold:
             # A genre lookup failed, so every finished title was kept out (`_in_excluded_genre`) and a
             # rebuild tonight would be unseen titles only — which a full row then carries forward
@@ -2611,14 +2828,49 @@ def _build_section_picks(
             # night's recipe so a settings change made tonight is still seen as one tomorrow.
             if not prior_valid:
                 logger.warning(
-                    "{}: rewatch row '{}' in '{}' not built tonight — its genres could not be checked",
+                    "{}: rewatch row '{}' in '{}' not built tonight — its genres could not be checked{}",
                     user.username,
                     spec.slug,
                     getattr(section, "title", section.key),
+                    f" and {family_dropped} carried pick(s) are no longer allowed in it" if family_dropped else "",
+                )
+                # Said in the TRACE, not only the log: this is the one path that abandons a section, and
+                # a row that keeps yesterday's picks because tonight's classification could not be read
+                # is knowingly stale. Without this the run page shows the row as simply absent.
+                policy.report.trace.setdefault("selection", []).append(
+                    {
+                        "row": spec.slug,
+                        "library": getattr(section, "title", str(section.key)),
+                        "decision": "held_unbuilt",
+                        "size": k,
+                        "delivered": 0,
+                        "candidates": len(sub),
+                        "rewatch": True,
+                        **({"family_dropped": family_dropped} if family_dropped else {}),
+                    }
                 )
                 continue
             refresh = recipe_changed = False
             recipe = was or recipe
+        # A rebuild night is also when an UNCONFIRMED carried pick goes. The engine answers at most
+        # `limit_per_media` titles, so a pick that has since fallen out of that answer is neither
+        # confirmed nor contradicted — and on a carry-forward night that is no reason to touch it (a row
+        # set never to rebuild would rebuild every night). On a night the row is rewritten anyway, a
+        # constrained row keeps only what tonight's answer admits. AFTER the genre hold above, which
+        # turns tonight into a carry-forward night precisely because the classification cannot be read.
+        unconfirmed_dropped = 0
+        if refresh and _family_constrains(spec, policy.household):
+            unconfirmed = [p for p in prior_valid if (p.tmdb_id, p.media_type) not in mentioned]
+            if unconfirmed:
+                unconfirmed_dropped = len(unconfirmed)
+                logger.info(
+                    "{}: row '{}' let go of {} carried pick(s) tonight's answer does not mention: {}",
+                    user.username,
+                    spec.slug,
+                    unconfirmed_dropped,
+                    ", ".join(p.title for p in unconfirmed),
+                )
+                prior_valid = [p for p in prior_valid if (p.tmdb_id, p.media_type) in mentioned]
         # Hoisted out of the refresh branch because the `new_first` order needs it on every path: a
         # pick is "new" if this row was not already carrying it, whichever branch produced it.
         prior_ids = {(p.tmdb_id, p.media_type) for p in prior_valid}
@@ -2656,6 +2908,7 @@ def _build_section_picks(
             # two-thirds of the OLD row, so a row switched to "prefer recent releases" would carry
             # most of its old titles forward and look like the change half-worked.
             prior_valid = []
+            family_dropped = unconfirmed_dropped = 0  # the recipe change took the row, not the rule
             prior_ids = set()
 
         if prior_valid and not refresh:
@@ -2787,6 +3040,8 @@ def _build_section_picks(
                 "candidates": len(sub),
                 "cut_cap": ctx.config.candidates_pre_rank,
                 "carried": len(prior_valid),
+                **({"family_dropped": family_dropped} if family_dropped else {}),
+                **({"unconfirmed_dropped": unconfirmed_dropped} if unconfirmed_dropped else {}),
                 "new": len(new_keys),
                 "refresh_night": due,  # the CADENCE's answer; `decision` says whether we acted on it
                 "rebuild_every_days": refresh_days or None,  # 0 = frozen, never rebuilt
@@ -3145,6 +3400,7 @@ def _run_user(
             k = (override.size if override and override.size else None) or spec.size or cfg.row_size
             targets = target_sections(ctx.delivery_sections, spec)
             pool_for_row: list[Candidate] = []
+            engine_view = _EngineView(frozenset(), frozenset())
             taste: set[tuple[int, MediaType]] = set()
             if not cold:
                 # This row's own pool: its sources, its media and its libraries — already narrowed to
@@ -3154,6 +3410,9 @@ def _run_user(
                 if pools is None:
                     continue  # every source this row uses is down; its siblings still deliver
                 in_library, pool_for_row = pools.in_library, pools.ranked
+                # Read before the cut and before draw-without-replacement: neither narrowing says
+                # anything about what a title IS (`_EngineView`).
+                engine_view = _engine_view(in_library, spec, policy.household)
                 taste = _taste(pools) if spec.rewatch else set()
                 # A row that overrides the server's release-date weight needs its OWN truncation, not
                 # just its own ordering: the cut decides which candidates a row may select from at all,
@@ -3180,7 +3439,15 @@ def _run_user(
                     },
                 )
             section_picks = _build_section_picks(
-                policy, spec, targets, k, cold=cold, base_cold=base_cold, pool_for_row=pool_for_row, taste=taste
+                policy,
+                spec,
+                targets,
+                k,
+                cold=cold,
+                base_cold=base_cold,
+                pool_for_row=pool_for_row,
+                taste=taste,
+                engine_view=engine_view,
             )
             # Stamp each pick with the row AND the library it belongs to, so the user page can group picks
             # per row and the effectiveness report can split a multi-library row into one line per library.

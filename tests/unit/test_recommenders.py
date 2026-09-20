@@ -15,7 +15,7 @@ from shortlist.engine import ranking
 from shortlist.engine.clients import http_retry
 from shortlist.engine.clients.engine_http import EngineClient, EngineError, recommend_payload
 from shortlist.engine.context import EngineContext
-from shortlist.engine.models import EngineConfig, MediaType, RowSpec, Seed
+from shortlist.engine.models import EngineConfig, MediaType, Pick, RowSpec, Seed
 from shortlist.engine.picker import reason_for
 from shortlist.engine.recommender import RecommendRequest, RecommendResult, engine_status
 from shortlist.engine.recommenders import BuiltinRecommender, FallbackRecommender, HttpRecommender
@@ -594,6 +594,271 @@ class TestRowSettingsUnderAnEngine:
         assert rows_mod._taste(pools) == {(900, MediaType.MOVIE)}
         pools = MagicMock(gathered=[make_candidate(5, "Five")], ranked=[c])
         assert rows_mod._taste(pools) == {(5, MediaType.MOVIE)}
+
+
+class TestCarriedPicksAndTheFamilyRule:
+    """A carried pick holds no children's flag of its own and the engine's classification can change
+    under it. Found live: King of the Hill (TV-14) stayed in a family row after the engine stopped
+    calling it a children's title. Re-checked against tonight's answer — but only a positive one."""
+
+    def _prior(self, ctx, *tmdb_ids: int, row: str = "fam") -> None:
+        # The fixture's section is a MagicMock; carry-forward is keyed on the section key as a STRING.
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", row, "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate(tmdb_ids)
+            ]
+        }
+
+    def _engine(self, ctx, *items: dict) -> None:
+        ctx.recommender = HttpRecommender(FakeEngineClient(list(items), name="e"), name="e")
+
+    @staticmethod
+    def _kid(tmdb_id: int, title: str) -> dict:
+        return _item(tmdb_id, title, kids=True, genres=("Animation", "Family"))
+
+    @staticmethod
+    def _grown_up(tmdb_id: int, title: str) -> dict:
+        return _item(tmdb_id, title, kids=False, genres=("Drama",))
+
+    def _row(self, **kw) -> RowSpec:
+        kw.setdefault("refresh_days", 0)  # frozen by default: carry-forward is what these test
+        kw.setdefault("size", 5)
+        return RowSpec(slug=kw.pop("slug", "fam"), name_template="Family", **kw)
+
+    def test_a_family_row_drops_a_pick_the_engine_no_longer_calls_a_childrens_title(self, ctx, mock_plextv):
+        self._prior(ctx, 10, 20)  # 20 was a children's title when it was delivered
+        self._engine(ctx, self._kid(10, "Ten"), self._grown_up(20, "Twenty"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only")])
+
+        assert [p.tmdb_id for p in report.picks] == [10]
+        selection = report.trace["selection"][0]
+        assert selection["family_dropped"] == 1  # the run trace can say why the row lost it
+
+    def test_absence_from_tonights_pool_is_not_an_answer(self, ctx, mock_plextv):
+        """The pool is truncated and narrowed by the person's other rows, so a children's title is
+        missing from it most nights. Dropping on absence would rebuild a frozen row every night."""
+        self._prior(ctx, 10, 20)
+        self._engine(ctx, self._kid(10, "Ten"))  # 20 simply is not in tonight's answer
+
+        report = _run(ctx, mock_plextv, [self._row(family="only")])
+
+        assert {p.tmdb_id for p in report.picks} == {10, 20}
+        assert "family_dropped" not in report.trace["selection"][0]
+
+    def test_an_unclassified_title_is_not_a_contradiction_either(self, ctx, mock_plextv):
+        """An engine that omits `kids`, or a genre lookup that failed, leaves a candidate unclassified.
+        "Not marked as a children's title" is not the same answer as "is not one"."""
+        self._prior(ctx, 10, 20)
+        self._engine(ctx, self._kid(10, "Ten"), _item(20, "Twenty"))  # no genres, no kids flag
+
+        report = _run(ctx, mock_plextv, [self._row(family="only")])
+
+        assert {p.tmdb_id for p in report.picks} == {10, 20}
+
+    def test_a_rebuild_night_also_lets_go_of_a_pick_tonights_answer_does_not_place_in_the_row(self, ctx, mock_plextv):
+        """The engine answers a bounded list, so a long-stale pick can fall out of it entirely — no
+        contradiction, no confirmation. On a night the row is rewritten anyway, it goes."""
+        self._prior(ctx, 10, 20)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", refresh_days=1)])  # rebuilds nightly
+
+        assert [p.tmdb_id for p in report.picks] == [10]
+        # Its own trace key: "tonight's answer refuses it" and "tonight's answer does not mention it"
+        # are different facts, and the run page should not report the second as the first.
+        assert report.trace["selection"][0]["unconfirmed_dropped"] == 1
+        assert "family_dropped" not in report.trace["selection"][0]
+
+    def test_an_exclude_row_drops_a_carried_pick_now_classed_as_a_childrens_title(self, ctx, mock_plextv):
+        self._prior(ctx, 10, 20)
+        self._engine(ctx, self._grown_up(10, "Ten"), self._kid(20, "Twenty"))
+        report = _run(ctx, mock_plextv, [self._row(family="exclude")])
+        assert [p.tmdb_id for p in report.picks] == [10]
+
+    def test_auto_re_checks_only_for_a_family_household(self, ctx, mock_plextv):
+        for household, expected in ((FAMILY, [10]), (ADULT, [10, 20])):  # module constants, defined below
+            self._prior(ctx, 10, 20)
+            ctx.recommender = HttpRecommender(
+                FakeEngineClient([self._grown_up(10, "Ten"), self._kid(20, "Twenty")], name="e", household=household),
+                name="e",
+            )
+            report = _run(ctx, mock_plextv, [self._row(family="auto")])
+            assert sorted(p.tmdb_id for p in report.picks) == expected, household
+
+    def test_with_no_household_an_auto_row_keeps_what_it_carried(self, ctx, mock_plextv):
+        """Deliberate, and the same answer `_family_admits` gives a fresh candidate: nothing could
+        label this person, so "children's titles belong elsewhere" has nobody to apply to."""
+        self._prior(ctx, 10, 20)
+        self._engine(ctx, self._grown_up(10, "Ten"), self._kid(20, "Twenty"))
+        report = _run(ctx, mock_plextv, [self._row(family="auto")])
+        assert sorted(p.tmdb_id for p in report.picks) == [10, 20]
+
+    def _classify_finished(self, ctx, kids: bool) -> None:
+        """What the finished title (tmdb 900, the fixture's watch) looks up as on TMDB."""
+        ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family", 18: "Drama"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [16, 10751] if kids else [18]
+
+    def test_a_rewatch_row_leads_with_a_finished_title_the_rule_admits(self, ctx, mock_plextv):
+        """A rewatch row leads with what they finished, which never went through the pool's filter — so
+        a "children's titles only" row served whatever they last rewatched. It must still LEAD with the
+        finished titles the rule does admit, or the fix is just an empty row."""
+        self._classify_finished(ctx, kids=True)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert 900 in [p.tmdb_id for p in report.picks]  # the finished children's title, kept
+        assert report.trace["selection"][0]["rewatches"] == 1
+
+    def test_a_rewatch_row_leaves_out_a_finished_title_the_rule_refuses(self, ctx, mock_plextv):
+        self._classify_finished(ctx, kids=False)  # Fargo is a drama
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert [p.tmdb_id for p in report.picks] == [10]
+        assert report.trace["selection"][0]["rewatches"] == 0  # counted after the rule, not before
+
+    def test_a_carried_rewatch_pick_the_rule_refuses_is_dropped_too(self, ctx, mock_plextv):
+        """A rewatch row's pool holds no finished title, so the pool can never contradict one. The
+        titles tonight's rule refused are carried back for exactly this."""
+        self._prior(ctx, 900, 10)  # 900 is the finished title, delivered when it counted as children's
+        self._classify_finished(ctx, kids=False)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert [p.tmdb_id for p in report.picks] == [10]
+        assert report.trace["selection"][0]["family_dropped"] == 1
+
+    def test_a_carried_pick_is_asked_about_directly_not_left_to_the_lead_scan(self, ctx, mock_plextv):
+        """The lead scan stops once the row has its leads, and it takes the person's OLDEST finished
+        titles first. A stale carried pick among their recent watches is never reached by it — so
+        whether the row let go of one used to depend on where it happened to sit in that order."""
+        ctx.plex.build_library_index.return_value = {900: 999, 10: 1010, 30: 1030, 40: 1040, 50: 1050}
+        ctx.history_source.fetch.return_value = [
+            make_watched("Fargo", days_ago=1, rating_key=999),  # most recent, so the scan reaches it last
+            make_watched("Cartoon A", days_ago=40, rating_key=1030, tmdb_id=30),
+            make_watched("Cartoon B", days_ago=41, rating_key=1040, tmdb_id=40),
+            make_watched("Cartoon C", days_ago=42, rating_key=1050, tmdb_id=50),
+        ]
+        # Fargo is a drama; the cartoons are children's titles and fill the scan's budget before it.
+        ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family", 18: "Drama"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [18] if tmdb_id == 900 else [16, 10751]
+        self._prior(ctx, 900)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0, size=1)])
+
+        assert 900 not in [p.tmdb_id for p in report.picks], [p.title for p in report.picks]
+        assert report.trace["selection"][0]["family_dropped"] == 1
+
+    def test_a_genre_map_that_came_back_empty_is_not_an_answer(self, ctx, mock_plextv):
+        """TMDB caches a 404 genre map as {} for a week. Reading that as "not a children's title"
+        dropped a real one out of the row that exists to hold it."""
+        ctx.tmdb.genre_names.return_value = {}  # nothing resolves
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [16, 10751]
+        self._prior(ctx, 900, 10)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert 900 in [p.tmdb_id for p in report.picks]  # left alone, not refused on unreadable data
+        assert "family_dropped" not in report.trace["selection"][0]
+
+    def test_a_cold_only_row_is_left_short_rather_than_padded_with_unvetted_titles(self, ctx, mock_plextv):
+        """A cold start has no history to classify from, and the server's top-rated titles carry no
+        classification at all — so they must not fill a children's-titles-ONLY row."""
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]  # thin: cold start
+        ctx.recommender = BuiltinRecommender()
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", cold_start="popular")])
+
+        assert [p.title for p in report.picks] == []
+
+    def test_a_cold_exclude_row_still_fills(self, ctx, mock_plextv):
+        """`exclude` admits an unclassified title, exactly as it does for a fresh candidate — so the
+        ordinary adult setting must not turn every cold-start person's row empty."""
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        ctx.recommender = BuiltinRecommender()
+
+        report = _run(ctx, mock_plextv, [self._row(family="exclude", cold_start="popular")])
+
+        assert [p.title for p in report.picks] == ["Top Rated"]
+
+    def test_a_held_row_says_in_the_trace_that_it_is_knowingly_stale(self, ctx, mock_plextv):
+        """The hold abandons the section; without a trace entry the run page shows the row as simply
+        absent, when in fact it is keeping yesterday's picks on purpose."""
+        ctx.tmdb.genre_names.side_effect = RuntimeError("tmdb is down")
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert report.picks == []
+        assert report.trace["selection"][0]["decision"] == "held_unbuilt"
+
+    def test_an_unreadable_genre_lookup_holds_the_row_rather_than_emptying_it(self, ctx, mock_plextv):
+        """The hold exists so a TMDB hiccup cannot decide who sees a children's title. Before this,
+        the rebuild-night drop ran first and the row disappeared with nothing in the trace."""
+        self._prior(ctx, 10, 20)
+        ctx.tmdb.genre_names.side_effect = RuntimeError("tmdb is down")
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0, refresh_days=1)])
+
+        assert {p.tmdb_id for p in report.picks} == {10, 20}  # last night's row, held
+        assert report.trace["selection"][0]["decision"] == "carried_forward"
+
+    def test_one_rows_lookup_failure_does_not_freeze_this_persons_other_rewatch_rows(self, ctx, mock_plextv):
+        """The children's-title lookup has its own flag. Sharing the excluded-genre one meant a TMDB
+        hiccup inside a family row held every rewatch row the person had, including the ones that asked
+        no children's-title question — and someone with no excluded genres could not reach that hold
+        at all before."""
+        ctx.tmdb.genre_names.side_effect = RuntimeError("tmdb is down")
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(
+            ctx,
+            mock_plextv,
+            [
+                self._row(slug="fam", family="only", rewatch=True, watched_pct=1.0),
+                RowSpec(slug="rew", name_template="Rewatch", size=5, rewatch=True, watched_pct=1.0),
+            ],
+        )
+
+        assert _rows(report).get("rew"), "the unconstrained rewatch row asked nothing and must still build"
+
+    def test_a_title_an_earlier_row_took_is_not_missing_from_tonights_answer(self, ctx, mock_plextv):
+        """Draw-without-replacement narrows what a row may SHOW, not what the answer contained. Reading
+        the narrowed pool made an earlier row's picks look unconfirmed and shrank the family row."""
+        self._prior(ctx, 10, 20)
+        self._engine(ctx, self._kid(10, "Ten"), self._kid(20, "Twenty"), self._kid(30, "Thirty"))
+
+        report = _run(
+            ctx,
+            mock_plextv,
+            [
+                RowSpec(slug="first", name_template="First", size=2),
+                self._row(slug="fam", family="only", size=2, refresh_days=1),
+            ],
+        )
+
+        rows = _rows(report)
+        assert rows["first"] == [10, 20]
+        assert len(rows["fam"]) == 2, rows  # a full row, not one shrunk by what the first row took
+        assert "unconfirmed_dropped" not in report.trace["selection"][1]
+
+    def test_an_unconstrained_row_keeps_what_it_carried(self, ctx, mock_plextv):
+        """The common case: no family rule in play, so nothing is re-checked and nothing churns."""
+        self._prior(ctx, 10, 20, row="picked")
+        self._engine(ctx, _item(10, "Ten"))
+        report = _run(ctx, mock_plextv, [RowSpec(slug="picked", name_template="Picked", size=5, refresh_days=0)])
+        assert {p.tmdb_id for p in report.picks} == {10, 20}
 
 
 class TestFamilyRows:

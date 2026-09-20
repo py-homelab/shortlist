@@ -793,20 +793,29 @@ export interface TraceSelection {
   /** `rebuilt` (built fresh) · `carried_forward` (redelivered untouched — not its refresh night) ·
    *  `refreshed` (kept the strongest two-thirds, swapped the rest) · `settings_changed` (rebuilt
    *  early because a setting that decides contents was edited) · `held_idle` (it WAS its refresh
-   *  night, but the person has watched nothing since the row was built) · `cold_start`. */
+   *  night, but the person has watched nothing since the row was built) · `cold_start` ·
+   *  `held_unbuilt` (left on last night's titles because its genres could not be read from TMDB
+   *  tonight — the row kept what it had rather than guess, and nothing was written for it). */
   decision:
     | "rebuilt"
     | "carried_forward"
     | "refreshed"
     | "settings_changed"
     | "held_idle"
-    | "cold_start";
+    | "cold_start"
+    | "held_unbuilt";
   size: number;
   delivered: number;
   candidates?: number;
   cut_cap?: number;
   carried?: number;
   new?: number;
+  /** Carried picks the row's children's-title setting no longer allows. Dropped this run — except on
+   *  a `held_unbuilt` row, which writes nothing, so there they are still in the row and go at its
+   *  next rebuild. */
+  family_dropped?: number;
+  /** Carried picks tonight's engine answer did not mention at all, dropped on a rebuild night. */
+  unconfirmed_dropped?: number;
   /** What the CADENCE said, not what happened — a `held_idle` row is `true` here. */
   refresh_night?: boolean;
   rebuild_every_days?: number | null;

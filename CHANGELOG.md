@@ -6,6 +6,45 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.5] - 2026-09-19 (py-homelab fork)
+
+### Fixed
+
+- **A children's-title rule now re-checks the picks a row carried over.** Whether a title is a
+  children's title is the engine's answer and can change — a show re-rated, a corrected rule — but a
+  carried pick held no flag of its own and was never re-asked, so an adult animated comedy sat in a
+  live family row after the engine stopped calling it one. A carried pick is now dropped when
+  tonight's answer contradicts the row's setting, and the run trace records how many went and why. On a night the
+  row rebuilds anyway it keeps only what tonight's answer admits, which also reaches a pick stale
+  enough to have fallen out of the engine's answer entirely. A row that never rebuilds still never
+  churns: absence alone is not a contradiction, because the pool is truncated and narrowed by the
+  person's other rows, so a good children's title is missing from it most nights.
+- **A rewatch row applies its children's-title setting to the titles it leads with.** Those come from
+  what the person finished rather than from the pool, and so skipped the filter entirely: a
+  "children's titles only" row served whatever they last rewatched. Their classification is looked up
+  (the same cached TMDB call the excluded-genre check makes) and the rule is applied before the row's
+  cut, so it cannot fill with titles the rule then throws away. A lookup that fails, or comes back with
+  nothing usable, holds that row on last night's picks rather than guess at a children's-title answer —
+  and holds only the rows that asked, so a hiccup inside one row leaves this person's other rewatch
+  rows alone. The row says in the run trace that it is knowingly stale rather than simply vanishing.
+  Those lookups are budgeted per slot the row is filling, so a row comes up short rather than walking
+  someone's whole history one request at a time.
+- **A cold start no longer pads a "children's titles only" row with titles nothing has classified.**
+  Someone too new to recommend for has no history to read a classification from, and the server's
+  top-rated titles carry none, so that row is left short instead. Only that setting: "exclude" and
+  "auto" admit an unclassified title, as they do anywhere else, and fill as before.
+- **The picks page fits a phone.** The deck's four actions overflowed the screen below ~400px. The
+  labels now appear only where there is room, the icons carry the row below that, and Request is
+  filled and wider — it is the action people came to take. In the grid, one labelled button beside
+  two bare icons became three actions of the same weight, each named for a screen reader and on
+  hover. One verb per action throughout — **Reject**, **Skip**, **Later**, **Request** — replacing
+  "Not for me" / "nope" / "Maybe later". `/me` joins the phone-width sweep as its own e2e test; it
+  was never in it, being the one page an owner session cannot reach.
+- **A swipe's label stays in view for the whole swipe.** Each one now sits on the edge the card is
+  travelling away from, instead of riding off the screen on the leading edge just as it is being
+  read. The label for a downward swipe was pinned to the bottom of the card, where the action row
+  hid it — so **Skip** looked like the one gesture with nothing to confirm it.
+
 ## [1.9.1-py.4] - 2026-09-19 (py-homelab fork)
 
 ### Fixed
