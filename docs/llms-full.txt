@@ -811,16 +811,16 @@ viewing:
 | Household | Decided when (defaults) | What they get |
 | --- | --- | --- |
 | **Family** | 15% or more of what they watched is children's titles, from at least 4 of them | Their own rows leave children's titles out; a **family row** carries them, ranked for them |
-| **A child's own account** | over 80% children's titles | Children's titles stay in their rows — they are the point |
+| **A child's own account** | over 80% children's titles, or you said so on their page | Rows left on _Decided per person_ hold **only** children's titles. No family row: those rows already are one |
 | **Grown-up viewing** | everyone else, and anyone with fewer than 10 titles to go on | Nothing is split; the odd animated film ranks with everything else |
 
 The row editor's **Children's & family titles** setting decides what each row does with it:
 
 | Choice | What it does |
 | --- | --- |
-| **Decided per person** | Left out for a family household, kept for everyone else. Use this on the usual rows. |
-| **Mixed in with everything else** | Always kept — how every row behaved before this existed. |
-| **Left out of this row** | Always left out, whoever it is. |
+| **Decided per person** | Left out for a family household; the **only** thing in the row for a child's own account; kept alongside everything else for anyone else. Use this on the usual rows. |
+| **Mixed in with everything else** | Always kept — how every row behaved before this existed. On a child's account that means grown-up titles too: Plex's parental restrictions will hide what that profile may not see, and the row comes out thin. |
+| **Left out of this row** | Always left out, whoever it is. Not built for a child's own account — it could only hold what is not for children. |
 | **This row is the family row** | Only children's and family titles. Built only for family households; anyone else's copy is removed. |
 
 The thresholds are in **Settings → Finding titles → Family households**, and each person's page
@@ -829,6 +829,39 @@ counts come from the engine: an [engine of your own](https://shortlistapp.dev/gu
 (`household` in its answer). With Shortlist's own engine nobody is sorted, "Decided per person"
 keeps children's titles, and a family row is a plain children's-titles row for everyone it is set
 up for. What counts as a children's title is the engine's call.
+
+**A household split into Plex Home profiles.** If your engine ranks several accounts as one person —
+a parents' profile and a children's profile sharing the household's history — it reports every one
+of them the same counts, so "decided from their viewing" says the same thing about all of them. Set
+**Who watches under this account** on each profile's page yourself: _A child's own account_ for the
+children's profile, _A family sharing the account with children_ or _Grown-up viewing_ for the other.
+That setting is the only thing that tells them apart, so the dashboard warns while a pooled profile
+is still on _Decide from what they watch_. It applies from the next run, and on the request page at once.
+
+What that setting does to a profile you mark as _A child's own account_, on its rows left on
+_Decided per person_:
+
+- They are rebuilt on the next run — frozen rows included — holding only children's titles. (A row
+  set to _Mixed in with everything else_ is left exactly as you set it; the family row, and a row
+  that leaves children's titles out, are not built for that profile.)
+- A row with no children's titles left for a library is taken down in that library rather than left
+  showing what it held before, and the run page says so. Two exceptions, both left alone: a copy that
+  was already built as a children's row (one thin night should not delete a good row), and a row
+  named after its own picks (`{top_seed}`) that Shortlist has no record of delivering, where there is
+  no title to find it by.
+- A new profile with too little watched to rank from gets no such row rather than the server's
+  top-rated films — except a watch-it-again row, which still leads with the children's titles they
+  have finished.
+- On a night your engine cannot be reached the profile is still treated as what the last run found
+  it to be. A label that changes on its own — viewing drifting across a threshold — rebuilds those
+  rows that night, frozen or not, because what they may hold has changed.
+
+Shortlist picks only titles Plex says a restricted profile can see, when it can read that profile's
+restrictions — it cannot for a PIN-protected profile, and then Plex alone does the hiding. One thing
+to know before making a children's profile: a profile given one of Plex's built-in restriction
+**presets** (Younger Kid, Older Kid, Teen) gets no Shortlist rows at all, because Plex will not let
+its sharing filters be edited, so everybody else's rows could not be hidden from it. Restrict it with
+your own allowed ratings and labels instead, and leave the preset on _None_.
 
 ## Seasonal rows
 
@@ -1523,7 +1556,11 @@ The answer, best first:
   how many of the titles this person watched over the engine's recent window were children's titles.
   Shortlist turns the counts into adult / family / kids with its own thresholds (see
   [Children's and family titles](https://shortlistapp.dev/guides/rows/#childrens-and-family-titles)); `label` is the engine's own
-  suggestion, shown beside Shortlist's.
+  suggestion, shown beside Shortlist's. An engine that ranks several accounts as ONE person (a
+  household's Plex Home profiles) adds `"group": <the account id they are pooled under>` to every one
+  of them: their counts are then identical, so Shortlist cannot tell a children's profile from the
+  adults' by viewing, and it uses `group` to warn the owner about a pooled profile whose household
+  was never set by hand.
 
 Only `tmdb_id` and `media_type` (`movie` | `show`) are required per item; a malformed item is
 skipped, not fatal. Send a token as `Authorization: Bearer …` if you set one. Shortlist retries a

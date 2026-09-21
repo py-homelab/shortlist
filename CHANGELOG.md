@@ -6,6 +6,38 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.7] - 2026-09-21 (py-homelab fork)
+
+### Changed
+
+- **A child's own account gets rows of children's titles.** A row left on "Decided per person" used
+  to keep everything for an account labelled _kids_ — so a child's profile was handed the household's
+  grown-up rows, and Plex's parental restrictions then hid most of each one. It now holds **only**
+  children's titles there. Setting someone to _A child's own account_ rebuilds those rows on the next
+  run, frozen ones included, whether or not a recipe was on record for them; such a row with no
+  children's titles left for a library is taken down there rather than left showing what it held
+  before (unless the copy was itself built as a children's row, or is a `{top_seed}` row Shortlist has
+  no record of delivering); and a profile you marked that has too little watched to rank from gets no
+  such row rather than the server's top-rated films. A night the engine cannot be reached no longer
+  reads as "not a child's account": the last label found stands in, and is not overwritten. The family row is not built for a
+  child's account (their own rows already are one), and neither is a row set to leave children's
+  titles out, which could only hold what is not for children — the run's Rows tab now names all three
+  household reasons instead of showing them as "not recorded". A row set to "Mixed in with everything
+  else" is left exactly as you set it. The request page follows suit, as soon as the setting is made:
+  a child's account sees, and can act on, only children's titles there. One change for people who are NOT a child's account: a household you set
+  by hand now applies on a cold start too (it used to wait for an engine's answer), so a grown-up you
+  pinned loses a family row on their first thin-history run rather than their first full one.
+
+### Added
+
+- **A warning for a pooled profile with no household of its own.** An engine that ranks a
+  household's Plex Home profiles as one person now says so (`household.group`), and because it then
+  reports them all the same counts, the dashboard warns about any such profile still left on "decide
+  from their viewing" — the per-person setting is the only thing that tells a children's profile
+  from the adults', and one that was never made fails silently.
+- The run page says what "Decided per person" came to for each row it built ("This is a kids account,
+  so the row holds only children's titles").
+
 ## [1.9.1-py.6] - 2026-09-20 (py-homelab fork)
 
 ### Fixed

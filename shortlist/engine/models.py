@@ -343,6 +343,10 @@ class UserProfile:
     # The owner's word on who watches under this account (`HOUSEHOLD_OVERRIDES`); "auto" = decide from
     # their viewing, which is what everyone starts on.
     household_override: str = "auto"
+    # What the last run that COULD tell concluded about this account (`Household.as_dict()`), or None.
+    # Only ever a stand-in for a night the engine that normally reports it said nothing — see
+    # `household.resolve_household`.
+    last_household: dict | None = None
 
     def __post_init__(self) -> None:
         if not self.slug:
@@ -459,8 +463,9 @@ class RowSpec:
     unstarted_only: bool = False
     # Children's / family titles (`Candidate.kids`): "include" keeps them with everything else — how
     # every row has always behaved; "exclude" keeps them out; "only" builds the row from nothing else;
-    # "auto" excludes them for a FAMILY household and includes them for anyone else. A row set to
-    # "only" is built only for family households once a household is known (see `household.py`).
+    # "auto" excludes them for a FAMILY household, holds ONLY them for a KIDS account, and includes
+    # them for anyone else (`rows._family_means`). Once a household is known, a row set to "only" is
+    # built only for family households, and one set to "exclude" is not built for a kids account.
     # Decided from what the engine tagged, never from the person's Plex restrictions.
     family: str = "include"
     # How often this row re-picks its titles, in DAYS: 0 = never once built (frozen), 1 = nightly,

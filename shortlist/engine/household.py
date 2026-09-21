@@ -28,10 +28,20 @@ class Household:
     window_titles: int | None = None
     window_days: int | None = None
     engine_label: str | None = None
+    #: The account whose history the engine pools this one with, when it pools it with any (a
+    #: household's Plex Home profiles ranked as one person). Every account in a group is reported the
+    #: SAME counts, so they cannot tell a children's profile from the adults' — only the owner's
+    #: per-person setting can, and this is what lets the dashboard notice one that was never set.
+    group: int | None = None
 
     @property
     def is_family(self) -> bool:
         return self.label == "family"
+
+    @property
+    def is_kids(self) -> bool:
+        """A child's own account or profile — every "auto" row holds only children's titles."""
+        return self.label == "kids"
 
     def as_dict(self) -> dict:
         return {
@@ -41,6 +51,8 @@ class Household:
             "window_titles": self.window_titles,
             "window_days": self.window_days,
             "engine_label": self.engine_label,
+            # Only when pooled: nearly nobody is, and a key that is always null is noise in a trace.
+            **({"group": self.group} if self.group is not None else {}),
         }
 
 
@@ -56,9 +68,20 @@ def classify(window_titles: int, kids_titles: int, cfg: EngineConfig) -> str:
     return "adult"
 
 
-def resolve_household(user: UserProfile, reported: dict | None, cfg: EngineConfig) -> Household:
+def resolve_household(
+    user: UserProfile, reported: dict | None, cfg: EngineConfig, *, engine_reports: bool = False
+) -> Household:
     """The owner's override, else the engine's counts classified with Shortlist's thresholds, else
-    unknown. ``reported`` is the engine's ``household`` object (``RecommendResult.household``)."""
+    — on a night an engine that normally reports said nothing — what the last run concluded, else
+    unknown. ``reported`` is the engine's ``household`` object (``RecommendResult.household``).
+
+    ``engine_reports`` is whether the configured engine is one that reports households at all. The
+    last-known label only stands in for THAT engine's silence (it was unreachable, and the built-in
+    one ranked instead): "nothing reported tonight" is not evidence that a child's account stopped
+    being one, and reading it that way rebuilt their rows with everything in them. With the built-in
+    engine configured nobody is sorted, tonight or ever, so a label left over from an engine since
+    removed must not go on sorting them.
+    """
     counts = {}
     if isinstance(reported, dict):
         try:
@@ -70,8 +93,23 @@ def resolve_household(user: UserProfile, reported: dict | None, cfg: EngineConfi
             }
         except (KeyError, TypeError, ValueError):
             counts = {}
+    # Read apart from the counts: it is a fact about identity, not about viewing, and an engine whose
+    # counts came through malformed is exactly the case where "this profile is pooled and unpinned"
+    # most needs saying.
+    raw_group = reported.get("group") if isinstance(reported, dict) else None
+    group = raw_group if isinstance(raw_group, int) and not isinstance(raw_group, bool) else None
     if user.household_override in ("adult", "family", "kids"):
-        return Household(label=user.household_override, source="override", **counts)
+        return Household(label=user.household_override, source="override", group=group, **counts)
     if counts:
-        return Household(label=classify(counts["window_titles"], counts["kids_titles"], cfg), source="engine", **counts)
-    return Household(label=None, source="none")
+        label = classify(counts["window_titles"], counts["kids_titles"], cfg)
+        return Household(label=label, source="engine", group=group, **counts)
+    last = user.last_household if isinstance(user.last_household, dict) else {}
+    # Only a label an ENGINE found. One the owner set and has since removed is not evidence of anything,
+    # and standing in for it would keep sorting the person by a setting that no longer exists — for
+    # ever, for someone the engine never reports on, since a stand-in is never written back.
+    found_by_engine = last.get("source") == "engine" and last.get("label") in ("adult", "family", "kids")
+    if engine_reports and reported is None and found_by_engine:
+        kept = {k: last.get(k) for k in ("kids_titles", "window_titles", "window_days", "engine_label")}
+        last_group = last.get("group") if isinstance(last.get("group"), int) else None
+        return Household(label=last["label"], source="last_run", group=last_group, **kept)
+    return Household(label=None, source="none", group=group)

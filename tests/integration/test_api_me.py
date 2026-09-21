@@ -116,13 +116,89 @@ class TestReadingMyPicks:
 
     def test_anyone_else_sees_children_s_titles_with_everything_else_and_no_toggle(self, client: TestClient):
         _seed(client, SARAH, [(10, "movie", "Ten", False), (30, "movie", "Cartoon", True)])
-        for household in (None, "adult", "kids"):
+        for household in (None, "adult"):
             _set_household(client, SARAH, household)
             _sign_in_as(client, SARAH)
             body = client.get("/api/me/suggestions").json()
             assert [i["tmdb_id"] for i in body["items"]] == [10, 30], household
             assert body["family"] == "include" and body["has_family"] is False
             assert body["household"] == household
+
+    def test_a_childs_own_account_sees_only_childrens_titles(self, client: TestClient):
+        """In step with their rows (`rows._family_means`): "auto" used to mean "everything" for a kids
+        account here too, so a child's request page listed the household's grown-up missing titles."""
+        _seed(client, SARAH, [(10, "movie", "Ten", False), (30, "movie", "Cartoon", True)])
+        _set_household(client, SARAH, "kids")
+        _sign_in_as(client, SARAH)
+
+        body = client.get("/api/me/suggestions").json()
+
+        assert [i["tmdb_id"] for i in body["items"]] == [30]
+        assert (body["family"], body["household"]) == ("only", "kids")
+
+    def test_a_childs_lane_is_not_a_preference(self, client: TestClient):
+        """`?family=include` in the address bar does not widen it, and a grown-up title cannot be acted
+        on from that account even though it sits in the household's list."""
+        _seed(client, SARAH, [(10, "movie", "Ten", False), (30, "movie", "Cartoon", True)])
+        _set_household(client, SARAH, "kids")
+        _sign_in_as(client, SARAH)
+
+        for asked in ("include", "exclude", "auto"):
+            body = client.get(f"/api/me/suggestions?family={asked}").json()
+            assert [i["tmdb_id"] for i in body["items"]] == [30], asked
+
+        refused = client.post("/api/me/act", json={"tmdb_id": 10, "media_type": "movie", "action": "never"})
+        allowed = client.post("/api/me/act", json={"tmdb_id": 30, "media_type": "movie", "action": "never"})
+        assert (refused.status_code, allowed.status_code) == (403, 200)
+
+    @respx.mock
+    def test_a_childs_page_lists_no_grown_up_title_in_ANY_of_its_lists(self, client: TestClient):
+        """The "already requested or on the way" posters are a second list, built beside the first. A
+        pooled children's profile reads its household's suggestions, so every grown-up title anyone in
+        the house had requested sat there with its poster and overview — one list below the one that
+        had been narrowed."""
+        _configure_seerr(client)
+        _mock_seerr(media=[{"id": 2, "tmdbId": 20, "mediaType": "tv", "status": 2}])
+        _seed(
+            client,
+            SARAH,
+            [(10, "movie", "Adult", False), (20, "show", "Adult On The Way", False), (30, "movie", "Cartoon", True)],
+        )
+        _set_household(client, SARAH, "kids")
+        _sign_in_as(client, SARAH)
+
+        body = client.get("/api/me/suggestions").json()
+        summary = client.get("/api/me").json()
+
+        assert [i["title"] for i in body["items"]] == ["Cartoon"]
+        assert body["queued"] == []
+        assert (summary["counts"]["items"], summary["counts"]["queued"]) == (1, 0)
+
+    @respx.mock
+    def test_everyone_else_still_sees_what_is_on_the_way(self, client: TestClient):
+        _configure_seerr(client)
+        _mock_seerr(media=[{"id": 2, "tmdbId": 20, "mediaType": "tv", "status": 2}])
+        _seed(client, SARAH, [(20, "show", "Adult On The Way", False), (30, "movie", "Cartoon", True)])
+        _set_household(client, SARAH, "family")
+        _sign_in_as(client, SARAH)
+
+        assert [i["title"] for i in client.get("/api/me/suggestions").json()["queued"]] == ["Adult On The Way"]
+
+    def test_the_owners_setting_applies_here_before_the_next_run_catches_up(self, client: TestClient):
+        """The stored label is last night's. A profile just marked as a child's must not go on being
+        shown the household's grown-up titles until a run happens to persist the new one."""
+        _seed(client, SARAH, [(10, "movie", "Ten", False), (30, "movie", "Cartoon", True)])
+        _set_household(client, SARAH, "family")  # what the last run stored
+        with client.app.state.sessions() as session:
+            user = session.query(User).filter_by(plex_account_id=SARAH).one()
+            user.prefs = {**(user.prefs or {}), "household": "kids"}
+            session.commit()
+        _sign_in_as(client, SARAH)
+
+        body = client.get("/api/me/suggestions").json()
+
+        assert [i["tmdb_id"] for i in body["items"]] == [30]
+        assert body["household"] == "kids"
 
     def test_the_owner_sees_their_own_page_too(self, client: TestClient):
         with client.app.state.sessions() as session:

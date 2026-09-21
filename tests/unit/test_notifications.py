@@ -1217,3 +1217,118 @@ class TestProxySignInUnverifiable:
         store = SettingsStore(session)
         store.set("auth.proxy.jwks_url", "https://auth.example/jwks/")
         assert notif._proxy_sign_in_unverifiable(session, store) is None
+
+
+class TestAPooledProfileWithNoHouseholdOfItsOwn:
+    """A household split into Plex Home profiles, pooled by the engine: every profile is reported the
+    same counts, so the owner's per-person setting is the only thing that makes the children's profile
+    a children's profile — and a setting that was never made, or got lost, fails silently."""
+
+    OWNER, ADULTS, KIDS = 895220, 856697834, 856698746
+
+    def _user(self, session, account_id, name, *, pinned=None, group=OWNER, enabled=True, label="family"):
+        from shortlist.server.db.models import User
+
+        household = {"label": pinned or label, "source": "override" if pinned else "engine"}
+        if group is not None:
+            household["group"] = group
+        user = User(
+            plex_account_id=account_id,
+            username=name,
+            slug=name,
+            user_type="owner" if account_id == self.OWNER else "managed",
+            enabled=enabled,
+            household=household,
+            prefs={"household": pinned} if pinned else {},
+        )
+        session.add(user)
+        session.commit()
+        return user
+
+    def test_a_pooled_profile_left_on_auto_is_called_out_by_name(self, session):
+        self._user(session, self.OWNER, "pavel")
+        self._user(session, self.ADULTS, "adults", pinned="family")
+        kids = self._user(session, self.KIDS, "kids")
+
+        result = notif._pooled_profile_with_no_household_of_its_own(session)
+
+        assert result["severity"] == "warning"
+        assert result["title"].startswith("kids shares a watch history")
+        assert "currently built as: family" in result["body"]
+        assert result["action_url"] == f"/users/{kids.id}"
+        assert result["id"] == f"pooled-household-{kids.id}"
+
+    def test_the_account_the_others_are_pooled_under_may_stay_on_auto(self, session):
+        """It is the household's own account: "auto" reading the shared history is right for it."""
+        self._user(session, self.OWNER, "pavel")
+        self._user(session, self.ADULTS, "adults", pinned="family")
+        self._user(session, self.KIDS, "kids", pinned="kids")
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is None
+
+    def test_the_setting_clears_it_without_waiting_for_a_run(self, session):
+        """Read from `prefs`, not from the last run's `source` — or pinning it would leave the warning
+        up until tomorrow, telling the owner to do what they just did."""
+        kids = self._user(session, self.KIDS, "kids")
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is not None
+
+        kids.prefs = {"household": "kids"}
+        session.commit()
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is None
+
+    def test_setting_it_back_to_auto_brings_it_back(self, session):
+        self._user(session, self.KIDS, "kids").prefs = {"household": "auto"}
+        session.commit()
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is not None
+
+    def test_nobody_pooled_means_nothing_to_say(self, session):
+        self._user(session, 42, "sarah", group=None, label="adult")
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is None
+
+    def test_a_profile_that_is_switched_off_is_not_anyones_problem_yet(self, session):
+        self._user(session, self.KIDS, "kids", enabled=False)
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is None
+
+    def test_two_of_them_are_named_together_and_dismissing_one_set_does_not_hide_another(self, session):
+        adults = self._user(session, self.ADULTS, "adults")
+        kids = self._user(session, self.KIDS, "kids")
+
+        result = notif._pooled_profile_with_no_household_of_its_own(session)
+
+        assert result["title"].startswith("adults, kids share a watch history")
+        assert result["id"] == f"pooled-household-{adults.id}-{kids.id}"
+
+    def test_it_reaches_the_dashboard(self, session):
+        self._user(session, self.KIDS, "kids")
+
+        ids = [n["id"] for n in notif.build_notifications(session, SettingsStore(session), "1.0.0")]
+
+        assert any(i.startswith("pooled-household-") for i in ids)
+
+    def test_someone_the_owner_filed_away_is_not_anyones_problem(self, session):
+        kids = self._user(session, self.KIDS, "kids")
+        kids.removed_at = datetime.now(UTC)
+        session.commit()
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is None
+
+    @pytest.mark.parametrize("household", [None, "family", {"label": "family"}, {"label": "family", "group": "895220"}])
+    def test_a_household_that_is_not_a_pooled_one_is_read_as_not_pooled(self, session, household):
+        """The column is free-form JSON written by earlier versions and by whatever the engine sent."""
+        kids = self._user(session, self.KIDS, "kids")
+        kids.household = household
+        session.commit()
+
+        assert notif._pooled_profile_with_no_household_of_its_own(session) is None
+
+    def test_two_profiles_are_spoken_of_in_the_plural(self, session):
+        self._user(session, self.ADULTS, "adults")
+        self._user(session, self.KIDS, "kids")
+
+        body = notif._pooled_profile_with_no_household_of_its_own(session)["body"]
+
+        assert "these profiles" in body and "this profile" not in body

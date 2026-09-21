@@ -246,7 +246,13 @@ def build_view(session: Session, user: User, seerr: SeerrView) -> dict:
 
 
 def household_label(user: User) -> str | None:
-    """The label the last run settled on for this person (adult | family | kids), or None."""
+    """Who watches under this account (adult | family | kids), or None: the owner's own setting when
+    there is one, else what the last run settled on. The setting first, so it takes effect on this
+    page the moment it is made — the stored label only catches up at the next run, and until then a
+    profile just marked as a child's would go on being shown the household's grown-up titles."""
+    pinned = (user.prefs or {}).get("household")
+    if pinned in ("adult", "family", "kids"):
+        return pinned
     hh = user.household if isinstance(user.household, dict) else None
     label = hh.get("label") if hh else None
     return label if label in ("adult", "family", "kids") else None
@@ -254,10 +260,35 @@ def household_label(user: User) -> str | None:
 
 def family_lane(user: User, family: str) -> str:
     """What `family=auto` means for this person: a FAMILY household keeps children's titles in their
-    own lane (exclude here, `only` behind the toggle); anyone else sees them with everything else."""
+    own lane (exclude here, `only` behind the toggle); a KIDS account sees only children's titles;
+    anyone else sees them with everything else. The request page's answer to the question
+    `engine.rows._family_means` answers for rows — kept in step with it by hand, because this side
+    reads the household the last run STORED and that side the one tonight's run resolved."""
+    label = household_label(user)
+    if label == "kids":
+        # Not a preference: on a child's account the lane is the point, so a `?family=include` typed
+        # into the address bar does not widen it. (`for_this_account` has already narrowed the view
+        # itself, which is what `act` and `seen` check a title against.)
+        return "only"
     if family != "auto":
         return family
-    return "exclude" if household_label(user) == "family" else "include"
+    return "exclude" if label == "family" else "include"
+
+
+def for_this_account(user: User, view: dict) -> dict:
+    """The view as THIS account may see it. For a child's own account that is children's titles only,
+    in every list the page shows — the suggestions and the "already requested or on the way" posters
+    alike. A pooled children's profile reads its household's list, so without this every grown-up title
+    anyone in the house had requested sat on the child's page with its poster and overview, one list
+    below the one that had been so carefully narrowed. Applied where the view is BUILT, so an endpoint
+    added later cannot forget it. Everyone else's view is returned as it is."""
+    if household_label(user) != "kids":
+        return view
+    return {
+        **view,
+        "items": family_filter(view["items"], "only"),
+        "queued": family_filter(view["queued"], "only"),
+    }
 
 
 def family_filter(items: list[dict], family: str) -> list[dict]:

@@ -63,14 +63,15 @@ export function FamilyHouseholdsCard({ settings }: { settings: Settings }) {
         <p className="text-sm text-muted-foreground">
           Some people share their Plex account with their children; most don’t. Each person is sorted
           by their own viewing over the last months: a <strong>family</strong> gets rows without
-          children’s titles plus a family row that carries them; everyone else sees children’s titles
-          ranked with everything else. Needs an engine that reports viewing (Settings → Engine);
+          children’s titles plus a family row that carries them; a <strong>child’s own account</strong>{" "}
+          gets only children’s titles in rows left on Decided per person; everyone else sees children’s titles ranked with
+          everything else. Needs an engine that reports viewing (Settings → Engine);
           override anyone on their user page.
         </p>
         <div className="grid gap-4 sm:grid-cols-2">
           {field("family-share", "A family at", share, setShare, "%", "or more of what they watched is children’s titles…")}
           {field("family-titles", "…from at least", kidsTitles, setKidsTitles, "titles", "distinct children’s titles, so one cartoon night does not count.")}
-          {field("kids-account", "A child’s own account above", kidsAccount, setKidsAccount, "%", "Children’s titles stay in their rows — they are the point.")}
+          {field("kids-account", "A child’s own account above", kidsAccount, setKidsAccount, "%", "Their rows left on Decided per person hold only children’s titles, and they get no separate family row.")}
           {field("min-titles", "Decide only after", minTitles, setMinTitles, "titles", "watched in the window; with fewer, everyone counts as grown-up viewing.")}
         </div>
         <SaveStatus

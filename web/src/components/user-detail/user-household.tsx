@@ -28,7 +28,7 @@ function asOverride(value: unknown): HouseholdOverride {
 
 /** What the last run concluded, and from what — so "why does my family row not appear?" has an
  *  answer on this page. */
-export function householdSummary(household: User["household"]): string {
+export function householdSummary(household: User["household"], accountId?: number): string {
   const hh = household as
     | {
         label?: string | null;
@@ -36,6 +36,7 @@ export function householdSummary(household: User["household"]): string {
         kids_titles?: number | null;
         window_titles?: number | null;
         window_days?: number | null;
+        group?: number | null;
       }
     | null
     | undefined;
@@ -48,7 +49,16 @@ export function householdSummary(household: User["household"]): string {
           hh.window_days ? Math.round(hh.window_days / 30) + " months" : "while"
         }`
       : "";
-  return `Last run: ${what}${counts}.`;
+  // Pooled with another account by the engine: these are the whole household's counts, identical for
+  // every profile in it, so they cannot say who watches on THIS one. Said here because this is the
+  // page where "decide from what they watch" is being trusted to do exactly that.
+  // Not on the account the others are pooled UNDER: it is the household's own, and deciding it from
+  // the household's viewing is exactly right.
+  const pooled =
+    hh.group != null && hh.group !== accountId
+      ? " Those counts are the whole household’s — this profile is ranked together with another account — so they say the same about every profile in it. Choose above instead."
+      : "";
+  return `Last run: ${what}${counts}.${pooled}`;
 }
 
 /**
@@ -91,11 +101,13 @@ export function UserHousehold({ user }: { user: User }) {
             </option>
           ))}
         </select>
-        <p className="text-sm text-muted-foreground">{householdSummary(user.household)}</p>
+        <p className="text-sm text-muted-foreground">{householdSummary(user.household, user.plex_account_id)}</p>
         <p className="text-sm text-muted-foreground">
           A family sharing the account gets rows without children’s titles, and a family row with them.
-          Everyone else sees children’s titles ranked with everything else. The thresholds are in
-          Settings → Finding titles.
+          A child’s own account gets only children’s titles in rows left on “Decided per person”,
+          from the next run. Everyone else sees
+          children’s titles ranked with everything else. The thresholds are in Settings → Finding
+          titles.
         </p>
         {patchUser.isError && (
           <p role="alert" className="text-sm text-destructive-text">

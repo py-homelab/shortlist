@@ -803,7 +803,10 @@ export interface TraceSelection {
     | "settings_changed"
     | "held_idle"
     | "cold_start"
-    | "held_unbuilt";
+    | "held_unbuilt"
+    /** A row on "auto" for a kids account that had no children's titles for this library tonight:
+     *  nothing was built, and the library's old copy (`removed`) was taken down rather than left. */
+    | "emptied";
   size: number;
   delivered: number;
   candidates?: number;
@@ -831,8 +834,13 @@ export interface TraceSelection {
   cooling?: number;
   rewatch_cooldown_days?: number;
   unstarted_only?: boolean;
-  /** Only when set away from the default: "exclude" | "only". */
+  /** Only when set away from the default: "exclude" | "only" | "auto". */
   family?: string;
+  /** Only for a row on "auto": what that came to for this person — "include" | "exclude" | "only". */
+  family_means?: string;
+  /** `emptied` only: whether there was an old copy in this library to take down (under a dry run:
+   *  one that WOULD be). */
+  removed?: boolean;
 }
 
 // --- SSE payloads (GET /api/events) ---
