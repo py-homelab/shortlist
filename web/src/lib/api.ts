@@ -397,6 +397,9 @@ export const api = {
     to_user_id: number;
     /** Whose watching to copy. Omit for the owner, which is the case the guide walks through. */
     from_user_id?: number;
+    /** Narrow the copy to titles Plex rates one of these and the target can see — a children's
+     *  profile. Omit to copy everything; an empty list is refused rather than read as that. */
+    ratings?: string[];
     dry_run: boolean;
   }): Promise<TransferResult> =>
     request("/api/watching-account/transfer", {

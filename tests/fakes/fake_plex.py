@@ -537,7 +537,14 @@ class FakePlexState:
             return False
         kind = section.type if section else ("movie" if item.media_type == "movie" else "show")
         fieldname = "filterMovies" if kind == "movie" else "filterTelevision"
-        return share_filter_admits(user.filters.get(fieldname) or "", item.labels, item.content_rating)
+        # An EPISODE follows its SHOW (`pms_share_filter_tv_by_key.json`): under a rating allow list an
+        # episode of a hidden show is absent from a by-key read, and the hidden show's /children and
+        # /allLeaves are 404 — the tree is closed at the show, so the show is what the filter is asked
+        # about. Judging an episode on its own rating would let one through under a show Plex hides.
+        judged = item
+        if item.media_type == "episode" and item.grandparent_rating_key is not None:
+            judged = self.item(item.grandparent_rating_key) or item
+        return share_filter_admits(user.filters.get(fieldname) or "", judged.labels, judged.content_rating)
 
 
 #: The demo library the docs screenshots are taken against. Real titles, because every one of
@@ -714,7 +721,7 @@ def _container(**attrs) -> Element:
     return root
 
 
-def _leaf_xml(parent: Element, item: FakeMovie, view_count: int, view_offset: int) -> Element:
+def _leaf_xml(parent: Element, item: FakeMovie, view_count: int, view_offset: int, show_title: str = "") -> Element:
     """One `<Video>` row of a LEAF read, shaped like the recorded fixtures.
 
     `viewCount` and `viewOffset` are OMITTED when zero, exactly as a real server omits them — the
@@ -727,7 +734,15 @@ def _leaf_xml(parent: Element, item: FakeMovie, view_count: int, view_offset: in
     element.set("type", item.media_type)
     element.set("title", item.title)
     element.set("duration", "3600000")
+    # On the leaf row itself, and OMITTED when Plex holds none — recorded in `pms_watched_episodes`
+    # (every row rated) and `pms_in_progress_movies` (one film of three with no attribute at all). A
+    # copy narrowed by rating reads it from here, so a fake that always rated would hide the
+    # unrated-title case entirely.
+    if item.content_rating:
+        element.set("contentRating", item.content_rating)
     if item.grandparent_rating_key is not None:
+        if show_title:
+            element.set("grandparentTitle", show_title)
         element.set("grandparentRatingKey", str(item.grandparent_rating_key))
         element.set("grandparentKey", f"/library/metadata/{item.grandparent_rating_key}")
         element.set("parentIndex", str(item.parent_index))
@@ -768,6 +783,11 @@ def _movie_xml(parent: Element, state: FakePlexState, movie: FakeMovie, *, watch
         # library's items would all claim to live in the first one.
         librarySectionID=section.key if section else state.section_id,
     )
+    # Omitted when Plex holds none, as on the leaf rows (`_leaf_xml`). Recorded in
+    # `pms_watched_user_rating` — a `type=1&unwatched=0` read, five of six films rated and the sixth
+    # with no attribute at all — and the watched half of a movie leaf read is served from here.
+    if movie.content_rating:
+        element.set("contentRating", movie.content_rating)
     if watched_by is not None:
         # Omitted for a show in `undated_in_show_read`: see the field. The episode read is then the
         # only place its date exists, which is what the production date-repair path is built on.
@@ -1083,7 +1103,8 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
                 size=len(listing[start : start + size]), totalSize=len(listing), librarySectionID=section_id
             )
             for item, count, offset in listing[start : start + size]:
-                _leaf_xml(root, item, count, offset)
+                show = state.item(item.grandparent_rating_key) if item.grandparent_rating_key else None
+                _leaf_xml(root, item, count, offset, show.title if show else "")
             return _xml(root)
         # The share-token watched read (ShareTokenWatchSource): `unwatched=0` filters to what the
         # REQUESTING account has watched, served AS them with their own per-user viewCount/leaf counts.

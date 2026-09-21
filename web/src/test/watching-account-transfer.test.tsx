@@ -69,6 +69,16 @@ function result(over: Partial<TransferResult>): TransferResult {
     snapshot_id: null,
     dry_run: false,
     source_empty: false,
+    ratings: [],
+    ratings_seen: {},
+    ratings_kept: {},
+    kept: 0,
+    left_out: 0,
+    hidden_from_target: 0,
+    kept_preview: [],
+    refused: "",
+    in_the_way: [],
+    residue_cleared: 0,
     errors: [],
     ...over,
   };
@@ -1299,5 +1309,249 @@ describe("TransferSteps explains a large removal count", () => {
     expect(
       screen.queryAllByText(/count this large almost always means/i),
     ).toHaveLength(0);
+  });
+});
+
+describe("TransferSteps narrowed to content ratings", () => {
+  const narrowed = (over: Partial<TransferResult> = {}) =>
+    result({
+      dry_run: true,
+      marks: 2,
+      planned: 2,
+      ratings: ["G", "TV-Y"],
+      ratings_seen: { R: 5, G: 1, "TV-Y": 1, "TV-Y7-FV": 3, "": 2 },
+      ratings_kept: { G: 1, "TV-Y": 1 },
+      kept: 2,
+      left_out: 10,
+      kept_preview: ["Aladdin", "Bluey"],
+      ...over,
+    });
+
+  async function narrowAndPreview() {
+    await userEvent.click(
+      await screen.findByRole("radio", { name: /steve tv/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: /only copy titles with certain/i }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+  }
+
+  it("copies everything unless the box is ticked", async () => {
+    transferWatchHistory.mockResolvedValue(result({ dry_run: true, marks: 1 }));
+    renderSteps();
+
+    await userEvent.click(
+      await screen.findByRole("radio", { name: /steve tv/i }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    await screen.findByText(/nothing has been changed yet/i);
+
+    expect(transferWatchHistory.mock.calls[0]![0]).not.toHaveProperty("ratings");
+  });
+
+  it("sends the strict children's set by default", async () => {
+    transferWatchHistory.mockResolvedValue(narrowed());
+    renderSteps();
+
+    await narrowAndPreview();
+    await screen.findByText(/nothing has been changed yet/i);
+
+    expect(transferWatchHistory.mock.calls[0]![0].ratings).toEqual([
+      "G",
+      "TV-G",
+      "TV-Y",
+      "TV-Y7",
+      "TV-Y7-FV",
+    ]);
+  });
+
+  it("says how much stays behind and names what would go", async () => {
+    transferWatchHistory.mockResolvedValue(narrowed());
+    renderSteps();
+
+    await narrowAndPreview();
+
+    expect(
+      await screen.findByText(/of 12 watched films and episodes/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Bluey")).toBeInTheDocument();
+    expect(screen.getByText("No rating")).toBeInTheDocument();
+  });
+
+  it("offers a rating the history holds even though nobody thought to list it", async () => {
+    // A British library's "U", or a rating Plex invents next year: a rating that is not offered is a
+    // rating nobody can tick, and its titles would stay behind with no way to say otherwise.
+    transferWatchHistory.mockResolvedValue(
+      narrowed({ ratings_seen: { "gb/U": 4, G: 1 } }),
+    );
+    renderSteps();
+
+    await narrowAndPreview();
+
+    expect(
+      await screen.findByRole("checkbox", { name: /gb\/U/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("makes you preview again after the list changes", async () => {
+    transferWatchHistory.mockResolvedValue(narrowed());
+    renderSteps();
+    await narrowAndPreview();
+    await screen.findByText(/nothing has been changed yet/i);
+    const real = screen.getByRole("button", { name: /copy my history across/i });
+    expect(real).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("checkbox", { name: /^PG/ }));
+
+    expect(real).toBeDisabled();
+    expect(screen.getByText(/press preview first/i)).toBeInTheDocument();
+  });
+
+  it("will not preview or copy with nothing ticked", async () => {
+    renderSteps();
+    await userEvent.click(
+      await screen.findByRole("radio", { name: /steve tv/i }),
+    );
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: /only copy titles with certain/i }),
+    );
+    for (const rating of ["G", "TV-G", "TV-Y", "TV-Y7", "TV-Y7-FV"])
+      await userEvent.click(
+        screen.getByRole("checkbox", { name: new RegExp(`^${rating}$`) }),
+      );
+
+    expect(screen.getByRole("button", { name: /^preview$/i })).toBeDisabled();
+    expect(screen.getByText(/tick at least one rating/i)).toBeInTheDocument();
+  });
+
+  it("shows a refusal, names what is in the way, and never arms the real button", async () => {
+    transferWatchHistory.mockResolvedValue(
+      narrowed({
+        marks: 0,
+        planned: 0,
+        refused: "that account already has 1 watched title of its own",
+        in_the_way: ["Their Own Film"],
+      }),
+    );
+    renderSteps();
+
+    await narrowAndPreview();
+
+    expect(
+      await screen.findByText(/this copy would be refused, and nothing was changed/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Their Own Film")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /copy my history across/i }),
+    ).toBeDisabled();
+    // The ordinary "Would tick N titles" sentence would be a claim about a copy that will not run.
+    expect(screen.queryByText(/nothing has been changed yet/i)).toBeNull();
+  });
+
+  it("blocks a list that matches nothing, rather than reporting a finished copy of nothing", async () => {
+    transferWatchHistory.mockResolvedValue(
+      narrowed({ marks: 0, planned: 0, kept: 0, left_out: 12, ratings_kept: {}, kept_preview: [] }),
+    );
+    renderSteps();
+
+    await narrowAndPreview();
+
+    expect(
+      await screen.findByText(/nothing in this history has those ratings/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /copy my history across/i }),
+    ).toBeDisabled();
+  });
+
+  it("goes stale when the box is ticked and emptied after a preview of everything", async () => {
+    // "Everything" and "narrowed, nothing ticked" once shared a key, so this preview stayed fresh.
+    transferWatchHistory.mockResolvedValue(result({ dry_run: true, marks: 1 }));
+    renderSteps();
+    await userEvent.click(
+      await screen.findByRole("radio", { name: /steve tv/i }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^preview$/i }));
+    await screen.findByText(/nothing has been changed yet/i);
+
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: /only copy titles with certain/i }),
+    );
+    for (const rating of ["G", "TV-G", "TV-Y", "TV-Y7", "TV-Y7-FV"])
+      await userEvent.click(
+        screen.getByRole("checkbox", { name: new RegExp(`^${rating}$`) }),
+      );
+
+    expect(screen.getByText(/press preview first/i)).toBeInTheDocument();
+  });
+
+  it("says what the account now HOLDS after a real narrowed copy, never that it matches yours", async () => {
+    transferWatchHistory
+      .mockResolvedValueOnce(narrowed())
+      .mockResolvedValueOnce(
+        narrowed({ dry_run: false, applied: 2, snapshot_id: 9, residue_cleared: 3 }),
+      );
+    renderSteps();
+    await narrowAndPreview();
+    await screen.findByText(/nothing has been changed yet/i);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /copy my history across/i }),
+    );
+
+    expect(
+      await screen.findByText(/now holds the 2 watched films and episodes rated G, TV-Y/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/dropped 3 leftover history entries/i)).toBeInTheDocument();
+    expect(screen.queryByText(/now matches yours/i)).toBeNull();
+    // Addressed to the owner about their OWN watching — wrong for a child's profile.
+    expect(screen.queryByText(/watch there from now on/i)).toBeNull();
+  });
+
+  it("says up front that a narrowed copy does not end up matching", async () => {
+    renderSteps();
+    await userEvent.click(
+      await screen.findByRole("radio", { name: /steve tv/i }),
+    );
+    expect(screen.queryByText(/doesn.t end up matching/i)).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: /only copy titles with certain/i }),
+    );
+
+    expect(screen.getByText(/doesn.t end up matching/i)).toBeInTheDocument();
+  });
+
+  it("does not claim the account holds all N when some could not be written", async () => {
+    // "Now holds the 40" directly above "3 were skipped" is two sentences contradicting each other.
+    transferWatchHistory
+      .mockResolvedValueOnce(narrowed())
+      .mockResolvedValueOnce(
+        narrowed({ dry_run: false, applied: 1, unreachable: 1, snapshot_id: 9 }),
+      );
+    renderSteps();
+    await narrowAndPreview();
+    await screen.findByText(/nothing has been changed yet/i);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /copy my history across/i }),
+    );
+
+    expect(
+      await screen.findByText(/everything that could be written is there/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/now holds the/i)).toBeNull();
+  });
+
+  it("says in the PREVIEW that an earlier copy's leftovers will be removed", async () => {
+    transferWatchHistory.mockResolvedValue(narrowed({ residue_cleared: 412 }));
+    renderSteps();
+
+    await narrowAndPreview();
+
+    expect(
+      await screen.findByText(/an earlier copy left 412 history entries/i),
+    ).toBeInTheDocument();
   });
 });

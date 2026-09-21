@@ -15,7 +15,7 @@ import asyncio
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import or_
 
 from shortlist.engine.clients.http_retry import redact
@@ -48,6 +48,27 @@ class TransferIn(BaseModel):
     #: the endpoint hardcoded the owner.
     from_user_id: int | None = None
     dry_run: bool = False
+    #: Narrow the copy to titles Plex rates one of these ("TV-Y", "G", …) and the watching account can
+    #: see; omit to copy everything. For a household splitting one shared account into a children's
+    #: profile and an adults' one. A narrowed copy never changes what is already on the account — it
+    #: is refused when it would, because the mirror would un-mark whatever that person watched
+    #: themselves.
+    ratings: list[str] | None = None
+
+    @field_validator("ratings")
+    @classmethod
+    def _ratings_name_something(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned = list(dict.fromkeys(r.strip() for r in value if r and r.strip()))
+        # An empty list is not "everything" — it is a copy narrowed to nothing, which can only be a
+        # mistake. Refused here rather than quietly read as None, which would copy the WHOLE history
+        # onto the profile the caller was trying to keep it off.
+        if not cleaned:
+            raise ValueError("name at least one content rating, or leave `ratings` out to copy everything")
+        if len(cleaned) > 30 or any(len(r) > 32 for r in cleaned):
+            raise ValueError("too many content ratings, or one too long to be a content rating")
+        return cleaned
 
 
 class TransferOut(PassthroughModel):
@@ -89,6 +110,24 @@ class TransferOut(PassthroughModel):
     # The SOURCE account has nothing to replicate — told apart from a plain `planned == 0`, because
     # "they already match" is success and the UI has to say something completely different (#88).
     source_empty: bool
+    # --- a copy narrowed by content rating; all empty/zero for a copy of everything ---------------
+    ratings: list[str]
+    # Leaves in the whole source under each rating, "" = unrated: what there is to choose from.
+    ratings_seen: dict[str, int]
+    # The same count over what the copy keeps — beside `ratings_seen`, a wrong list shows before it is run.
+    ratings_kept: dict[str, int]
+    kept: int
+    left_out: int
+    # Rated inside the list, but the watching account's own Plex restrictions hide it — left out too.
+    hidden_from_target: int
+    kept_preview: list[str]
+    # Why a PREVIEW says the real copy would be refused, "" when it would not. A real run that is
+    # refused never gets this far: it answers 409 with the same sentence.
+    refused: str
+    in_the_way: list[str]
+    # Shortlist-side leftovers of an EARLIER copy (copied play events, cached titles it dated) for
+    # titles this narrowed copy does not carry, removed so they stop feeding that account's seeds.
+    residue_cleared: int
     errors: list[str]
 
 
@@ -238,6 +277,7 @@ async def transfer(body: TransferIn, request: Request) -> dict:
             "to_user_id": body.to_user_id,
             "from_user_id": source_id,
             "dry_run": force_dry_run() or body.dry_run,
+            **({"ratings": body.ratings} if body.ratings is not None else {}),
         },
         "watch-state replication",
     )
@@ -302,4 +342,10 @@ async def _via_job(state, kind: str, payload: dict, label: str) -> dict:
                 status_code=503,
                 detail="Plex is busy with another job right now — this has been queued and will finish on its own.",
             )
-        return {**TransferReport().as_dict(), **(job.result or {})}
+        result = {**TransferReport().as_dict(), **(job.result or {})}
+        # A refused REAL copy is an error to the caller, not a report with a field to remember to
+        # check: a client that renders `applied: 0` as "done" would otherwise tell someone their copy
+        # went through. A refused PREVIEW stays a 200 — saying so is what a preview is for.
+        if result["refused"] and not result["dry_run"]:
+            raise HTTPException(status_code=409, detail=result["refused"])
+        return result

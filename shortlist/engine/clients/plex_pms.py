@@ -527,6 +527,8 @@ def _merge_leaf(prior: ItemState, later: ItemState) -> ItemState:
         last_viewed_at=max(prior.last_viewed_at, later.last_viewed_at),
         show_rating_key=prior.show_rating_key or later.show_rating_key,
         title=prior.title or later.title,
+        content_rating=prior.content_rating or later.content_rating,
+        show_title=prior.show_title or later.show_title,
     )
 
 
@@ -1958,6 +1960,10 @@ class PlexClient:
             last_viewed_at=int(el.get("lastViewedAt") or 0),
             show_rating_key=show_key,
             title=el.get("title") or "",
+            # On the leaf rows themselves — an episode carries its show's rating (19 of 19 shows on a
+            # real server) — so narrowing a copy by rating costs no read this one does not already make.
+            content_rating=el.get("contentRating") or "",
+            show_title=(el.get("grandparentTitle") or "") if kind == "episode" else "",
         )
 
     # A watched-titles read for one section, paged. Plex defaults to 50 unless X-Plex-Container-Size

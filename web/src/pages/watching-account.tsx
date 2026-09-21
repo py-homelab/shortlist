@@ -8,12 +8,17 @@ import {
   OWNER_SHELF_ALERT_ID,
   OWNER_SHELF_NOTE_ID,
 } from "@/components/owner-note";
+import {
+  NarrowByRating,
+  NarrowedPreview,
+} from "@/components/narrow-by-rating";
 import { PageHeader } from "@/components/page-header";
 import { EmptyState, QueryBoundary } from "@/components/query-boundary";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { api, apiErrorMessage } from "@/lib/api";
+import { ratingsKey } from "@/lib/content-ratings";
 import { encode, hasHome, hasLibrary } from "@/lib/placement";
 import {
   queryKeys,
@@ -334,6 +339,11 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
   // target alone let a preview taken from another account authorise a real run that reads the
   // owner instead — that account's numbers and acknowledgement in front of a different write.
   const [previewSource, setPreviewSource] = useState<number | null>(null);
+  // Narrow the copy to some content ratings (a children's profile); null copies everything. The
+  // preview remembers which choice it was made for, exactly as it remembers which accounts: ticking
+  // PG after a preview must not leave a real button armed by numbers that never included PG.
+  const [ratings, setRatings] = useState<string[] | null>(null);
+  const [previewRatings, setPreviewRatings] = useState("");
   // Copying is additive; removing is not. A preview that says "this un-marks 412 things" has to be
   // acknowledged before the real run, so the destructive half is never a surprise.
   const [acceptedRemovals, setAcceptedRemovals] = useState(false);
@@ -456,6 +466,7 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
       {
         to_user_id: target,
         ...(effectiveSource !== null ? { from_user_id: effectiveSource } : {}),
+        ...(ratings !== null ? { ratings } : {}),
         dry_run: dryRun,
       },
       {
@@ -473,6 +484,7 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
           setPreview(reallyWrote ? null : result);
           setPreviewOf(reallyWrote ? null : target);
           setPreviewSource(reallyWrote ? null : effectiveSource);
+          setPreviewRatings(reallyWrote ? "" : ratingsKey(ratings));
           if (!reallyWrote)
             setAcceptedRemovals(dryRun ? false : acceptedRemovals);
           if (reallyWrote) {
@@ -499,7 +511,9 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
   // one account must not authorise a real run against another.
   const staleTarget =
     preview !== null &&
-    (previewOf !== target || previewSource !== effectiveSource);
+    (previewOf !== target ||
+      previewSource !== effectiveSource ||
+      previewRatings !== ratingsKey(ratings));
   /** A 200 is only a restore when it carried no errors AND actually wrote.
    *
    *  Safe mode forces `dry_run` on server-side even when the real button was pressed, so a report
@@ -530,8 +544,16 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
     (transfer.data?.snapshot_id == null
       ? undone.userId === transferredTo
       : undone.id === transfer.data.snapshot_id);
+  // A refused preview never arms the real button: the server would answer the real run with the same
+  // refusal, and a button that can only fail is not something to offer.
   const blocked =
-    preview === null || staleTarget || (removals > 0 && !acceptedRemovals);
+    preview === null ||
+    staleTarget ||
+    preview.refused !== "" ||
+    (ratings !== null && ratings.length === 0) ||
+    // A list that matches nothing: the real run would write nothing and then report a finished copy.
+    (preview.ratings.length > 0 && preview.kept === 0) ||
+    (removals > 0 && !acceptedRemovals);
 
   return (
     <div ref={ref} className="scroll-mt-6">
@@ -694,6 +716,20 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
             order, and Shortlist keeps the real dates itself, so your
             recommendations are unaffected.
           </p>
+          {ratings !== null && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {/* The paragraph above describes a copy of everything. With the box below ticked it
+                  is not what happens, and this is the screen that authorises the write. */}
+              <strong className="text-foreground">
+                With &ldquo;only certain content ratings&rdquo; ticked it
+                doesn&rsquo;t end up matching
+              </strong>
+              : that account gets just the titles with those ratings. Nothing
+              already watched on it is un-marked or rewound &mdash; a title you
+              have both watched is topped up to your play count, and if the copy
+              would have to do more than that it is refused instead.
+            </p>
+          )}
         </div>
 
         {/* Hidden only when the success panel's OWN inline undo has taken over — which needs a
@@ -813,10 +849,24 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
             </div>
           )}
 
+        <NarrowByRating
+          ratings={ratings}
+          seen={
+            preview !== null && Object.keys(preview.ratings_seen).length > 0
+              ? preview.ratings_seen
+              : null
+          }
+          onChange={setRatings}
+        />
+
         <div className="flex flex-wrap items-center gap-2">
           <Button
             variant="outline"
-            disabled={target === null || transfer.isPending}
+            disabled={
+              target === null ||
+              transfer.isPending ||
+              (ratings !== null && ratings.length === 0)
+            }
             onClick={() => run(true)}
           >
             {transfer.isPending && (
@@ -837,7 +887,11 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
             <span className="text-xs text-muted-foreground">
               {preview === null || staleTarget
                 ? "Press Preview first \u2014 it shows what would change, including anything it would un-tick."
-                : "Tick the box above to continue."}
+                : preview.refused !== ""
+                  ? "This copy would be refused \u2014 see below."
+                  : preview.ratings.length > 0 && preview.kept === 0
+                    ? "Nothing in this history has those ratings, so there is nothing to copy."
+                    : "Tick the box above to continue."}
             </span>
           )}
         </div>
@@ -895,8 +949,13 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
           </p>
         )}
 
-        {preview && !nothingToCopy && (
+        {preview && !nothingToCopy && preview.refused !== "" && (
+          <NarrowedPreview preview={preview} />
+        )}
+
+        {preview && !nothingToCopy && preview.refused === "" && (
           <div className="space-y-2 rounded-md border border-dashed bg-muted/30 p-3 text-sm">
+            <NarrowedPreview preview={preview} />
             <p>
               Would tick <strong>{preview.marks}</strong>{" "}
               {preview.marks === 1 ? "title" : "titles"} on that account
@@ -1005,8 +1064,12 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
                 {transfer.data.applied === 1 ? "change" : "changes"} across
                 {transfer.data.unmarks > 0 &&
                   `, including ${transfer.data.unmarks} un-ticked`}
-                . Switch to that account in your Plex app and watch there from
-                now on &mdash; its row fills in on the next run.
+                .{" "}
+                {/* A narrowed copy sets up SOMEONE ELSE'S profile — a child's — so "you switch to it
+                    and watch there" is addressed to the wrong person about the wrong account. */}
+                {transfer.data.ratings.length > 0
+                  ? "That account's rows fill in on the next run after you turn it on in Users."
+                  : "Switch to that account in your Plex app and watch there from now on \u2014 its row fills in on the next run."}
               </span>
             </p>
             {/* Re-read afterwards rather than trusting the writes: Plex accepting a write is not
@@ -1026,6 +1089,18 @@ export function TransferSteps({ numbered = true }: { numbered?: boolean }) {
                 {transfer.data.verify_mismatched} didn&rsquo;t take effect when
                 Shortlist checked afterwards. Run it again &mdash; it only
                 writes what&rsquo;s still missing.
+              </p>
+            ) : transfer.data.ratings.length > 0 ? (
+              /* It does NOT match the source, by design: it holds the rated, visible slice of it.
+                 "Now matches yours" here would be a false claim about a Plex write. And "holds the N"
+                 is only claimed when all N could be written — a skipped title is said just below,
+                 and the two sentences must not contradict each other. */
+              <p className="text-xs text-muted-foreground">
+                {transfer.data.unreachable === 0
+                  ? `Checked afterwards: that account now holds the ${transfer.data.kept} watched films and episodes rated ${transfer.data.ratings.join(", ")}.`
+                  : `Checked afterwards: everything that could be written is there \u2014 films and episodes rated ${transfer.data.ratings.join(", ")}.`}
+                {transfer.data.residue_cleared > 0 &&
+                  ` Shortlist also dropped ${transfer.data.residue_cleared} leftover history ${transfer.data.residue_cleared === 1 ? "entry" : "entries"} from an earlier copy that this one doesn't carry.`}
               </p>
             ) : (
               <p className="text-xs text-muted-foreground">

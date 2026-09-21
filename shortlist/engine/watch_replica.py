@@ -26,7 +26,8 @@ Three rules, each measured against a real server (see
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Collection, Iterable
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 #: Plex echoes an offset back rounded, so an exact comparison would rewrite thousands of positions on
@@ -62,6 +63,14 @@ class ItemState:
     last_viewed_at: int = 0
     show_rating_key: int | None = None
     title: str = ""
+    #: Plex's own `contentRating` for this leaf ("TV-Y7", "PG-13"), "" when Plex holds none. Read, never
+    #: written: it exists so a copy can be narrowed to what a restricted profile is allowed to hold
+    #: (`scope_to_ratings`). Plex's rather than TMDB's because Plex's is the one its parental
+    #: restrictions act on, so it is the only rating that predicts what the target can see.
+    content_rating: str = ""
+    #: The show an episode belongs to, by name — only so a preview can say "Bluey" rather than list
+    #: forty episode titles. "" for a movie.
+    show_title: str = ""
 
     @property
     def is_empty(self) -> bool:
@@ -220,6 +229,53 @@ def _plan_one(key: int, want: ItemState | None, have: ItemState | None) -> tuple
         additions.append(op(OpKind.SET_OFFSET, offset_ms=want_offset))
 
     return removals, additions
+
+
+def scope_to_ratings(state: WatchState, ratings: Iterable[str], visible: Collection[int]) -> WatchState:
+    """The part of `state` a copy narrowed to these content ratings may carry.
+
+    For a household moving off one shared account onto two profiles: the children's profile should
+    receive the children's titles out of the shared history, not all of it. A leaf is kept when Plex
+    rates it one of `ratings` (compared caselessly — Plex is not consistent about "TV-Y7" vs "tv-y7")
+    AND the target can see it (`visible`, read AS the target). Both, because they answer different
+    questions: the rating is the owner's choice of what belongs there, and visibility is Plex's own
+    verdict — a plan holding a write the target cannot see comes back as `unreachable` or as a verify
+    mismatch, and a report full of those cannot tell a working copy from a broken one.
+
+    An unrated leaf is never kept. "" is not a rating anybody chose, and guessing sends an unrated
+    film onto a child's profile.
+
+    `unreadable` is carried over untouched: narrowing a partial read does not make it complete, and
+    the caller's refusal to mirror from one must still fire.
+    """
+    wanted = {r.strip().casefold() for r in ratings if r and r.strip()}
+    kept = {
+        key: item
+        for key, item in state.items.items()
+        if item.content_rating.strip().casefold() in wanted and key in visible
+    }
+    return replace(state, items=kept)
+
+
+def ratings_seen(state: WatchState) -> dict[str, int]:
+    """How many leaves carry each content rating, "" for unrated — most-used first.
+
+    For the preview of a narrowed copy: the owner is choosing a list of ratings, and the only way to
+    choose one is to see which ratings the history actually holds and how much sits under each.
+    """
+    counts: dict[str, int] = {}
+    for item in state.items.values():
+        counts[item.content_rating.strip()] = counts.get(item.content_rating.strip(), 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def names_of(state: WatchState, limit: int = 0) -> list[str]:
+    """What a state holds, by name, for a person to check — a show once, however many episodes."""
+    names: dict[str, None] = {}
+    for item in sorted(state.items.values(), key=lambda i: (i.show_title or i.title).casefold()):
+        names.setdefault(item.show_title or item.title or f"ratingKey {item.rating_key}")
+    out = list(names)
+    return out[:limit] if limit else out
 
 
 def summarise(plan: list[WriteOp]) -> dict[str, int]:

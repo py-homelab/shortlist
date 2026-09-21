@@ -6,6 +6,24 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.8] - 2026-09-21 (py-homelab fork)
+
+### Added
+
+- **A watching-account copy can be narrowed to content ratings.** For a household leaving one shared
+  Plex account for a children's profile and an adults' one: tick "Only copy titles with certain
+  content ratings" and the children's profile receives just the titles Plex rates inside the list
+  (G, TV-G, TV-Y, TV-Y7 and TV-Y7-FV by default) that the profile is allowed to see. The narrowing
+  covers Shortlist's own copy of the play log too, not only the ticks on Plex — that log is read
+  separately, and left alone it would have filled the child's history, seeds and rewatch row with
+  every adult watch while Plex looked exactly right. The preview lists every rating the history
+  holds with how much sits under each and how much of it would go. A narrowed copy never un-marks or
+  rewinds what is already on the account — it may top a shared title up to the source's play count —
+  and if it would have to do more it is refused and names what is in the way, while a copy that only
+  half-finished can simply be run again.
+  Leftovers of an earlier copy of everything onto the same profile are removed from Shortlist's own
+  history for the titles the narrowed copy does not carry.
+
 ## [1.9.1-py.7] - 2026-09-21 (py-homelab fork)
 
 ### Changed

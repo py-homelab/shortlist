@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from shortlist.server.db.models import User, WatchedTitle, utcnow
 from shortlist.server.services.watching_account import TransferReport
 
@@ -620,3 +622,115 @@ class TestTheSourceCanBeAnAccountOtherThanTheOwner:
         )
 
         assert r.status_code == 400
+
+
+class TestACopyNarrowedByContentRating:
+    """`ratings` on the transfer — a children's profile receiving the children's titles only."""
+
+    def _post(self, client, target_id, report, **body):
+        with (
+            patch.object(client.app.state.run_service, "build_context", return_value=_plex_ctx()),
+            patch(TRANSFER, return_value=report) as service,
+        ):
+            r = client.post("/api/watching-account/transfer", json={"to_user_id": target_id, **body})
+        return r, service
+
+    def test_the_ratings_reach_the_service(self, client):
+        _, target_id = _seed_owner_and_target(client)
+
+        _, service = self._post(client, target_id, _report(), ratings=["TV-Y", " G ", "G"])
+
+        assert service.call_args.kwargs["ratings"] == ["TV-Y", "G"]
+
+    def test_leaving_them_out_copies_everything_as_it_always_did(self, client):
+        _, target_id = _seed_owner_and_target(client)
+
+        _, service = self._post(client, target_id, _report())
+
+        assert service.call_args.kwargs["ratings"] is None
+
+    @pytest.mark.parametrize("ratings", [[], ["", "  "]])
+    def test_an_empty_list_is_refused_not_read_as_everything(self, client, ratings):
+        """The dangerous reading. `[]` quietly meaning "no narrowing" would copy the WHOLE history onto
+        the profile the caller was trying to keep it off."""
+        _, target_id = _seed_owner_and_target(client)
+
+        r, service = self._post(client, target_id, _report(), ratings=ratings)
+
+        assert r.status_code == 422
+        service.assert_not_called()
+
+    def test_a_refused_copy_is_a_409_carrying_the_reason(self, client):
+        """Not a 200 with a field to remember to check — a client that renders `applied: 0` as "done"
+        would tell someone their copy went through."""
+        _, target_id = _seed_owner_and_target(client)
+        refused = _report(refused="that account already has 3 watched title(s) of its own", in_the_way=["Bluey"])
+
+        r, _ = self._post(client, target_id, refused, ratings=["G"])
+
+        assert r.status_code == 409
+        assert "already has 3" in r.json()["detail"]
+
+    def test_a_refused_PREVIEW_is_a_200_that_says_so(self, client):
+        _, target_id = _seed_owner_and_target(client)
+        refused = _report(dry_run=True, refused="that account already has 3", in_the_way=["Bluey"])
+
+        r, _ = self._post(client, target_id, refused, ratings=["G"], dry_run=True)
+
+        assert r.status_code == 200
+        assert (r.json()["refused"], r.json()["in_the_way"]) == ("that account already has 3", ["Bluey"])
+
+    def test_a_refusal_is_audited_as_a_warning(self, client):
+        from shortlist.server.db.models import Event
+
+        _, target_id = _seed_owner_and_target(client)
+
+        self._post(client, target_id, _report(refused="that account already has 3"), ratings=["G"])
+
+        with client.app.state.sessions() as session:
+            event = session.query(Event).filter(Event.scope == "watching_account.transfer").one()
+        assert event.level == "warning"
+        assert event.message["refused"] == "that account already has 3"
+
+    def test_the_schema_carries_what_the_preview_needs_to_show(self, client):
+        props = client.app.openapi()["components"]["schemas"]["TransferOut"]["properties"]
+
+        for field in ("ratings", "ratings_seen", "ratings_kept", "kept", "left_out", "hidden_from_target"):
+            assert field in props, field
+        for field in ("kept_preview", "refused", "in_the_way"):
+            assert field in props, field
+
+    def test_the_jobs_page_says_refused_not_copied_nothing(self, client):
+        """The job row outlives the request, and "Copied 0 title(s) onto that account" under a refused
+        copy reads as a copy that ran and found nothing."""
+        from shortlist.server.db.models import Job
+
+        _, target_id = _seed_owner_and_target(client)
+
+        self._post(client, target_id, _report(refused="that account already has 3"), ratings=["G"])
+
+        with client.app.state.sessions() as session:
+            job = session.query(Job).filter(Job.kind == "watching_account.transfer").one()
+        assert job.result["detail"] == "Refused, nothing written — that account already has 3"
+
+    def test_the_jobs_page_says_what_a_narrowed_copy_left_behind(self, client):
+        from shortlist.server.db.models import Job
+
+        _, target_id = _seed_owner_and_target(client)
+        done = _report(marks=40, kept=40, left_out=900, ratings=["G", "TV-Y"])
+
+        self._post(client, target_id, done, ratings=["G", "TV-Y"])
+
+        with client.app.state.sessions() as session:
+            job = session.query(Job).filter(Job.kind == "watching_account.transfer").one()
+        assert job.result["detail"] == "Copied 40 title(s) onto that account, leaving 900 behind (only G, TV-Y copied)"
+
+    @pytest.mark.parametrize("ratings", [[f"R{i}" for i in range(31)], ["G" * 33]])
+    def test_a_list_that_cannot_be_content_ratings_is_refused(self, client, ratings):
+        _, target_id = _seed_owner_and_target(client)
+
+        r, service = self._post(client, target_id, _report(), ratings=ratings)
+
+        assert r.status_code == 422
+        assert "too many content ratings" in r.text
+        service.assert_not_called()
