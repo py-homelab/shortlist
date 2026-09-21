@@ -127,7 +127,7 @@ describe("groupRunByRow", () => {
       CONFIG_NAMES,
     );
 
-    expect(groups[0].people.map((p) => p.decision)).toEqual([
+    expect(groups[0]!.people.map((p) => p.decision)).toEqual([
       "kids_rows_are_already_childrens_titles",
       "no_grown_ups_row_on_a_kids_account",
       "not_a_family_household",
