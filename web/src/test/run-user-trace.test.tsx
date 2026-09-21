@@ -863,6 +863,17 @@ describe("TraceView — the flow explains freshness, the cut and release date", 
     expect(screen.queryByText(/candidates survived filtering/i)).not.toBeInTheDocument();
   });
 
+  it("says why a frozen watch-it-again row changed", () => {
+    render(
+      <TraceView
+        data={withSelection({ decision: "carried_forward", elsewhere_dropped: 2 })}
+      />,
+    );
+    expect(
+      screen.getByText(/2 filler titles were taken out because another of their rows already shows them/i),
+    ).toBeInTheDocument();
+  });
+
   it("names a settings change as the reason a row rebuilt early", () => {
     render(
       <TraceView data={withSelection({ decision: "settings_changed" })} />,

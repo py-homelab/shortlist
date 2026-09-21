@@ -817,6 +817,9 @@ export interface TraceSelection {
    *  a `held_unbuilt` row, which writes nothing, so there they are still in the row and go at its
    *  next rebuild. */
   family_dropped?: number;
+  /** A watch-it-again row only: carried top-up titles dropped because another of this person's rows
+   *  holds them tonight — the one reason such a row changes while frozen. */
+  elsewhere_dropped?: number;
   /** Carried picks tonight's engine answer did not mention at all, dropped on a rebuild night. */
   unconfirmed_dropped?: number;
   /** What the CADENCE said, not what happened — a `held_idle` row is `true` here. */

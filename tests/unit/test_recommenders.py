@@ -3,6 +3,7 @@ fallback between them, and what the row build does with an engine's final order.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import ClassVar
 from unittest.mock import MagicMock
 
@@ -1616,6 +1617,229 @@ class TestAColdStartWhereEveryRowIsOneThisHouseholdDoesNotGet:
         report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100)]).users[0]
 
         assert report.household is None
+
+
+class TestARewatchRowsTopUpDoesNotRepeatASibling:
+    """Found on a child's new profile (dry run, 2026-09-21): "TV Shows you've already seen" held two
+    real rewatches and three shows never watched — the same three that WERE "TV Shows Picked for You".
+
+    A rewatch row leads with finished titles and tops up what is left from the pool its sibling rows
+    draw from. It was exempt from draw-without-replacement as "built from history", which is only true
+    of the lead: on a thin history the pads were the head of the pool, exactly what the row before it
+    had just taken. Invisible on a full history, where there is no top-up at all."""
+
+    ROWS: ClassVar[list[RowSpec]] = [
+        RowSpec(slug="picked", name_template="Picked", size=2),
+        RowSpec(slug="again", name_template="Already seen", size=3, rewatch=True, watched_pct=1.0),
+    ]
+
+    def _by_row(self, report):
+        out = {}
+        for pick in report.picks:
+            out.setdefault(pick.collection_slug, []).append(pick.tmdb_id)
+        return out
+
+    def _engine(self, ctx):
+        ctx.recommender = HttpRecommender(
+            FakeEngineClient([_item(10, "Ten"), _item(20, "Twenty"), _item(30, "Thirty")])
+        )
+
+    def test_the_top_up_takes_what_the_earlier_row_left(self, ctx, mock_plextv):
+        self._engine(ctx)
+
+        rows = self._by_row(_run(ctx, mock_plextv, self.ROWS))
+
+        assert rows["picked"] == [10, 20]
+        assert rows["again"] == [900, 30]  # the finished title leads; the pad is the one title left
+        assert not set(rows["picked"]) & set(rows["again"])
+
+    def test_a_short_row_beats_a_padded_one(self, ctx, mock_plextv):
+        """Nothing left in the pool: deliver the rewatches and stop. The row's NAME says "already seen"."""
+        self._engine(ctx)
+        rows = [RowSpec(slug="picked", name_template="Picked", size=3), self.ROWS[1]]
+
+        assert self._by_row(_run(ctx, mock_plextv, rows))["again"] == [900]
+
+    def test_pads_carried_from_before_the_fix_go_too_and_the_rewatch_stays(self, ctx, mock_plextv):
+        """The pool cannot reach a pick the row is CARRYING, and a live run before this shipped would
+        have persisted exactly these pads. A finished title is the row's own and is never dropped for
+        appearing elsewhere."""
+        self._engine(ctx)
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "again", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((900, 10, 20))
+            ]
+        }
+        frozen = [self.ROWS[0], RowSpec(slug="again", name_template="Already seen", size=3, rewatch=True,
+                                        watched_pct=1.0, refresh_days=0)]  # fmt: skip
+
+        report = _run(ctx, mock_plextv, frozen)
+        rows = self._by_row(report)
+
+        assert rows["picked"] == [10, 20]
+        assert 900 in rows["again"]
+        assert not {10, 20} & set(rows["again"])
+        # The one reason a frozen watch-it-again row changes, so the run page has to be able to say it.
+        entry = next(e for e in report.trace["selection"] if e["row"] == "again")
+        assert entry["elsewhere_dropped"] == 2
+
+    def test_a_finished_title_is_the_rows_own_even_when_another_row_holds_it(self, ctx, mock_plextv):
+        """Two watch-it-again rows both lead with what they finished; that was never drawn from the
+        pool and is not a pad. Treating it as a repeat would empty the second row's lead every night."""
+        self._engine(ctx)
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "again2", "1"): [
+                Pick(tmdb_id=900, rating_key=1900, title="Fargo", rank=1, reason="kept", media_type=MediaType.MOVIE)
+            ]
+        }
+        rows = [
+            RowSpec(slug="again", name_template="Already seen", size=2, rewatch=True, watched_pct=1.0),
+            RowSpec(slug="again2", name_template="Again, again", size=2, rewatch=True, watched_pct=1.0, refresh_days=0),
+        ]
+
+        report = _run(ctx, mock_plextv, rows)
+        by_row = self._by_row(report)
+
+        assert by_row["again"][0] == 900
+        assert 900 in by_row["again2"]
+        # And it was CARRIED, not dropped as a repeat and picked straight back up: the titles come out
+        # the same either way, which is how that churn would hide.
+        entry = next(e for e in report.trace["selection"] if e["row"] == "again2")
+        assert (entry["decision"], entry["carried"]) == ("carried_forward", 1)
+
+    def test_a_carried_pad_nobody_else_holds_is_left_alone(self, ctx, mock_plextv):
+        """Only a REPEAT goes. A pad the row has carried that no sibling holds is an ordinary pick, and
+        dropping it would rebuild a frozen row every night."""
+        self._engine(ctx)
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "again", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((900, 30))
+            ]
+        }
+        frozen = [self.ROWS[0], RowSpec(slug="again", name_template="Already seen", size=3, rewatch=True,
+                                        watched_pct=1.0, refresh_days=0)]  # fmt: skip
+
+        report = _run(ctx, mock_plextv, frozen)
+
+        assert self._by_row(report)["again"] == [900, 30]
+        assert next(e for e in report.trace["selection"] if e["row"] == "again")["decision"] == "carried_forward"
+
+    def test_a_row_that_is_nothing_but_repeats_with_nothing_to_replace_them_is_carried(self, ctx, mock_plextv):
+        """Dropping them would build nothing, and a library a row builds nothing for is left alone — so
+        the same pads would stay on Plex, come back as "carried" tomorrow and be dropped again, every
+        night, with no trace entry at all. Carried until there is something to put in their place."""
+        self._engine(ctx)
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.history_source.fetch.return_value = []  # nothing finished, so no lead either
+        ctx.config.min_history = 0
+        ctx.previous_picks = {
+            ("sarah", "again", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((10, 20))
+            ]
+        }
+        rows = [RowSpec(slug="picked", name_template="Picked", size=3), replace(self.ROWS[1], refresh_days=0)]
+
+        report = _run(ctx, mock_plextv, rows)
+
+        entry = next(e for e in report.trace["selection"] if e["row"] == "again")
+        assert entry["decision"] == "carried_forward" and "elsewhere_dropped" not in entry
+        assert self._by_row(report)["again"] == [10, 20]
+
+    def test_a_finished_title_outside_tonights_scan_is_still_not_a_pad(self, ctx, mock_plextv):
+        """The scan of their history is a window (a few times the row's size, in an order that moves
+        with taste). "Not in tonight's window" is not "not finished": asked of the whole finished set,
+        or a second watch-it-again row drops a rewatch it has carried for months and re-stamps itself."""
+        self._engine(ctx)
+        ctx.plex.sections.return_value[0].key = "1"
+        finished = list(range(900, 908))
+        ctx.plex.build_library_index.return_value = {
+            **{t: 1000 + t for t in (10, 20, 30)},
+            **{t: 9000 + t for t in finished},
+        }
+        ctx.history_source.fetch.return_value = [
+            make_watched(f"Film {t}", days_ago=100 + i, rating_key=9000 + t, tmdb_id=t) for i, t in enumerate(finished)
+        ]
+        ctx.previous_picks = {
+            ("sarah", "again", "1"): [
+                Pick(
+                    tmdb_id=t,
+                    rating_key=9000 + t,
+                    title=f"Film {t}",
+                    rank=i + 1,
+                    reason="kept",
+                    media_type=MediaType.MOVIE,
+                )
+                for i, t in enumerate((900, 907))
+            ],
+            # 900 is their most RECENT finish, and the scan reads oldest-first: with a window of three
+            # (size 1) it never reaches 900, which is what made it look like a pad.
+            ("sarah", "again2", "1"): [
+                Pick(tmdb_id=900, rating_key=9900, title="Film 900", rank=1, reason="kept", media_type=MediaType.MOVIE)
+            ],
+        }
+        rows = [
+            RowSpec(slug="again", name_template="Already seen", size=2, rewatch=True, watched_pct=1.0, refresh_days=0),
+            RowSpec(slug="again2", name_template="Again, again", size=1, rewatch=True, watched_pct=1.0, refresh_days=0),
+        ]
+
+        report = _run(ctx, mock_plextv, rows)
+
+        entry = next(e for e in report.trace["selection"] if e["row"] == "again2")
+        assert (entry["decision"], entry["carried"]) == ("carried_forward", 1)
+        assert "elsewhere_dropped" not in entry
+        assert self._by_row(report)["again2"] == [900]
+
+    def test_a_frozen_row_does_not_trade_a_title_back_and_forth_with_a_sibling_that_refreshes(self, ctx, mock_plextv):
+        """A sibling that refreshes rotates a title out; the freed title landed here the same night and
+        swapped back on the next refresh — so a row set NEVER to rebuild rewrote itself on its sibling's
+        cadence, for ever. Six nights on a static answer: it may correct itself once, then never moves."""
+        ids = [10, 20, 30, 40, 50, 60, 70]
+        ctx.plex.build_library_index.return_value = {900: 999, **{t: 1000 + t for t in ids}}
+        ctx.plex.sections.return_value[0].key = "1"
+        rows = [
+            RowSpec(slug="picked", name_template="Picked", size=3, refresh_days=1, idle_hold_days=0),
+            replace(self.ROWS[1], refresh_days=0),
+        ]
+        seen = []
+        for _night in range(6):
+            ctx.recommender = HttpRecommender(FakeEngineClient([_item(t, f"T{t}") for t in ids]))
+            report = _run(ctx, mock_plextv, rows)
+            by_row: dict[str, list[Pick]] = {}
+            for pick in report.picks:
+                by_row.setdefault(pick.collection_slug, []).append(pick)
+            seen.append(sorted(p.tmdb_id for p in by_row["again"]))
+            ctx.previous_picks = {
+                ("sarah", slug, "1"): sorted(picks, key=lambda p: p.rank) for slug, picks in by_row.items()
+            }
+            ctx.previous_recipes = {
+                key: picks[0].recipe for key, picks in ctx.previous_picks.items() if picks and picks[0].recipe
+            }
+
+        # One correction is legitimate — the night the sibling's refresh takes a title this row is
+        # carrying, that pad goes. After it, a static answer must leave the frozen row alone for good.
+        assert all(night == seen[1] for night in seen[1:]), seen
+
+    def test_shortlists_own_engine_is_left_as_upstream_has_it(self, ctx, mock_plextv):
+        """Drawing without replacement is for an engine that answers one ordered list per pool. The
+        built-in engine ranks per row, and its behaviour is upstream's to change."""
+        ctx.recommender = BuiltinRecommender()
+
+        before = self._by_row(_run(ctx, mock_plextv, self.ROWS))
+
+        assert before["again"][0] == 900
+        assert set(before["picked"]) & set(before["again"])  # it repeats, as it always did
 
 
 class TestANightTheEngineSaidNothing:

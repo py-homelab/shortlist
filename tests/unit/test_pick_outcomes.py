@@ -22,7 +22,12 @@ from shortlist.engine.models import MediaType, UserProfile, UserType, WatchedIte
 from shortlist.server.db.models import Base, Collection, Delivery, PickRow, User
 from shortlist.server.services.run_persistence import live_pick_ids, reconcile_watched
 
-NOW = datetime(2026, 8, 16, 12, 0, tzinfo=UTC)
+# Relative to the real clock, not a fixed date. Code that windows against the REAL now makes a fixed
+# NOW pass for a month and then fail on every branch the day it slides out (`test_watch_audit` did on
+# 2026-09-21). This file: kept in step with its siblings — the same fixture shape, moved before it can age out.
+# Ten days back keeps it inside a 30-day window with room to spare, and old enough for a stopped
+# title to have settled.
+NOW = (datetime.now(UTC) - timedelta(days=10)).replace(hour=12, minute=0, second=0, microsecond=0)
 
 
 def watched_item(media_type: MediaType, *, tmdb_id: int = 100, viewed=None, leaf=None, when=None) -> WatchedItem:

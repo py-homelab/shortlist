@@ -34,7 +34,12 @@ from shortlist.server.db.models import (
 from shortlist.server.services.report_service import BOUNCE_PERCENT, engagement, resolve_outcomes
 from shortlist.server.services.run_persistence import FINISHED_PERCENT, reconcile_watched
 
-NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
+# Relative to the real clock, not a fixed date. Code that windows against the REAL now makes a fixed
+# NOW pass for a month and then fail on every branch the day it slides out (`test_watch_audit` did on
+# 2026-09-21). This file: kept in step with its siblings — the same fixture shape, moved before it can age out.
+# Ten days back keeps it inside a 30-day window with room to spare, and old enough for a stopped
+# title to have settled.
+NOW = (datetime.now(UTC) - timedelta(days=10)).replace(hour=12, minute=0, second=0, microsecond=0)
 SETTINGS = settings(max_examples=50, deadline=None)
 
 

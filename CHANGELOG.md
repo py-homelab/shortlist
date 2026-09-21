@@ -6,6 +6,24 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.9] - 2026-09-21 (py-homelab fork)
+
+### Fixed
+
+- **A watch-it-again row no longer pads itself with another row's titles.** With an external engine
+  a person's rows draw from one ranked list without replacement, so no title is drawn twice on the
+  same night — except that the watch-it-again row was left out of that, as "built from history". Only its
+  lead is: what it cannot fill from finished titles it tops up from the same list. On a thin history
+  the pads were therefore the head of that list, which the row before it had just taken — found on a
+  child's new profile, whose "TV Shows you've already seen" held two real rewatches and the three
+  shows that made up its entire "Picked for You". The top-up now takes what the earlier rows left
+  (and leaves alone what a sibling row held last night, so a frozen row does not trade a title back
+  and forth with one that refreshes); a pad the row was already carrying goes if another row holds it,
+  and the run page says so; and a row with too little left to pad with is short rather than padded
+  with repeats. A row that is nothing but repeats, with nothing to replace them, is carried as it is
+  until there is. Anything the person has finished is never treated as a pad, and Shortlist's own
+  engine is untouched.
+
 ## [1.9.1-py.8] - 2026-09-21 (py-homelab fork)
 
 ### Added
