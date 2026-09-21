@@ -820,6 +820,13 @@ export interface TraceSelection {
   /** A watch-it-again row only: carried top-up titles dropped because another of this person's rows
    *  holds them tonight — the one reason such a row changes while frozen. */
   elsewhere_dropped?: number;
+  /** A children's-titles-only row: titles this row could pick tonight only because the owner labelled
+   *  them "also show" for this account (the engine did not call them children's titles). */
+  label_admitted?: number;
+  /** …and titles the engine calls children's that the owner labelled "never show" for this account. */
+  label_refused?: number;
+  /** Plex could not be asked which titles carry the account's labels; the row went by the engine alone. */
+  title_labels_unreadable?: boolean;
   /** Carried picks tonight's engine answer did not mention at all, dropped on a rebuild night. */
   unconfirmed_dropped?: number;
   /** What the CADENCE said, not what happened — a `held_idle` row is `true` here. */

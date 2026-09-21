@@ -737,6 +737,138 @@ class TestCarriedPicksAndTheFamilyRule:
         assert [p.tmdb_id for p in report.picks] == [10]
         assert report.trace["selection"][0]["family_dropped"] == 1
 
+    def _labelled(self, ctx, *, admit=(), hide=()) -> None:
+        """The owner's labels for this account, with the finished title (Fargo, ratingKey 999) carrying
+        every one of them."""
+        from shortlist.engine.models import TitleLabels
+
+        ctx.title_labels = {100: TitleLabels(admit=tuple(admit), hide=tuple(hide))}
+        ctx.plex.items_labelled.side_effect = lambda section, label: frozenset({999})
+
+    def test_a_finished_title_the_owner_admitted_by_label_leads_a_childrens_rewatch_row(self, ctx, mock_plextv):
+        """The rewatch lead never goes through the pool, so the label has to reach it on its own."""
+        self._classify_finished(ctx, kids=False)  # a drama by its genres; for this child, by the owner
+        self._labelled(ctx, admit=("KidsAllow",))
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert 900 in [p.tmdb_id for p in report.picks]
+        assert report.trace["selection"][0]["rewatches"] == 1
+
+    def test_and_one_the_owner_hid_by_label_does_not_though_its_genres_say_childrens(self, ctx, mock_plextv):
+        self._classify_finished(ctx, kids=True)
+        self._labelled(ctx, hide=("KidsDeny",))
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert [p.tmdb_id for p in report.picks] == [10]
+        assert report.trace["selection"][0]["rewatches"] == 0
+
+    def test_a_carried_rewatch_pick_the_owner_has_since_hidden_is_dropped(self, ctx, mock_plextv):
+        """Past the lead scan's reach — `size=1`, and older finished cartoons fill it first — so only
+        the direct question about carried picks can answer for it."""
+        ctx.plex.build_library_index.return_value = {900: 999, 10: 1010, 30: 1030, 40: 1040, 50: 1050}
+        ctx.history_source.fetch.return_value = [
+            make_watched("Fargo", days_ago=1, rating_key=999),  # most recent, so the scan reaches it last
+            make_watched("Cartoon A", days_ago=40, rating_key=1030, tmdb_id=30),
+            make_watched("Cartoon B", days_ago=41, rating_key=1040, tmdb_id=40),
+            make_watched("Cartoon C", days_ago=42, rating_key=1050, tmdb_id=50),
+        ]
+        ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [16, 10751]  # both children's titles
+        self._labelled(ctx, hide=("KidsDeny",))
+        self._prior(ctx, 900)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0, size=1)])
+
+        assert 900 not in [p.tmdb_id for p in report.picks], [p.title for p in report.picks]
+        assert report.trace["selection"][0]["family_dropped"] == 1
+
+    def test_the_label_answers_for_a_finished_title_tmdb_knows_no_genres_for(self, ctx, mock_plextv):
+        """The titles labelled by hand are the obscure ones. TMDB having nothing to say about one used to
+        mean "cannot classify, skip" before the label was ever asked. Found by review, 2026-09-21."""
+        ctx.tmdb.genre_names.return_value = {16: "Animation"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: []
+        self._labelled(ctx, admit=("KidsAllow",))
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert 900 in [p.tmdb_id for p in report.picks]
+        ctx.tmdb.genre_ids_for.assert_not_called()  # decided by the label: no lookup spent on it
+
+    def test_and_with_tmdb_away_a_labelled_title_still_leads(self, ctx, mock_plextv):
+        ctx.tmdb.genre_names.side_effect = ConnectionError("tmdb is away")
+        self._labelled(ctx, admit=("KidsAllow",))
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0)])
+
+        assert 900 in [p.tmdb_id for p in report.picks]
+
+    def test_a_carried_finished_title_the_owner_admitted_is_kept_though_its_genres_say_otherwise(
+        self, ctx, mock_plextv
+    ):
+        ctx.plex.build_library_index.return_value = {900: 999, 10: 1010, 30: 1030, 40: 1040, 50: 1050}
+        ctx.history_source.fetch.return_value = [
+            make_watched("Fargo", days_ago=1, rating_key=999),
+            make_watched("Cartoon A", days_ago=40, rating_key=1030, tmdb_id=30),
+            make_watched("Cartoon B", days_ago=41, rating_key=1040, tmdb_id=40),
+            make_watched("Cartoon C", days_ago=42, rating_key=1050, tmdb_id=50),
+        ]
+        ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family", 18: "Drama"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [18] if tmdb_id == 900 else [16, 10751]
+        self._labelled(ctx, admit=("KidsAllow",))
+        self._prior(ctx, 900)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0, size=1)])
+
+        assert "family_dropped" not in report.trace["selection"][0]
+
+    def test_a_carried_finished_title_the_owner_hid_is_dropped_though_tmdb_cannot_classify_it(self, ctx, mock_plextv):
+        ctx.plex.build_library_index.return_value = {900: 999, 10: 1010, 30: 1030, 40: 1040, 50: 1050}
+        ctx.history_source.fetch.return_value = [
+            make_watched("Fargo", days_ago=1, rating_key=999),
+            make_watched("Cartoon A", days_ago=40, rating_key=1030, tmdb_id=30),
+            make_watched("Cartoon B", days_ago=41, rating_key=1040, tmdb_id=40),
+            make_watched("Cartoon C", days_ago=42, rating_key=1050, tmdb_id=50),
+        ]
+        ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [] if tmdb_id == 900 else [16, 10751]
+        self._labelled(ctx, hide=("KidsDeny",))
+        self._prior(ctx, 900)
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0, size=1)])
+
+        assert 900 not in [p.tmdb_id for p in report.picks]
+        assert report.trace["selection"][0]["family_dropped"] == 1
+
+    def test_a_refresh_night_the_labels_cannot_be_read_does_not_let_go_of_an_admitted_title(self, ctx, mock_plextv):
+        """Unread, the admitted title is a Drama by TMDB and nothing in tonight's answer vouches for it —
+        so a REFRESH dropped it as "not mentioned". The row is carried as it is instead, like the
+        genre hold. Found by review, 2026-09-21."""
+
+        def away(section, label):
+            raise ConnectionError("pms is away")
+
+        self._prior(ctx, 900, 10)
+        self._classify_finished(ctx, kids=False)
+        self._labelled(ctx, admit=("KidsAllow",))
+        ctx.plex.items_labelled.side_effect = away
+        self._engine(ctx, self._kid(10, "Ten"))
+
+        report = _run(ctx, mock_plextv, [self._row(family="only", rewatch=True, watched_pct=1.0, refresh_days=1)])
+
+        entry = report.trace["selection"][0]
+        assert sorted(p.tmdb_id for p in report.picks) == [10, 900]
+        assert entry["decision"] == "carried_forward" and entry["title_labels_unreadable"] is True
+        assert not {"family_dropped", "unconfirmed_dropped"} & entry.keys()
+
     def test_a_carried_pick_is_asked_about_directly_not_left_to_the_lead_scan(self, ctx, mock_plextv):
         """The lead scan stops once the row has its leads, and it takes the person's OLDEST finished
         titles first. A stale carried pick among their recent watches is never reached by it — so
@@ -1255,6 +1387,481 @@ class TestAKidsAccount:
 
         entry = next(e for e in report.trace["selection"] if e["row"] == "picked")
         assert (entry["family"], entry["family_means"]) == ("auto", "only")
+
+
+class TestTheOwnersLabelsDecideWhatIsAChildrensTitle:
+    """Pavel, 2026-09-21: a title admitted to an account BY LABEL counts as a children's title for that
+    account's rows, and one hidden by label never does. The engine's flag answers "is this made for
+    children?"; the label answers "is this for THIS child?", and that is what the row is asking.
+
+    Ratings and genres cannot say it: Planet Earth is TV-PG and MasterChef Junior TV-Y."""
+
+    ROW: ClassVar[list[RowSpec]] = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto")]
+    CARTOON, DRAMA, ANIME = 10, 20, 30
+
+    def _kids(
+        self,
+        ctx,
+        mock_plextv,
+        *,
+        admit=(),
+        hide=(),
+        carrying=None,
+        rows=None,
+        household_override="kids",
+        genres=False,
+        reads=None,
+    ):
+        """A child's profile, the owner's labels for it, and which library titles carry each label —
+        by ratingKey, the way `PlexClient.items_labelled` answers (this library's keys are 1000+id)."""
+        from shortlist.engine.models import TitleLabels
+
+        # `genres=True` is an engine that CLASSIFIES what it sends: only then is "not a children's
+        # title" an answer about a carried pick rather than silence.
+        kinds = {10: ("Animation", "Family"), 20: ("Documentary",), 30: ("Animation", "Family")} if genres else {}
+        items = [
+            _item(10, "Cartoon", kids=True, genres=kinds.get(10, ())),
+            _item(20, "Drama", genres=kinds.get(20, ())),
+            _item(30, "Anime", kids=True, genres=kinds.get(30, ())),
+        ]
+        ctx.recommender = HttpRecommender(FakeEngineClient(items, household=FAMILY))
+        ctx.config.rows = rows or self.ROW
+        ctx.title_labels = {100: TitleLabels(admit=tuple(admit), hide=tuple(hide))}
+        carrying = carrying or {}
+        ctx.plex.items_labelled.reset_mock()
+        ctx.plex.items_labelled.side_effect = reads or (
+            lambda section, label: (
+                None if carrying.get(label, ()) is None else frozenset(1000 + t for t in carrying.get(label, ()))
+            )
+        )
+        mock_plextv.users = [plextv_user(100, "kids-tv")]
+        profile = make_profile("kids-tv", account_id=100, household_override=household_override)
+        return pipeline_mod.run(ctx, [profile]).users[0]
+
+    def _picked(self, report):
+        return [p.tmdb_id for p in report.picks if p.collection_slug == "picked"]
+
+    def test_a_title_admitted_by_label_is_a_childrens_title_here_in_the_engines_order(self, ctx, mock_plextv):
+        report = self._kids(ctx, mock_plextv, admit=("KidsAllow",), carrying={"KidsAllow": [self.DRAMA]})
+
+        assert self._picked(report) == [self.CARTOON, self.DRAMA, self.ANIME]
+
+    def test_a_title_hidden_by_label_is_not_however_the_engine_flags_it(self, ctx, mock_plextv):
+        report = self._kids(ctx, mock_plextv, hide=("KidsDeny",), carrying={"KidsDeny": [self.CARTOON]})
+
+        assert self._picked(report) == [self.ANIME]
+
+    def test_hidden_wins_on_a_title_carrying_both_as_it_does_in_the_restriction(self, ctx, mock_plextv):
+        report = self._kids(
+            ctx,
+            mock_plextv,
+            admit=("KidsAllow",),
+            hide=("KidsDeny",),
+            carrying={"KidsAllow": [self.DRAMA], "KidsDeny": [self.DRAMA]},
+        )
+
+        assert self._picked(report) == [self.CARTOON, self.ANIME]
+
+    def test_the_trace_counts_where_the_label_and_the_engine_disagreed(self, ctx, mock_plextv):
+        report = self._kids(
+            ctx,
+            mock_plextv,
+            admit=("KidsAllow",),
+            hide=("KidsDeny",),
+            # The anime carries the admit label too: the engine already said "children's", so that is
+            # agreement and is not counted.
+            carrying={"KidsAllow": [self.DRAMA, self.ANIME], "KidsDeny": [self.CARTOON]},
+        )
+
+        entry = next(e for e in report.trace["selection"] if e["row"] == "picked")
+        assert (entry["label_admitted"], entry["label_refused"]) == (1, 1)
+
+    def test_an_account_with_no_labels_costs_nothing_and_changes_nothing(self, ctx, mock_plextv):
+        report = self._kids(ctx, mock_plextv)
+
+        assert self._picked(report) == [self.CARTOON, self.ANIME]
+        ctx.plex.items_labelled.assert_not_called()
+        entry = next(e for e in report.trace["selection"] if e["row"] == "picked")
+        assert not {"label_admitted", "label_refused", "title_labels_unreadable"} & entry.keys()
+
+    def test_a_row_that_EXCLUDES_childrens_titles_is_not_the_labels_business(self, ctx, mock_plextv):
+        """A teenager's account allowed PG-13 with "also show: Teen OK" must not lose every labelled
+        film from their own rows: an admit label says "for this account", not "made for children"."""
+        report = self._kids(
+            ctx,
+            mock_plextv,
+            admit=("Teen OK",),
+            hide=("Not Yet",),
+            carrying={"Teen OK": [self.DRAMA], "Not Yet": [self.CARTOON]},
+            household_override="family",
+        )
+
+        assert self._picked(report) == [self.DRAMA]  # exactly what a family household's row held before
+        ctx.plex.items_labelled.assert_not_called()  # a row the labels cannot decide costs Plex nothing
+        entry = next(e for e in report.trace["selection"] if e["row"] == "picked")
+        assert not {"label_admitted", "label_refused", "title_labels_unreadable"} & entry.keys()
+
+    def test_a_carried_pick_the_owner_admitted_is_not_dropped_as_not_a_childrens_title(self, ctx, mock_plextv):
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("kids_tv", "picked", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((self.CARTOON, self.DRAMA))
+            ]
+        }
+        frozen = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)]
+
+        report = self._kids(ctx, mock_plextv, admit=("KidsAllow",), carrying={"KidsAllow": [self.DRAMA]}, rows=frozen)
+
+        assert set(self._picked(report)) >= {self.CARTOON, self.DRAMA}
+        # (The row is rebuilt tonight anyway — a kids row with no recipe on record always is — so what
+        # this pins is the re-check that runs first: it must not call the admitted title a contradiction.)
+        assert "family_dropped" not in report.trace["selection"][0]
+
+    def test_and_a_carried_pick_the_owner_has_since_hidden_is(self, ctx, mock_plextv):
+        """With nothing but the label to say so: the engine's answer gives it no genres and calls it a
+        children's title, which without the label is never a reason to drop a carried pick."""
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("kids_tv", "picked", "1"): [
+                Pick(
+                    tmdb_id=self.CARTOON,
+                    rating_key=1010,
+                    title="Cartoon",
+                    rank=1,
+                    reason="kept",
+                    media_type=MediaType.MOVIE,
+                )
+            ]
+        }
+        frozen = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)]
+
+        report = self._kids(ctx, mock_plextv, hide=("KidsDeny",), carrying={"KidsDeny": [self.CARTOON]}, rows=frozen)
+
+        assert self.CARTOON not in self._picked(report)
+        assert report.trace["selection"][0]["family_dropped"] == 1
+
+    def test_the_label_is_an_answer_even_about_a_title_the_engine_said_nothing_about(self, ctx, mock_plextv):
+        """No genres and no flag is "the engine did not say", which is never a reason to drop a carried
+        pick. The owner hiding it from this account is one."""
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("kids_tv", "picked", "1"): [
+                Pick(
+                    tmdb_id=self.DRAMA,
+                    rating_key=1020,
+                    title="Drama",
+                    rank=1,
+                    reason="kept",
+                    media_type=MediaType.MOVIE,
+                )
+            ]
+        }
+        frozen = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)]
+
+        unlabelled = self._kids(ctx, mock_plextv, rows=frozen)
+        hidden = self._kids(ctx, mock_plextv, hide=("KidsDeny",), carrying={"KidsDeny": [self.DRAMA]}, rows=frozen)
+
+        assert "family_dropped" not in unlabelled.trace["selection"][0]
+        assert hidden.trace["selection"][0]["family_dropped"] == 1
+
+    def test_labels_plex_could_not_be_asked_about_leave_the_engines_word_and_say_so(self, ctx, mock_plextv, caplog):
+        from shortlist.engine.models import TitleLabels
+
+        items = [_item(10, "Cartoon", kids=True), _item(20, "Drama"), _item(30, "Anime", kids=True)]
+        ctx.recommender = HttpRecommender(FakeEngineClient(items, household=FAMILY))
+        ctx.config.rows = self.ROW
+        ctx.title_labels = {100: TitleLabels(admit=("KidsAllow",))}
+        ctx.plex.items_labelled.side_effect = ConnectionError("pms is away")
+        mock_plextv.users = [plextv_user(100, "kids-tv")]
+
+        report = pipeline_mod.run(ctx, [make_profile("kids-tv", account_id=100, household_override="kids")]).users[0]
+
+        assert self._picked(report) == [self.CARTOON, self.ANIME]
+        assert report.trace["selection"][0]["title_labels_unreadable"] is True
+
+    def test_a_night_the_labels_cannot_be_read_does_not_cost_an_admitted_title_its_place(self, ctx, mock_plextv):
+        """The engine SAYS the documentary is not a children's title — that is why it was labelled. Judged
+        on the engine's word alone for one night it was dropped as a contradiction, and on a full frozen
+        row it never came back. Found by review, 2026-09-21."""
+        frozen = RowSpec(slug="picked", name_template="Picked", size=2, family="auto", refresh_days=0)
+        labelled = {"admit": ("KidsAllow",), "carrying": {"KidsAllow": [self.DRAMA]}}
+
+        def away(section, label):
+            raise ConnectionError("pms is away")
+
+        first = self._kids(ctx, mock_plextv, rows=[frozen], genres=True, **labelled)
+        assert self._picked(first) == [self.CARTOON, self.DRAMA]
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {("kids_tv", "picked", "1"): list(first.picks)}
+        ctx.previous_recipes = {("kids_tv", "picked", "1"): first.picks[0].recipe}
+
+        second = self._kids(ctx, mock_plextv, rows=[frozen], genres=True, admit=("KidsAllow",), reads=away)
+
+        assert self._picked(second) == [self.CARTOON, self.DRAMA]
+        entry = second.trace["selection"][0]
+        assert entry["title_labels_unreadable"] is True and "family_dropped" not in entry
+
+    def test_naming_a_label_rebuilds_their_rows_that_night_full_and_frozen_or_not(self, ctx, mock_plextv):
+        """ "Their rows follow on the next run" is what the page says. A full frozen row carried forward
+        untouched instead, while its trace claimed a title "could be picked". Found by review."""
+        frozen = RowSpec(slug="picked", name_template="Picked", size=2, family="auto", refresh_days=0)
+        before = self._kids(ctx, mock_plextv, rows=[frozen])
+        assert self._picked(before) == [self.CARTOON, self.ANIME]
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {("kids_tv", "picked", "1"): list(before.picks)}
+        ctx.previous_recipes = {("kids_tv", "picked", "1"): before.picks[0].recipe}
+
+        unchanged = self._kids(ctx, mock_plextv, rows=[frozen])
+        named = self._kids(ctx, mock_plextv, rows=[frozen], admit=("KidsAllow",), carrying={"KidsAllow": [self.DRAMA]})
+
+        assert unchanged.trace["selection"][0]["decision"] == "carried_forward"  # the control: nothing named
+        assert named.trace["selection"][0]["decision"] == "settings_changed"
+        assert self._picked(named) == [self.CARTOON, self.DRAMA]
+
+    def _carry(self, ctx, report) -> str:
+        """Tonight's delivery becomes what the next night finds on the server."""
+        ctx.plex.sections.return_value[0].key = "1"
+        picks = [p for p in report.picks if p.collection_slug == "picked"]
+        ctx.previous_picks = {("kids_tv", "picked", "1"): picks}
+        ctx.previous_recipes = {("kids_tv", "picked", "1"): picks[0].recipe}
+        return picks[0].recipe
+
+    @staticmethod
+    def _away(section, label):
+        raise ConnectionError("pms is away")
+
+    def test_a_label_named_on_a_night_plex_is_away_still_reaches_a_full_frozen_row(self, ctx, mock_plextv):
+        """The settings change rebuilt the row that night WITHOUT the label and stamped tonight's recipe
+        on it; every night after matched, and a full frozen row never took the admitted title. Now the
+        row is carried under the recipe it HAD, so the first readable night is the settings change."""
+        frozen = [RowSpec(slug="picked", name_template="Picked", size=2, family="auto", refresh_days=0)]
+        before = self._carry(ctx, self._kids(ctx, mock_plextv, rows=frozen))
+
+        away = self._kids(ctx, mock_plextv, rows=frozen, admit=("KidsAllow",), reads=self._away)
+        assert away.trace["selection"][0]["decision"] == "carried_forward"
+        assert self._carry(ctx, away) == before  # not stamped as built with the labels
+        back = self._kids(ctx, mock_plextv, rows=frozen, admit=("KidsAllow",), carrying={"KidsAllow": [self.DRAMA]})
+
+        assert back.trace["selection"][0]["decision"] == "settings_changed"
+        assert self._picked(back) == [self.CARTOON, self.DRAMA]
+
+    def test_a_row_first_built_on_such_a_night_is_rebuilt_once_the_labels_can_be_read(self, ctx, mock_plextv):
+        frozen = [RowSpec(slug="picked", name_template="Picked", size=2, family="auto", refresh_days=0)]
+        labelled = {"admit": ("KidsAllow",), "carrying": {"KidsAllow": [self.DRAMA]}}
+
+        first = self._kids(ctx, mock_plextv, rows=frozen, admit=("KidsAllow",), reads=self._away)
+        assert self._picked(first) == [self.CARTOON, self.ANIME]  # the engine's word alone, and it says so:
+        assert "labels=unread" in self._carry(ctx, first).split("|")
+        still_away = self._kids(ctx, mock_plextv, rows=frozen, admit=("KidsAllow",), reads=self._away)
+        assert still_away.trace["selection"][0]["decision"] == "carried_forward"  # an outage is not nightly churn
+        self._carry(ctx, still_away)
+        back = self._kids(ctx, mock_plextv, rows=frozen, **labelled)
+        recipe = self._carry(ctx, back)
+        settled = self._kids(ctx, mock_plextv, rows=frozen, **labelled)
+
+        assert self._picked(back) == [self.CARTOON, self.DRAMA]
+        assert "labels=unread" not in recipe.split("|")
+        assert settled.trace["selection"][0]["decision"] == "carried_forward"
+
+    def test_the_hold_is_for_the_rows_the_labels_decide_and_no_others(self, ctx, mock_plextv):
+        """One person, one row the labels decide and one set to "everything": on a night the labels
+        cannot be read only the first is held, and only the first says so."""
+        rows = [
+            RowSpec(slug="picked", name_template="Picked", size=5, family="auto"),
+            RowSpec(slug="all", name_template="Everything", size=5, family="include"),
+        ]
+
+        report = self._kids(ctx, mock_plextv, rows=rows, admit=("KidsAllow",), reads=self._away)
+
+        by_row = {e["row"]: e for e in report.trace["selection"]}
+        assert by_row["picked"]["title_labels_unreadable"] is True
+        assert "title_labels_unreadable" not in by_row["all"]
+
+    def test_and_a_row_they_do_not_decide_still_lets_go_of_what_its_own_rule_refuses(self, ctx, mock_plextv):
+        """A family household: the family row is the labels' business, the grown-ups' row is not — and
+        the night the labels cannot be read, the grown-ups' row still drops the cartoon it was carrying."""
+        rows = [
+            RowSpec(slug="fam", name_template="Family", size=5, family="only"),
+            RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0),
+        ]
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("kids_tv", "picked", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((self.CARTOON, self.DRAMA))
+            ]
+        }
+
+        report = self._kids(
+            ctx,
+            mock_plextv,
+            rows=rows,
+            admit=("KidsAllow",),
+            reads=self._away,
+            genres=True,
+            household_override="family",
+        )
+
+        by_row = {e["row"]: e for e in report.trace["selection"]}
+        assert by_row["fam"]["title_labels_unreadable"] is True
+        assert by_row["picked"]["family_dropped"] == 1 and "title_labels_unreadable" not in by_row["picked"]
+
+    def test_the_recipe_part_is_the_label_names_themselves(self, ctx):
+        """Present is not enough: renaming a label, or adding a second, has to rebuild a frozen row too."""
+        from types import SimpleNamespace
+
+        from shortlist.engine.household import Household
+        from shortlist.engine.models import TitleLabels
+        from shortlist.engine.rows import _label_recipe
+
+        def part(admit=(), hide=()):
+            policy = SimpleNamespace(
+                ctx=SimpleNamespace(title_labels={100: TitleLabels(admit=tuple(admit), hide=tuple(hide))}),
+                user=SimpleNamespace(plex_account_id=100),
+                household=Household(label="kids", source="override"),
+            )
+            return _label_recipe(policy, self.ROW[0])
+
+        assert part(admit=("A",)) != part(admit=("B",))
+        assert part(hide=("X",)) != part(hide=("Y",))
+        assert part(admit=("A",)) != part(admit=("A", "B"))
+        assert part(admit=("A",)) != part(hide=("A",))
+        assert part(admit=("a", "B")) == part(admit=("B", "A"))  # order and case are not a change
+        assert part() == ()
+
+    def test_a_night_the_labels_cannot_be_read_is_not_a_settings_change(self, ctx, mock_plextv):
+        from shortlist.engine.rows import _label_recipe
+
+        def policy(unreadable, label="kids"):
+            from types import SimpleNamespace
+
+            from shortlist.engine.household import Household
+            from shortlist.engine.models import TitleLabels
+
+            return SimpleNamespace(
+                ctx=SimpleNamespace(title_labels={100: TitleLabels(admit=("KidsAllow",), hide=("KidsDeny",))}),
+                user=SimpleNamespace(plex_account_id=100),
+                household=Household(label=label, source="override"),
+                title_labels_unreadable=unreadable,
+            )
+
+        assert _label_recipe(policy(False), self.ROW[0]) == _label_recipe(policy(True), self.ROW[0]) != ()
+        # ...and a row the labels cannot decide keeps the fingerprint it always had: a teenager's
+        # account naming "also show: Teen OK" must not rebuild rows the label never touches.
+        assert _label_recipe(policy(False, "family"), self.ROW[0]) == ()
+
+    def test_a_label_plex_does_not_have_is_said_out_loud_once(self, ctx, mock_plextv):
+        from loguru import logger
+
+        lines: list[str] = []
+        sink = logger.add(lambda message: lines.append(str(message)), level="WARNING")
+        try:
+            report = self._kids(ctx, mock_plextv, admit=("KidsAlow",), carrying={"KidsAlow": None})
+        finally:
+            logger.remove(sink)
+
+        assert self._picked(report) == [self.CARTOON, self.ANIME]
+        assert sum("Plex has no label 'KidsAlow'" in line for line in lines) == 1
+
+
+class TestWhichTitlesTheLabelsDecide:
+    """`RowPolicy.kids_by_label` itself, over more than the one movie library the pipeline fixture has:
+    shows, two libraries of a kind, two accounts, a label Plex lacks, a library that cannot be read."""
+
+    MOVIES, FOUR_K, TV = "1", "2", "3"
+
+    def _policy(self, *, account=100, labels=None, carrying=None, sections=None, raises=()):
+        """A stand-in with exactly what the property reads. `carrying` is {(library, label): keys | None}."""
+        from types import SimpleNamespace
+
+        from shortlist.engine.models import TitleLabels
+
+        kinds = {self.MOVIES: "movie", self.FOUR_K: "movie", self.TV: "show"}
+        asked: list[tuple[str, str]] = []
+
+        def items_labelled(section, label):
+            asked.append((section.key, label))
+            if section.key in raises:
+                raise ConnectionError("pms is away")
+            found = (carrying or {}).get((section.key, label), frozenset())
+            return None if found is None else frozenset(found)
+
+        ctx = SimpleNamespace(
+            title_labels={100: TitleLabels(admit=("KidsAllow",), hide=("KidsDeny",)), **(labels or {})},
+            delivery_sections=[SimpleNamespace(key=key, type=kinds[key]) for key in sections or kinds],
+            # The SAME tmdb id in every library, and as a movie AND a show: ids overlap across kinds.
+            section_index={self.MOVIES: {20: 1020, 30: 1030}, self.FOUR_K: {20: 2020}, self.TV: {20: 3020}},
+            plex=SimpleNamespace(items_labelled=items_labelled),
+        )
+        policy = SimpleNamespace(
+            ctx=ctx,
+            user=SimpleNamespace(plex_account_id=account, username="kids-tv"),
+            title_labels_missing=set(),
+            title_labels_unreadable=False,
+        )
+        return policy, asked
+
+    def _verdicts(self, policy):
+        from shortlist.engine.rows import RowPolicy
+
+        return RowPolicy.kids_by_label.func(policy)
+
+    def test_a_show_and_a_film_with_the_same_tmdb_id_are_two_titles(self):
+        policy, _ = self._policy(carrying={(self.TV, "KidsAllow"): [3020], (self.MOVIES, "KidsDeny"): [1020]})
+
+        assert self._verdicts(policy) == {(20, MediaType.SHOW): True, (20, MediaType.MOVIE): False}
+
+    @pytest.mark.parametrize("order", [("1", "2"), ("2", "1")])
+    def test_hidden_wins_whichever_library_the_hidden_copy_is_in(self, order):
+        policy, _ = self._policy(
+            sections=order, carrying={(self.MOVIES, "KidsDeny"): [1020], (self.FOUR_K, "KidsAllow"): [2020]}
+        )
+
+        assert self._verdicts(policy) == {(20, MediaType.MOVIE): False}
+
+    def test_every_library_is_asked_not_only_the_first(self):
+        policy, asked = self._policy(carrying={(self.TV, "KidsAllow"): [3020]})
+
+        assert self._verdicts(policy) == {(20, MediaType.SHOW): True}
+        assert {library for library, _ in asked} == {self.MOVIES, self.FOUR_K, self.TV}
+
+    def test_an_account_gets_its_own_labels_and_never_anothers(self):
+        """Per user means per user. A sibling with no labels is asked about nothing at all."""
+        from shortlist.engine.models import TitleLabels
+
+        mine = {200: TitleLabels(admit=("Teen OK",))}
+        policy, asked = self._policy(account=200, labels=mine, carrying={(self.MOVIES, "Teen OK"): [1030]})
+        nobody, never = self._policy(account=300, carrying={(self.MOVIES, "KidsAllow"): [1020]})
+
+        assert self._verdicts(policy) == {(30, MediaType.MOVIE): True}
+        assert {label for _, label in asked} == {"Teen OK"}
+        assert self._verdicts(nobody) == {} and never == []
+
+    def test_a_label_plex_lacks_does_not_stop_the_ones_after_it(self):
+        from shortlist.engine.models import TitleLabels
+
+        two = {100: TitleLabels(admit=("KidsAlow", "KidsAllow"))}
+        policy, _ = self._policy(
+            labels=two,
+            sections=[self.MOVIES],
+            carrying={(self.MOVIES, "KidsAlow"): None, (self.MOVIES, "KidsAllow"): [1020]},
+        )
+
+        assert self._verdicts(policy) == {(20, MediaType.MOVIE): True}
+        assert policy.title_labels_missing == {"KidsAlow"}
+
+    def test_one_library_that_cannot_be_read_means_nothing_is_decided_tonight(self):
+        """Half an answer is worse than none: with the hide labels of the unread library missing, an
+        admit from the first would stand where the owner's hide should have beaten it."""
+        policy, _ = self._policy(carrying={(self.MOVIES, "KidsAllow"): [1020]}, raises=(self.FOUR_K,))
+
+        assert self._verdicts(policy) == {}
+        assert policy.title_labels_unreadable is True
 
 
 class TestAKidsRowWithNothingToShow:

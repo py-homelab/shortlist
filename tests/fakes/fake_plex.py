@@ -330,6 +330,29 @@ class FakePlexState:
     def items_in(self, section_id: int) -> dict[int, FakeMovie]:
         return self.sections[section_id].items
 
+    def label_keys(self) -> dict[str, int]:
+        """Every label on any ITEM, lowercased -> its numeric key. SERVER-wide, as recorded
+        (`pms_label_listing.json`): the choices a section offers are identical in every section, so a
+        label that exists only on shows is still offered under Movies."""
+        names = sorted(
+            {
+                label.casefold()
+                for section in self.sections.values()
+                for item in section.items.values()
+                for label in item.labels
+            }
+        )
+        return {name: 216000 + i for i, name in enumerate(names)}
+
+    def label_titles(self) -> dict[str, str]:
+        """Lowercased label -> the casing it is stored under."""
+        return {
+            label.casefold(): label
+            for section in self.sections.values()
+            for item in section.items.values()
+            for label in item.labels
+        }
+
     def titles_of_type(self, kind: str) -> list[FakeMovie]:
         """Every distinct TMDB title of a type, across every library of that type.
 
@@ -1067,6 +1090,23 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             )
         return _xml(root)
 
+    @app.get("/library/sections/{section_id}/label")
+    def section_label_choices(section_id: int) -> Response:
+        """The label facet. Three attributes per entry and nothing else, as recorded."""
+        if section_id not in state.sections:
+            return Response(status_code=404)
+        keys, titles = state.label_keys(), state.label_titles()
+        root = _container(size=len(keys), title2="By Label", viewGroup="secondary")
+        for name, key in keys.items():
+            SubElement(
+                root,
+                "Directory",
+                fastKey=f"/library/sections/{section_id}/all?label={key}",
+                key=str(key),
+                title=titles[name],
+            )
+        return _xml(root)
+
     @app.get("/library/sections/{section_id}/all")
     @app.get("/library/sections/{section_id}/collections")
     def section_all(section_id: int, request: Request) -> Response:
@@ -1079,6 +1119,27 @@ def make_fake_plex(state: FakePlexState) -> FastAPI:
             root = _container(size=len(owned), totalSize=len(owned), librarySectionID=section_id)
             for collection in owned:
                 _collection_xml(root, state, collection, labels=False)
+            return _xml(root)
+        # The owner's "which titles carry this label" read (`PlexClient.items_labelled`). Recorded
+        # (`pms_label_listing.json`): matched by the choice's key OR by name; a label nobody carries,
+        # or one that does not exist, is a 200 with no rows — never an error; a label on a SHOW matches
+        # no episode (`type=4` is empty); and neither `totalSize` nor any inline <Label> is served.
+        if query.get("label") is not None:
+            # By key, or by the name EXACTLY as stored — the only name match the recording has. (A real
+            # PMS may well fold case; a fake that assumed so would be easier than the server.)
+            wanted = query["label"]
+            by_key = {str(key): name for name, key in state.label_keys().items()}
+            stored = {title: name for name, title in state.label_titles().items()}
+            name = by_key.get(wanted) or stored.get(wanted)
+            kind = {"1": "movie", "2": "show"}.get(query.get("type") or "", "")
+            carrying = [
+                item
+                for item in _sorted_items(list(items.values()), None)
+                if item.media_type == kind and name in {label.casefold() for label in item.labels}
+            ]
+            root = _container(size=len(carrying), librarySectionID=section_id)
+            for item in carrying:
+                _movie_xml(root, state, item)
             return _xml(root)
         # LEAF reads — the watching-account transfer's four reads. `type=4` is episodes; `viewOffset>`
         # is the only way a PARTIAL play is visible at all, and both filters ARE honoured server-side

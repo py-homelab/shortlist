@@ -9,9 +9,13 @@ what the owner meant? It is the same by-key read a restricted person's rows are 
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from shortlist.engine.clients.plex_pms import PlexClient
+from shortlist.engine.models import MediaType
 from shortlist.engine.privacy import plan_account_filter
 from tests.fakes.fake_plex import make_fake_plex, seed_state
 from tests.integration.test_watch_replica_vs_fake import OWNER_TOKEN, TARGET_ACCOUNT, TARGET_TOKEN, _UvicornThread
@@ -73,3 +77,95 @@ def test_taking_the_labels_away_is_back_to_the_ratings(kids):
     _write(state, ledger)
 
     assert client.visible_to(TARGET_TOKEN, [PLANET_EARTH, SPACE_ODYSSEY, BLUEY, ALIEN]) == {SPACE_ODYSSEY, BLUEY}
+
+
+class TestWhichTitlesCarryALabel:
+    """`PlexClient.items_labelled` — the owner's read behind "a labelled title IS a children's title
+    for this account's rows". The fake answers the way a real PMS was recorded to
+    (`pms_label_listing.json`): no inline labels on a listing, a missing label is a 200 with no rows,
+    and a label on a show matches the show and none of its episodes."""
+
+    def _section(self, client, kind):
+        return client.sections_by_type()[kind]
+
+    def test_a_movie_and_a_show_by_label_each_in_its_own_library(self, kids):
+        _, client = kids
+
+        assert client.items_labelled(self._section(client, MediaType.MOVIE), "Not For Kids") == {SPACE_ODYSSEY}
+        assert client.items_labelled(self._section(client, MediaType.SHOW), "For Kids") == {PLANET_EARTH}
+
+    def test_the_name_is_matched_whatever_its_case(self, kids):
+        _, client = kids
+
+        assert client.items_labelled(self._section(client, MediaType.SHOW), "for kids") == {PLANET_EARTH}
+
+    def test_a_label_the_server_has_but_this_library_does_not_is_empty_not_missing(self, kids):
+        """The label choices are the SERVER's, identical in every section (recorded: the same 104 under
+        Movies and TV). So "For Kids", carried only by a show, is offered under Movies too."""
+        _, client = kids
+
+        assert client.items_labelled(self._section(client, MediaType.MOVIE), "For Kids") == frozenset()
+
+    def test_a_label_plex_does_not_have_is_none_so_a_typo_can_be_told_from_nothing_labelled(self, kids):
+        _, client = kids
+
+        assert client.items_labelled(self._section(client, MediaType.MOVIE), "For Kidz") is None
+
+    def test_a_label_named_like_another_labels_key_is_still_found_by_its_name(self, kids):
+        """Why the listing is asked for by KEY: `label=2024` by name would be read as a key."""
+        state, client = kids
+        state.item(ALIEN).labels = ["For Kids"]
+        numeric = str(state.label_keys()["for kids"])  # a label whose NAME is "For Kids"'s key
+        state.item(SPACE_ODYSSEY).labels = [numeric]
+
+        assert client.items_labelled(self._section(client, MediaType.MOVIE), numeric) == {SPACE_ODYSSEY}
+
+    def test_the_label_choices_are_read_once_per_library_however_many_labels_are_named(self, kids):
+        _, client = kids
+        section = self._section(client, MediaType.MOVIE)
+        asked = []
+        real = client._server.query
+        client._server.query = lambda path, *a, **kw: asked.append(path) or real(path, *a, **kw)
+
+        client.items_labelled(section, "Not For Kids")
+        client.items_labelled(section, "For Kids")
+
+        assert sum(path.endswith("/label") for path in asked) == 1
+
+    def test_every_account_naming_a_label_shares_one_read(self, kids):
+        _, client = kids
+        section = self._section(client, MediaType.SHOW)
+        client.items_labelled(section, "For Kids")
+        asked = []
+        real = client._server.query
+        client._server.query = lambda path, *a, **kw: asked.append(path) or real(path, *a, **kw)
+
+        client.items_labelled(section, "For Kids")
+
+        assert asked == []
+
+
+class TestTheRecordedListing:
+    """What `items_labelled` and the fake above are built on, read off the recording."""
+
+    RECORDED = json.loads((Path(__file__).parents[1] / "fixtures" / "pms_label_listing.json").read_text())
+
+    def test_a_listing_carries_no_inline_labels_even_when_asked_to(self):
+        rows = self.RECORDED["reads"]["7_includeLabels_probe_one_item"]["metadata"]
+
+        assert rows and not any(row["label_inline"] for row in rows)
+
+    def test_a_missing_label_is_a_200_with_no_rows_by_name_and_by_key(self):
+        for read in ("6a_missing_label_by_name", "6b_missing_label_by_key"):
+            assert (self.RECORDED["reads"][read]["status"], self.RECORDED["reads"][read]["metadata_count"]) == (200, 0)
+
+    def test_a_show_label_matches_the_show_and_none_of_its_episodes(self):
+        reads = self.RECORDED["reads"]
+
+        assert reads["4a_tv_KidsAllow_by_key"]["metadata_count"] == 6
+        assert reads["4c_tv_episodes_KidsAllow_by_key_size_only"]["metadata_count"] == 0
+
+    def test_the_label_choices_are_the_servers_not_the_librarys(self):
+        assert self.RECORDED["label_keys"]["movie"] == self.RECORDED["label_keys"]["show"]
+        choices = self.RECORDED["label_choices"]
+        assert choices["movie_no_type"]["directory_count"] == choices["show_no_type"]["directory_count"] == 104

@@ -425,9 +425,31 @@ function decisionLine(entry: TraceSelection): string {
   const said = family ? `${withRewatch} ${family}` : withRewatch;
   // Why a watch-it-again row changed though it was not due to: without this line a frozen row that
   // moved reads as a bug.
-  return entry.elsewhere_dropped
+  const moved = entry.elsewhere_dropped
     ? `${said} ${entry.elsewhere_dropped} filler ${entry.elsewhere_dropped === 1 ? "title was" : "titles were"} taken out because another of their rows already shows ${entry.elsewhere_dropped === 1 ? "it" : "them"}.`
     : said;
+  const labels = labelLine(entry);
+  return labels ? `${moved} ${labels}` : moved;
+}
+
+/** Where the owner's own title labels overruled the engine about what is a children's title for this
+ *  account — the answer to "why is a TV-PG documentary in a child's row?", and to its opposite. */
+function labelLine(entry: TraceSelection): string {
+  const count = (n: number) => `${n} ${n === 1 ? "title" : "titles"}`;
+  const parts: string[] = [];
+  if (entry.label_admitted)
+    parts.push(
+      `${count(entry.label_admitted)} could be picked because you labelled ${entry.label_admitted === 1 ? "it" : "them"} for this account.`,
+    );
+  if (entry.label_refused)
+    parts.push(
+      `${count(entry.label_refused)} that would count as children's ${entry.label_refused === 1 ? "was" : "were"} left out because you labelled ${entry.label_refused === 1 ? "it" : "them"} never to show here.`,
+    );
+  if (entry.title_labels_unreadable)
+    parts.push(
+      "Plex could not be asked which titles carry this account's labels tonight, so the row was kept as it was — anything new in it went by the engine alone.",
+    );
+  return parts.join(" ");
 }
 
 /** What a row left on "automatic" came to for THIS person. The setting alone does not say, and it is

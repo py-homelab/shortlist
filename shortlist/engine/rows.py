@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import time
 import zlib
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -606,6 +606,7 @@ def _rewatch_candidates(
     # contradiction check cannot see them.
     refused: set[tuple[int, MediaType]] = set()
     constrained = spec is not None and _family_constrains(spec, policy.household)
+    labelled = _labelled(policy, spec) if spec is not None else None
     # A refused title takes no slot, so on a constrained row `limit` alone would let the scan walk the
     # person's whole history, one TMDB detail call each (measured: 100 lookups for a 3-slot row).
     # Carried picks are re-checked directly (`_refused_carried`), so this scan only has to find tonight's
@@ -618,7 +619,10 @@ def _rewatch_candidates(
             continue
         genres: list[str] = []
         kids = False
-        if constrained:
+        # The owner's label answers before TMDB is asked, and instead of it: a title they labelled is
+        # decided whether or not TMDB knows its genres (the obscure ones are exactly the ones that get
+        # labelled by hand), and spends none of the lookups this scan is rationed.
+        if constrained and (labelled or {}).get((tid, media)) is None:
             budget -= 1
             names = _finished_genres(policy, tid, kind)
             if names is None:
@@ -635,7 +639,7 @@ def _rewatch_candidates(
             genres=genres,
             kids=kids,
         )
-        if constrained and not _family_admits(spec, candidate, policy.household):
+        if constrained and not _family_admits(spec, candidate, policy.household, labelled):
             refused.add((tid, media))
             continue
         out.append(candidate)
@@ -662,10 +666,16 @@ def _refused_carried(
     if not (spec.rewatch and _family_constrains(spec, policy.household)):
         return set()
     refused: set[tuple[int, MediaType]] = set()
+    labelled = _labelled(policy, spec)
     for pick in prior:
         key = (pick.tmdb_id, pick.media_type)
         if key not in finished:
             continue  # not one of their finished titles: the pool speaks for it
+        verdict = (labelled or {}).get(key)
+        if verdict is not None:
+            if not verdict:
+                refused.add(key)  # the owner's label answers, whatever TMDB would have said
+            continue
         names = _finished_genres(policy, pick.tmdb_id, kind)
         if names is None:
             continue  # unreadable or unclassifiable — the hold and `_engine_view` both leave these alone
@@ -676,7 +686,7 @@ def _refused_carried(
             genres=names,
             kids=is_kids(names),
         )
-        if not _family_admits(spec, candidate, policy.household):
+        if not _family_admits(spec, candidate, policy.household, labelled):
             refused.add(key)
     return refused
 
@@ -1101,6 +1111,12 @@ def row_recipe(policy: RowPolicy, spec: RowSpec) -> str:
             # child's row until the next refresh night — or for ever, on a frozen row. Conditional for
             # the usual reason: nobody else's fingerprint changes on upgrade.
             *(("means=only",) if spec.family == "auto" and _family_means(spec, policy.household) == "only" else ()),
+            # The owner's title labels for this account, on a row they decide — so naming a label on a
+            # child's page rebuilds their rows that night instead of waiting behind the cadence (or for
+            # ever, on a frozen row that is full). The label NAMES, not the titles carrying them: those
+            # are read from Plex, and a night that read fails must not look like a settings change.
+            # Conditional for the usual reason: nobody else's fingerprint changes on upgrade.
+            *_label_recipe(policy, spec),
             *((hashlib.blake2b(repr(sorted(blocked)).encode(), digest_size=8).hexdigest(),) if blocked else ()),
             # Rewatch rows only, for the same reason the blocked seeds are conditional: an unconditional
             # part would mismatch every other row's stored recipe and rebuild the server on the night
@@ -1112,6 +1128,14 @@ def row_recipe(policy: RowPolicy, spec: RowSpec) -> str:
             *((f"season={spec.season.slug}@{spec.season.anchor.isoformat()}",) if spec.season else ()),
         )
     )
+
+
+def _label_recipe(policy: RowPolicy, spec: RowSpec) -> tuple[str, ...]:
+    labels = policy.ctx.title_labels.get(policy.user.plex_account_id)
+    if not labels or not (labels.admit or labels.hide) or _family_means(spec, policy.household) != "only":
+        return ()
+    named = (sorted(label.casefold() for label in labels.admit), sorted(label.casefold() for label in labels.hide))
+    return ("labels=" + hashlib.blake2b(repr(named).encode(), digest_size=8).hexdigest(),)
 
 
 def _family_means(spec: RowSpec, household: Household | None) -> str:
@@ -1141,14 +1165,42 @@ def _family_means(spec: RowSpec, household: Household | None) -> str:
     return "include"
 
 
-def _family_admits(spec: RowSpec, candidate: Candidate, household: Household | None = None) -> bool:
-    """Whether this row's `family` setting lets a candidate in, for this person (`_family_means`)."""
+#: (tmdb_id, media) -> what the owner's own title labels say about it FOR ONE ACCOUNT: True for a title
+#: they admitted by label, False for one they hid (`RowPolicy.kids_by_label`).
+LabelVerdicts = Mapping[tuple[int, MediaType], bool]
+
+
+def _family_admits(
+    spec: RowSpec, candidate: Candidate, household: Household | None = None, labelled: LabelVerdicts | None = None
+) -> bool:
+    """Whether this row's `family` setting lets a candidate in, for this person (`_family_means`).
+
+    On a row that holds ONLY children's titles, the owner's word beats the engine's: a title they
+    labelled "also show" for this account IS a children's title here, whatever its rating or genres
+    (Planet Earth, TV-PG), and one they labelled "never show" is not, however it is rated
+    (MasterChef Junior, TV-Y). The engine's flag answers "is this made for children?"; the label
+    answers "is this for THIS child?", which is the question the row is asking.
+
+    Only there. On a row that EXCLUDES children's titles an admit label proves nothing about the
+    title — a teenager's account allowed PG-13 and "also show: Teen OK" would lose every labelled
+    film from their own rows to a family row they may not even have.
+    """
     means = _family_means(spec, household)
     if means == "exclude":
         return not candidate.kids
     if means == "only":
-        return candidate.kids
+        verdict = (labelled or {}).get((candidate.tmdb_id, candidate.media_type))
+        return candidate.kids if verdict is None else verdict
     return True
+
+
+def _labelled(policy: RowPolicy, spec: RowSpec) -> LabelVerdicts | None:
+    """The owner's label verdicts for this person, for a row they apply to — None for any other row.
+
+    Asked here, not at the call sites, so the labels are READ only for a row that holds nothing but
+    children's titles: an adult's account with an "also show" label costs Plex nothing, and a night the
+    read fails is reported on the rows it touched and no others."""
+    return policy.kids_by_label if _family_means(spec, policy.household) == "only" else None
 
 
 def _family_constrains(spec: RowSpec, household: Household | None) -> bool:
@@ -1173,15 +1225,20 @@ class _EngineView(NamedTuple):
     mentioned: frozenset[tuple[int, MediaType]]
 
 
-def _engine_view(in_library: list[Candidate], spec: RowSpec, household: Household | None) -> _EngineView:
+def _engine_view(
+    in_library: list[Candidate], spec: RowSpec, household: Household | None, labelled: LabelVerdicts | None = None
+) -> _EngineView:
     if not _family_constrains(spec, household):
         return _EngineView(frozenset(), frozenset())
+    labelled = labelled or {}
     contradicted = {
         (c.tmdb_id, c.media_type)
         for c in in_library
         # No genres and no flag is not an answer: an engine that omits the field, or a genre lookup that
-        # failed. Reading that as "not a children's title" would empty an `only` row.
-        if (c.genres or c.kids) and not _family_admits(spec, c, household)
+        # failed. Reading that as "not a children's title" would empty an `only` row. The owner's label
+        # IS an answer, with or without either.
+        if (c.genres or c.kids or (c.tmdb_id, c.media_type) in labelled)
+        and not _family_admits(spec, c, household, labelled)
     }
     return _EngineView(frozenset(contradicted), frozenset((c.tmdb_id, c.media_type) for c in in_library))
 
@@ -1989,6 +2046,10 @@ class RowPolicy:
     #: The children's-title lookup failed for this person tonight (`_finished_genres`). Separate from
     #: `genres_unreadable` so it holds only the rows whose family setting needed that answer.
     kids_genres_unreadable: bool = False
+    #: The owner's title labels for this account could not be read from Plex tonight (`kids_by_label`).
+    title_labels_unreadable: bool = False
+    #: Labels named on their page that Plex does not have at all — a typo, usually.
+    title_labels_missing: set[str] = field(default_factory=set)
     # Who watches under this account tonight (`household.resolve_household`), set once the pools are in.
     household: Household | None = None
     # ratingKey -> can this person see it (`visible`). Memoised across their rows: one read per title.
@@ -2043,6 +2104,60 @@ class RowPolicy:
                 return None
             self.visibility.update({k: k in seen for k in unknown})
         return {k for k in rating_keys if self.visibility.get(k)}
+
+    @cached_property
+    def kids_by_label(self) -> dict[tuple[int, MediaType], bool]:
+        """What the owner's title labels for THIS account say about the library's titles.
+
+        The labels are the ones on the person's page ("Also show / Never show titles labelled …") —
+        the same ones the privacy pass writes into their Plex restriction — and Plex is asked, as the
+        owner, which titles carry each (`PlexClient.items_labelled`). True for an admitted title, False
+        for a hidden one; hidden wins on a title carrying both, as it does in the restriction.
+
+        Empty, at no cost, for an account with no labels — which is nearly everyone. Read once per
+        person, and only in the libraries tonight's rows deliver to.
+
+        A read that FAILS leaves this empty and says so (`title_labels_unreadable`): a row these labels
+        decide is then HELD — carried as it is, not refreshed, its carried picks not judged — and one
+        with nothing to carry is built on the engine's word alone and recorded as built without its
+        labels. See where that flag is read. It cannot show anybody anything: what each account sees
+        is still Plex's decision.
+        """
+        labels = self.ctx.title_labels.get(self.user.plex_account_id)
+        if not labels or not (labels.admit or labels.hide):
+            return {}
+        verdicts: dict[tuple[int, MediaType], bool] = {}
+        try:
+            # Every admit label in every library, THEN every hide label: hidden wins, and must win
+            # whichever library a title's hidden copy happens to be in.
+            for verdict, names in ((True, labels.admit), (False, labels.hide)):
+                for section, name in ((section, name) for section in self.ctx.delivery_sections for name in names):
+                    carrying = self.ctx.plex.items_labelled(section, name)
+                    if carrying is None:
+                        self.title_labels_missing.add(name)
+                        continue
+                    kind = section_kind(section)
+                    index = self.ctx.section_index.get(section.key, {})
+                    by_key = {key: tmdb_id for tmdb_id, key in index.items()}
+                    verdicts.update({(by_key[key], kind): verdict for key in carrying if key in by_key})
+        except Exception as e:
+            self.title_labels_unreadable = True
+            logger.warning(
+                "{}: could not read which titles carry their labels ({}) — tonight their children's rows go "
+                "by the engine alone",
+                self.user.username,
+                type(e).__name__,
+            )
+            return {}
+        # A label Plex does not have at all is a typo, or one not yet put on anything. (Its label choices
+        # are the server's, the same in every library, so "missing" is never about one library.)
+        for name in sorted(self.title_labels_missing):
+            logger.warning(
+                "{}: Plex has no label '{}' — check the spelling on their page against the label in Plex",
+                self.user.username,
+                name,
+            )
+        return verdicts
 
     @cached_property
     def ratings(self) -> RatingsPolicy:
@@ -2796,6 +2911,9 @@ def _build_section_picks(
                 # `exclude` admits an unclassified title (as `_family_admits` does), so it fills as
                 # before; so does `auto` for a household only an engine's counts could have labelled,
                 # since on a cold start there are none.
+                # The owner's "also show" labels are NOT consulted here: the server's top-rated titles
+                # will almost never be the handful they labelled, and a cold row is a placeholder. A
+                # finished title they labelled still leads a rewatch row below (`_rewatch_candidates`).
                 cands = []
             cands = cands[:k]
             rewatches = library_cooling = 0
@@ -2880,11 +2998,23 @@ def _build_section_picks(
             continue
         sec_idx = ctx.section_index.get(section.key, {})
         pct = policy.effective_watched_pct(spec)
+        labelled = _labelled(policy, spec)
+        labels_unreadable = labelled is not None and policy.title_labels_unreadable
         sub = [
             c
             for c in pool_for_row
-            if c.media_type is kind and c.tmdb_id in sec_idx and _family_admits(spec, c, policy.household)
+            if c.media_type is kind and c.tmdb_id in sec_idx and _family_admits(spec, c, policy.household, labelled)
         ]
+        # Where the owner's label and the engine DISAGREED about a title this row could have shown —
+        # the two numbers behind "why is a TV-PG documentary in a child's row?" and its opposite.
+        label_admitted = label_refused = 0
+        if labelled:
+            for c in pool_for_row:
+                verdict = labelled.get((c.tmdb_id, c.media_type))
+                if verdict is None or c.media_type is not kind or c.tmdb_id not in sec_idx:
+                    continue
+                label_admitted += verdict and not c.kids
+                label_refused += c.kids and not verdict
         rewatch_reasons: dict[tuple[int, MediaType], str] = {}
         mentioned = set(engine_view.mentioned)
         if spec.rewatch:
@@ -2969,6 +3099,13 @@ def _build_section_picks(
             # nightly, with no trace. Carried as they are until there is something to replace them with.
         # A children's-title rule is the engine's classification, which can change under a carried pick.
         family_out = family_out | _refused_carried(policy, spec, prior_valid, finished, kind)
+        if labels_unreadable:
+            # The labels could not be read, so which carried picks the owner ADMITTED is unknown — and
+            # an admitted title is by definition one the engine does not call a children's title.
+            # Judged on the engine's word alone it is dropped as a contradiction, and on a full frozen
+            # row it never comes back. Nothing carried is judged tonight; like the genre hold, this does
+            # not guess. (A title the owner HID is hidden from this account by Plex itself.)
+            family_out = set()
         kept_prior = [p for p in prior_valid if (p.tmdb_id, p.media_type) not in family_out]
         family_dropped = len(prior_valid) - len(kept_prior)
         if family_dropped:
@@ -3052,6 +3189,22 @@ def _build_section_picks(
             # "built as a children's row" (`means=only`), and tomorrow nothing would look changed.
             unrecorded_kids_row = not was and spec.family == "auto" and _family_means(spec, policy.household) == "only"
             recipe = "" if unrecorded_kids_row else (was or recipe)
+        if labels_unreadable and prior_valid:
+            # The same hold, for the same reason, on a row the owner's title labels decide: which titles
+            # they admitted could not be read, so a rebuild tonight would be the engine's word alone —
+            # stamped with tonight's recipe, and then carried forward untouched however long the row is
+            # frozen. (Naming a label on a night Plex was away rebuilt the row WITHOUT it, and nothing
+            # ever rebuilt it again.) A refresh would also let go of every carried title tonight's
+            # answer does not vouch for, which is exactly what an admitted title is. So the row is
+            # carried as it is, under the recipe it had, and a settings change made tonight is still
+            # seen as one on the first night the labels can be read.
+            refresh = recipe_changed = False
+            unrecorded_kids_row = not was and spec.family == "auto" and _family_means(spec, policy.household) == "only"
+            recipe = "" if unrecorded_kids_row else (was or recipe)
+        elif labels_unreadable:
+            # Nothing to carry, so the row IS built tonight, on the engine's word alone — and recorded as
+            # built without its labels, so the first night they can be read does not match and rebuilds.
+            recipe = "|".join("labels=unread" if part.startswith("labels=") else part for part in recipe.split("|"))
         # A rebuild night is also when an UNCONFIRMED carried pick goes. The engine answers at most
         # `limit_per_media` titles, so a pick that has since fallen out of that answer is neither
         # confirmed nor contradicted — and on a carry-forward night that is no reason to touch it (a row
@@ -3252,6 +3405,9 @@ def _build_section_picks(
                 # Carried top-up titles dropped because another of this person's rows holds them — the
                 # one reason a frozen watch-it-again row changes, so it has to be sayable.
                 **({"elsewhere_dropped": elsewhere_dropped} if elsewhere_dropped else {}),
+                **({"label_admitted": label_admitted} if label_admitted else {}),
+                **({"label_refused": label_refused} if label_refused else {}),
+                **({"title_labels_unreadable": True} if labels_unreadable else {}),
                 "new": len(new_keys),
                 "refresh_night": due,  # the CADENCE's answer; `decision` says whether we acted on it
                 "rebuild_every_days": refresh_days or None,  # 0 = frozen, never rebuilt
@@ -3650,7 +3806,7 @@ def _run_user(
                 in_library, pool_for_row = pools.in_library, pools.ranked
                 # Read before the cut and before draw-without-replacement: neither narrowing says
                 # anything about what a title IS (`_EngineView`).
-                engine_view = _engine_view(in_library, spec, policy.household)
+                engine_view = _engine_view(in_library, spec, policy.household, _labelled(policy, spec))
                 taste = _taste(pools) if spec.rewatch else set()
                 # A row that overrides the server's release-date weight needs its OWN truncation, not
                 # just its own ordering: the cut decides which candidates a row may select from at all,

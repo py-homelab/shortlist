@@ -124,7 +124,9 @@ export function UserTitleLabels({ user }: { user: User }) {
           {saved && (
             <span className="text-xs text-muted-foreground">
               Shortlist is updating this account&rsquo;s Plex restriction now.
-              Their rows follow on the next run.
+              Their rows follow on the next run: on a child&rsquo;s own account a
+              title you admitted counts as a children&rsquo;s title, and one you hid
+              never does.
             </span>
           )}
         </div>

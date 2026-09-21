@@ -115,6 +115,53 @@ class TestWhatARealServerRecorded:
         assert case["movies_visible"] == 401 + 11
 
 
+class TestWhatARealServerDidWithTheLabelsShortlistWrote:
+    """`pms_share_filter_title_labels.json`: the filters py.10's own privacy pass wrote for a child's
+    profile, and what that profile could then open. The TV half was only expected until this was
+    recorded — a label on a SHOW carries every one of its episodes, in both directions."""
+
+    RECORDED = json.loads((Path(__file__).parents[1] / "fixtures" / "pms_share_filter_title_labels.json").read_text())
+
+    @pytest.mark.parametrize(
+        "kind, field", [("movies_as_account", "filterMovies"), ("shows_as_account", "filterTelevision")]
+    )
+    def test_the_evaluator_these_tests_trust_agrees_with_the_server_title_by_title(self, kind, field):
+        raw = self.RECORDED["filters_as_written"][field].replace("<12 Shortlist_ values>", "Shortlist_someone")
+        for title in self.RECORDED[kind]:
+            item = {"contentRating": {title["rating"]} if title["rating"] else set()}
+            item = with_labels(item, title["label"]) if title["label"] else item
+            opened = title.get("by_key", title.get("show")) == 200
+
+            assert visible_or_binds_tighter(raw, item) is opened, title["title"]
+
+    def test_a_labelled_show_takes_all_its_episodes_with_it_both_ways(self):
+        for show in self.RECORDED["shows_as_account"]:
+            if show["label"] == "KidsAllow":
+                assert (show["allLeaves"], show["episodes_seen"], show["episode_by_key"]) == (
+                    200,
+                    show["episodes"],
+                    200,
+                )
+            if show["label"] == "KidsDeny":
+                assert (show["show"], show["allLeaves"], show["episodes_seen"], show["episode_by_key"]) == (
+                    404,
+                    404,
+                    0,
+                    404,
+                )
+
+    def test_the_planner_writes_that_filter_from_the_one_the_profile_had(self):
+        had = "contentRating=TV-Y%2CTV-Y7%2CTV-Y7-FV|label=Shortlist_me&label!=Shortlist_other"
+
+        planned, ledger = plan(had, admit=("KidsAllow",), hide=("KidsDeny",))
+
+        assert (
+            planned
+            == "contentRating=TV-Y%2CTV-Y7%2CTV-Y7-FV|label=Shortlist_me%2CKidsAllow&label!=Shortlist_other%2CKidsDeny"
+        )
+        assert ledger == (("KidsAllow",), ("KidsDeny",))
+
+
 class TestTheShapePavelAskedFor:
     """A child's profile restricted by rating: Planet Earth II (TV-G, outside the list) let in by hand,
     2001: A Space Odyssey (G, inside it) kept out by hand."""

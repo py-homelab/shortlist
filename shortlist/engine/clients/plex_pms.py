@@ -606,6 +606,9 @@ class PlexClient:
         # every cold user, so a cold-heavy night (a Tautulli outage pushes many users below min_history)
         # otherwise repeats the same search O(cold_users x sections). Keyed (section.key, limit).
         self._top_rated_cache: dict[tuple[str, int], list[tuple[int, object]]] = {}
+        # Per-run memo for `items_labelled`: a label's titles are the same for every account that names it.
+        self._label_keys_cache: dict[str, dict[str, str]] = {}
+        self._labelled_cache: dict[tuple[str, str], frozenset[int] | None] = {}
 
     @property
     def machine_id(self) -> str:
@@ -695,6 +698,50 @@ class PlexClient:
             "library index for '{}': {} of {} items have TMDB ids", section.title, len(index), section.totalSize
         )
         return index
+
+    def items_labelled(self, section: LibrarySection, label: str) -> frozenset[int] | None:
+        """The titles in this library — movies, or SHOWS — that carry the owner's `label`, by ratingKey.
+
+        Recorded on a real PMS (`tests/fixtures/pms_label_listing.json`), because none of it is what
+        one would assume:
+
+        * a section listing carries NO inline ``<Label>`` (and ``includeLabels=1`` adds none), so the
+          library scan cannot answer this — the question has to be put to the server as a filter;
+        * a label that does not exist is a 200 with no rows, by name and by key alike — never an error.
+          So the name is looked up in the section's label choices first (``/library/sections/{id}/label``),
+          and **None** is what "Plex has no such label" comes back as: a typo must not read as "nothing
+          is labelled". The choices are the SERVER's labels, identical in every section, so finding the
+          name there says nothing about this library — the listing does that;
+        * a label on a show matches the show (``type=2``) and none of its episodes (``type=4`` is
+          empty), which is the level rows are built at.
+
+        Matched by the choice's numeric key rather than by name: both work, but a label called "2024"
+        would be read as a key. Memoised for the run — every account naming a label shares one read.
+
+        Raises:
+            Whatever the reads raise. The caller decides what an unreadable label means.
+        """
+        cache_key = (str(section.key), label.casefold())
+        if cache_key in self._labelled_cache:
+            return self._labelled_cache[cache_key]
+        choices = self._label_keys_cache.get(str(section.key))
+        if choices is None:
+            listing = self._server.query(f"/library/sections/{section.key}/label")
+            choices = {
+                (el.attrib.get("title") or "").casefold(): el.attrib["key"]
+                for el in listing.iter("Directory")
+                if el.attrib.get("key")
+            }
+            self._label_keys_cache[str(section.key)] = choices
+        key = choices.get(label.casefold())
+        if key is None:
+            self._labelled_cache[cache_key] = None
+            return None
+        kind = 1 if section.type == "movie" else 2
+        rows = self._server.query(f"/library/sections/{section.key}/all?type={kind}&label={key}")
+        found = frozenset(int(el.attrib["ratingKey"]) for el in rows if el.attrib.get("ratingKey", "").isdigit())
+        self._labelled_cache[cache_key] = found
+        return found
 
     def section_signature(self, section: LibrarySection) -> str | None:
         """A cheap fingerprint of a section's contents for the cross-run index cache — its item count

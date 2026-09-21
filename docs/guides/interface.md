@@ -76,13 +76,16 @@ has two fields:
 Label the titles in Plex as you normally would, name the labels here, and Shortlist writes them into
 that account's restriction straight away — `contentRating=G,PG|label=For Kids`, with your hidden label
 added to the same exclusions that hide other people's rows. For a series, label the SHOW: Plex
-restricts a TV library show by show, and an episode follows its show. (That is measured for ratings;
-for a label it is what we expect and have not yet recorded from a real server, so check one labelled
-show on that profile the first time.) It works for an account that is switched off or paused too.
+restricts a TV library show by show, and an episode follows its show — measured on a real server for
+labels as for ratings: a labelled show outside the ratings opened with every episode, and a hidden
+one inside them was gone with every episode. It works for an account that is switched off or paused
+too.
 
-Their rows follow on the next run with nothing to set, because when Shortlist can read what an
-account is allowed to see, it picks only from that (it cannot for a PIN-protected profile, where Plex
-alone does the hiding).
+Their rows follow on the next run with nothing to set. Where Shortlist can read what an account is
+allowed to see, it picks only from that (it cannot for a PIN-protected profile, where Plex alone does
+the hiding). And on [a child's own account](rows.md#childrens-and-family-titles), whose rows hold
+only children's titles, a title you admitted by label counts as one and a title you hid by label
+never does — so the documentary you labelled for them can be recommended to them, not merely found.
 
 Shortlist keeps a record of exactly which labels it wrote into which restriction. Removing a label
 here takes out what Shortlist added and nothing else: a label that was already in the restriction
