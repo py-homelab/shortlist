@@ -27,15 +27,22 @@ under every grouping the recording allows.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from loguru import logger
 
-from shortlist.engine.models import LABEL_PREFIX, SHARED_LABEL_PREFIX, FilterSnapshot, UserProfile, UserType
+from shortlist.engine.models import (
+    LABEL_PREFIX,
+    SHARED_LABEL_PREFIX,
+    FilterSnapshot,
+    TitleLabels,
+    UserProfile,
+    UserType,
+)
 
 if TYPE_CHECKING:
     from shortlist.engine.clients.plextv import PlexTvClient, PlexTvUser
@@ -650,6 +657,289 @@ def plan_share_filter(
     return current if planned == current else planned
 
 
+class TitleLabelLedger(Protocol):
+    """Where the record of what Shortlist wrote into each account's filter is kept (`TitleLabels.written`)."""
+
+    def save(self, plex_account_id: int, written: dict[str, dict[str, list[str]]]) -> None: ...
+
+
+def _listed(label: str, among: Iterable[str]) -> bool:
+    return any(_same_value(label, other) for other in among)
+
+
+#: The ledger's kinds, per filter field. `hide_copy` is a hide label the owner ALREADY had somewhere
+#: in the filter when Shortlist first wrote it — behind a `|`, say, where Plex ignores it. Shortlist
+#: adds one copy where Plex applies it, and that one copy is all it may ever take back. A plain `hide`
+#: label had no copy anywhere: every standalone copy of it is Shortlist's (the merge can leave two,
+#: see the retire step), and all of them go.
+LEDGER_KINDS = ("admit", "hide", "hide_copy")
+
+
+def plan_title_labels(
+    raw: str,
+    *,
+    admit: Iterable[str] = (),
+    hide: Iterable[str] = (),
+    written: Mapping[str, Iterable[str]] | None = None,
+    own_row_label: str | None = None,
+    label_prefix: str = LABEL_PREFIX,
+) -> tuple[str, dict[str, tuple[str, ...]]]:
+    """Write one account's admit / hide labels into ONE filter field, byte-preserving everything else.
+
+    Run AFTER `plan_share_filter`, on a filter whose excludes already sit where Plex applies them.
+
+    ADMIT goes in as one more alternative in EVERY allow group — `contentRating=G,PG|label=For Kids` —
+    because `&` between two allow conditions is a strict AND (measured: a label in only one of two
+    groups changes nothing). That an OR'd label admits TITLES, not only collections, is recorded too:
+    `contentRating=G|label=recommended` showed 412 movies, the 401 rated G plus the 11 labelled
+    (`tests/fixtures/pms_share_filter_allow_lists.json`). A filter with no allow list hides nothing
+    by rating, so there is nothing to admit a title INTO and it is left alone — writing `label=X`
+    there would create an allow list, hiding the whole library but the labelled titles.
+
+    HIDE goes into the enforced `label!=` clause, beside the row excludes, through the same merge.
+
+    **Whose label is it?** `written_*` is the ledger of what Shortlist put in THIS field. A label the
+    filter already carries that is not in it is the OWNER's — typed into Plex by hand — and is left
+    exactly where it is: never added to, never counted as ours, and above all never removed when the
+    setting goes away. (The converse is deliberate: a copy the owner types in while the label IS
+    listed is indistinguishable from ours, and is treated as ours.) `label=Kids` is the commonest
+    allow list there is; treating it as ours because the owner also named "Kids" here deleted it, and
+    showed a child the whole library.
+
+    Only what the ledger lists comes back out: a written label no longer configured is removed — an
+    admit label from every allow clause, a `hide` label from every exclude clause that stands alone in
+    its `&`-group (never a `|`-joined alternative: the owner's `contentRating=G|label!=Scary` is
+    theirs), and a `hide_copy` label from ONE clause, the last where Plex applies it, and only while
+    the filter still holds a second copy. And where the owner has emptied ONE group of their own
+    allow conditions while another remains (`contentRating=G,PG&label=Shortlist_me,Kids`), a written
+    admit label left alone in it is taken out and re-joined to the group that remains, which is what
+    it was written as.
+
+    **The invariant.** None of that ever takes a field from having an allow list to having none — see
+    the check in the body. It fails closed, and hands the label to the owner.
+
+    Returns:
+        ``(planned, written)`` — the filter (``raw`` itself when nothing changes) and the ledger for
+        this field as it stands after the write, by `LEDGER_KINDS` with empty kinds left out.
+
+    Raises:
+        AmbiguousFilterError, FilterParseError: As `merge_label_excludes`.
+    """
+    admit, hide = tuple(admit), tuple(hide)
+    written = {kind: tuple((written or {}).get(kind, ())) for kind in LEDGER_KINDS}
+    written_admit = written["admit"]
+    if not (admit or hide or any(written.values())):
+        return raw, {}
+    conditions = parse_filter(raw)
+    literal = _literal_ampersand_values(conditions)
+    if literal:
+        raise AmbiguousFilterError(
+            f"{', '.join(repr(unquote(v)) for v in literal)} has an '&' in it, which Plex can't read in a restriction"
+        )
+    _, house_value_sep = _house_style(conditions)
+
+    def allowed_now() -> list[str]:
+        return [v for c in conditions if c.field == "label" and _is_allow(c) for v in c.values]
+
+    # OURS: what the ledger lists. The owner's: what the filter carries that the ledger does not list.
+    # (A listed label the filter no longer carries needs no special case: there is nothing of it to
+    # remove, and it drops off the returned ledger unless tonight's write puts it back.)
+    ours_admit = list(written_admit)
+    owners_admit = [label for label in admit if _listed(label, allowed_now()) and not _listed(label, ours_admit)]
+
+    def is_ours(value: str) -> bool:
+        return _listed(value, ours_admit) or (own_row_label is not None and _same_value(value, own_row_label))
+
+    def owners_allow(condition: FilterCondition) -> bool:
+        return _is_allow(condition) and not all(is_ours(value) for value in condition.values)
+
+    def take_out(these: list[str], *, only_in_emptied_groups: bool) -> None:
+        nonlocal conditions
+        if not these:
+            return
+        for group in reversed(_allow_groups(conditions)):
+            if only_in_emptied_groups and any(owners_allow(conditions[j]) for j in group):
+                continue
+            for j in reversed(group):
+                condition = conditions[j]
+                if condition.field != "label" or not _is_allow(condition):
+                    continue
+                remainder = _without_values(condition, lambda v: _listed(v, these))
+                if remainder is None:
+                    conditions = _drop_condition(conditions, j)
+                elif remainder != condition:
+                    conditions[j] = remainder
+
+    before_admit = list(conditions)
+    take_out([label for label in ours_admit if not _listed(label, admit)], only_in_emptied_groups=False)
+    take_out(ours_admit, only_in_emptied_groups=True)
+
+    def restricts(these: list[FilterCondition]) -> bool:
+        """Whether an allow list is left once this account's own ROW label is set aside — that one the
+        row planner removes by itself the moment nothing else is beside it, so it holds nothing up.
+
+        `own_row_label` is None on a pass that could not enumerate the server's collections, and
+        `label=Shortlist_me,Kids` then looked restricted with Kids gone — until the next night, when
+        the row planner took `Shortlist_me` out too and the child saw the whole library. So on such a
+        pass, and only then, EVERY `shortlist_` label is set aside: which of them is this account's
+        cannot be told. When it can, the others count — the row planner never removes a sibling's or
+        a shared row's label, so `label=Shortlist_shared_x` is an allow list that stays, and setting
+        it aside made a label written beside it impossible to take back out."""
+
+        def aside(value: str) -> bool:
+            if own_row_label is not None:
+                return _same_value(value, own_row_label)
+            return _is_ours(value, label_prefix)
+
+        return any(_is_allow(c) and not all(aside(v) for v in c.values) for c in these)
+
+    if restricts(before_admit) and not restricts(conditions):
+        # THE INVARIANT: planning title labels never takes a field from having an allow list to having
+        # none. `label=Shortlist_me,Kids` with Kids in the ledger is what Plex Web leaves when an owner
+        # clears the ratings and keeps the labels its form shows — and it is ALSO, character for
+        # character, an owner saying "allow only Kids". Removing our label there deletes the last
+        # allow list and shows a child the whole library; leaving it shows them only the labelled
+        # titles, which the owner can see and fix. So it fails CLOSED: the filter is left exactly as
+        # it is, and the label stops being listed as ours — from here on it is the owner's.
+        logger.warning(
+            "a title label Shortlist wrote is the only allow list left in this restriction — left in place "
+            "and treated as the owner's from now on, rather than removed to show everything"
+        )
+        conditions = before_admit
+        owners_admit = [label for label in admit if _listed(label, allowed_now())]
+    for label in admit:
+        if _listed(label, owners_admit):
+            continue  # the owner allows it already, in their own way; theirs to arrange
+        for group in reversed(_allow_groups(conditions)):
+            if not any(owners_allow(conditions[j]) for j in group):
+                continue
+            clauses = [j for j in group if conditions[j].field == "label" and _is_allow(conditions[j])]
+            if any(_same_value(value, label) for j in clauses for value in conditions[j].values):
+                continue
+            encoded = quote(label, safe="")
+            if not clauses:
+                conditions.insert(group[-1] + 1, FilterCondition("label", "=", (encoded,), sep="|"))
+                continue
+            condition = conditions[clauses[0]]
+            existing = condition._padded_seps()
+            fill = condition.value_seps[-1] if condition.value_seps else house_value_sep
+            grown = (*condition.values, encoded)
+            conditions[clauses[0]] = replace(
+                condition, values=grown, value_seps=existing + (fill,) * (len(grown) - 1 - len(existing))
+            )
+    now_admit = tuple(label for label in admit if not _listed(label, owners_admit) and _listed(label, allowed_now()))
+
+    # HIDE. Whose is a copy that is already there? Decided ONCE, the first time a label is written:
+    # no copy anywhere -> wholly ours (`hide`); a copy of the owner's somewhere Plex does not apply it
+    # -> we add ONE where it does (`hide_copy`); a copy where Plex applies it -> the owner's, untouched.
+    def excluded_anywhere() -> list[str]:
+        return [v for c in conditions if _is_exclude(c) for v in c.values]
+
+    ours_whole, ours_copy = list(written["hide"]), list(written["hide_copy"])
+    enforced = _enforced_exclude_values(conditions)
+    newly = [label for label in hide if not _listed(label, ours_whole) and not _listed(label, ours_copy)]
+    owners_hide = [label for label in newly if _listed(label, enforced)]
+    beside_owners = [label for label in newly if not _listed(label, enforced) and _listed(label, excluded_anywhere())]
+
+    retire_whole = [label for label in ours_whole if not _listed(label, hide)]
+    retire_copy = [label for label in ours_copy if not _listed(label, hide)]
+    if retire_whole:
+        # From every exclude clause that STANDS ALONE in its `&`-group — not only the enforced one.
+        # Shortlist writes a hide label into the first enforced `label!=` clause, which is often the
+        # owner's own leading one (`label!=Family,…,Kids&contentRating=G`). The day that person gets a
+        # row, an own-row `|` appears later in the filter, that leading clause stops counting as
+        # enforced, and the merge writes a second copy at the end. Retiring only the enforced copy left
+        # the first one in the owner's clause for ever, hiding titles no setting explains. A clause that
+        # is a `|`-joined ALTERNATIVE is never touched: `contentRating=G|label!=Scary` is the owner's.
+        alone = {group[0] for group in _allow_groups(conditions) if len(group) == 1}
+        for j in sorted(alone, reverse=True):
+            if not _is_exclude(conditions[j]):
+                continue
+            remainder = _without_values(conditions[j], lambda v: _listed(v, retire_whole))
+            if remainder is None:
+                conditions = _drop_condition(conditions, j)  # its own `&`-group, so nothing regroups
+            elif remainder != conditions[j]:
+                conditions[j] = remainder
+    if retire_copy:
+        # ONE copy per label — the LAST one where Plex applies it, which is the one Shortlist added: it
+        # goes in only because the owner's own copy sat ahead of a `|`, so ours is always the later of
+        # the two. "Every enforced copy" was wrong: the owner's `label!=Scary&contentRating=G` is
+        # unenforced only while OUR own-row `|` follows it, so the night that person's row goes both
+        # copies are enforced, and un-ticking the label then deleted the one the owner typed.
+        #
+        # And only while there ARE two. A save in Plex's own form rewrites the restriction from what the
+        # form shows — each label once — so it can fold the owner's copy and ours into one clause.
+        # Taking "ours" back then deleted the only exclusion there was, one the owner had before
+        # Shortlist. A single copy is left where it is and stops being listed: the owner's from now on.
+        positions = _enforced_positions(conditions)
+        pending = [
+            label
+            for label in retire_copy
+            if sum(1 for c in conditions if _is_exclude(c) and _listed(label, c.values)) >= 2
+        ]
+        for j in range(len(conditions) - 1, -1, -1):
+            if not pending or not (positions[j] and _is_exclude(conditions[j])):
+                continue
+            here = [label for label in pending if _listed(label, conditions[j].values)]
+            if not here:
+                continue
+            pending = [label for label in pending if label not in here]
+            remainder = _without_values(conditions[j], lambda v, here=here: _listed(v, here))
+            if remainder is None:
+                conditions = _drop_condition(conditions, j)
+            else:
+                conditions[j] = remainder
+    planned = serialize_filter(conditions)
+    wanted_hide = [label for label in hide if not _listed(label, owners_hide)]
+    if wanted_hide:
+        planned = merge_label_excludes(planned, {quote(label, safe="") for label in wanted_hide})
+    a_copy = [*ours_copy, *beside_owners]
+    now = {
+        "admit": now_admit,
+        "hide": tuple(label for label in wanted_hide if not _listed(label, a_copy)),
+        "hide_copy": tuple(label for label in wanted_hide if _listed(label, a_copy)),
+    }
+    return (raw if planned == raw else planned), {kind: labels for kind, labels in now.items() if labels}
+
+
+def plan_account_filter(
+    current: str,
+    wanted: set[str],
+    *,
+    own_row_label: str | None,
+    show: bool,
+    admit: Iterable[str] = (),
+    hide: Iterable[str] = (),
+    written: Mapping[str, Iterable[str]] | None = None,
+    label_prefix: str = LABEL_PREFIX,
+) -> tuple[str, dict[str, tuple[str, ...]]]:
+    """Everything one account's filter FIELD should carry, settled in ONE write: its own rows admitted,
+    everyone else's excluded (`plan_share_filter`), and the owner's title labels (`plan_title_labels`).
+
+    Repeated until neither planner changes anything, because each can undo a precondition of the
+    other. The row planner keeps our row label in any group that still holds an allow value it does
+    not recognise as its own — and a written admit label is one. So in a group the owner has emptied
+    (Plex Web re-saves what its form shows) it takes the title planner to remove the admit label
+    first, and a second look from the row planner to see that nothing of the owner's is left. One pass
+    would leave `label=Shortlist_me` standing alone: the whole library hidden from that person until
+    the next night. The row planner itself is left exactly as it was.
+
+    Returns ``(planned, written)`` as `plan_title_labels` does.
+    """
+    admit, hide = tuple(admit), tuple(hide)
+    ledger: Mapping[str, Iterable[str]] = dict(written or {})
+    planned = current
+    for _ in range(_PLAN_PASSES):
+        rows = plan_share_filter(planned, wanted, own_row_label=own_row_label, show=show, label_prefix=label_prefix)
+        titled, ledger = plan_title_labels(
+            rows, admit=admit, hide=hide, written=ledger, own_row_label=own_row_label, label_prefix=label_prefix
+        )
+        if titled == planned:
+            break
+        planned = titled
+    return (current if planned == current else planned), {kind: tuple(v) for kind, v in ledger.items() if tuple(v)}
+
+
 def shortlist_labels_in(raw: str, label_prefix: str) -> set[str]:
     """Return the shortlist-owned labels currently excluded in a filter string.
 
@@ -765,6 +1055,13 @@ def sync_user_restrictions(
     # {field: why} filled with every field Plex itself cannot read; that field is skipped and the rest
     # written. None raises `AmbiguousFilterError` instead.
     refused: dict[str, str] | None = None,
+    # The owner's admit / hide labels for THIS account, and where to record which of them Shortlist
+    # wrote. Passed in by account rather than read off `user`: a privacy-only pass builds stub profiles
+    # for the whole audience, and a label the owner set has to reach those too — and a disabled or
+    # paused account, which no profile is ever built for. Without a ledger nothing is written: a label
+    # nobody recorded writing is one nobody could safely take back out.
+    labels: TitleLabels | None = None,
+    ledger: TitleLabelLedger | None = None,
     dry_run: bool = False,
 ) -> dict[str, tuple[str, str]] | None:
     """Merge the desired shortlist excludes into one user's share filters.
@@ -967,12 +1264,23 @@ def sync_user_restrictions(
     admit_label = own_label or own_row_label
     if own_label is None and not collections_known:
         admit_label = None
+    if ledger is None:
+        labels = None
+    labels = labels or TitleLabels()
+    written_now: dict[str, dict[str, list[str]]] = {}
     desired_fields = {}
     for fieldname in RESTRICTED_FILTER_FIELDS:
         current = remote.filters[fieldname]
         try:
-            merged = plan_share_filter(
-                current, wanted, own_row_label=admit_label, show=own_label is not None, label_prefix=label_prefix
+            merged, wrote = plan_account_filter(
+                current,
+                wanted,
+                own_row_label=admit_label,
+                show=own_label is not None,
+                admit=labels.admit,
+                hide=labels.hide,
+                written=labels.written.get(fieldname),
+                label_prefix=label_prefix,
             )
         except AmbiguousFilterError as e:
             # Per field: the other one may be perfectly readable, and leaving it unwritten would promote
@@ -980,13 +1288,29 @@ def sync_user_restrictions(
             if refused is None:
                 raise
             refused[fieldname] = str(e)
+            # Untouched tonight, so whatever was recorded for it still stands.
+            kept = {kind: list(labels.written_in(fieldname, kind)) for kind in LEDGER_KINDS}
+            if any(kept.values()):
+                written_now[fieldname] = {kind: values for kind, values in kept.items() if values}
             continue
+        if wrote:
+            written_now[fieldname] = {kind: list(values) for kind, values in wrote.items()}
         if prunable:
             merged = remove_label_excludes(merged, prunable)
         if merged != current:
             desired_fields[fieldname] = merged
 
+    ledger_was = {
+        fieldname: {kind: list(values) for kind, values in kinds.items() if values}
+        for fieldname, kinds in labels.written.items()
+        if any(kinds.values())
+    }
+    ledger_changed = ledger is not None and written_now != ledger_was
     if not desired_fields:
+        if ledger_changed and not dry_run:
+            # Nothing to write, but the record moved: a label the owner retired that the filter no
+            # longer held (a save in Plex Web wipes what we wrote) stops being listed as ours.
+            ledger.save(user.plex_account_id, written_now)
         return None
 
     if snapshots.get(user.plex_account_id) is None:
@@ -1003,18 +1327,64 @@ def sync_user_restrictions(
             logger.info("{}: snapshot persisted before first restriction write", user.username)
 
     diff = {k: (remote.filters[k], v) for k, v in desired_fields.items()}
+    # What changed for their TITLES, in words. The filter summary only knows Shortlist's own row
+    # labels, so a write that changed what a child can see read as "filterMovies rewritten".
+    titles = _summarise_ledger_change(ledger_was, written_now)
+    summary = summarise_filter_diff(diff, label_prefix) + (f"; {titles}" if titles else "")
     if dry_run:
-        logger.info("[dry-run] {}: would merge filters — {}", user.username, summarise_filter_diff(diff, label_prefix))
+        logger.info("[dry-run] {}: would merge filters — {}", user.username, summary)
         return diff
 
+    if ledger_changed:
+        # AHEAD of the write, like the snapshot — and as the UNION of what was listed and what is about
+        # to be. A write that lands with no record behind it is a label that looks like the owner's for
+        # ever and can never be taken back out, and that is true in BOTH directions: a label being
+        # added must be listed before it lands, and a label being retired must STAY listed until it has
+        # actually left (plex.tv refusing the write, or a restart between these two lines, left it in
+        # the filter with nothing listing it). Listing too much costs nothing — a listed label the
+        # filter does not carry drops off on the next pass.
+        ledger.save(user.plex_account_id, _ledger_union(ledger_was, written_now))
     plextv.update_user_filters(user.plex_account_id, desired_fields)
+    if ledger_changed and _ledger_union(ledger_was, written_now) != written_now:
+        ledger.save(user.plex_account_id, written_now)
     # Verification is NOT done per-user here: each read-back was a full GET /api/users, so on a night
     # that writes A accounts it cost A full-roster fetches (~O(A²)). The caller instead reads the roster
     # ONCE after all writes and verifies every written account's shortlist excludes persisted, still
     # strictly before any promotion — see the batched read-back at the end of _privacy_sync_phase in
     # pipeline.py (plex-safety rule 1).
-    logger.info("{}: filters merged — {}", user.username, summarise_filter_diff(diff, label_prefix))
+    logger.info("{}: filters merged — {}", user.username, summary)
     return diff
+
+
+def _ledger_union(was: dict, now: dict) -> dict[str, dict[str, list[str]]]:
+    """Every label either record lists, per field and kind — what is safe to have on file while a
+    write is in flight. A label that changes kind keeps the kind it HAD: the filter still holds it that
+    way if the write never lands."""
+    union: dict[str, dict[str, list[str]]] = {}
+    for fieldname in (*was, *(f for f in now if f not in was)):
+        listed: list[str] = []
+        for record in (was, now):
+            for kind in LEDGER_KINDS:
+                for label in record.get(fieldname, {}).get(kind, []):
+                    if not _listed(label, listed):
+                        listed.append(label)
+                        union.setdefault(fieldname, {}).setdefault(kind, []).append(label)
+    return union
+
+
+def _summarise_ledger_change(was: dict, now: dict) -> str:
+    """ "also shows 'For Kids'; no longer hides 'Scary'" — the owner's title labels this write added or took out."""
+    words = {("admit", True): "also shows", ("admit", False): "no longer shows", ("hide", True): "hides",
+             ("hide", False): "no longer hides"}  # fmt: skip
+    parts = []
+    for kind, stored in (("admit", ("admit",)), ("hide", ("hide", "hide_copy"))):
+        before = {label.casefold(): label for kinds in was.values() for k in stored for label in kinds.get(k, [])}
+        after = {label.casefold(): label for kinds in now.values() for k in stored for label in kinds.get(k, [])}
+        for added, labels in ((True, after.keys() - before.keys()), (False, before.keys() - after.keys())):
+            if labels:
+                names = ", ".join(repr({**before, **after}[key]) for key in sorted(labels))
+                parts.append(f"{words[(kind, added)]} titles labelled {names}")
+    return "; ".join(parts)
 
 
 def clear_our_excludes(

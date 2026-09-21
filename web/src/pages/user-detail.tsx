@@ -11,6 +11,7 @@ import { BlockedSeedsList } from "@/components/user-detail/blocked-seeds";
 import { RecentRuns } from "@/components/user-detail/recent-runs";
 import { UserDetailHeader } from "@/components/user-detail/user-detail-header";
 import { UserHousehold } from "@/components/user-detail/user-household";
+import { UserTitleLabels } from "@/components/user-detail/user-title-labels";
 import { UserNickname } from "@/components/user-detail/user-nickname";
 import { UserRowsSection } from "@/components/user-detail/user-row-card";
 import { UserSharing } from "@/components/user-detail/user-sharing";
@@ -119,6 +120,7 @@ export function UserDetailBody({ user }: { user: User }) {
           <section className="space-y-3">
             <SectionHeading>Plex sharing</SectionHeading>
             <UserSharing user={user} />
+            <UserTitleLabels user={user} />
           </section>
 
           <section className="space-y-3">

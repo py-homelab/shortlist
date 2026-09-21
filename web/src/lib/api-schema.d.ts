@@ -5503,10 +5503,14 @@ export interface components {
         };
         /** UserPrefs */
         UserPrefs: {
+            /** Admit Labels */
+            admit_labels?: string[] | null;
             /** Blocked Seeds */
             blocked_seeds?: (number | components["schemas"]["BlockSeedBody"])[] | null;
             /** Excluded Genres */
             excluded_genres?: string[] | null;
+            /** Hide Labels */
+            hide_labels?: string[] | null;
             /** Household */
             household?: ("auto" | "adult" | "family" | "kids") | null;
             /** Paused */

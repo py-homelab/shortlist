@@ -3886,6 +3886,32 @@ class TestAFirstRowIsHiddenAsSoonAsItsPersonIsDelivered:
         mock_plextv.update_user_filters.assert_not_called()
         assert report.filter_writes[100]["fields"]["filterMovies"][1] == "label!=Shortlist_mike"
 
+    def test_the_early_merge_never_plans_the_owners_title_labels(self, ctx: EngineContext, mock_plextv):
+        """Additive by contract, and it runs once per NEW PERSON — so with title labels it would retire,
+        re-plan and save the record several times in one run, each from the same snapshot of it, and
+        the last save would erase what the first wrote: a label Shortlist added, recorded as nobody's,
+        that no setting could ever take back out. The end-of-run pass is the one place a run plans them."""
+        from shortlist.engine.models import TitleLabels
+
+        class _Record:
+            saved: ClassVar[list] = []
+
+            def save(self, account_id, written):
+                self.saved.append((account_id, written))
+
+        mock_plextv.users = [plextv_user(100, "sarah", filters={"filterMovies": "contentRating=G"})]
+        ctx.title_labels = {100: TitleLabels(admit=("For Kids",), hide=("Scary",))}
+        ctx.title_label_ledger = _Record()
+        report = pipeline_mod.RunReport(started_at=datetime.now(UTC))
+
+        pipeline_mod._exclude_first_rows(
+            ctx, [make_profile("mike", account_id=200)], {"mike": "Shortlist_mike"}, report, who="mike"
+        )
+
+        written = mock_plextv.update_user_filters.call_args.args[1]["filterMovies"]
+        assert written == "contentRating=G&label!=Shortlist_mike"
+        assert _Record.saved == []
+
     def test_an_account_left_alone_gets_no_early_exclude(self, ctx: EngineContext, mock_plextv):
         """ "Leave this account's Plex sharing alone" (#92): the end-of-run pass REMOVES our excludes from it,
         so writing one early would flip its filter twice a night."""
@@ -6811,3 +6837,29 @@ class TestShelfSequence:
             ("anchor", "Recently Added Movies"),
             ("rows", {21}),
         ]
+
+
+class TestEveryPrivacyPassSeesTheLabels:
+    """`privacy.sync` — the pass the settings page queues, and the one that runs every half hour — is
+    `run(ctx, [])`: no users, so every account is a stub profile built from the roster. Labels riding
+    on a `UserProfile` reached only a nightly run's enabled, unpaused people, while the page that set
+    them said "Shortlist is updating this account's Plex restriction now"."""
+
+    def test_a_pass_with_no_users_writes_a_disabled_accounts_labels(self, ctx, mock_plextv):
+        from shortlist.engine.models import TitleLabels
+        from tests.unit.test_privacy_title_labels import ADMIT, HIDE, _Ledger
+
+        order: list[str] = []
+        ledger = _Ledger(order)
+        mock_plextv.users = [plextv_user(400, "kids", filters={"filterMovies": "contentRating=G%2CPG"})]
+        mock_plextv.update_user_filters.side_effect = lambda _id, fields: mock_plextv.users[0].filters.update(fields)
+        ctx.title_labels = {400: TitleLabels(admit=(ADMIT,), hide=(HIDE,))}
+        ctx.title_label_ledger = ledger
+        ctx.known_slugs = {400: "kids"}
+        ctx.disabled_account_ids = {400}
+
+        pipeline_mod.run(ctx, [])
+
+        written = mock_plextv.users[0].filters["filterMovies"]
+        assert "label=Hand%20Picked" in written and "Not%20For%20Kids" in written, written
+        assert ledger.saved[400]["filterMovies"] == {"admit": [ADMIT], "hide": [HIDE]}

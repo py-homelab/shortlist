@@ -1547,3 +1547,117 @@ def test_the_family_thresholds_are_validated(client: TestClient):
     assert client.put("/api/settings", json={"values": ok}).status_code == 200
     for bad in ({"family.min_share": 1.5}, {"family.min_kids_titles": 0}, {"family.kids_account_share": -1}):
         assert client.put("/api/settings", json={"values": bad}).status_code == 422
+
+
+class TestTitleLabels:
+    """The owner's own admit / hide labels for one account (`prefs.admit_labels` / `hide_labels`)."""
+
+    @pytest.fixture
+    def queued(self, monkeypatch):
+        from shortlist.server.api import users as users_api
+
+        reasons: list[str] = []
+
+        async def fake_queue(state, reason):
+            reasons.append(reason)
+
+        monkeypatch.setattr(users_api.jobs, "queue_privacy_sync", fake_queue)
+        return reasons
+
+    def _uid(self, client) -> int:
+        return client.get("/api/users").json()[0]["id"]
+
+    def _prefs(self, client, uid: int) -> dict:
+        return next(u for u in client.get("/api/users").json() if u["id"] == uid)["prefs"]
+
+    def test_they_are_stored_tidied_and_applied_without_waiting_for_the_schedule(self, client, queued):
+        uid = self._uid(client)
+
+        r = client.patch(
+            f"/api/users/{uid}",
+            json={"prefs": {"admit_labels": [" For   Kids ", "for kids", ""], "hide_labels": ["Not For Kids"]}},
+        )
+
+        assert r.status_code == 200
+        prefs = self._prefs(client, uid)
+        assert (prefs["admit_labels"], prefs["hide_labels"]) == (["For Kids"], ["Not For Kids"])
+        assert len(queued) == 1 and "labels" in queued[0]
+
+    def test_sending_the_same_labels_again_queues_nothing(self, client, queued):
+        """Queued on a CHANGE, not on a mention: the card's Save sends both lists every time."""
+        uid = self._uid(client)
+        client.patch(f"/api/users/{uid}", json={"prefs": {"admit_labels": ["For Kids"], "hide_labels": []}})
+        queued.clear()
+
+        client.patch(f"/api/users/{uid}", json={"prefs": {"admit_labels": ["For Kids"], "hide_labels": []}})
+
+        assert queued == []
+
+    def test_taking_a_label_away_queues_the_pass_that_takes_it_out(self, client, queued):
+        uid = self._uid(client)
+        client.patch(f"/api/users/{uid}", json={"prefs": {"admit_labels": ["For Kids"]}})
+        queued.clear()
+
+        client.patch(f"/api/users/{uid}", json={"prefs": {"admit_labels": None}})
+
+        assert len(queued) == 1 and "admit_labels" not in self._prefs(client, uid)
+
+    def test_the_record_of_what_shortlist_wrote_cannot_be_set_from_outside(self, client, queued):
+        """It decides which labels may be REMOVED from someone's Plex restriction, so it is the privacy
+        pass's to write and nobody else's."""
+        uid = self._uid(client)
+
+        client.patch(
+            f"/api/users/{uid}",
+            json={"prefs": {"written_title_labels": {"filterMovies": {"admit": ["Kids"]}}, "admit_labels": ["Nature"]}},
+        )
+
+        # Unknown to the model, so it is dropped — and it would not count if it were not: the record
+        # lives in a column of its own that no PATCH can reach (`users.title_labels_written`).
+        assert "written_title_labels" not in self._prefs(client, uid)
+        with client.app.state.sessions() as session:
+            assert session.get(User, uid).title_labels_written is None
+
+    def test_an_unrelated_change_queues_nothing(self, client, queued):
+        uid = self._uid(client)
+        client.patch(f"/api/users/{uid}", json={"prefs": {"admit_labels": ["For Kids"]}})
+        queued.clear()
+
+        client.patch(f"/api/users/{uid}", json={"prefs": {"household": "kids"}})
+
+        assert queued == []
+
+    @pytest.mark.parametrize(
+        ("labels", "says"),
+        [
+            (["Rock & Roll"], "can't be used as a label"),  # a raw `&` makes Plex answer Home with a 500
+            (["a|b"], "can't be used as a label"),
+            (["a,b"], "can't be used as a label"),
+            (["x" * 65], "can't be used as a label"),
+            (["shortlist_sarah"], "Shortlist's own row labels"),
+            (["Shortlist"], "Shortlist's own row labels"),
+            ([f"l{i}" for i in range(11)], "ten labels at most"),
+        ],
+    )
+    def test_a_label_the_filter_could_not_carry_is_refused(self, client, queued, labels, says):
+        r = client.patch(f"/api/users/{self._uid(client)}", json={"prefs": {"admit_labels": labels}})
+
+        assert r.status_code == 422 and says in r.text
+        assert queued == []
+
+    def test_one_label_cannot_both_show_and_hide(self, client, queued):
+        r = client.patch(
+            f"/api/users/{self._uid(client)}", json={"prefs": {"admit_labels": ["Mixed"], "hide_labels": ["mixed"]}}
+        )
+
+        assert r.status_code == 422 and "both show and hide" in r.text
+
+    def test_nor_across_two_requests(self, client, queued):
+        """The model only sees one request; the collision is with what is already stored."""
+        uid = self._uid(client)
+        client.patch(f"/api/users/{uid}", json={"prefs": {"admit_labels": ["Mixed"]}})
+
+        r = client.patch(f"/api/users/{uid}", json={"prefs": {"hide_labels": ["mixed"]}})
+
+        assert r.status_code == 422 and "both show and hide" in r.text
+        assert "hide_labels" not in self._prefs(client, uid)

@@ -620,6 +620,10 @@ def _exclude_first_rows(
                     ctx.config.hide_shared_from_disabled and user.plex_account_id in ctx.disabled_account_ids
                 ),
                 refused={},
+                # NO title labels here. This early pass is additive by contract, and it runs once per new
+                # person — so with labels it would retire, re-plan and save the ledger several times in
+                # one run from the same snapshot of it, and the last save would erase what the first
+                # recorded. The end-of-run pass is the one place a run plans them.
                 dry_run=ctx.config.dry_run,
             )
         except FilterWriteRefused:
@@ -1028,6 +1032,8 @@ def _privacy_sync_phase(
                     ctx.config.hide_shared_from_disabled and user.plex_account_id in ctx.disabled_account_ids
                 ),
                 refused=refused,
+                labels=ctx.title_labels.get(user.plex_account_id),
+                ledger=ctx.title_label_ledger,
                 dry_run=ctx.config.dry_run,
             )
             if refused:

@@ -165,6 +165,47 @@ class TestBuildContext:
         assert ctx.unmanaged_account_ids == {102}
         assert ctx.disabled_account_ids == {103}
 
+    def test_title_labels_reach_the_engine_for_every_account_with_the_ledger_to_record_them(
+        self, service, configured, sessions
+    ):
+        """The one link between what the owner typed on a person's page and the pass that writes it.
+
+        By account and for EVERYONE — switched off, paused, never run — because the privacy pass
+        builds stub profiles for the whole audience and mostly runs with no users at all. The first
+        version put the labels on the run's `UserProfile`s, so a child's profile that was not enabled
+        never got them and the half-hourly pass wrote none, while the page said "updating now"."""
+        from shortlist.server.db.adapters import DbTitleLabelLedger
+
+        with sessions() as session:
+            session.add_all(
+                [
+                    User(
+                        plex_account_id=201,
+                        username="kids",
+                        slug="kids",
+                        enabled=False,
+                        prefs={"admit_labels": ["For Kids"]},
+                        title_labels_written={"filterMovies": {"admit": ["For Kids"]}},
+                    ),
+                    User(
+                        plex_account_id=202,
+                        username="paused",
+                        slug="paused",
+                        prefs={"paused": True, "hide_labels": ["Scary"]},
+                    ),
+                    User(plex_account_id=203, username="plain", slug="plain", enabled=True),
+                ]
+            )
+            session.commit()
+
+        ctx = service.build_context(dry_run=True)
+
+        assert set(ctx.title_labels) == {201, 202}
+        assert ctx.title_labels[201].admit == ("For Kids",)
+        assert ctx.title_labels[201].written_in("filterMovies", "admit") == ("For Kids",)
+        assert ctx.title_labels[202].hide == ("Scary",)
+        assert isinstance(ctx.title_label_ledger, DbTitleLabelLedger)
+
     def test_plex_only_skips_the_clients_a_label_walk_never_touches(self, service, configured, monkeypatch):
         """The reconciles, the pause/disable handlers and the watch sync only ever walk collections
         under a label — but every one of them opened Trakt, Exa, MDBList, the LLM curator and the

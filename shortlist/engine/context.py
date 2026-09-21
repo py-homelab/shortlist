@@ -24,8 +24,8 @@ from shortlist.engine.clients.tmdb import Cache, NullCache, TmdbClient
 from shortlist.engine.clients.trakt import TraktClient
 from shortlist.engine.curator import Curator
 from shortlist.engine.history import HistorySource
-from shortlist.engine.models import EngineConfig, Pick, UserProfile, UserRunReport, WrittenDetails
-from shortlist.engine.privacy import SnapshotStore
+from shortlist.engine.models import EngineConfig, Pick, TitleLabels, UserProfile, UserRunReport, WrittenDetails
+from shortlist.engine.privacy import SnapshotStore, TitleLabelLedger
 from shortlist.engine.recommender import Recommender
 from shortlist.engine.recommenders.builtin import BuiltinRecommender
 from shortlist.engine.seasons import SeasonTitles
@@ -99,6 +99,14 @@ class EngineContext:
     # and the account can therefore see other people's rows unless their own Plex restrictions stop it.
     # The two combine freely: an account can have a row and untouched sharing.
     unmanaged_account_ids: set[int] = field(default_factory=set)
+    # The owner's hand-applied admit / hide labels, by Plex account id, for EVERY account Shortlist
+    # knows — enabled or not, paused or not — and where what gets written is recorded. By account
+    # rather than on `UserProfile` because the privacy pass that applies them builds its own stub
+    # profiles for the whole audience (`pipeline._server_audience`), and mostly runs with no users at
+    # all (`privacy.sync` is `run(ctx, [])`): labels riding on a profile reached only a nightly run's
+    # enabled, unpaused people, and the page that set them said "updating now". No ledger, no writes.
+    title_labels: dict[int, TitleLabels] = field(default_factory=dict)
+    title_label_ledger: TitleLabelLedger | None = None
     # section key -> {tmdb_id: ratingKey}: per-library index so a row delivered into a specific
     # library uses that library's ratingKeys. Built by _build_indexes each run.
     section_index: dict[str, dict[int, int]] = field(default_factory=dict)

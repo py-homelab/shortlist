@@ -205,11 +205,13 @@ CATALOG: tuple[JobKind, ...] = (
             "people's rows out of sight. That filter is the whole privacy system: each account is "
             "told to ignore the label Shortlist puts on everybody else's collections."
             "\n\nIt builds no rows, delivers nothing, puts nothing on anyone's Home screen and deletes "
-            "nothing, so the worst it can do to who-sees-what is make your server more private — which "
-            "is why it is safe to press at any time."
+            "nothing, so it is safe to press at any time. It shows somebody more only where you asked it "
+            "to: a title you labelled for them on their own page, their own row under an allow list of "
+            "yours, or — for an account you told Shortlist to leave alone — other people's rows, which "
+            "is what leaving it alone means."
             "\n\nIt does NOT move your rows around the Recommended shelf — the nightly run does that, "
-            "and so does Check and fix rows on Plex. This pass only ever changes who can see a row, "
-            "never where it sits."
+            "and so does Check and fix rows on Plex. This pass changes who can see what, never where a "
+            "row sits."
             "\n\nRuns every 30 minutes by default. It reads the list of accounts from Plex each time, "
             "so someone you have just shared your server with stops seeing other people's rows within "
             "half an hour. A pass that changes nothing is not listed under Recent."
@@ -494,8 +496,19 @@ async def queue_privacy_sync(state, reason: str) -> None:
     alone"), the pass REMOVES our per-person excludes from that one account instead of merging into it
     (`pipeline._leave_sharing_alone`). That widens what that account sees, by request. It stays handler-safe
     because it creates and promotes nothing — no row becomes visible that was not already on the server — and it
-    touches nobody else's filter, so every other account still excludes that person's row. Anything else that
-    widens visibility needs its own argument; rule 1 does not cover it.
+    touches nobody else's filter, so every other account still excludes that person's row.
+
+    A SECOND, bounded the same way: the owner's own title labels (`privacy.plan_title_labels`). An ADMIT
+    label shows one account titles its rating allow list hid, and taking a HIDE label away shows it
+    titles that label kept out. Both widen — by request, of that one account only, and of nothing but
+    LIBRARY TITLES carrying a label the owner named for it on its own page: no row, nobody else's
+    filter, and never past an exclude that stands on its own (the label is an alternative inside an
+    ALLOW group; an exclude the owner OR-joined INTO an allow group is part of that group). Only what
+    the ledger records Shortlist writing is ever removed, so a label that was in the restriction before
+    Shortlist first wrote it cannot be taken out from under it (one the owner types in AFTERWARDS,
+    while it is still listed, counts as Shortlist's) — and the last allow list in a field never is.
+
+    Anything else that widens visibility needs its own argument; rule 1 does not cover it.
     """
     enqueue(state.sessions, "privacy.sync", {"reason": reason})
     await drain_now(state, reason)
@@ -1089,8 +1102,19 @@ def _privacy_sync(state, payload: dict) -> dict:
     alone"), the pass REMOVES our per-person excludes from that one account instead of merging into it
     (`pipeline._leave_sharing_alone`). That widens what that account sees, by request. It stays handler-safe
     because it creates and promotes nothing — no row becomes visible that was not already on the server — and it
-    touches nobody else's filter, so every other account still excludes that person's row. Anything else that
-    widens visibility needs its own argument; rule 1 does not cover it.
+    touches nobody else's filter, so every other account still excludes that person's row.
+
+    A SECOND, bounded the same way: the owner's own title labels (`privacy.plan_title_labels`). An ADMIT
+    label shows one account titles its rating allow list hid, and taking a HIDE label away shows it
+    titles that label kept out. Both widen — by request, of that one account only, and of nothing but
+    LIBRARY TITLES carrying a label the owner named for it on its own page: no row, nobody else's
+    filter, and never past an exclude that stands on its own (the label is an alternative inside an
+    ALLOW group; an exclude the owner OR-joined INTO an allow group is part of that group). Only what
+    the ledger records Shortlist writing is ever removed, so a label that was in the restriction before
+    Shortlist first wrote it cannot be taken out from under it (one the owner types in AFTERWARDS,
+    while it is still listed, counts as Shortlist's) — and the last allow list in a field never is.
+
+    Anything else that widens visibility needs its own argument; rule 1 does not cover it.
 
     It writes NOTHING to Plex beyond the share filters. It used to also move our hubs on the
     Recommended shelf — added 2026-08-12 so a shelf left in pieces could be repaired by a job rather

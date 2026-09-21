@@ -6,6 +6,30 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.10] - 2026-09-21 (py-homelab fork)
+
+### Added
+
+- **Titles picked by hand, for an account you restrict by rating.** A rating says a title is safe, not
+  that it is for them: a child's profile allowed TV-Y7 gets a cooking competition rated TV-Y7 and
+  never the nature documentary rated TV-G. Each person's page now has **Also show titles labelled …**
+  and **Never show titles labelled …**. Label titles in Plex, name the labels there, and Shortlist
+  writes them into that account's Plex restriction — the admit label as one more alternative in every
+  allow group (`contentRating=G,PG|label=For Kids`), the hide label beside the exclusions that hide
+  other people's rows — on the privacy pass the page queues, for any account, switched on or not.
+  Shortlist records exactly which labels it wrote into which restriction, so removing one takes out
+  what it added and nothing else: a label that was already in the restriction when you first named
+  it (`label=Kids` as your own allow list) is left exactly where it is and is never removed, while a
+  label Shortlist is on record as writing stays Shortlist's for as long as it is named. Rows follow on the next run with nothing to
+  configure, because where Shortlist can read what an account may see, it picks only from that. This
+  also means the restriction never has to be edited in Plex, where a save drops every exclusion
+  Shortlist has written to that account until the next privacy pass. An account with no rating
+  restriction is never given an allow list, the last allow list in a restriction is never removed
+  (a label left as the only one becomes yours, rather than being taken out to show everything), and
+  an admit label never gets past an exclusion that stands on its own (`…&contentRating!=R`). Adds
+  migration 0097 (`users.title_labels_written`, a nullable column): the record of what Shortlist
+  wrote is kept apart from the settings a PATCH rewrites, so neither save can overwrite the other.
+
 ## [1.9.1-py.9] - 2026-09-21 (py-homelab fork)
 
 ### Fixed

@@ -41,15 +41,17 @@ from shortlist.engine.models import (
     PosterSpec,
     RowOverride,
     RowSpec,
+    TitleLabels,
     UserProfile,
     UserType,
     WrittenDetails,
     is_human_rating,
 )
+from shortlist.engine.privacy import LEDGER_KINDS
 from shortlist.engine.recommender import Recommender
 from shortlist.engine.recommenders import BuiltinRecommender, FallbackRecommender, HttpRecommender
 from shortlist.engine.rows import row_shown_today
-from shortlist.server.db.adapters import DbCache, DbSnapshotStore
+from shortlist.server.db.adapters import DbCache, DbSnapshotStore, DbTitleLabelLedger
 from shortlist.server.db.models import (
     DEFAULT_SLUG,
     Collection,
@@ -305,6 +307,21 @@ def _merge_watched_copies(rows: list[WatchedTitle]) -> dict:
     }
 
 
+def _title_labels(prefs: dict, ledger: dict | None = None) -> TitleLabels:
+    """The owner's admit / hide labels for one account (`prefs`), and the record of what Shortlist
+    wrote (`users.title_labels_written`)."""
+
+    def listed(value) -> tuple[str, ...]:
+        return tuple(str(v) for v in value if isinstance(v, str) and v.strip()) if isinstance(value, list) else ()
+
+    written = {
+        fieldname: {kind: listed(kinds.get(kind)) for kind in LEDGER_KINDS}
+        for fieldname, kinds in (ledger.items() if isinstance(ledger, dict) else ())
+        if isinstance(kinds, dict)
+    }
+    return TitleLabels(admit=listed(prefs.get("admit_labels")), hide=listed(prefs.get("hide_labels")), written=written)
+
+
 class ContextBuilder:
     """Builds an EngineContext and user profiles from DB settings — the engine's server adapter."""
 
@@ -382,6 +399,12 @@ class ContextBuilder:
             unmanaged_account_ids = {
                 u.plex_account_id for u in session.query(User).filter_by(manage_sharing=False).all()
             }
+            # Every account, enabled or not: see `EngineContext.title_labels`.
+            title_labels = {
+                u.plex_account_id: labels
+                for u in session.query(User).all()
+                if (labels := _title_labels(u.prefs or {}, u.title_labels_written))
+            }
             concurrency = int(store.get("run.concurrency") or 1)
             # Every user Shortlist knows, enabled or not: the engine answers "whose row is this?"
             # by account id, because a name can change and two names can slugify alike.
@@ -452,6 +475,8 @@ class ContextBuilder:
                 token_for_user=lambda profile, _history=history: _history._token_for(profile),
                 disabled_account_ids=disabled_account_ids,
                 unmanaged_account_ids=unmanaged_account_ids,
+                title_labels=title_labels,
+                title_label_ledger=DbTitleLabelLedger(self._sessions),
                 known_slugs=known_slugs,
                 departed_slugs=departed_slugs,
                 owner_slug=owner_slug,

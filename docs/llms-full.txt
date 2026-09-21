@@ -420,6 +420,65 @@ depth just for them. Opening a person shows their recent watch history (distinct
 and episode numbers for TV), their picks grouped by row (long lists collapse behind a "show more"),
 and a **Run now** button to rebuild just that person.
 
+### Titles picked by hand, for an account you restrict by rating
+
+A rating says a title is _safe_; it does not say it is _for them_. A child's profile allowed G and
+TV-Y7 still gets a cooking competition and a Korean drama that happen to carry those ratings, and
+never gets the nature documentary rated one step above. So each person's **Settings → Plex sharing**
+has two fields:
+
+- **Also show titles labelled …** — a title carrying that Plex label is shown though its rating is
+  outside what the account is allowed. It only gets past the account's _allow_ lists: a rule that
+  excludes something outright and stands on its own (`…&contentRating!=R`, the form Plex's own page
+  writes) still applies, and a title carrying both kinds of label stays hidden. The one exception is
+  an exclusion joined to an allow list with OR (`contentRating!=R|label=Kids`, which only a
+  hand-written restriction has): that is part of the allow list, so a labelled title gets past it too.
+- **Never show titles labelled …** — a title carrying that label is hidden though its rating is
+  allowed.
+
+Label the titles in Plex as you normally would, name the labels here, and Shortlist writes them into
+that account's restriction straight away — `contentRating=G,PG|label=For Kids`, with your hidden label
+added to the same exclusions that hide other people's rows. For a series, label the SHOW: Plex
+restricts a TV library show by show, and an episode follows its show. (That is measured for ratings;
+for a label it is what we expect and have not yet recorded from a real server, so check one labelled
+show on that profile the first time.) It works for an account that is switched off or paused too.
+
+Their rows follow on the next run with nothing to set, because when Shortlist can read what an
+account is allowed to see, it picks only from that (it cannot for a PIN-protected profile, where Plex
+alone does the hiding).
+
+Shortlist keeps a record of exactly which labels it wrote into which restriction. Removing a label
+here takes out what Shortlist added and nothing else: a label that was already in the restriction
+when you first named it here — `label=Kids` as an allow list of your own, say — is yours, is left
+exactly where it is, and is never removed. The other way round does not hold: a label Shortlist is on
+record as having written stays Shortlist's for as long as you name it here. Type that same label
+into the restriction yourself afterwards, or re-save the restriction in Plex (which turns Shortlist's
+"rating OR label" into "rating AND label"), and Shortlist still treats it as its own — it puts it
+back as an alternative beside the ratings, and takes it out when you remove it here. To take a label
+over by hand, remove it here first, let the privacy pass run, and then add it in Plex.
+
+A "never show" label you already had somewhere in the restriction gets one extra copy from Shortlist,
+placed where Plex applies it, and removing the label here takes back that one copy. If a save in Plex
+has folded the two into one by then, Shortlist leaves it alone — it is yours from then on, and you
+remove it in Plex if you no longer want it.
+
+Set them here rather than in Plex's own restriction form, for two reasons. That form can only combine a
+label list with a rating list as "both", which hides everything you have not labelled. And saving it
+rewrites the whole restriction from what the form shows, which **drops every exclusion Shortlist has
+written to that account** — until the next privacy pass (within half an hour) that account can see
+other people's rows by name. If you do change a rating there, run **Privacy sync** from the Jobs page
+straight after.
+
+"Also show" does nothing for an account with no allow list — it already sees everything, and
+Shortlist will not create one where you have none. Nor will it ever remove the last one: if you clear
+the ratings in Plex and the restriction is left as nothing but the labels, Shortlist leaves it exactly
+so — that account sees only the labelled titles, which you can see and change — and treats the label
+as yours from then on, rather than take it out and show that account everything. Neither field is written for the server
+owner (Plex never restricts that account), for an account on a built-in Plex restriction preset
+(Plex refuses label rules while one is applied), or for an account whose sharing Shortlist leaves
+alone (below) — and switching an account to "leave alone" leaves any labels already written where
+they are, like the rest of its restriction.
+
 ### Leaving someone's Plex sharing alone
 
 To keep their own row private, Shortlist adds `label!=` exclusions to every other account's Plex
@@ -2610,7 +2669,7 @@ POST /api/setup/probe · POST /api/setup/link · GET/PUT /api/setup/state
 ## Users
 
 ```
-GET  /api/users · PATCH /api/users/{id} {enabled?, manage_sharing?, prefs?} (`prefs.household`: auto|adult|family|kids overrides who watches under the account; `household` on GET is what the last run decided: {label, source, kids_titles, window_titles, window_days, engine_label}) — a `prefs` key sent as `null` CLEARS that preference. Only the keys actually present are touched: an omitted key keeps its stored value, so a partial write cannot wipe the rest. · DELETE /api/users/{id} (only for someone plex.tv no longer lists: drops their picks and run history and hides them from the list; keeps the users row and their pre-Shortlist share-filter snapshot, which uninstall restores from — 409 for anyone still on the share) · POST /api/users/sync (shared + Home users from plex.tv, plus the server owner, whom that list never returns)
+GET  /api/users · PATCH /api/users/{id} {enabled?, manage_sharing?, prefs?} (`prefs.household`: auto|adult|family|kids overrides who watches under the account; `prefs.admit_labels` / `prefs.hide_labels`: up to ten of the owner's own Plex labels each — a title carrying an admit label is shown though its rating is outside the account's allow list, one carrying a hide label is hidden though it is inside; written into the account's share filter by the privacy pass, which this PATCH queues; letters, digits, spaces and `. _ ' -` only, never a `shortlist_` label, and no label in both; which of them Shortlist itself wrote into which filter field is recorded apart from `prefs` (`users.title_labels_written`, not readable or settable here), and those are the only labels it ever removes; `household` on GET is what the last run decided: {label, source, kids_titles, window_titles, window_days, engine_label}) — a `prefs` key sent as `null` CLEARS that preference. Only the keys actually present are touched: an omitted key keeps its stored value, so a partial write cannot wipe the rest. · DELETE /api/users/{id} (only for someone plex.tv no longer lists: drops their picks and run history and hides them from the list; keeps the users row and their pre-Shortlist share-filter snapshot, which uninstall restores from — 409 for anyone still on the share) · POST /api/users/sync (shared + Home users from plex.tv, plus the server owner, whom that list never returns)
 POST /api/users/set-enabled {enabled} (bulk enable/disable every user at once)
 ```
 

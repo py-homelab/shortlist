@@ -85,6 +85,26 @@ class DbSnapshotStore:
             session.commit()
 
 
+class DbTitleLabelLedger:
+    """Engine `TitleLabelLedger` over ``users.title_labels_written``.
+
+    What Shortlist itself wrote into each account's share filter, per field — the only record that
+    tells a label Shortlist added from one the owner typed into Plex (`engine.models.TitleLabels`). A
+    column of its own and never a key in ``prefs``: see the model, and migration 0097.
+    """
+
+    def __init__(self, session_factory: sessionmaker[Session]):
+        self._sessions = session_factory
+
+    def save(self, plex_account_id: int, written: dict[str, dict[str, list[str]]]) -> None:
+        with self._sessions() as session:
+            user = session.query(User).filter_by(plex_account_id=plex_account_id).one_or_none()
+            if user is None:
+                return  # an account Shortlist has no row for has no settings, so nothing was written
+            user.title_labels_written = written or None
+            session.commit()
+
+
 class DbCache:
     """Engine TMDB cache over the caches table."""
 
