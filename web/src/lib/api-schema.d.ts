@@ -5179,6 +5179,8 @@ export interface components {
             dry_run: boolean;
             /** From User Id */
             from_user_id?: number | null;
+            /** Ratings */
+            ratings?: string[] | null;
             /** To User Id */
             to_user_id: number;
         };
@@ -5201,6 +5203,16 @@ export interface components {
             events_copied: number;
             /** Failed */
             failed: number;
+            /** Hidden From Target */
+            hidden_from_target: number;
+            /** In The Way */
+            in_the_way: string[];
+            /** Kept */
+            kept: number;
+            /** Kept Preview */
+            kept_preview: string[];
+            /** Left Out */
+            left_out: number;
             /** Marks */
             marks: number;
             /** Offsets Cleared */
@@ -5209,8 +5221,22 @@ export interface components {
             offsets_set: number;
             /** Planned */
             planned: number;
+            /** Ratings */
+            ratings: string[];
+            /** Ratings Kept */
+            ratings_kept: {
+                [key: string]: number;
+            };
+            /** Ratings Seen */
+            ratings_seen: {
+                [key: string]: number;
+            };
+            /** Refused */
+            refused: string;
             /** Removals Preview */
             removals_preview: string[];
+            /** Residue Cleared */
+            residue_cleared: number;
             /** Shows Cleared */
             shows_cleared: number;
             /** Snapshot Id */

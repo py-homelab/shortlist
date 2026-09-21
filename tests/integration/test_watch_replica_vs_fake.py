@@ -319,3 +319,227 @@ class TestReplicatingOverRealHttp:
         op = WriteOp(kind=OpKind.MARK, rating_key=999_999_999, media_type="movie", view_count=1, scrobbles=1)
 
         assert client.apply_watch_op(op, TARGET_TOKEN) is False
+
+
+@pytest.fixture
+def db(tmp_path):
+    from shortlist.server.db.models import User
+    from shortlist.server.db.session import make_engine, make_session_factory, run_migrations
+
+    run_migrations(tmp_path)
+    engine = make_engine(tmp_path)
+    sessions = make_session_factory(engine)
+    with sessions() as session:
+        # The fake files the owner's plays under its LOCAL PMS account id, as a real server does.
+        session.add(User(id=1, plex_account_id=1, username="steve", slug="steve", user_type="owner"))
+        session.add(User(id=2, plex_account_id=TARGET_ACCOUNT, username="kids", slug="kids", user_type="managed"))
+        session.commit()
+    yield sessions
+    engine.dispose()
+
+
+class TestACopyNarrowedByRatingOverRealHttp:
+    """The children's-profile copy: the real SERVICE, the real client, and a PMS that really restricts
+    the target.
+
+    The unit suite hands the service a set of hidden keys. Here the hiding is the fake PMS applying the
+    profile's `contentRating` share filters to a batch read made AS the target — the recorded behaviour
+    (`pms_share_filter_allow_lists.json`) — and the ratings arrive as attributes on the leaf rows, the
+    way the real parser has to find them. Nothing about the narrowing is re-implemented here: an
+    earlier version of this class computed it by hand and so never ran `_narrow` at all.
+    """
+
+    KIDS = ("G", "TV-Y")
+    OTHER_SHOW = 302
+
+    def _household(self, state, episodes):
+        """Four films (two G, one R, one unrated), a TV-Y show the profile may see, and a second show
+        whose EPISODES say TV-Y while the show itself is TV-14 — which is what Plex restricts on."""
+        state.item(101).content_rating = "G"
+        state.item(102).content_rating = "R"
+        state.item(103).content_rating = "G"
+        state.item(104).content_rating = ""  # Plex holds no rating for it
+        state.item(SHOW_KEY).content_rating = "TV-Y"
+        state.item(self.OTHER_SHOW).content_rating = "TV-14"
+        hidden_episodes = _add_episodes(state, self.OTHER_SHOW, 2)
+        for key in (*episodes, *hidden_episodes):
+            state.item(key).content_rating = "TV-Y"
+        for key in (101, 102, 103, 104, *episodes[:2], *hidden_episodes):
+            state.leaf(1, key)[0] = 1
+        kids = state.users[TARGET_ACCOUNT]
+        kids.filters["filterMovies"] = "contentRating=G"
+        kids.filters["filterTelevision"] = "contentRating=TV-Y"
+        # The owner's play log, where the R-rated play sits right beside the G-rated ones. (The seed
+        # also gives the owner eight unrated films, 109-116, which is why "" counts nine below.)
+        state.history.extend(FakeHistoryEntry(1, key, 1_600_000_000 + key) for key in (101, 102, 103))
+        return hidden_episodes
+
+    def _copy(self, db, client, **kw):
+        from shortlist.server.services.watching_account import transfer_watch_history
+
+        with db() as session:
+            report = transfer_watch_history(
+                session,
+                sessions=db,
+                from_user_id=1,
+                to_user_id=2,
+                plex=client,
+                source_token=OWNER_TOKEN,
+                target_token=TARGET_TOKEN,
+                ratings=list(self.KIDS),
+                **kw,
+            )
+            session.commit()
+        return report
+
+    def _landed(self, state, keys):
+        return {k for k in keys if state.leaf_view(TARGET_ACCOUNT, k)[0]}
+
+    def test_only_the_childrens_titles_the_profile_can_see_land(self, pms, db):
+        state, client, episodes = pms
+        hidden = self._household(state, episodes)
+
+        report = self._copy(db, client)
+
+        assert self._landed(state, (101, 102, 103, 104, *episodes, *hidden)) == {101, 103, *episodes[:2]}
+        assert (report.kept, report.unreachable, report.failed, report.verify_mismatched) == (4, 0, 0, 0)
+
+    def test_episodes_under_a_show_the_profile_cannot_see_stay_behind(self, pms, db):
+        """Rated TV-Y episode by episode, inside the list — and the SHOW is TV-14, which is what the
+        profile's restriction hides. Asked about the show, Plex says no, and both are left out; asked
+        about nothing, they would be written to an account that can never see them."""
+        state, client, episodes = pms
+        hidden = self._household(state, episodes)
+
+        report = self._copy(db, client)
+
+        assert self._landed(state, hidden) == set()
+        assert report.hidden_from_target == 2
+        assert report.ratings_seen == {"": 9, "TV-Y": 4, "G": 2, "R": 1}
+        assert report.ratings_kept == {"G": 2, "TV-Y": 2}
+
+    def test_shortlists_own_history_for_the_profile_holds_no_adult_play(self, pms, db):
+        """Read from the PMS's real history endpoint, where the R-rated play sits right beside the
+        G-rated one under the same account."""
+        from shortlist.server.db.models import WatchEvent
+
+        state, client, episodes = pms
+        self._household(state, episodes)
+
+        self._copy(db, client)
+
+        with db() as session:
+            copied = {e.rating_key for e in session.query(WatchEvent).filter_by(plex_account_id=TARGET_ACCOUNT)}
+        assert copied == {101, 103, *episodes[:2]}
+
+    def test_a_preview_writes_nothing_and_shows_the_same_split(self, pms, db):
+        state, client, episodes = pms
+        hidden = self._household(state, episodes)
+
+        report = self._copy(db, client, dry_run=True)
+
+        assert self._landed(state, (101, 102, 103, 104, *episodes, *hidden)) == set()
+        assert (report.kept, report.left_out, report.hidden_from_target) == (4, 12, 2)
+        assert report.kept_preview == sorted([state.item(101).title, state.item(103).title, state.item(SHOW_KEY).title])
+
+
+class TestTheFakeAnswersAByKeyTvReadTheWayARealServerDid:
+    """`tests/fixtures/pms_share_filter_tv_by_key.json`, replayed against the fake (rule 11: a fixture
+    nothing reads is documentation).
+
+    The narrowed copy and every restricted person's rows both ask "which of these can this account
+    see?" with one by-key read. For SHOWS and EPISODES under a `filterTelevision` rating allow list,
+    that was an assumption until it was measured on 2026-09-20 — the fake extrapolated it from the
+    movie recording. Each assertion below is one recorded fact, read off the fixture rather than
+    restated, so the fake cannot be made easier than the server without this failing.
+    """
+
+    @staticmethod
+    def _recorded() -> dict:
+        import json
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "fixtures" / "pms_share_filter_tv_by_key.json"
+        return json.loads(path.read_text())
+
+    def _world(self, state, episodes):
+        """The recorded six keys, built in the fake with the recorded ratings and the recorded filters."""
+        recorded = self._recorded()
+        ratings = {name: spec["contentRating"] for name, spec in recorded["keys"].items()}
+        other_show = 302
+        out_episodes = _add_episodes(state, other_show, 1)
+        keys = {
+            "show_in": SHOW_KEY,
+            "show_out": other_show,
+            "episode_in": episodes[0],
+            "episode_out": out_episodes[0],
+            "movie_in": 101,
+            "movie_out": 102,
+        }
+        for name, key in keys.items():
+            state.item(key).content_rating = ratings[name]
+        account = state.users[TARGET_ACCOUNT]
+        account.filters["filterMovies"] = recorded["account"]["filterMovies"]
+        account.filters["filterTelevision"] = recorded["account"]["filterTelevision"]
+        return recorded, keys
+
+    def test_a_batch_leaves_out_the_hidden_show_and_the_episode_under_it(self, pms):
+        state, client, episodes = pms
+        recorded, keys = self._world(state, episodes)
+
+        seen = client.visible_to(TARGET_TOKEN, list(keys.values()))
+
+        assert {name for name, key in keys.items() if key in seen} == set(
+            recorded["read_as_account"]["all_six"]["present"]
+        )
+
+    def test_the_admin_sees_all_six(self, pms):
+        state, client, episodes = pms
+        recorded, keys = self._world(state, episodes)
+
+        assert len(client.visible_to(OWNER_TOKEN, list(keys.values()))) == recorded["read_as_admin"]["all_six"]["size"]
+
+    def test_a_batch_of_only_hidden_keys_is_a_404_which_reads_as_none_visible(self, pms):
+        import httpx
+
+        state, client, episodes = pms
+        recorded, keys = self._world(state, episodes)
+        hidden = [keys[name] for name in recorded["read_as_account"]["all_six"]["absent"]]
+
+        raw = httpx.get(
+            f"{client._server._baseurl}/library/metadata/{','.join(map(str, hidden))}",
+            headers={"X-Plex-Token": TARGET_TOKEN, "Accept": "application/json"},
+        )
+
+        assert raw.status_code == recorded["read_as_account"]["batch_of_only_hidden"]["status"]
+        assert client.visible_to(TARGET_TOKEN, hidden) == set()
+
+    def test_an_episode_rated_inside_the_list_is_still_hidden_under_a_show_that_is_not(self, pms):
+        """The tree is closed at the show (its /children and /allLeaves were 404), so an episode cannot
+        be visible under a show that is not — whatever rating the episode itself carries."""
+        state, client, episodes = pms
+        _, keys = self._world(state, episodes)
+        state.item(keys["episode_out"]).content_rating = "TV-Y"
+
+        assert client.visible_to(TARGET_TOKEN, [keys["episode_out"], keys["episode_in"]]) == {keys["episode_in"]}
+
+    def test_order_does_not_matter(self, pms):
+        state, client, episodes = pms
+        _, keys = self._world(state, episodes)
+
+        assert client.visible_to(TARGET_TOKEN, [keys["show_out"], keys["episode_out"], keys["show_in"]]) == {
+            keys["show_in"]
+        }
+
+    def test_asking_about_the_show_gives_the_answer_asking_about_the_episode_would(self, pms):
+        """Conclusion 4 — what lets the narrowed copy ask one question per show."""
+        state, client, episodes = pms
+        _, keys = self._world(state, episodes)
+
+        by_show = client.visible_to(TARGET_TOKEN, [keys["show_in"], keys["show_out"]])
+        by_episode = client.visible_to(TARGET_TOKEN, [keys["episode_in"], keys["episode_out"]])
+
+        assert (keys["show_in"] in by_show, keys["show_out"] in by_show) == (
+            keys["episode_in"] in by_episode,
+            keys["episode_out"] in by_episode,
+        )

@@ -66,6 +66,25 @@ class TestReadingWatchState:
         assert state.items[60632].view_offset_ms == 490509
 
     @respx.mock
+    @pytest.mark.parametrize("rated_read", ["watched", "in_progress"])
+    def test_a_rewatch_in_progress_keeps_its_rating_and_its_shows_name(self, mock_plex: PlexClient, rated_read):
+        """A children's episode being REWATCHED is in both reads, and the merge builds a new item from
+        the two. Dropping `contentRating` there reads it as unrated, and a copy narrowed by rating
+        then leaves it behind without a word — the title a child is most likely to be half-way through.
+        Whichever read carried the attribute, it has to survive."""
+        mock_plex._server.url.return_value = SHOWS_URL
+        extra = 'contentRating="TV-Y" grandparentTitle="Bluey"'
+        row = '<Video ratingKey="7" type="episode" title="Hospital" {state} {extra}/>'
+        watched = row.format(state='viewCount="2"', extra=extra if rated_read == "watched" else "")
+        partial = row.format(state='viewOffset="90000"', extra=extra if rated_read == "in_progress" else "")
+        route_for(SHOWS_URL, container(watched), container(partial))
+
+        item = mock_plex.read_watch_state([("2", MediaType.SHOW)], "TARGET-TOKEN").items[7]
+
+        assert (item.content_rating, item.show_title) == ("TV-Y", "Bluey")
+        assert (item.view_count, item.view_offset_ms) == (2, 90000)
+
+    @respx.mock
     def test_the_merge_does_not_depend_on_which_read_ran_first(self, mock_plex: PlexClient):
         """Same two rows, swapped between the reads. Overwriting rather than merging would keep
         whichever landed last, so this is the assertion that pins the direction-independence."""
@@ -362,6 +381,33 @@ class TestTheRecordedResponses:
 
         assert root.get("size") == "0"
         assert list(root) == []
+
+    @respx.mock
+    def test_a_real_episode_read_carries_its_content_rating_and_its_shows_name(self, mock_plex: PlexClient):
+        """What lets a copy be narrowed by rating for free: the rating is on the rows this read already
+        fetches, so no second metadata read per title is needed. Plex's own rating, not TMDB's —
+        Plex's is the one its parental restrictions act on."""
+        mock_plex._server.url.return_value = SHOWS_URL
+        route_for(SHOWS_URL, self._fixture("pms_watched_episodes"), container())
+
+        state = mock_plex.read_watch_state([("2", MediaType.SHOW)], "TOKEN")
+
+        assert {item.content_rating for item in state.items.values()} == {"TV-14", "TV-MA"}
+        assert {item.show_title for item in state.items.values()} == {"#TextMeWhenYouGetHome", "3 Body Problem"}
+
+    @respx.mock
+    def test_a_real_movie_plex_holds_no_rating_for_reads_as_unrated_not_as_a_guess(self, mock_plex: PlexClient):
+        """One of the three recorded films has no `contentRating` at all. It must read as "" — the
+        narrowing treats that as "never copy", and any default here would put it on a child's profile."""
+        mock_plex._server.url.return_value = MOVIES_URL
+        route_for(MOVIES_URL, container(), self._fixture("pms_in_progress_movies"))
+
+        state = mock_plex.read_watch_state([("1", MediaType.MOVIE)], "TOKEN")
+
+        by_title = {item.title: item.content_rating for item in state.items.values()}
+        assert by_title["10 Cloverfield Lane"] == "PG-13"
+        assert by_title["752 Is Not a Number"] == ""
+        assert all(item.show_title == "" for item in state.items.values())
 
 
 class TestTheOwnersTokenNeverReachesTheUrl:

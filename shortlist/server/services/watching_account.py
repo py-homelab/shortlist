@@ -22,6 +22,15 @@ source account, and `shortlist.engine.watch_replica` turns two states into an or
 repairs an account the old version spoiled. That makes this the one path in Shortlist that can delete
 watch history, so it snapshots first (rule 2) and `undo_transfer` restores from that snapshot.
 
+**A narrowed copy** (`ratings=`). A household leaving one shared account for two profiles wants the
+children's profile to receive the children's titles out of that history, not all of it. The copy is
+then made from the part of the source Plex rates inside the list AND the target can see
+(`watch_replica.scope_to_ratings`) — and the SAME narrowing is applied to the play log, which is read
+separately from the state and would otherwise pour every adult watch into the child's Shortlist
+history while Plex looked exactly right. It never changes what is already on the account: the mirror
+removes what its source lacks, so narrowing the source onto an account with watching of its own would
+un-mark everything that person watched themselves — and such a copy is refused instead.
+
 **The date problem, and why `source_viewed_at` still exists.** Plex has no way to backdate a watch —
 every write is stamped `now`, and no endpoint accepts a date. So the true dates are kept on our side:
 `source_viewed_at` per cached title, and the source's own play-log rows copied into `watch_events`.
@@ -31,6 +40,7 @@ target's Continue Watching sort the way the source's does.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -40,10 +50,14 @@ from sqlalchemy.orm import Session
 
 from shortlist.engine.models import MediaType, UserType
 from shortlist.engine.watch_replica import (
+    OFFSET_TOLERANCE_MS,
     OpKind,
     WatchState,
     build_plan,
+    names_of,
+    ratings_seen,
     removals_by_title,
+    scope_to_ratings,
     summarise,
 )
 from shortlist.server.db.models import User, WatchedTitle, WatchEvent, WatchStateSnapshot, utcnow
@@ -96,6 +110,38 @@ class TransferReport:
     #: match" is success and this is the copy being impossible — collapsing the two into one bare 0 is
     #: what made the setup wizard silently useless (#88).
     source_empty: bool = False
+    #: The content ratings this copy was narrowed to, [] for a copy of everything. On the report — and
+    #: so on the audit row — because "copied 400 titles" means something else entirely when 9,000
+    #: were deliberately left behind (rule 10).
+    ratings: list[str] = field(default_factory=list)
+    #: A narrowed copy only. How many leaves the whole source holds under each rating, "" = unrated:
+    #: the owner is choosing a list of ratings, and this is what there is to choose from.
+    ratings_seen: dict[str, int] = field(default_factory=dict)
+    #: The same count over what the narrowed copy KEEPS. Against `ratings_seen` it shows a wrong list
+    #: before anything is written: a rating that is missing, or one the target's own restrictions
+    #: hide most of.
+    ratings_kept: dict[str, int] = field(default_factory=dict)
+    #: A narrowed copy only. Leaves kept, leaves left behind, and — counted apart, because it is
+    #: Plex's verdict rather than the owner's — leaves rated inside the list that the target cannot
+    #: see, which are left behind too.
+    kept: int = 0
+    left_out: int = 0
+    hidden_from_target: int = 0
+    #: What a narrowed copy would carry, by name, capped — the thing to read before saying yes.
+    kept_preview: list[str] = field(default_factory=list)
+    #: Why this copy was REFUSED, "" when it was not. A result rather than an exception because the
+    #: job queue retries whatever raises, and a refusal is the same answer every time. Nothing was
+    #: written, under dry run or not.
+    refused: str = ""
+    #: When refused: the watching on that account the copy would have removed or overwritten, by
+    #: name, capped.
+    in_the_way: list[str] = field(default_factory=list)
+    #: A narrowed copy only. Shortlist-side rows an EARLIER copy left for titles this one does not
+    #: carry — copied play events, and cached titles pinned by a copied date — removed so they stop
+    #: feeding that account's seeds (under a dry run: how many WOULD be). Plex is not involved: the
+    #: refusal above has already established that nothing outside the narrowed history is on the
+    #: account, as far as that account can be read.
+    residue_cleared: int = 0
     errors: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -118,6 +164,16 @@ class TransferReport:
             "snapshot_id": self.snapshot_id,
             "dry_run": self.dry_run,
             "source_empty": self.source_empty,
+            "ratings": self.ratings,
+            "ratings_seen": self.ratings_seen,
+            "ratings_kept": self.ratings_kept,
+            "kept": self.kept,
+            "left_out": self.left_out,
+            "hidden_from_target": self.hidden_from_target,
+            "kept_preview": self.kept_preview,
+            "refused": self.refused,
+            "in_the_way": self.in_the_way,
+            "residue_cleared": self.residue_cleared,
             "errors": self.errors,
         }
 
@@ -243,6 +299,7 @@ def transfer_watch_history(
     target_token: str,
     dry_run: bool = False,
     job_id: int | None = None,
+    ratings: Sequence[str] | None = None,
 ) -> TransferReport:
     """Make the target account's watch state match the source's, exactly.
 
@@ -264,9 +321,12 @@ def transfer_watch_history(
             protect (rule 8).
         job_id: The job this runs under, so an undo can find this transfer's snapshot rather than the
             newest one.
+        ratings: Narrow the copy to leaves Plex rates one of these AND the target can see; None copies
+            everything. A narrowed copy is refused (`TransferReport.refused`, nothing written) when it
+            would remove or overwrite anything already on the target — see `_in_the_way`.
 
     Returns:
-        A `TransferReport`.
+        A `TransferReport`. Check `refused` before reading anything else off it.
 
     Raises:
         LookupError: Either user is unknown.
@@ -298,7 +358,37 @@ def transfer_watch_history(
     # then partial, and an undo restoring from a partial snapshot would remove watches it never
     # recorded — so it is flagged here and `undo_transfer` refuses to act on it.
     report.target_unreadable = list(target_state.unreadable)
+
+    # Everything below this line sees ONLY the narrowed state: the plan, the show clears, the copied
+    # play log and the verify pass. Rebinding the one name is deliberate — a second variable would be
+    # a standing invitation for one of those four to read the whole history instead, and the play log
+    # doing so is invisible from Plex's side (it looks exactly right) while the child's Shortlist
+    # history fills with every adult watch.
+    only: set[int] | None = None
+    if ratings is not None:
+        source_state = _narrow(plex, source_state, ratings, target_token, report)
+        only = set(source_state.items)
+        blocking = _in_the_way(source_state, target_state)
+        if blocking.items:
+            report.refused = _REFUSAL.format(count=len(blocking.items))
+            report.in_the_way = names_of(blocking, limit=REMOVAL_PREVIEW)
+            logger.warning(
+                "watch replication {} -> {} REFUSED, nothing written: {}",
+                source_user.username,
+                target_user.username,
+                report.refused,
+            )
+            return report
+
     plan = build_plan(source_state, target_state)
+    if only is not None and any(op.kind in _REMOVALS for op in plan):
+        # Cannot happen — `_in_the_way` asks the same planner about every leaf on the target — and is
+        # checked anyway, here where the writes start, because this is the one promise a narrowed
+        # copy makes and the cost of being wrong about it is somebody's watch history.
+        report.refused = "this copy would have removed watching from that account, which a narrowed copy never does"
+        report.in_the_way = removals_by_title(plan, limit=REMOVAL_PREVIEW)
+        logger.error("watch replication REFUSED at the plan: {} removal(s) survived the guard", len(report.in_the_way))
+        return report
     report.planned = len(plan)
     counts = summarise(plan)
     report.marks = counts[OpKind.MARK.value]
@@ -339,8 +429,14 @@ def transfer_watch_history(
     # rather than skipped, because a preview that omits them understates what a real run does.
     _clear_emptied_shows(plex, plan, source_state, target_token, report, dry_run=dry_run)
 
+    if only is not None:
+        # Counted under a dry run too: a preview that leaves out something the real run deletes
+        # understates it, which is the one thing a preview must not do.
+        report.residue_cleared = _clear_residue(
+            session, target_user, source_state, target_state.unreadable, dry_run=dry_run
+        )
     if not dry_run:
-        report.events_copied = _copy_play_events(session, source_user, target_user, plex, source_state)
+        report.events_copied = _copy_play_events(session, source_user, target_user, plex, source_state, only)
         # Flushed so `stamp_true_dates` can read the events this transfer just wrote — it queries the
         # table rather than the in-memory list, precisely so `WatchSync` can re-run it later.
         session.flush()
@@ -362,6 +458,133 @@ def transfer_watch_history(
         dry_run,
     )
     return report
+
+
+def _narrow(plex, whole: WatchState, ratings: Sequence[str], target_token: str, report: TransferReport) -> WatchState:
+    """The part of the source a narrowed copy carries, with the report filled in to explain it."""
+    wanted = {r.strip().casefold() for r in ratings if r and r.strip()}
+    rated = [item for item in whole.items.values() if item.content_rating.strip().casefold() in wanted]
+    # Asked about the SHOW for an episode, not the episode. Recorded on a real server
+    # (`pms_share_filter_tv_by_key.json`): a by-key read honours `filterTelevision` for a show key, an
+    # episode follows its show, and an all-hidden batch is a 404 — so one question per show gives the
+    # answer one per episode would, for a fraction of the requests, and it is the same read every
+    # restricted person's rows already depend on (`RowPolicy.visible`). An episode with no show key
+    # (Plex always sent one: 9,850 of 9,850) is asked about itself.
+    asks = {item.rating_key: item.show_rating_key or item.rating_key for item in rated}
+    # Read AS the target, and allowed to raise: `visible_to` turns only a 404 into "none of these",
+    # so an expired token fails the copy rather than narrowing it to nothing and reporting success.
+    seen = plex.visible_to(target_token, sorted(set(asks.values()))) if asks else set()
+    visible = {key for key, asked in asks.items() if asked in seen}
+    narrowed = scope_to_ratings(whole, ratings, visible)
+    report.ratings = sorted({r.strip() for r in ratings if r and r.strip()}, key=str.casefold)
+    report.ratings_seen = ratings_seen(whole)
+    report.ratings_kept = ratings_seen(narrowed)
+    report.kept = len(narrowed.items)
+    report.hidden_from_target = len(rated) - len(narrowed.items)
+    report.left_out = len(whole.items) - len(narrowed.items)
+    report.kept_preview = names_of(narrowed, limit=REMOVAL_PREVIEW)
+    return narrowed
+
+
+_REFUSAL = (
+    "that account already has {count} watched or part-watched title(s) this copy would un-tick, rewind or "
+    "overwrite. A copy narrowed by rating never changes what is already on an account — undo the earlier "
+    "copy, or mark those titles unwatched in Plex, and run it again."
+)
+
+
+def _in_the_way(narrowed: WatchState, target: WatchState) -> WatchState:
+    """The part of the target's own watching a narrowed copy would remove or overwrite.
+
+    A refusal and not a warning. The copy mirrors, so whatever the narrowed source lacks is REMOVED —
+    and what it lacks, by construction, includes everything that person watched on their own account
+    that the source never did. There is no version of "are you sure?" that makes un-marking a child's
+    own watching the right outcome, so there is nothing to confirm.
+
+    Decided on the HARM, not on "is the account empty". Empty was the first rule and it stranded the
+    very copies it should have let finish: a run where a few writes raised ends `done`, the page says
+    "Run it again — it only writes what's still missing", and that second run is a new job looking at
+    an account that is no longer empty.
+
+    And decided by ASKING THE PLANNER, leaf by leaf, rather than by restating its rules here. A
+    hand-written version of "would this be removed?" agreed with `_plan_one` everywhere except a
+    position under a second — which it let through while the planner cleared it, un-scrobbling the
+    title on the way. Two descriptions of one rule drift; one cannot. A leaf is in the way when the
+    plan for it holds a removal (an un-mark, or a rewind — both are `/:/unscrobble`), or would leave
+    it at a different position than the person left it (a scrobble clears a position, measured).
+
+    What is left is a leaf the narrowed history holds at least as much of: untouched, or topped up to
+    the source's play count — which is what a half-made copy looks like, and all it looks like.
+    """
+    blocking = {}
+    for key, have in target.items.items():
+        want = narrowed.items.get(key)
+        ops = build_plan(WatchState(items={key: want} if want else {}), WatchState(items={key: have}))
+        if any(op.kind in _REMOVALS for op in ops) or _moves_their_position(have, ops):
+            blocking[key] = have
+    return WatchState(items=blocking)
+
+
+_REMOVALS = (OpKind.UNMARK, OpKind.CLEAR_OFFSET)
+
+
+def _moves_their_position(have, ops) -> bool:
+    """Whether these writes leave a part-watched title somewhere other than where its owner left it."""
+    if not have.view_offset_ms or not ops:
+        return False
+    # Every write but SET_OFFSET zeroes the position (a scrobble does too — measured), and a
+    # SET_OFFSET, always last, names where it ends up.
+    ends_at = next((op.offset_ms for op in reversed(ops) if op.kind is OpKind.SET_OFFSET), 0)
+    return abs(ends_at - have.view_offset_ms) > OFFSET_TOLERANCE_MS
+
+
+def _clear_residue(
+    session: Session, target: User, narrowed: WatchState, unreadable: Sequence[str] = (), *, dry_run: bool = False
+) -> int:
+    """Remove what an EARLIER copy left in Shortlist's own records for titles this one does not carry.
+    Returns how many rows that is — counted, not deleted, under `dry_run`.
+
+    The likely first move for someone setting up a children's profile is a plain copy of everything
+    onto it. Undoing that clears these rows; emptying the account by hand in Plex does not — nothing
+    on Plex holds them. Left alone, every adult play that first copy logged stays in the child's
+    `watch_events`, and any cached title it dated (`source_viewed_at`) is exempt from every deletion
+    path the watch sync has, so it would seed that account's rows for ever while Plex showed a
+    perfectly narrowed history.
+
+    What makes it safe to be blunt: `_in_the_way` has already refused unless everything the account
+    can be SEEN to hold is inside the narrowed history, so a row outside it describes nothing that
+    account has watched. "Seen" is the limit of that argument, and it is honoured here: a library the
+    target cannot read was never examined, its cached titles may be the person's own watching
+    (`stamp_true_dates` matches on rating key alone, so it dates those too), and a row deleted there
+    never comes back — `SectionNotShared` keeps what it has and refills nothing. Those are left alone.
+
+    Only `source='transfer'` events and cached titles carrying a copied date — never the person's own
+    plays, never Plex's own log, never another account's.
+    """
+    leaves = set(narrowed.items)
+    titles = leaves | {item.show_rating_key for item in narrowed.items.values() if item.show_rating_key}
+    stale_events = [
+        row_id
+        for row_id, rating_key in session.query(WatchEvent.id, WatchEvent.rating_key).filter(
+            WatchEvent.plex_account_id == target.plex_account_id, WatchEvent.source == "transfer"
+        )
+        if rating_key not in leaves
+    ]
+    # `watched_titles` is keyed at SHOW level for a series, which is why `titles` carries show keys.
+    unseen = {str(key) for key in unreadable}
+    stale_titles = [
+        row_id
+        for row_id, rating_key, section_key in session.query(
+            WatchedTitle.id, WatchedTitle.rating_key, WatchedTitle.section_key
+        ).filter(WatchedTitle.user_id == target.id, WatchedTitle.source_viewed_at.isnot(None))
+        if rating_key not in titles and str(section_key) not in unseen
+    ]
+    if not dry_run:
+        for model, ids in ((WatchEvent, stale_events), (WatchedTitle, stale_titles)):
+            for start in range(0, len(ids), _IN_CHUNK):
+                chunk = ids[start : start + _IN_CHUNK]
+                session.query(model).filter(model.id.in_(chunk)).delete(synchronize_session=False)
+    return len(stale_events) + len(stale_titles)
 
 
 def _clear_emptied_shows(
@@ -433,8 +656,15 @@ def _verify(
     report.verify_mismatched = sum(1 for op in remaining if op.rating_key not in could_not_write)
 
 
-def _copy_play_events(session: Session, source: User, target: User, plex, source_state: WatchState) -> int:
+def _copy_play_events(
+    session: Session, source: User, target: User, plex, source_state: WatchState, only: set[int] | None = None
+) -> int:
     """Copy the source's play log onto the target's account id, keeping the TRUE timestamps.
+
+    `only` is a narrowed copy's rating keys, None for a copy of everything. It exists because the log
+    is read from the PMS on its own — `source_state` never touches it — so narrowing the state alone
+    narrows the fallback below and leaves this half copying every play the source ever made. Nothing
+    on Plex would show it; the target's seeds, recency and rewatch row would.
 
     This is the only dated history the new account will ever have: probed live, a scrobble writes no
     row to `/status/sessions/history/all`, so the target's own log stays empty however much we write.
@@ -444,7 +674,7 @@ def _copy_play_events(session: Session, source: User, target: User, plex, source
     back-dated credit is a bug shape this codebase has shipped before.
     """
     rows = plex.play_history(since=None)
-    mine = [e for e in rows if e.plex_account_id == source.plex_account_id]
+    mine = [e for e in rows if e.plex_account_id == source.plex_account_id and (only is None or e.rating_key in only)]
     # NO early return on an empty log — the fallback below is the path that actually carries the
     # dates on a real server, and returning here skipped it entirely.
     #
@@ -494,6 +724,10 @@ def _copy_play_events(session: Session, source: User, target: User, plex, source
     covered = {e.rating_key for e in mine}
     for item in source_state.items.values():
         if item.rating_key in covered or not item.last_viewed_at:
+            continue
+        # Its own check, though a narrowed copy passes a narrowed state too: this function decides
+        # what enters another person's history, and it should not depend on its caller for that.
+        if only is not None and item.rating_key not in only:
             continue
         key = f"transfer:{target.plex_account_id}:state:{item.rating_key}"
         if key in already:

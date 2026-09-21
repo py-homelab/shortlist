@@ -353,7 +353,10 @@ CATALOG: tuple[JobKind, ...] = (
             "Makes your watching account's watch history match yours: the same films ticked off, the "
             "same episodes of each show, and anything you are part-way through sitting at the same "
             "point in Continue Watching. Anything watched on that account that you have not watched "
-            "is un-ticked, which is what makes the two match. Your own account is never written to."
+            "is un-ticked, which is what makes the two match. Your own account is never written to. "
+            "A copy narrowed to some content ratings, for a children's profile, carries only those "
+            "titles. It tops up a title both accounts have watched, and is refused rather than un-tick "
+            "or rewind anything already watched there."
             "\n\nOn a heavy library this is several thousand writes to Plex, which is why it runs "
             "here rather than while you wait. The account's state is saved before the first write, so "
             "it can be put back exactly."
@@ -1600,6 +1603,10 @@ def _watching_account_transfer(state, payload: dict, job_id: int | None = None) 
 
     to_user_id = int(payload["to_user_id"])
     requested = bool(payload.get("dry_run", False))
+    # None copies everything; a list narrows the copy to those content ratings. Kept as None rather
+    # than defaulted to [] — an empty list would narrow the copy to nothing, which is a different
+    # request from not narrowing it.
+    ratings = payload.get("ratings")
     ctx = state.run_service.build_context(dry_run=requested, plex_only=True)
     # `or requested` is the floor, matching every other writer here: the chokepoint may force a dry
     # run ON, never off, so a context that dropped the flag cannot turn a preview into a real run.
@@ -1647,11 +1654,13 @@ def _watching_account_transfer(state, payload: dict, job_id: int | None = None) 
             source_token=source_token,
             target_token=token,
             dry_run=dry_run,
+            ratings=[str(r) for r in ratings] if ratings is not None else None,
         )
         add_audit(
             session,
             "watching_account.transfer",
-            "info",
+            # A refusal is on the record too, and louder: somebody asked for a copy and did not get one.
+            "warning" if report.refused else "info",
             from_user_id=source_id,
             to_user_id=to_user_id,
             **report.as_dict(),
@@ -1659,11 +1668,15 @@ def _watching_account_transfer(state, payload: dict, job_id: int | None = None) 
         session.commit()
         out = report.as_dict()
 
+    if report.refused:
+        out["detail"] = f"Refused, nothing written — {report.refused}"
+        return out
     verb = "Would copy" if dry_run else "Copied"
     removed = report.unmarks + report.offsets_cleared
     out["detail"] = (
         f"{verb} {report.marks} title(s) onto that account"
         + (f", removing {removed}" if removed else "")
+        + (f", leaving {report.left_out} behind (only {', '.join(report.ratings)} copied)" if report.ratings else "")
         + (" (preview)" if dry_run else "")
     )
     return out

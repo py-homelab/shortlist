@@ -1663,3 +1663,467 @@ class TestUndoLeavesNoPhantomWatchesBehind:
         session.commit()
 
         assert session.query(WatchedTitle).filter(WatchedTitle.user_id == 2).one().source_viewed_at is not None
+
+
+class _RestrictedPlex(FakePlex):
+    """A PMS whose target has parental restrictions: some titles it simply cannot see.
+
+    `visible_to` is answered from a set of hidden keys rather than from ratings, deliberately — Plex's
+    verdict and the owner's list are different questions, and a fake that derived one from the other
+    could never show the two disagreeing.
+    """
+
+    def __init__(self, *a, hidden=(), **kw):
+        super().__init__(*a, **kw)
+        self.hidden = set(hidden)
+        self.visibility_asked: list[tuple[str, list[int]]] = []
+
+    def visible_to(self, token, rating_keys):
+        self.visibility_asked.append((token, list(rating_keys)))
+        return set(rating_keys) - self.hidden
+
+
+def rated(key: int, rating: str, **kw) -> ItemState:
+    return replace(leaf(key, count=1, at=1_600_000_000 + key, **kw), content_rating=rating)
+
+
+KIDS = ["TV-Y", "TV-Y7", "TV-G", "G"]
+
+
+class TestACopyNarrowedByContentRating:
+    """One shared account becoming a children's profile and an adults' one.
+
+    The children's profile should receive the children's titles out of the shared history — on Plex,
+    and in Shortlist's OWN record of that account, which is a separate copy made by a separate read.
+    """
+
+    def _household(self, **kw):
+        return _RestrictedPlex(
+            {
+                "ADMIN": {
+                    1: rated(1, "G", title="Aladdin"),
+                    2: rated(2, "R", title="Alien"),
+                    3: replace(rated(3, "TV-Y", kind="episode", show=30, title="Magic Xylophone"), show_title="Bluey"),
+                    4: rated(4, "TV-MA", kind="episode", show=40, title="Pilot"),
+                    5: rated(5, "", title="Home Movie"),
+                }
+            },
+            **kw,
+        )
+
+    def test_only_titles_rated_inside_the_list_are_written(self, session):
+        plex = self._household()
+
+        report = replicate(session, plex, ratings=KIDS)
+
+        assert set(plex.state["TARGET"]) == {1, 3}
+        assert (report.kept, report.left_out, report.hidden_from_target) == (2, 3, 0)
+        assert report.ratings == ["G", "TV-G", "TV-Y", "TV-Y7"]
+
+    def test_the_copied_play_log_is_narrowed_too(self, session):
+        """THE test in this class. The play log is read from the PMS on its own — the narrowed state
+        never touches it — so narrowing only the state leaves every adult play being copied into the
+        child's Shortlist history. Plex looks exactly right, verify passes, and the only symptom is
+        the child's seeds and rewatch row filling with adult titles weeks later."""
+        when = datetime(2021, 5, 4, tzinfo=UTC)
+        plex = self._household(
+            history=[
+                PlayEvent(10, 1, None, "movie", when, "h-aladdin"),
+                PlayEvent(10, 2, None, "movie", when, "h-alien"),
+                PlayEvent(10, 4, 40, "episode", when, "h-pilot"),
+            ]
+        )
+
+        replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        copied = {e.rating_key for e in session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20)}
+        assert copied == {1, 3}  # 1 from the log; 3 dated from its last view. Never 2, 4 or 5.
+
+    def test_a_title_with_no_log_entry_is_not_dated_from_the_whole_history_either(self, session):
+        """The other half of the same copy: the fallback that dates what the log could not."""
+        plex = self._household()
+
+        replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        copied = {e.rating_key for e in session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20)}
+        assert copied == {1, 3}
+
+    def test_the_dating_fallback_narrows_by_itself_whatever_state_it_is_handed(self, session):
+        """`_copy_play_events` decides what enters another person's history, so it holds the line on
+        its own — handed the WHOLE state by some future caller, it still dates only what `only` names."""
+        from shortlist.server.services.watching_account import _copy_play_events
+
+        plex = self._household()
+        whole = WatchState(items=dict(plex.state["ADMIN"]))
+
+        _copy_play_events(session, session.get(User, 1), session.get(User, 2), plex, whole, only={1})
+        session.commit()
+
+        assert {e.rating_key for e in session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20)} == {1}
+
+    def test_a_title_the_profile_cannot_see_is_never_planned(self, session):
+        """Rated inside the list but hidden by the profile's own restrictions. It must not reach the
+        plan at all — as a planned write it comes back `unreachable` or as a verify mismatch, and a
+        report full of those cannot tell a working copy from a broken one."""
+        plex = self._household(hidden={30})  # the SHOW is what Plex hides; its episodes go with it
+
+        report = replicate(session, plex, ratings=KIDS)
+
+        assert set(plex.state["TARGET"]) == {1}
+        assert not [w for w in plex.writes if w[1] == 3]
+        assert (report.kept, report.hidden_from_target, report.unreachable, report.verify_mismatched) == (1, 1, 0, 0)
+
+    def test_visibility_is_asked_as_the_target_about_shows_and_only_what_the_list_admits(self, session):
+        """About the SHOW (30) for an episode (3): Plex's TV restrictions act on shows, and that is the
+        read every row already depends on — a by-key read of an episode under a hidden show has never
+        been recorded from a real server."""
+        plex = self._household()
+
+        replicate(session, plex, ratings=KIDS)
+
+        assert plex.visibility_asked == [("TARGET", [1, 30])]
+
+    def test_every_episode_of_a_show_costs_one_question(self, session):
+        plex = _RestrictedPlex(
+            {"ADMIN": {k: rated(k, "TV-Y", kind="episode", show=30) for k in range(100, 140)}},
+        )
+
+        report = replicate(session, plex, ratings=KIDS)
+
+        assert plex.visibility_asked == [("TARGET", [30])]
+        assert report.kept == 40
+
+    def test_a_clean_narrowed_copy_verifies_clean(self, session):
+        """Verify diffs against the NARROWED source. Against the whole one, every title left behind on
+        purpose would count as a mismatch and a correct copy would report itself broken."""
+        report = replicate(session, self._household(), ratings=KIDS)
+
+        assert (report.verify_checked, report.verify_mismatched) == (2, 0)
+
+    def test_the_preview_says_what_would_go_and_what_there_is_to_choose_from(self, session):
+        plex = self._household()
+
+        report = replicate(session, plex, ratings=KIDS, dry_run=True)
+
+        assert report.kept_preview == ["Aladdin", "Bluey"]
+        assert report.ratings_seen == {"": 1, "G": 1, "R": 1, "TV-MA": 1, "TV-Y": 1}
+        assert report.ratings_kept == {"G": 1, "TV-Y": 1}
+        assert "TARGET" not in plex.state
+
+    def test_an_unreadable_visibility_check_fails_the_copy_rather_than_narrowing_it_to_nothing(self, session):
+        class _Expired(_RestrictedPlex):
+            def visible_to(self, token, rating_keys):
+                raise RuntimeError("401")
+
+        plex = _Expired({"ADMIN": {1: rated(1, "G")}})
+
+        with pytest.raises(RuntimeError):
+            replicate(session, plex, ratings=KIDS)
+        assert not plex.writes
+
+    def test_a_copy_of_everything_is_exactly_what_it_was(self, session):
+        """`ratings=None` — every transfer before this feature. No visibility read, nothing left out,
+        the whole play log copied."""
+        when = datetime(2021, 5, 4, tzinfo=UTC)
+        plex = self._household(history=[PlayEvent(10, 2, None, "movie", when, "h-alien")])
+
+        report = replicate(session, plex)
+        session.commit()
+
+        assert set(plex.state["TARGET"]) == {1, 2, 3, 4, 5}
+        assert plex.visibility_asked == []
+        assert (report.ratings, report.kept, report.left_out, report.refused) == ([], 0, 0, "")
+        assert session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20).count() == 5
+
+
+class TestANarrowedCopyNeverChangesWhatIsAlreadyThere:
+    """A refusal, not a warning. The mirror removes what its source lacks, and a narrowed source
+    lacks — by construction — everything that person watched on their own account. There is no
+    "are you sure?" that makes un-marking a child's own watching the right outcome.
+
+    Decided on the HARM, not on "is the account empty": the empty rule stranded a half-made copy,
+    because the page's own "Run it again" is a new job looking at an account that is no longer empty.
+    """
+
+    def _onto(self, target: dict[int, ItemState], source: dict[int, ItemState] | None = None):
+        return _RestrictedPlex(
+            {"ADMIN": source or {1: rated(1, "G", title="Aladdin"), 3: rated(3, "G", title="Bambi")}, "TARGET": target}
+        )
+
+    def _refused_untouched(self, session, plex, names):
+        before = dict(plex.state["TARGET"])
+
+        report = replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        assert "never changes what is already on an account" in report.refused
+        assert report.in_the_way == names
+        assert plex.writes == []
+        assert plex.state["TARGET"] == before
+        assert session.query(WatchStateSnapshot).count() == 0
+        assert session.query(WatchEvent).count() == 0
+
+    def test_a_title_they_watched_that_the_narrowed_history_lacks(self, session):
+        plex = self._onto({9: replace(leaf(9, count=1, title="Their Own Film"), content_rating="G")})
+
+        self._refused_untouched(session, plex, ["Their Own Film"])
+
+    def test_a_title_they_have_watched_more_times_than_the_source(self, session):
+        """The mirror would un-mark it and re-mark it once: a rewatch count of theirs, gone."""
+        plex = self._onto({1: leaf(1, count=4, title="Aladdin")})
+
+        self._refused_untouched(session, plex, ["Aladdin"])
+
+    def test_a_title_they_are_part_way_through_at_their_own_position(self, session):
+        """A scrobble clears a position (measured), and the copy then sets the SOURCE's — either way
+        their own place in it is lost."""
+        plex = self._onto({1: leaf(1, count=0, offset=600_000, title="Aladdin")})
+
+        self._refused_untouched(session, plex, ["Aladdin"])
+
+    def test_only_what_is_in_the_way_is_named(self, session):
+        plex = self._onto({1: leaf(1, count=1, title="Aladdin"), 9: leaf(9, count=1, title="Their Own Film")})
+
+        self._refused_untouched(session, plex, ["Their Own Film"])
+
+    def test_a_preview_says_it_would_be_refused(self, session):
+        report = replicate(session, self._onto({9: leaf(9, count=1)}), ratings=KIDS, dry_run=True)
+
+        assert report.refused and report.dry_run
+
+    def test_a_half_made_copy_can_be_finished_by_running_it_again(self, session):
+        """THE reason the rule is about harm. A run where some writes raised ends `done`, the page says
+        "Run it again — it only writes what's still missing", and that press is a NEW job. Under the
+        empty-account rule it was refused, and the only way forward was to undo a copy that had done
+        nothing wrong."""
+        plex = self._onto({1: leaf(1, count=1, title="Aladdin")})  # what the first run got done
+
+        report = replicate(session, plex, ratings=KIDS, job_id=43)
+
+        assert report.refused == ""
+        assert set(plex.state["TARGET"]) == {1, 3}
+        assert [w[1] for w in plex.writes] == [3]  # and Aladdin is not written a second time
+
+    def test_a_rewatch_count_left_short_by_a_failed_write_is_topped_up(self, session):
+        plex = self._onto({1: leaf(1, count=1)}, source={1: replace(rated(1, "G"), view_count=3)})
+
+        report = replicate(session, plex, ratings=KIDS)
+
+        assert report.refused == ""
+        assert plex.state["TARGET"][1].view_count == 3
+
+    def test_a_position_under_a_second_is_still_their_position(self, session):
+        """The hand-written guard let this through — "within rounding of zero" — while the planner,
+        which has no tolerance on CLEARING, un-scrobbled the title. With the re-mark then raising a
+        timeout, their watch was simply gone. The guard now asks the planner instead of paraphrasing it."""
+        plex = self._onto({1: leaf(1, count=1, offset=800, title="Aladdin")})
+
+        self._refused_untouched(session, plex, ["Aladdin"])
+
+    def test_a_position_a_top_up_would_wipe_is_in_the_way(self, session):
+        """Same count short, their own position, and a source with none: the top-up's scrobble clears
+        a position (measured) and nothing sets it back."""
+        plex = self._onto(
+            {1: leaf(1, count=1, offset=600_000, title="Aladdin")}, source={1: replace(rated(1, "G"), view_count=2)}
+        )
+
+        self._refused_untouched(session, plex, ["Aladdin"])
+
+    @pytest.mark.parametrize("have_count", [0, 1, 2])
+    @pytest.mark.parametrize("have_offset", [0, 1, 800, 1_000, 1_001, 5_000, 600_000])
+    @pytest.mark.parametrize("want_count", [0, 1, 2])
+    @pytest.mark.parametrize("want_offset", [0, 1, 800, 1_000, 1_001, 5_000, 600_000])
+    @pytest.mark.parametrize("in_source", [True, False])
+    def test_whatever_passes_the_guard_is_never_un_marked_rewound_or_moved(
+        self, have_count, have_offset, want_count, want_offset, in_source
+    ):
+        """The promise, as a property over every small state rather than the cases someone thought of:
+        if the guard lets a leaf through, the plan for it holds no removal and leaves a part-watched
+        title where its owner left it."""
+        from shortlist.engine.watch_replica import OFFSET_TOLERANCE_MS, build_plan
+        from shortlist.server.services.watching_account import _in_the_way
+
+        have = leaf(1, count=have_count, offset=have_offset)
+        if have.is_empty:
+            pytest.skip("nothing on the target to protect")
+        source = WatchState(items={1: leaf(1, count=want_count, offset=want_offset)} if in_source else {})
+        target = WatchState(items={1: have})
+        if _in_the_way(source, target).items:
+            return  # refused: nothing is written at all
+
+        plan = build_plan(source, target)
+
+        assert not [op for op in plan if op.kind in (OpKind.UNMARK, OpKind.CLEAR_OFFSET)]
+        if have_offset and plan:
+            ends_at = next((op.offset_ms for op in reversed(plan) if op.kind is OpKind.SET_OFFSET), 0)
+            assert abs(ends_at - have_offset) <= OFFSET_TOLERANCE_MS
+
+    def test_a_shared_position_is_not_in_the_way(self, session):
+        source = {1: replace(rated(1, "G"), view_count=0, view_offset_ms=600_000)}
+        plex = self._onto({1: leaf(1, offset=600_400)}, source=source)  # inside Plex's rounding
+
+        assert replicate(session, plex, ratings=KIDS).refused == ""
+
+    def test_the_same_account_still_takes_a_copy_of_everything(self, session):
+        """The refusal belongs to narrowing. A plain copy onto a populated account is the repair the
+        mirror exists for, and it names what it removes and snapshots first — unchanged."""
+        report = replicate(session, self._onto({9: leaf(9, count=1)}))
+
+        assert report.refused == ""
+        assert report.unmarks == 1
+
+
+class TestWhatAnEarlierCopyLeftBehind:
+    """Someone setting up a children's profile will quite likely copy EVERYTHING onto it first. Undo
+    clears Shortlist's side of that; emptying the account by hand in Plex — which the refusal itself
+    offers as a way forward — does not. Nothing on Plex holds these rows, so nothing on Plex can show
+    that they are still feeding the child's seeds."""
+
+    def _after_a_plain_copy_emptied_by_hand(self, session):
+        when = datetime(2021, 5, 4, tzinfo=UTC)
+        plex = _RestrictedPlex(
+            {
+                "ADMIN": {
+                    1: rated(1, "G", title="Aladdin"),
+                    2: rated(2, "R", title="Alien"),
+                    3: rated(3, "TV-Y", kind="episode", show=30),
+                    4: rated(4, "TV-MA", kind="episode", show=40),
+                }
+            },
+            history=[PlayEvent(10, 2, None, "movie", when, "h-alien")],
+        )
+        replicate(session, plex)
+        # The watch sync then caches what Plex now reports, and the copied dates get stamped on.
+        for key in (1, 2, 30, 40):
+            watched(session, 2, f"cached {key}", key=key, viewed_at=utcnow(), source=OLD)
+        # Their OWN play, and a cached title of their own: neither is a copy's to remove.
+        session.add(WatchEvent(plex_account_id=20, rating_key=2, media_type="movie", viewed_at=when, source="plex"))
+        watched(session, 2, "their own", key=77, viewed_at=utcnow())
+        session.commit()
+        plex.state["TARGET"] = {}  # "mark those titles unwatched in Plex"
+        return plex
+
+    def _transfer_events(self, session):
+        rows = session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20, WatchEvent.source == "transfer")
+        return {e.rating_key for e in rows}
+
+    def test_the_adult_plays_it_logged_are_gone_after_the_narrowed_copy(self, session):
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+        assert self._transfer_events(session) == {1, 2, 3, 4}
+
+        report = replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        assert self._transfer_events(session) == {1, 3}
+        assert report.residue_cleared == 4  # events 2 and 4, cached titles 2 and 40
+
+    def test_the_cached_titles_it_dated_are_gone_too_by_show_for_a_series(self, session):
+        """A stamped row is exempt from every deletion path the watch sync has, so nothing else would
+        ever remove it. `watched_titles` keys a series by its SHOW, the copy works in episodes."""
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+
+        replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        cached = {t.rating_key for t in session.query(WatchedTitle).filter(WatchedTitle.user_id == 2)}
+        assert cached == {1, 30, 77}
+
+    def test_their_own_plays_are_never_touched(self, session):
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+
+        replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        own = session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20, WatchEvent.source == "plex").all()
+        assert [e.rating_key for e in own] == [2]
+
+    def test_a_preview_deletes_nothing_and_still_says_how_much_the_real_run_will(self, session):
+        """A preview that leaves out something the real run deletes understates it — the one thing a
+        preview must not do."""
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+
+        report = replicate(session, plex, ratings=KIDS, dry_run=True)
+        session.commit()
+
+        assert report.residue_cleared == 4
+        assert self._transfer_events(session) == {1, 2, 3, 4}
+        assert session.query(WatchedTitle).filter(WatchedTitle.user_id == 2).count() == 5
+
+    def test_another_accounts_copied_history_is_never_touched(self, session):
+        """Every other residue test has ONE account with copied rows, so deleting the account filter
+        from either query passed them all — and would have wiped every other watching account's
+        copied history the first time a children's profile was set up."""
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+        session.add(User(id=3, plex_account_id=30, username="adults", slug="adults", user_type="managed"))
+        when = datetime(2021, 5, 4, tzinfo=UTC)
+        session.add(WatchEvent(plex_account_id=30, rating_key=2, media_type="movie", viewed_at=when, source="transfer"))
+        watched(session, 3, "their Alien", key=2, viewed_at=utcnow(), source=OLD)
+        session.commit()
+
+        replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        assert session.query(WatchEvent).filter(WatchEvent.plex_account_id == 30).count() == 1
+        assert session.query(WatchedTitle).filter(WatchedTitle.user_id == 3).count() == 1
+
+    def test_a_cached_title_in_a_library_that_account_cannot_read_is_left_alone(self, session):
+        """The safety argument is "the guard saw everything on the account" — and it did not see this
+        library. A dated row there may be the person's OWN watch (the stamping matches on rating key
+        alone), and one deleted there never comes back: an unshared section refills nothing."""
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+        session.add(
+            WatchedTitle(
+                user_id=2, section_key="9", rating_key=88, tmdb_id=88, media_type="movie", title="Unshared",
+                year=2020, watch_count=1, viewed_at=utcnow(), source_viewed_at=OLD,
+            )
+        )  # fmt: skip
+        session.commit()
+        unreadable = WatchState(items={}, unreadable=("9",))
+        plex.read_watch_state = lambda sections, token: (
+            unreadable if token == "TARGET" else WatchState(items=dict(plex.state["ADMIN"]))
+        )
+
+        report = replicate(session, plex, ratings=KIDS, dry_run=True)
+
+        assert report.target_unreadable == ["9"]
+        assert report.residue_cleared == 4  # the same four as ever; key 88 is not among them
+
+    def test_more_leftovers_than_one_sql_statement_can_name(self, session):
+        """A heavy account's plain copy leaves one event per leaf, and SQLite caps the variables in one
+        statement at 32,766 — so the delete is chunked. One past the cap, so a single `IN` really fails."""
+        from sqlalchemy import insert
+
+        plex = _RestrictedPlex({"ADMIN": {1: rated(1, "G")}})
+        when = datetime(2021, 5, 4, tzinfo=UTC)
+        session.execute(
+            insert(WatchEvent),
+            [
+                {
+                    "plex_account_id": 20,
+                    "rating_key": 100_000 + n,
+                    "media_type": "movie",
+                    "viewed_at": when,
+                    "source": "transfer",
+                    "history_key": f"transfer:20:state:{100_000 + n}",
+                }
+                for n in range(32_767)
+            ],
+        )
+        session.commit()
+
+        report = replicate(session, plex, ratings=KIDS)
+        session.commit()
+
+        assert report.residue_cleared == 32_767
+        assert {e.rating_key for e in session.query(WatchEvent).filter(WatchEvent.plex_account_id == 20)} == {1}
+
+    def test_a_copy_of_everything_clears_nothing(self, session):
+        plex = self._after_a_plain_copy_emptied_by_hand(session)
+
+        report = replicate(session, plex)
+        session.commit()
+
+        assert report.residue_cleared == 0
+        assert self._transfer_events(session) == {1, 2, 3, 4}

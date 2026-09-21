@@ -404,3 +404,88 @@ class TestRemovalsAreNamed:
         have = WatchState(items={20: ItemState(rating_key=20, media_type="movie", view_count=1)})
 
         assert removals_by_title(build_plan(EMPTY, have)) == ["ratingKey 20"]
+
+
+class TestNarrowingAStateToContentRatings:
+    """`scope_to_ratings` — the part of a shared history a children's profile should receive.
+
+    Pure on purpose: what may land on a child's account is decided here, where it can be tested
+    without a PMS, and the mirror in `build_plan` is left exactly as it was.
+    """
+
+    @staticmethod
+    def _rated(key: int, rating: str, **kw) -> ItemState:
+        return ItemState(rating_key=key, media_type="movie", view_count=1, content_rating=rating, **kw)
+
+    def test_it_keeps_what_is_rated_inside_the_list_and_nothing_else(self):
+        from shortlist.engine.watch_replica import scope_to_ratings
+
+        state = WatchState(items={1: self._rated(1, "G"), 2: self._rated(2, "R"), 3: self._rated(3, "TV-Y7")})
+
+        kept = scope_to_ratings(state, ["G", "TV-Y7"], visible={1, 2, 3})
+
+        assert set(kept.items) == {1, 3}
+
+    def test_an_unrated_title_is_never_kept(self):
+        """ "" is not a rating anybody chose. Even a list that somehow names it keeps nothing unrated."""
+        from shortlist.engine.watch_replica import scope_to_ratings
+
+        state = WatchState(items={1: self._rated(1, ""), 2: self._rated(2, "G")})
+
+        assert set(scope_to_ratings(state, ["G", "", "  "], visible={1, 2}).items) == {2}
+
+    def test_a_title_the_target_cannot_see_is_left_out_whatever_its_rating(self):
+        """Plex's verdict beats the list: a write the target cannot see would come back `unreachable`,
+        and a report full of those cannot tell a working copy from a broken one."""
+        from shortlist.engine.watch_replica import scope_to_ratings
+
+        state = WatchState(items={1: self._rated(1, "G"), 2: self._rated(2, "G")})
+
+        assert set(scope_to_ratings(state, ["G"], visible={2}).items) == {2}
+
+    def test_ratings_compare_caselessly_and_ignore_padding(self):
+        from shortlist.engine.watch_replica import scope_to_ratings
+
+        state = WatchState(items={1: self._rated(1, "tv-y7"), 2: self._rated(2, "TV-Y7 ")})
+
+        assert set(scope_to_ratings(state, [" TV-Y7"], visible={1, 2}).items) == {1, 2}
+
+    def test_a_partial_read_stays_partial(self):
+        """Narrowing must not launder an incomplete read into a complete one — the caller's refusal
+        to mirror from a source that could not see a library has to fire all the same."""
+        from shortlist.engine.watch_replica import scope_to_ratings
+
+        state = WatchState(items={1: self._rated(1, "G")}, unreadable=("2",))
+
+        assert scope_to_ratings(state, ["G"], visible={1}).unreadable == ("2",)
+
+    def test_the_whole_state_is_left_as_it_was(self):
+        from shortlist.engine.watch_replica import scope_to_ratings
+
+        state = WatchState(items={1: self._rated(1, "G"), 2: self._rated(2, "R")})
+        scope_to_ratings(state, ["G"], visible={1, 2})
+
+        assert set(state.items) == {1, 2}
+
+    def test_the_ratings_on_offer_are_counted_most_used_first_with_unrated_as_blank(self):
+        from shortlist.engine.watch_replica import ratings_seen
+
+        state = WatchState(
+            items={1: self._rated(1, "R"), 2: self._rated(2, "G"), 3: self._rated(3, "G"), 4: self._rated(4, "")}
+        )
+
+        assert list(ratings_seen(state).items()) == [("G", 2), ("", 1), ("R", 1)]
+
+    def test_a_show_is_named_once_however_many_episodes_it_has(self):
+        from shortlist.engine.watch_replica import names_of
+
+        state = WatchState(
+            items={
+                1: self._rated(1, "TV-Y", title="Magic Xylophone", show_title="Bluey"),
+                2: self._rated(2, "TV-Y", title="Hospital", show_title="Bluey"),
+                3: self._rated(3, "G", title="Aladdin"),
+            }
+        )
+
+        assert names_of(state) == ["Aladdin", "Bluey"]
+        assert names_of(state, limit=1) == ["Aladdin"]

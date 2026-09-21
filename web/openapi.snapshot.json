@@ -6028,6 +6028,20 @@
             ],
             "title": "From User Id"
           },
+          "ratings": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ratings"
+          },
           "to_user_id": {
             "title": "To User Id",
             "type": "integer"
@@ -6066,6 +6080,32 @@
             "title": "Failed",
             "type": "integer"
           },
+          "hidden_from_target": {
+            "title": "Hidden From Target",
+            "type": "integer"
+          },
+          "in_the_way": {
+            "items": {
+              "type": "string"
+            },
+            "title": "In The Way",
+            "type": "array"
+          },
+          "kept": {
+            "title": "Kept",
+            "type": "integer"
+          },
+          "kept_preview": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Kept Preview",
+            "type": "array"
+          },
+          "left_out": {
+            "title": "Left Out",
+            "type": "integer"
+          },
           "marks": {
             "title": "Marks",
             "type": "integer"
@@ -6082,12 +6122,41 @@
             "title": "Planned",
             "type": "integer"
           },
+          "ratings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Ratings",
+            "type": "array"
+          },
+          "ratings_kept": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Ratings Kept",
+            "type": "object"
+          },
+          "ratings_seen": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Ratings Seen",
+            "type": "object"
+          },
+          "refused": {
+            "title": "Refused",
+            "type": "string"
+          },
           "removals_preview": {
             "items": {
               "type": "string"
             },
             "title": "Removals Preview",
             "type": "array"
+          },
+          "residue_cleared": {
+            "title": "Residue Cleared",
+            "type": "integer"
           },
           "shows_cleared": {
             "title": "Shows Cleared",
@@ -6155,6 +6224,16 @@
           "snapshot_id",
           "dry_run",
           "source_empty",
+          "ratings",
+          "ratings_seen",
+          "ratings_kept",
+          "kept",
+          "left_out",
+          "hidden_from_target",
+          "kept_preview",
+          "refused",
+          "in_the_way",
+          "residue_cleared",
           "errors"
         ],
         "title": "TransferOut",
@@ -7620,7 +7699,7 @@
   },
   "info": {
     "title": "Shortlist",
-    "version": "1.9.1+py.7"
+    "version": "1.9.1+py.8"
   },
   "openapi": "3.1.0",
   "paths": {

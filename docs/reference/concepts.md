@@ -163,6 +163,43 @@ Three things keep the dates:
   order is what Continue Watching and "recently watched" sort on. So the shelves come out right even
   though every date reads as today.
 
+### Splitting one shared account into a children's profile and an adults' one
+
+A household that has always watched under one account has one history holding everyone's viewing.
+Moving to two Plex Home profiles, the adults' profile takes a plain copy of everything. The
+children's profile should get the children's titles only — tick **Only copy titles with certain
+content ratings** before previewing.
+
+- **Plex's own rating decides**, not TMDB's. It is the rating Plex's parental restrictions act on, so
+  it is the only one that predicts what that profile can see, and it comes with the watch-state read
+  at no extra cost. The default list is the strict one — G, TV-G, TV-Y, TV-Y7, TV-Y7-FV; PG and TV-PG
+  are yours to add, and the preview offers every other rating your history turns out to hold.
+  Ratings match exactly: "TV-Y7" does not cover "TV-Y7-FV".
+- **A title Plex holds no rating for stays behind**, always. Give it a rating in Plex first if it
+  belongs on that profile.
+- **A title the profile cannot see stays behind too**, whatever its rating. Shortlist asks Plex, as
+  that profile, which of the rated films and shows it can see (a show answers for its episodes), and
+  plans writes for those alone — so the report never fills with writes Plex refused.
+- **Shortlist's own history for the profile is narrowed the same way.** The play log is copied
+  separately from the ticks on Plex; narrowing only the ticks would leave Plex looking right while
+  the profile's seeds, recency and "already seen" row filled with every adult watch.
+- **It never un-marks or rewinds what is already on the profile.** The copy mirrors: what the source
+  lacks is un-ticked. A narrowed source lacks everything the children watched on their own profile
+  that you never did, so a narrowed copy that would un-tick a title, rewind it, or move it from where
+  they left it is refused, not warned about, and names what is in the way. What it may still do is
+  top a title up: one both accounts have watched ends at the shared account's play count and
+  position. Do it before anyone watches on the new profile; if it is too late, undo the earlier copy
+  or mark those titles unwatched in Plex. A copy that only half-finished is not in its own way — run
+  it again and it writes what is missing, as long as the shared account has not moved on in those
+  titles since (if it has, the refusal names them).
+- **An earlier copy of everything is cleaned up after.** If the whole history was copied onto the
+  profile first and then removed by hand in Plex, Shortlist's own record of that copy would still
+  hold every adult play. A narrowed copy removes those leftovers for the titles it does not carry —
+  the preview says how many — except in a library that profile cannot read, which it leaves alone.
+- **Do it before turning the profile on in Shortlist.** The page will not offer an account that
+  already has rows of its own, and a copy made first means the profile's very first run already
+  knows what has been seen.
+
 ## How a pick is chosen (and why a row can be short)
 
 Every candidate carries an **affinity**: how strongly the source that produced it vouched for it,

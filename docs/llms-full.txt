@@ -2677,10 +2677,11 @@ GET  /api/users/{id}/watched?q=&media_type=movie|show&library=&limit=&offset= ->
 ```
 GET  /api/watching-account/candidates -> [{plex_account_id, title, protected, already_a_shortlist_user}]
      Plex Home users the owner could move their watching to. The admin account is never a candidate.
-POST /api/watching-account/transfer {to_user_id, from_user_id?, dry_run?} -> {planned, applied, unreachable, failed, marks,
+POST /api/watching-account/transfer {to_user_id, from_user_id?, ratings?, dry_run?} -> {planned, applied, unreachable, failed, marks,
      unmarks, offsets_set, offsets_cleared, removals_preview, verify_mismatched, verify_checked,
      shows_cleared, target_unreadable, events_copied, titles_cached, snapshot_id, dry_run,
-     source_empty, errors}
+     source_empty, ratings, ratings_seen, ratings_kept, kept, left_out, hidden_from_target,
+     kept_preview, refused, in_the_way, residue_cleared, errors}
      Replicates one account's watch state onto the watching account: the exact episodes, the exact
      rewatch counts, and the exact position in anything part-watched.
      `from_user_id` defaults to the OWNER, which is the case the guide walks through. Name a
@@ -2705,6 +2706,33 @@ POST /api/watching-account/transfer {to_user_id, from_user_id?, dry_run?} -> {pl
      episode un-scrobble does not clear its show, and a show left flagged at 0/N goes invisible to
      the watch cache. `target_unreadable` lists libraries the TARGET cannot see: not a failure, but
      it makes the snapshot partial, so undo is refused for it.
+     NARROWED BY RATING — `ratings: ["G", "TV-Y", …]` copies only the titles Plex itself rates one of
+     those AND the watching account can see (asked of Plex AS that account). For a household moving
+     off one shared account onto a children's profile and an adults' one: the children's profile gets
+     the children's titles out of the shared history, the adults' one gets a plain copy of everything.
+     The same narrowing is applied to the play log Shortlist copies into its OWN history for that
+     account, so the profile's seeds and rewatch row are built from those titles only. A title Plex
+     holds no rating for is never copied. Ratings compare caselessly and exactly ("TV-Y7" does not
+     cover "TV-Y7-FV"). Omit `ratings` to copy everything; `[]` is a 422, never read as "everything".
+     A narrowed copy never changes what is already on the account. The copy mirrors, so onto an
+     account with watching of its own it would un-mark every title the narrowed history lacks —
+     there is nothing to confirm, so it is refused: a real run answers 409 with the reason, a dry run
+     answers 200 with `refused` set and `in_the_way` naming the watching that is in the way. In the
+     way means a leaf the narrowed history does not hold, holds fewer plays of, or holds at a
+     different position (the planner itself is asked, leaf by leaf, whether it would remove or move
+     it); a leaf it holds at least as much of is left alone or topped up to the source's count and
+     position, so a copy that half-finished can simply be run again — provided the source has not
+     moved on in those titles since, in which case the refusal names them.
+     `residue_cleared` counts Shortlist-side leftovers of an EARLIER copy onto that account — copied
+     play events and cached titles it dated — for titles this copy does not carry, removed so an
+     earlier copy of everything cannot go on seeding a children's profile. Plex is not involved. A
+     dry run reports how many WOULD be removed and removes none; cached titles in a library that
+     account cannot read are never removed.
+     Visibility is asked per SHOW for an episode: Plex's TV restrictions act on shows.
+     Always dry-run first: `ratings_seen` counts the whole history's leaves under each rating ("" =
+     unrated), `ratings_kept` the same over what would be copied, `kept`/`left_out` the totals,
+     `hidden_from_target` how many were rated inside the list but hidden by that account's own Plex
+     restrictions, and `kept_preview` names up to 50 of the films and shows that would go across.
 GET  /api/watching-account/snapshots -> [{id, user_id, username, taken_at, entries, complete}]
      Transfers that can still be undone, newest first. Needed because the undo is otherwise reachable
      only from the response of the transfer that created it — and the queue exists precisely so the
@@ -3216,6 +3244,43 @@ Three things keep the dates:
 - **Writes go oldest first.** The dates cannot be replicated, but the ORDER can, and `lastViewedAt`
   order is what Continue Watching and "recently watched" sort on. So the shelves come out right even
   though every date reads as today.
+
+### Splitting one shared account into a children's profile and an adults' one
+
+A household that has always watched under one account has one history holding everyone's viewing.
+Moving to two Plex Home profiles, the adults' profile takes a plain copy of everything. The
+children's profile should get the children's titles only — tick **Only copy titles with certain
+content ratings** before previewing.
+
+- **Plex's own rating decides**, not TMDB's. It is the rating Plex's parental restrictions act on, so
+  it is the only one that predicts what that profile can see, and it comes with the watch-state read
+  at no extra cost. The default list is the strict one — G, TV-G, TV-Y, TV-Y7, TV-Y7-FV; PG and TV-PG
+  are yours to add, and the preview offers every other rating your history turns out to hold.
+  Ratings match exactly: "TV-Y7" does not cover "TV-Y7-FV".
+- **A title Plex holds no rating for stays behind**, always. Give it a rating in Plex first if it
+  belongs on that profile.
+- **A title the profile cannot see stays behind too**, whatever its rating. Shortlist asks Plex, as
+  that profile, which of the rated films and shows it can see (a show answers for its episodes), and
+  plans writes for those alone — so the report never fills with writes Plex refused.
+- **Shortlist's own history for the profile is narrowed the same way.** The play log is copied
+  separately from the ticks on Plex; narrowing only the ticks would leave Plex looking right while
+  the profile's seeds, recency and "already seen" row filled with every adult watch.
+- **It never un-marks or rewinds what is already on the profile.** The copy mirrors: what the source
+  lacks is un-ticked. A narrowed source lacks everything the children watched on their own profile
+  that you never did, so a narrowed copy that would un-tick a title, rewind it, or move it from where
+  they left it is refused, not warned about, and names what is in the way. What it may still do is
+  top a title up: one both accounts have watched ends at the shared account's play count and
+  position. Do it before anyone watches on the new profile; if it is too late, undo the earlier copy
+  or mark those titles unwatched in Plex. A copy that only half-finished is not in its own way — run
+  it again and it writes what is missing, as long as the shared account has not moved on in those
+  titles since (if it has, the refusal names them).
+- **An earlier copy of everything is cleaned up after.** If the whole history was copied onto the
+  profile first and then removed by hand in Plex, Shortlist's own record of that copy would still
+  hold every adult play. A narrowed copy removes those leftovers for the titles it does not carry —
+  the preview says how many — except in a library that profile cannot read, which it leaves alone.
+- **Do it before turning the profile on in Shortlist.** The page will not offer an account that
+  already has rows of its own, and a copy made first means the profile's very first run already
+  knows what has been seen.
 
 ## How a pick is chosen (and why a row can be short)
 

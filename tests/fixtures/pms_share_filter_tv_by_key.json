@@ -1,0 +1,55 @@
+{
+  "_why": "What `GET /library/metadata/{keys}` answers for SHOWS and EPISODES when read as a Plex Home managed account whose `filterTelevision` is a contentRating allow list. The movie half of this read was recorded in `pms_share_filter_allow_lists.json`; the TV half never was, and two things rest on it: `RowPolicy.visible` (a restricted person's rows hold only shows Plex lets them see) and the watching-account copy narrowed by rating (`watching_account._narrow`, which asks about the SHOW for an episode). Read-only: six GETs, no writes.",
+  "recorded": "2026-09-20",
+  "pms_version": "1.43",
+  "account": {
+    "kind": "Plex Home managed user, no PIN, restrictionProfile None (custom restrictions)",
+    "filterMovies": "contentRating=G%2CTV-G%2CPG",
+    "filterTelevision": "contentRating=TV-G%2CTV-Y%2CTV-Y7%2CTV-Y7-FV",
+    "token": "the account's own server token (shared_servers accessToken) — never the admin's"
+  },
+  "endpoint_read": "GET /library/metadata/{k1,k2,...}  headers X-Plex-Token, Accept: application/json",
+  "keys": {
+    "show_in": {"type": "show", "contentRating": "TV-Y"},
+    "show_out": {"type": "show", "contentRating": "TV-MA"},
+    "episode_in": {"type": "episode", "contentRating": "TV-Y", "grandparent": "show_in"},
+    "episode_out": {"type": "episode", "contentRating": "TV-MA", "grandparent": "show_out"},
+    "movie_in": {"type": "movie", "contentRating": "G"},
+    "movie_out": {"type": "movie", "contentRating": "R"}
+  },
+  "read_as_admin": {
+    "all_six": {"status": 200, "size": 6, "present": ["show_in", "show_out", "episode_in", "episode_out", "movie_in", "movie_out"]}
+  },
+  "read_as_account": {
+    "all_six": {
+      "status": 200,
+      "size": 3,
+      "present": ["show_in", "episode_in", "movie_in"],
+      "absent": ["show_out", "episode_out", "movie_out"]
+    },
+    "single_key": {
+      "show_in": 200, "episode_in": 200, "movie_in": 200,
+      "show_out": 404, "episode_out": 404, "movie_out": 404
+    },
+    "hidden_show_tree": {
+      "_why": "A hidden show's tree is closed, not just its root.",
+      "/library/metadata/{show_out}/children": 404,
+      "/library/metadata/{show_out}/allLeaves": 404
+    },
+    "batch_of_only_hidden": {"status": 404, "note": "show+movie, and show+episode+movie: 404 either way"},
+    "hidden_plus_nonexistent": {"status": 404},
+    "visible_plus_nonexistent": {"status": 200, "size": 1},
+    "hidden_first_visible_last": {"status": 200, "size": 1, "note": "order does not matter"}
+  },
+  "library_listing_as_account": {
+    "_why": "The listing and the by-key read agree with each other and with the filter.",
+    "tv": {"visible": 28, "of": 507, "by_rating": {"TV-G": 12, "TV-Y7": 8, "TV-Y": 7, "TV-Y7-FV": 1}},
+    "movies": {"visible": 295, "of": 1387, "by_rating": {"PG": 222, "G": 71, "TV-G": 2}}
+  },
+  "conclusions": [
+    "1. A by-key read honours filterTelevision for a SHOW key: a show rated outside the allow list is absent from a 200, exactly as a movie outside filterMovies is.",
+    "2. An EPISODE follows its show: an episode of a hidden show is absent too, and the hidden show's /children and /allLeaves are 404.",
+    "3. A batch in which every key is hidden (or hidden and nonexistent) is a 404, never a 401/403 — so a client must read 404 as 'none of these', and anything else as a failure.",
+    "4. Asking about the show for an episode (one key per show) gives the same answer as asking about each episode, at a fraction of the requests."
+  ]
+}

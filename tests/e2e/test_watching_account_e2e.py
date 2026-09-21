@@ -34,6 +34,20 @@ class TestWatchingAccountGuide:
         # The honest bit that has to survive a skim: Plex cannot record the original watch dates.
         expect(page.get_by_text(re.compile("watched today", re.I))).to_be_visible()
 
+    def test_narrowing_the_copy_offers_the_strict_childrens_ratings_already_ticked(self, page: Page, app: ShortlistApp):
+        """A children's profile is the reason the control exists, so the list it opens with has to be
+        the safe one: every rating ticked is one a young child's Plex restriction admits, and PG is
+        offered but left for the household to choose."""
+        page.goto("/watching-account")
+        page.get_by_role("button", name=re.compile("Set it up", re.I)).click()
+
+        page.get_by_role("checkbox", name=re.compile("Only copy titles with certain content ratings", re.I)).check()
+
+        for rating in ("G", "TV-G", "TV-Y", "TV-Y7", "TV-Y7-FV"):
+            expect(page.get_by_role("checkbox", name=rating, exact=True)).to_be_checked()
+        for rating in ("PG", "TV-PG"):
+            expect(page.get_by_role("checkbox", name=rating, exact=True)).not_to_be_checked()
+
     # The equivalent "the warnings link here" check lives in vitest (`owner-note.test.tsx`), not
     # here: the e2e fixture seeds only managed and shared users (`conftest.py:303`), so no owner row
     # exists and `OwnerNote` — which is what carries the link on the Users page — never renders.

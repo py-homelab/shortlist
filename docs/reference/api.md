@@ -88,10 +88,11 @@ GET  /api/users/{id}/watched?q=&media_type=movie|show&library=&limit=&offset= ->
 ```
 GET  /api/watching-account/candidates -> [{plex_account_id, title, protected, already_a_shortlist_user}]
      Plex Home users the owner could move their watching to. The admin account is never a candidate.
-POST /api/watching-account/transfer {to_user_id, from_user_id?, dry_run?} -> {planned, applied, unreachable, failed, marks,
+POST /api/watching-account/transfer {to_user_id, from_user_id?, ratings?, dry_run?} -> {planned, applied, unreachable, failed, marks,
      unmarks, offsets_set, offsets_cleared, removals_preview, verify_mismatched, verify_checked,
      shows_cleared, target_unreadable, events_copied, titles_cached, snapshot_id, dry_run,
-     source_empty, errors}
+     source_empty, ratings, ratings_seen, ratings_kept, kept, left_out, hidden_from_target,
+     kept_preview, refused, in_the_way, residue_cleared, errors}
      Replicates one account's watch state onto the watching account: the exact episodes, the exact
      rewatch counts, and the exact position in anything part-watched.
      `from_user_id` defaults to the OWNER, which is the case the guide walks through. Name a
@@ -116,6 +117,33 @@ POST /api/watching-account/transfer {to_user_id, from_user_id?, dry_run?} -> {pl
      episode un-scrobble does not clear its show, and a show left flagged at 0/N goes invisible to
      the watch cache. `target_unreadable` lists libraries the TARGET cannot see: not a failure, but
      it makes the snapshot partial, so undo is refused for it.
+     NARROWED BY RATING — `ratings: ["G", "TV-Y", …]` copies only the titles Plex itself rates one of
+     those AND the watching account can see (asked of Plex AS that account). For a household moving
+     off one shared account onto a children's profile and an adults' one: the children's profile gets
+     the children's titles out of the shared history, the adults' one gets a plain copy of everything.
+     The same narrowing is applied to the play log Shortlist copies into its OWN history for that
+     account, so the profile's seeds and rewatch row are built from those titles only. A title Plex
+     holds no rating for is never copied. Ratings compare caselessly and exactly ("TV-Y7" does not
+     cover "TV-Y7-FV"). Omit `ratings` to copy everything; `[]` is a 422, never read as "everything".
+     A narrowed copy never changes what is already on the account. The copy mirrors, so onto an
+     account with watching of its own it would un-mark every title the narrowed history lacks —
+     there is nothing to confirm, so it is refused: a real run answers 409 with the reason, a dry run
+     answers 200 with `refused` set and `in_the_way` naming the watching that is in the way. In the
+     way means a leaf the narrowed history does not hold, holds fewer plays of, or holds at a
+     different position (the planner itself is asked, leaf by leaf, whether it would remove or move
+     it); a leaf it holds at least as much of is left alone or topped up to the source's count and
+     position, so a copy that half-finished can simply be run again — provided the source has not
+     moved on in those titles since, in which case the refusal names them.
+     `residue_cleared` counts Shortlist-side leftovers of an EARLIER copy onto that account — copied
+     play events and cached titles it dated — for titles this copy does not carry, removed so an
+     earlier copy of everything cannot go on seeding a children's profile. Plex is not involved. A
+     dry run reports how many WOULD be removed and removes none; cached titles in a library that
+     account cannot read are never removed.
+     Visibility is asked per SHOW for an episode: Plex's TV restrictions act on shows.
+     Always dry-run first: `ratings_seen` counts the whole history's leaves under each rating ("" =
+     unrated), `ratings_kept` the same over what would be copied, `kept`/`left_out` the totals,
+     `hidden_from_target` how many were rated inside the list but hidden by that account's own Plex
+     restrictions, and `kept_preview` names up to 50 of the films and shows that would go across.
 GET  /api/watching-account/snapshots -> [{id, user_id, username, taken_at, entries, complete}]
      Transfers that can still be undone, newest first. Needed because the undo is otherwise reachable
      only from the response of the transfer that created it — and the queue exists precisely so the
