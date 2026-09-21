@@ -6831,6 +6831,20 @@
       },
       "UserPrefs": {
         "properties": {
+          "admit_labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Admit Labels"
+          },
           "blocked_seeds": {
             "anyOf": [
               {
@@ -6865,6 +6879,20 @@
               }
             ],
             "title": "Excluded Genres"
+          },
+          "hide_labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hide Labels"
           },
           "household": {
             "anyOf": [
@@ -7699,7 +7727,7 @@
   },
   "info": {
     "title": "Shortlist",
-    "version": "1.9.1+py.9"
+    "version": "1.9.1+py.10"
   },
   "openapi": "3.1.0",
   "paths": {

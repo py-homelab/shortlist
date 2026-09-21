@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import StrEnum
@@ -313,6 +313,34 @@ class RowOverride:
     muted: bool = False  # this person doesn't get this row at all
     size: int | None = None  # override the row's size for this person
     recent_count: int | None = None  # override how many recent watches the web-search source searches
+
+
+@dataclass(frozen=True)
+class TitleLabels:
+    """The owner's hand-applied labels for ONE account, on top of whatever ratings its filter allows.
+
+    Ratings say "safe"; these say "for this person". `admit` lets a labelled title through an allow
+    list that would otherwise hide it (a nature documentary rated outside a child's list); `hide`
+    keeps a labelled title out though the list admits it (a G-rated film that is not for children).
+
+    `written` is the LEDGER: per filter field, the labels Shortlist itself put there
+    (``{"filterMovies": {"admit": [...], "hide": [...]}}``). It is the only thing that tells a label
+    Shortlist wrote from one the owner typed into Plex. These labels are the owner's own words — no
+    `shortlist_` prefix marks them — so without it, taking a label back out of the settings would
+    delete `label=Kids` from an allow list the owner built by hand, and their whole library would
+    show. A label the filter already carried before Shortlist wrote it is never in here, and is never
+    removed (`privacy.plan_title_labels`).
+    """
+
+    admit: tuple[str, ...] = ()
+    hide: tuple[str, ...] = ()
+    written: Mapping[str, Mapping[str, tuple[str, ...]]] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.admit or self.hide or any(v for kinds in self.written.values() for v in kinds.values()))
+
+    def written_in(self, fieldname: str, kind: str) -> tuple[str, ...]:
+        return tuple(self.written.get(fieldname, {}).get(kind, ()))
 
 
 @dataclass

@@ -7,17 +7,18 @@ nightly job is its other caller, so it is not this layer's to own.
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import String, cast, func
 from sqlalchemy.orm import Session
 
 from shortlist.engine.clients.http_retry import redact
-from shortlist.engine.models import DEFAULT_ROW_TEMPLATE
+from shortlist.engine.models import DEFAULT_ROW_TEMPLATE, LABEL_PREFIX
 from shortlist.engine.placeholders import refusal
 from shortlist.server.api.schemas import PassthroughModel
 from shortlist.server.api.serializers import UserOut, UserPickOut, pick_dict, user_dict
@@ -66,6 +67,50 @@ class UserPrefs(BaseModel):
     # default), "adult", "family" (shares it with children: their own rows leave children's titles
     # out and a family row carries them) or "kids" (a child's own account).
     household: Literal["auto", "adult", "family", "kids"] | None = None
+    # The owner's own Plex labels, on top of whatever ratings this account's Plex restrictions allow:
+    # a title carrying an ADMIT label is shown though its rating is outside the list, one carrying a
+    # HIDE label is not though its rating is inside it. Shortlist writes them into the account's share
+    # filter on the next privacy pass (`engine.privacy.plan_title_labels`) — so the restriction never
+    # has to be edited in Plex, where a save drops every exclude Shortlist has written. Which labels
+    # Shortlist actually wrote is recorded in a column of its own (`users.title_labels_written`, which
+    # no PATCH can reach), so taking one away removes what Shortlist added and nothing else.
+    admit_labels: list[str] | None = None
+    hide_labels: list[str] | None = None
+
+    @field_validator("admit_labels", "hide_labels")
+    @classmethod
+    def _labels_plex_can_read(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned: list[str] = []
+        for raw in value:
+            label = " ".join(str(raw).split())
+            if not label:
+                continue
+            # The filter grammar's own characters. A raw `&` makes Plex answer that account's Home with
+            # a 500 (measured); the rest would split one label into two conditions or two values.
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._'-]{0,63}", label):
+                raise ValueError(
+                    f"{label!r} can't be used as a label here: letters, digits, spaces and . _ ' - only, "
+                    "starting with a letter or digit, 64 characters at most"
+                )
+            if (
+                label.casefold().startswith(f"{LABEL_PREFIX}_".casefold())
+                or label.casefold() == LABEL_PREFIX.casefold()
+            ):
+                raise ValueError(f"{label!r} is one of Shortlist's own row labels, which it manages itself")
+            if not any(label.casefold() == seen.casefold() for seen in cleaned):
+                cleaned.append(label)
+        if len(cleaned) > 10:
+            raise ValueError("ten labels at most")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _a_label_cannot_both_admit_and_hide(self) -> UserPrefs:
+        both = {a.casefold() for a in self.admit_labels or []} & {h.casefold() for h in self.hide_labels or []}
+        if both:
+            raise ValueError(f"{sorted(both)[0]!r} is set to both show and hide titles — pick one")
+        return self
 
     @field_validator("row_name_tpl")
     @classmethod
@@ -424,6 +469,7 @@ async def patch_user(user_id: int, patch: UserPatch, request: Request) -> dict:
     paused_slug: str | None = None
     unpaused_slug: str | None = None
     sharing_slug: tuple[str, bool] | None = None  # (slug, now managed?) when the setting actually changed
+    labels_slug: str | None = None
     was_called: dict[str, str] = {}  # {slug -> the display name their collections are still titled with}
     with state.sessions() as session:
         user = session.get(User, user_id)
@@ -463,7 +509,19 @@ async def patch_user(user_id: int, patch: UserPatch, request: Request) -> dict:
             user.nickname = nickname
         if patch.prefs is not None:
             was_paused = bool((user.prefs or {}).get("paused"))
-            prefs = merged_prefs(user.prefs or {}, patch.prefs)
+            before = user.prefs or {}
+            prefs = merged_prefs(before, patch.prefs)
+            # Checked on what is about to be STORED: the model only sees this request, and a PATCH
+            # that names one list can collide with the other list already saved.
+            both = {a.casefold() for a in prefs.get("admit_labels") or []} & {
+                h.casefold() for h in prefs.get("hide_labels") or []
+            }
+            if both:
+                raise HTTPException(
+                    status_code=422, detail=f"{sorted(both)[0]!r} is set to both show and hide titles — pick one"
+                )
+            if any((prefs.get(key) or []) != (before.get(key) or []) for key in ("admit_labels", "hide_labels")):
+                labels_slug = user.slug
             user.prefs = prefs
             # Pausing means "stop showing their row", so it has to come down NOW — a paused person is
             # absent from every run by definition, so nothing else would ever act on it. Unpausing is
@@ -498,6 +556,10 @@ async def patch_user(user_id: int, patch: UserPatch, request: Request) -> dict:
             if managed
             else f"'{slug}' was set to leave their Plex sharing alone",
         )
+    if labels_slug is not None:
+        # Applied by the privacy pass, which otherwise runs on its own schedule: up to half an hour of
+        # "I ticked it and nothing happened" on the one setting whose whole point is what they see NOW.
+        await jobs.queue_privacy_sync(state, f"the labels '{labels_slug}' can see were changed")
     if paused_slug is not None:
         await _hide_paused_users_rows(state, paused_slug)
     if unpaused_slug is not None:

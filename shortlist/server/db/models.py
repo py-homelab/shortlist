@@ -141,6 +141,11 @@ class User(Base):
     # Who watches under this account as of the last run (`engine.household.Household.as_dict()`): the
     # label, what decided it and the counts behind it. NULL until a run could say.
     household: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
+    # Which of the owner's title labels Shortlist itself wrote into which share-filter field of this
+    # account (`engine.models.TitleLabels.written`). The only record that tells a label Shortlist added
+    # from one the owner typed into Plex, so it decides what may ever be removed. Its own column, NOT a
+    # key in `prefs`: every settings PATCH rewrites `prefs` whole — see migration 0097.
+    title_labels_written: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     label: Mapped[str] = mapped_column(String(255), default="")  # as stored by Plex (title-cased)
     prefs: Mapped[dict] = mapped_column(JSON, default=dict)
 
