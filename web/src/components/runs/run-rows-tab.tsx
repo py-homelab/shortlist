@@ -37,6 +37,15 @@ const DECISION_LABEL: Record<string, string> = {
   not_in_audience: "not in the audience",
   not_due: "not due",
   out_of_season: "out of season",
+  // The household decided these. They used to fall through as "not recorded", which read as a gap
+  // in the run's record rather than as the run's own decision. Each completes "This row was … on
+  // this run."
+  not_a_family_household:
+    "left out, because it is the family row and they are not a family household,",
+  kids_rows_are_already_childrens_titles:
+    "left out, because this is a kids account and its rows left on Decided per person already hold only children's titles,",
+  no_grown_ups_row_on_a_kids_account:
+    "left out, because it holds everything but children's titles and this is a kids account,",
 };
 
 /** "+7 −7 · kept 8" for one library's delivery. */

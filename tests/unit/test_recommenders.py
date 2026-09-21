@@ -1098,18 +1098,734 @@ class TestHouseholds:
     def test_with_nothing_to_go_on_nobody_is_labelled_and_nothing_is_filtered(self, ctx, mock_plextv):
         ctx.recommender = HttpRecommender(FakeEngineClient(self._items()))  # no household reported
         report = _run(ctx, mock_plextv, self.ROWS)
-        assert report.household == {
-            "label": None,
-            "source": "none",
-            "kids_titles": None,
-            "window_titles": None,
-            "window_days": None,
-            "engine_label": None,
-        }
+        # Nothing was ESTABLISHED tonight, so nothing is reported — the run is persisted over what the
+        # last good run found, and "unknown" written there would erase it.
+        assert report.household is None
         # Nothing filtered: the personal row keeps the children's titles too, and the family row, which
         # draws after it from the same engine list, finds them already on this person's Home.
         assert self._by_row(report) == {"picked": [10, 20, 30]}
         assert report.rows_considered["fam"] == "due"
+
+
+class TestAKidsAccount:
+    """A child's own profile. "auto" rows hold ONLY children's titles — they used to admit everything,
+    which handed a child five rows of the household's adult taste for Plex's parental filter to hide —
+    and the two family-SPLIT settings come down, each for a reason of its own."""
+
+    KIDS: ClassVar[dict] = {"label": "kids", "kids_titles": 90, "window_titles": 100, "window_days": 365}
+    ROWS: ClassVar[list[RowSpec]] = [
+        RowSpec(slug="picked", name_template="Picked", size=5, family="auto"),
+        RowSpec(slug="fam", name_template="Family", size=5, family="only"),
+        RowSpec(slug="grownups", name_template="Grown-ups", size=5, family="exclude"),
+        RowSpec(slug="all", name_template="Everything", size=5, family="include"),
+    ]
+
+    def _items(self):
+        return [_item(10, "Cartoon", kids=True), _item(20, "Drama"), _item(30, "Anime", kids=True)]
+
+    def _by_row(self, report):
+        out = {}
+        for p in report.picks:
+            out.setdefault(p.collection_slug, []).append(p.tmdb_id)
+        return out
+
+    def _pinned(self, ctx, mock_plextv, rows, household=None):
+        """The real case: counts say one thing (a pooled household's say "family" for every profile in
+        it), and the owner's per-person pin says this profile is the children's."""
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=household or FAMILY))
+        ctx.config.rows = rows
+        mock_plextv.users = [plextv_user(100, "kids-tv")]
+        profile = make_profile("kids-tv", account_id=100, household_override="kids")
+        return pipeline_mod.run(ctx, [profile]).users[0]
+
+    def test_an_auto_row_holds_only_childrens_titles(self, ctx, mock_plextv):
+        report = self._pinned(ctx, mock_plextv, self.ROWS[:1])
+
+        assert self._by_row(report) == {"picked": [10, 30]}
+        assert report.household["label"] == "kids" and report.household["source"] == "override"
+
+    def test_the_same_holds_when_the_engines_counts_say_kids_with_no_pin(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=self.KIDS))
+
+        report = _run(ctx, mock_plextv, self.ROWS[:1])
+
+        assert self._by_row(report) == {"picked": [10, 30]}
+        assert report.household["source"] == "engine"
+
+    def test_the_family_shelf_comes_down_and_says_why(self, ctx, mock_plextv):
+        """Deliberate, not inherited from "not a family household": its own rows ARE the children's
+        shelf, so a family row is a sixth row of the same titles from the same answer."""
+        report = self._pinned(ctx, mock_plextv, self.ROWS[:2])
+
+        assert "fam" not in self._by_row(report)
+        assert report.rows_considered["fam"] == "kids_rows_are_already_childrens_titles"
+
+    def test_the_grown_ups_half_of_the_split_comes_down_too(self, ctx, mock_plextv):
+        """An `exclude` row on a kids account could only ever hold titles that are NOT for children."""
+        report = self._pinned(ctx, mock_plextv, [self.ROWS[0], self.ROWS[2]])
+
+        assert "grownups" not in self._by_row(report)
+        assert report.rows_considered["grownups"] == "no_grown_ups_row_on_a_kids_account"
+
+    def test_a_row_set_to_everything_is_left_exactly_as_the_owner_set_it(self, ctx, mock_plextv):
+        """`include` is an explicit per-row "everything". Not second-guessed, only documented."""
+        report = self._pinned(ctx, mock_plextv, [self.ROWS[3]])
+
+        assert self._by_row(report) == {"all": [10, 20, 30]}
+
+    def test_an_adult_still_loses_only_the_family_shelf(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient(self._items(), household=ADULT))
+
+        report = _run(ctx, mock_plextv, self.ROWS[1:3])
+
+        assert report.rows_considered["fam"] == "not_a_family_household"
+        assert self._by_row(report) == {"grownups": [20]}
+
+    def test_a_pick_carried_from_before_the_pin_is_dropped_once_the_engine_says_what_it_is(self, ctx, mock_plextv):
+        """The day a profile is pinned "kids", its frozen rows still hold whatever they held. `auto`
+        now constrains for this person, so carried picks are re-checked like any family row's."""
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "picked", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((10, 20))
+            ]
+        }
+        frozen = RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)
+        # CLASSIFIED, both of them. A title with no genres and no flag is "the engine did not say",
+        # which is deliberately never a reason to drop a carried pick.
+        answer = [
+            _item(10, "Cartoon", kids=True, genres=("Animation", "Family")),
+            _item(20, "Drama", genres=("Drama",)),
+        ]
+        ctx.recommender = HttpRecommender(FakeEngineClient(answer, household=FAMILY))
+        ctx.config.rows = [frozen]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        pinned = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+
+        assert [p.tmdb_id for p in pinned.picks] == [10]
+        assert pinned.trace["selection"][0]["family_dropped"] == 1
+
+    def test_the_same_carried_picks_are_left_alone_for_an_adult(self, ctx, mock_plextv):
+        """The control for the test above: same row, same carried picks, same answer — no pin."""
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "picked", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((10, 20))
+            ]
+        }
+        answer = [
+            _item(10, "Cartoon", kids=True, genres=("Animation", "Family")),
+            _item(20, "Drama", genres=("Drama",)),
+        ]
+        ctx.recommender = HttpRecommender(FakeEngineClient(answer, household=ADULT))
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100)]).users[0]
+
+        assert {p.tmdb_id for p in report.picks} == {10, 20}
+        assert "family_dropped" not in report.trace["selection"][0]
+
+    def test_a_cold_start_on_a_pinned_kids_profile_is_left_short_not_filled_with_top_rated(self, ctx, mock_plextv):
+        """The pin needs no engine, so it is known on a cold start too — and the server's top-rated
+        films, which carry no classification at all, are the last thing a new child's profile should
+        be handed because it happens to be new."""
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]  # thin: cold start
+        ctx.recommender = BuiltinRecommender()
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", cold_start="popular")]
+        mock_plextv.users = [plextv_user(100, "kids-tv")]
+
+        pinned = pipeline_mod.run(ctx, [make_profile("kids-tv", account_id=100, household_override="kids")]).users[0]
+        unpinned = pipeline_mod.run(ctx, [make_profile("kids-tv", account_id=100)]).users[0]
+
+        assert [p.title for p in pinned.picks] == []
+        assert pinned.household["label"] == "kids"
+        assert [p.title for p in unpinned.picks] == ["Top Rated"]  # nobody else's cold start changed
+
+    def test_the_trace_says_what_auto_came_to(self, ctx, mock_plextv):
+        report = self._pinned(ctx, mock_plextv, self.ROWS[:1])
+
+        entry = next(e for e in report.trace["selection"] if e["row"] == "picked")
+        assert (entry["family"], entry["family_means"]) == ("auto", "only")
+
+
+class TestAKidsRowWithNothingToShow:
+    """Delivery leaves a library a row has no picks for ALONE — right when the alternative is deleting
+    a good row over one thin night, wrong here: until the day the account was labelled kids its "auto"
+    rows held everything, so the copy being left alone is a row of grown-up titles on a child's
+    profile. And with several such rows drawing children's titles from one answer without
+    replacement, a later row coming up empty is the ordinary case."""
+
+    ANSWER: ClassVar[list] = [
+        _item(10, "Cartoon", kids=True, genres=("Animation", "Family")),
+        _item(20, "Drama", genres=("Drama",)),
+        _item(40, "Thriller", genres=("Thriller",)),
+        _item(50, "Horror", genres=("Horror",)),
+    ]
+    ROWS: ClassVar[list[RowSpec]] = [
+        RowSpec(slug="a", name_template="A", size=5, family="auto"),
+        RowSpec(slug="b", name_template="B", size=5, family="auto"),
+    ]
+
+    def _run(self, ctx, mock_plextv, monkeypatch, *, pin="kids", household=FAMILY, rows=None):
+        import shortlist.engine.rows as rows_mod
+
+        taken_down = []
+
+        def _spy(plex, profile, config, spec, **kw):
+            taken_down.append((spec.slug, [s.key for s in kw["sections"]], kw["dry_run"]))
+            return [str(s.key) for s in kw["sections"]]
+
+        monkeypatch.setattr(rows_mod, "remove_row", _spy)
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "b", "1"): [
+                Pick(
+                    tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="kept", media_type=MediaType.MOVIE
+                )
+                for i, t in enumerate((40, 50))
+            ]
+        }
+        ctx.recommender = HttpRecommender(FakeEngineClient(list(self.ANSWER), household=household))
+        ctx.config.rows = rows or self.ROWS
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        profile = make_profile("sarah", account_id=100, **({"household_override": pin} if pin else {}))
+        return pipeline_mod.run(ctx, [profile]).users[0], taken_down
+
+    def test_the_old_copy_of_an_emptied_row_is_taken_down_in_that_library(self, ctx, mock_plextv, monkeypatch):
+        report, taken_down = self._run(ctx, mock_plextv, monkeypatch)
+
+        assert {p.collection_slug: p.tmdb_id for p in report.picks} == {"a": 10}  # the one children's title
+        assert taken_down == [("b", ["1"], False)]
+
+    def test_the_run_page_is_told_rather_than_shown_nothing(self, ctx, mock_plextv, monkeypatch):
+        report, _ = self._run(ctx, mock_plextv, monkeypatch)
+
+        entry = next(e for e in report.trace["selection"] if e["row"] == "b")
+        assert (entry["decision"], entry["delivered"], entry["family_means"], entry["removed"]) == (
+            "emptied",
+            0,
+            "only",
+            True,
+        )
+
+    def test_a_row_already_built_as_a_childrens_row_is_left_alone_on_a_thin_night(self, ctx, mock_plextv, monkeypatch):
+        """What is up is then NOT the grown-up row this exists to remove (the recipe records what
+        "auto" came to), so one night of an engine answering with little must not delete a good row."""
+        from shortlist.engine.household import Household
+        from shortlist.engine.rows import RowPolicy, _rating_key_resolver, row_recipe
+
+        policy = RowPolicy(
+            ctx=ctx,
+            user=make_profile("sarah", account_id=100, household_override="kids"),
+            cfg=ctx.config,
+            specs=self.ROWS,
+            library_index={},
+            report=MagicMock(),
+            resolve=_rating_key_resolver({}),
+        )
+        policy.household = Household(label="kids", source="override")
+        ctx.previous_recipes = {("sarah", "b", "1"): row_recipe(policy, self.ROWS[1])}
+
+        _, taken_down = self._run(ctx, mock_plextv, monkeypatch)
+
+        assert taken_down == []
+
+    def test_nobody_elses_empty_row_is_touched(self, ctx, mock_plextv, monkeypatch):
+        """The control: same rows, same carried picks, an adult. "Left alone" still stands for them."""
+        _, taken_down = self._run(ctx, mock_plextv, monkeypatch, pin=None, household=ADULT)
+
+        assert taken_down == []
+
+    def test_an_explicit_family_row_that_comes_up_empty_is_still_left_alone(self, ctx, mock_plextv, monkeypatch):
+        """Only "auto" changed meaning. An `only` row never held anything but children's titles, so its
+        old copy is not a row of grown-up titles and the usual rule is the right one."""
+        rows = [self.ROWS[0], RowSpec(slug="b", name_template="B", size=5, family="only")]
+
+        _, taken_down = self._run(ctx, mock_plextv, monkeypatch, pin="family", rows=rows)
+
+        assert ("b", ["1"], False) not in taken_down
+
+    def test_a_cold_row_with_nothing_vetted_takes_its_old_copy_down_too(self, ctx, mock_plextv, monkeypatch):
+        """A new profile that already got a cold row of the server's top-rated films, THEN was pinned."""
+        import shortlist.engine.rows as rows_mod
+
+        taken_down = []
+        monkeypatch.setattr(
+            rows_mod,
+            "remove_row",
+            lambda plex, profile, config, spec, **kw: taken_down.append(spec.slug) or ["1"],
+        )
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]  # thin: cold start
+        ctx.recommender = BuiltinRecommender()
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", cold_start="popular")]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+
+        assert taken_down == ["picked"]
+        assert [e["decision"] for e in report.trace["selection"]] == ["emptied"]
+
+
+class TestTakingAnEmptiedKidsRowDownForReal:
+    """The REAL `remove_row`, against the Plex mock. The tests above stub it out, and a stub that
+    answers the same whatever it is handed let every argument be wrong: a delete during a dry run,
+    every library instead of this one, and a ledger that went on calling a deleted collection live."""
+
+    ANSWER: ClassVar[list] = [
+        _item(10, "Cartoon", kids=True, genres=("Animation", "Family")),
+        _item(20, "Drama", genres=("Drama",)),
+    ]
+
+    @staticmethod
+    def _collection(title: str, key: int):
+        from shortlist.engine.delivery import row_marker
+
+        found = MagicMock()
+        found.title = title + row_marker(100)
+        found.ratingKey = key
+        return found
+
+    def _run(self, ctx, mock_plextv, rows, collections, *, dry_run=False, ledger=None):
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.config.dry_run = dry_run
+        ctx.config.rows = rows
+        ctx.plex.find_owned_collections.return_value = collections
+        ctx.delivered_keys = ledger or {}
+        ctx.previous_picks = {
+            ("sarah", "b", "1"): [
+                Pick(tmdb_id=20, rating_key=1020, title="Drama", rank=1, reason="kept", media_type=MediaType.MOVIE,
+                     seed_title="Fargo", seed_tmdb_id=900)
+            ]
+        }  # fmt: skip
+        ctx.previous_recipes = {("sarah", "b", "1"): "built before the pin"}
+        ctx.recommender = HttpRecommender(FakeEngineClient(list(self.ANSWER), household=FAMILY))
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+        deleted = [call.args[0].ratingKey for call in ctx.plex.delete_owned_collection.call_args_list]
+        emptied = [e for e in report.trace["selection"] if e["decision"] == "emptied"]
+        return report, deleted, emptied
+
+    ROWS: ClassVar[list[RowSpec]] = [
+        RowSpec(slug="a", name_template="A", size=5, family="auto"),
+        RowSpec(slug="b", name_template="B", size=5, family="auto"),
+    ]
+
+    def test_the_emptied_rows_own_collection_goes_and_no_other(self, ctx, mock_plextv):
+        _, deleted, emptied = self._run(
+            ctx, mock_plextv, self.ROWS, [self._collection("A", 1), self._collection("B", 2)]
+        )
+
+        assert deleted == [2]
+        assert [(e["row"], e["removed"]) for e in emptied] == [("b", True)]
+
+    def test_a_dry_run_deletes_nothing_and_still_says_a_copy_would_come_down(self, ctx, mock_plextv):
+        report, deleted, emptied = self._run(
+            ctx, mock_plextv, self.ROWS, [self._collection("A", 1), self._collection("B", 2)], dry_run=True
+        )
+
+        assert deleted == []
+        assert "B" in report.diff.deleted
+        assert emptied[0]["removed"] is True
+
+    def test_with_no_old_copy_there_is_nothing_to_say_was_removed(self, ctx, mock_plextv):
+        _, deleted, emptied = self._run(ctx, mock_plextv, self.ROWS, [self._collection("A", 1)])
+
+        assert deleted == []
+        assert emptied[0]["removed"] is False
+
+    def test_the_rows_copy_in_another_library_is_not_touched(self, ctx, mock_plextv, monkeypatch):
+        """THIS library came up empty. The same row's copy in another library is a good children's row
+        (its recipe says so), and taking "the row" down everywhere would delete it too."""
+        import shortlist.engine.rows as rows_mod
+
+        elsewhere = MagicMock()
+        elsewhere.key, elsewhere.type, elsewhere.title = "2", "movie", "4K Movies"
+        ctx.plex.sections.return_value = [ctx.plex.sections.return_value[0], elsewhere]
+        good_copy = self._collection("B", 22)
+        ctx.plex.find_owned_collections.side_effect = lambda section, label: (
+            [good_copy] if str(section.key) == "2" else []
+        )
+        scanned = []
+        real = rows_mod.remove_row
+
+        def watching(*a, **kw):
+            scanned.append([str(section.key) for section in kw["sections"]])
+            return real(*a, **kw)
+
+        monkeypatch.setattr(rows_mod, "remove_row", watching)
+
+        self._run(ctx, mock_plextv, self.ROWS, [])
+
+        assert scanned and all(len(sections) == 1 for sections in scanned)
+
+    def test_the_ledger_stops_calling_the_deleted_collection_live(self, ctx, mock_plextv):
+        """An emptied section persists no picks, so this path repeats nightly — and a stale ledger key
+        is re-presented each time, where a sibling row that has since reused that key would be deleted
+        in its place. The old picks would also stay creditable as "on Plex"."""
+        rows = [self.ROWS[0], RowSpec(slug="b", name_template="Because you watched {top_seed}", size=5, family="auto")]
+        collections = [self._collection("A", 1), self._collection("Because you watched Fargo", 2)]
+
+        report, deleted, _ = self._run(ctx, mock_plextv, rows, collections, ledger={("sarah", "b", "1"): 2})
+
+        assert deleted == [2]
+        assert report.removed_deliveries, "the ledger still calls the deleted collection live"
+
+    def test_a_row_named_after_its_picks_with_no_ledger_key_is_never_guessed_at(self, ctx, mock_plextv):
+        """Such a row renders to nothing with no picks, so there is no title to match on — and matching
+        on anything else would delete somebody's live row. Left alone, and the trace does not claim
+        otherwise."""
+        rows = [self.ROWS[0], RowSpec(slug="b", name_template="Because you watched {top_seed}", size=5, family="auto")]
+        collections = [self._collection("A", 1), self._collection("Because you watched Fargo", 2)]
+
+        _, deleted, emptied = self._run(ctx, mock_plextv, rows, collections)
+
+        assert deleted == []
+        assert emptied[0]["removed"] is False
+
+
+class TestPinningAProfileKidsRebuildsItsRows:
+    def test_a_frozen_row_does_not_keep_an_adult_pick_the_answer_happens_not_to_mention(self, ctx, mock_plextv):
+        """Carried picks are only dropped on a POSITIVE contradiction, so an adult title tonight's
+        answer omits rode on — for ever, on a frozen row — under a run page saying "holds only
+        children's titles". What "auto" came to is part of the recipe now, so the pin is a settings
+        change and the row rebuilds that night, cadence and hold notwithstanding."""
+        ctx.plex.sections.return_value[0].key = "1"
+        frozen = RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        ctx.config.rows = [frozen]
+        ctx.recommender = HttpRecommender(
+            FakeEngineClient(
+                [_item(10, "Cartoon", kids=True, genres=("Animation", "Family")), _item(30, "Anime", kids=True)],
+                household=FAMILY,
+            )
+        )
+        # Last night, before the pin: an ordinary row holding a drama the answer no longer mentions,
+        # stored with the recipe an unpinned person's row has.
+        from shortlist.engine.rows import RowPolicy, _rating_key_resolver, row_recipe
+
+        real = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100)]).users[0]
+        unpinned = RowPolicy(
+            ctx=ctx,
+            user=make_profile("sarah", account_id=100),
+            cfg=ctx.config,
+            specs=ctx.config.rows,
+            library_index={},
+            report=MagicMock(),
+            resolve=_rating_key_resolver({}),
+        )
+        ctx.previous_picks = {
+            ("sarah", "picked", "1"): [
+                *real.picks,
+                Pick(tmdb_id=20, rating_key=1020, title="Drama", rank=9, reason="kept", media_type=MediaType.MOVIE),
+            ]
+        }
+        ctx.previous_recipes = {("sarah", "picked", "1"): row_recipe(unpinned, frozen)}
+
+        after = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+
+        assert 20 not in [p.tmdb_id for p in after.picks]
+        assert after.trace["selection"][0]["decision"] == "settings_changed"
+
+    def test_the_recipe_of_everyone_else_is_what_it_was(self, ctx, mock_plextv):
+        """Conditional on purpose: an unconditional part would rebuild every row on the server the
+        night this shipped."""
+        from shortlist.engine.household import Household
+        from shortlist.engine.rows import row_recipe
+
+        spec = RowSpec(slug="r", name_template="R", size=5, family="auto")
+        policy = MagicMock()
+        policy.user.blocked_seeds = []
+        policy.effective_sources.return_value = ["tmdb"]
+
+        def recipe(label):
+            policy.household = Household(label=label, source="override") if label else None
+            return row_recipe(policy, spec)
+
+        assert recipe("family") == recipe("adult") == recipe(None)
+        assert recipe("kids") != recipe(None) and "means=only" in recipe("kids")
+
+
+class TestAColdStartWhereEveryRowIsOneThisHouseholdDoesNotGet:
+    """`_cold_start` sizes itself from the rows it is handed. The household used to be settled only for
+    a warm person, so it was never handed none — until a pin could take every due row down first, and
+    the person failed with "max() iterable argument is empty" on every run scoped to that row."""
+
+    @pytest.mark.parametrize(
+        ("pin", "family"),
+        [("kids", "only"), ("kids", "exclude"), ("adult", "only")],
+    )
+    def test_it_is_skipped_with_a_reason_not_failed(self, ctx, mock_plextv, pin, family):
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]  # thin: cold start
+        ctx.recommender = BuiltinRecommender()
+        ctx.config.rows = [RowSpec(slug="r", name_template="R", size=5, family=family, cold_start="popular")]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override=pin)]).users[0]
+
+        assert (report.status, report.error) == ("skipped", None)
+        assert f"not built for this account's household ({pin})" in report.reason
+        assert report.picks == []
+
+    def test_an_engine_that_takes_thin_people_on_and_answers_nothing_gives_the_same_reason(self, ctx, mock_plextv):
+        """The late road to a cold start. It did not crash, but it blamed the rows' cold-start setting:
+        "The 0 rows due in this run are set to build nothing until then"."""
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        ctx.recommender = HttpRecommender(FakeEngineClient([]), serves_cold=True)
+        ctx.config.rows = [
+            RowSpec(slug="fam", name_template="F", size=5, family="only", cold_start="popular"),
+            RowSpec(slug="grown", name_template="G", size=5, family="exclude", cold_start="popular"),
+        ]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+
+        assert report.status == "skipped"
+        assert report.reason.startswith("All 2 rows due in this run are not built for this account's household (kids)")
+
+    def test_the_rows_they_DO_get_are_still_built(self, ctx, mock_plextv):
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        ctx.recommender = BuiltinRecommender()
+        ctx.config.rows = [
+            RowSpec(slug="fam", name_template="F", size=5, family="only", cold_start="popular"),
+            RowSpec(slug="all", name_template="A", size=5, family="include", cold_start="popular"),
+        ]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="adult")]).users[0]
+
+        assert report.status != "error"
+        assert {p.collection_slug for p in report.picks} == {"all"}
+
+    def test_a_cold_start_with_no_pin_does_not_report_an_unknown_household(self, ctx, mock_plextv):
+        """The run is persisted over what the last good run found. "Unknown" written there flips the
+        person's request page out of its family lane and silences the pooled-profile warning — on
+        exactly the night the engine could not be reached."""
+        ctx.history_source.fetch.return_value = [make_watched("Fargo", rating_key=999)]
+        ctx.recommender = BuiltinRecommender()
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        ctx.config.rows = [RowSpec(slug="picked", name_template="P", size=5, cold_start="popular")]
+
+        report = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100)]).users[0]
+
+        assert report.household is None
+
+
+class TestANightTheEngineSaidNothing:
+    """Fallback is the default: an unreachable engine means the built-in one ranks, and reports no
+    household. "Nothing reported tonight" is not evidence that a child's account stopped being one —
+    read that way, its frozen rows were rebuilt as "everything" (the recipe lost `means=only`) and the
+    stored label was overwritten with "unknown"."""
+
+    KIDS_LAST_NIGHT: ClassVar[dict] = {"label": "kids", "source": "engine", "kids_titles": 90, "window_titles": 100}
+
+    def _run(self, ctx, mock_plextv, *, last, engine="recommendarr"):
+        silent = HttpRecommender(FakeEngineClient([_item(10, "Cartoon", kids=True), _item(20, "Drama")]), name=engine)
+        ctx.recommender = silent
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto")]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        profile = make_profile("sarah", account_id=100)
+        profile.last_household = last
+        return pipeline_mod.run(ctx, [profile]).users[0]
+
+    def test_a_kids_account_by_counts_is_still_one(self, ctx, mock_plextv):
+        report = self._run(ctx, mock_plextv, last=self.KIDS_LAST_NIGHT)
+
+        assert [p.tmdb_id for p in report.picks] == [10]
+        assert report.trace["selection"][0]["family_means"] == "only"
+
+    def test_and_last_nights_label_is_not_restamped_as_tonights(self, ctx, mock_plextv):
+        """Nothing was established, so nothing is reported and the stored household stands as it was."""
+        assert self._run(ctx, mock_plextv, last=self.KIDS_LAST_NIGHT).household is None
+
+    def test_someone_with_no_earlier_label_is_unknown_as_before(self, ctx, mock_plextv):
+        report = self._run(ctx, mock_plextv, last=None)
+
+        assert [p.tmdb_id for p in report.picks] == [10, 20]
+
+    def test_a_label_left_over_from_an_engine_since_removed_sorts_nobody(self):
+        """With the built-in engine configured nobody is sorted, tonight or ever."""
+        from shortlist.engine.household import resolve_household
+
+        profile = make_profile("s")
+        profile.last_household = self.KIDS_LAST_NIGHT
+
+        assert resolve_household(profile, None, EngineConfig(), engine_reports=False).label is None
+        assert resolve_household(profile, None, EngineConfig(), engine_reports=True).source == "last_run"
+
+    def test_a_setting_the_owner_has_since_removed_is_not_stood_in_for(self):
+        """Stored as `source: "override"`. It is not evidence of anything once removed — and a stand-in
+        is never written back, so for someone the engine never reports on it would sort them for ever."""
+        from shortlist.engine.household import resolve_household
+
+        profile = make_profile("s")
+        profile.last_household = {"label": "kids", "source": "override"}
+
+        assert resolve_household(profile, None, EngineConfig(), engine_reports=True).label is None
+
+    def test_tonights_answer_beats_last_nights(self):
+        from shortlist.engine.household import resolve_household
+
+        profile = make_profile("s")
+        profile.last_household = self.KIDS_LAST_NIGHT
+
+        assert resolve_household(profile, ADULT, EngineConfig(), engine_reports=True).label == "adult"
+
+
+class TestARowWithNoRecipeOnRecord:
+    def test_a_cold_built_row_is_not_carried_onto_a_childs_profile(self, ctx, mock_plextv):
+        """A row built on a cold start records no recipe, and "no recipe" is read as "unchanged"
+        everywhere — so the pin did not rebuild it: the server's top-rated films were carried forward
+        onto the child's profile, for ever if frozen, under "holds only children's titles"."""
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "picked", "1"): [
+                Pick(tmdb_id=t, rating_key=1000 + t, title=f"T{t}", rank=i + 1, reason="Popular on this server",
+                     media_type=MediaType.MOVIE)
+                for i, t in enumerate((20, 30))
+            ]
+        }  # fmt: skip
+        ctx.previous_recipes = {}
+        ctx.recommender = HttpRecommender(
+            FakeEngineClient([_item(10, "Cartoon", kids=True, genres=("Animation", "Family"))], household=FAMILY)
+        )
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto", refresh_days=0)]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        pinned = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+        unpinned = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="adult")]).users[0]
+
+        assert [p.tmdb_id for p in pinned.picks] == [10]
+        assert {20, 30} <= {p.tmdb_id for p in unpinned.picks}  # and nobody else's carry-forward changed
+
+
+class TestAHeldRowDoesNotRecordItselfAsAChildrensRow:
+    def test_a_tmdb_outage_on_the_night_of_the_pin_only_delays_the_rebuild(self, ctx, mock_plextv):
+        """The genre hold carries the row as it is and stamps a recipe on what it carries. With none on
+        record it stamped TONIGHT's — `means=only` — onto the server's top-rated films, so the next
+        night nothing looked changed and they stayed on the child's frozen row for good."""
+        ctx.plex.sections.return_value[0].key = "1"
+        ctx.previous_picks = {
+            ("sarah", "rew", "1"): [
+                Pick(tmdb_id=t, rating_key=1000 + t, title=f"Adult{t}", rank=i + 1, reason="Popular on this server",
+                     media_type=MediaType.MOVIE)
+                for i, t in enumerate((20, 30))
+            ]
+        }  # fmt: skip
+        ctx.previous_recipes = {}
+        ctx.tmdb.genre_names.side_effect = RuntimeError("tmdb is down")
+        ctx.recommender = HttpRecommender(
+            FakeEngineClient([_item(10, "Cartoon", kids=True, genres=("Animation", "Family"))], name="e"), name="e"
+        )
+        ctx.config.rows = [
+            RowSpec(
+                slug="rew", name_template="Again", size=5, family="auto", rewatch=True, watched_pct=1.0, refresh_days=0
+            )
+        ]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+        kid = make_profile("sarah", account_id=100, household_override="kids")
+
+        held = pipeline_mod.run(ctx, [kid]).users[0]
+        assert not any("means=only" in (p.recipe or "") for p in held.picks)
+
+        # The next night TMDB answers, and the row is rebuilt as it should have been.
+        ctx.previous_picks = {("sarah", "rew", "1"): list(held.picks)}
+        ctx.previous_recipes = {
+            key: picks[0].recipe for key, picks in ctx.previous_picks.items() if picks and picks[0].recipe
+        }
+        ctx.tmdb.genre_names.side_effect = None
+        ctx.tmdb.genre_names.return_value = {16: "Animation", 10751: "Family", 18: "Drama"}
+        ctx.tmdb.genre_ids_for.side_effect = lambda tmdb_id, kind: [18]
+
+        rebuilt = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+
+        assert not {20, 30} & {p.tmdb_id for p in rebuilt.picks}
+
+
+class TestWhatAutoMeans:
+    """`_family_means` — the one place "auto" is resolved, so the filter, the carried-pick re-check
+    and the cold start cannot come to different answers about the same row."""
+
+    @pytest.mark.parametrize(
+        ("label", "means", "constrains"),
+        [("family", "exclude", True), ("kids", "only", True), ("adult", "include", False), (None, "include", False)],
+    )
+    def test_by_household(self, label, means, constrains):
+        from shortlist.engine.household import Household
+        from shortlist.engine.rows import _family_constrains, _family_means
+
+        spec = RowSpec(slug="r", name_template="R", size=5, family="auto")
+        household = Household(label=label, source="override" if label else "none")
+
+        assert _family_means(spec, household) == means
+        assert _family_constrains(spec, household) is constrains
+
+    def test_nobody_settled_yet_is_everything(self):
+        from shortlist.engine.rows import _family_means
+
+        assert _family_means(RowSpec(slug="r", name_template="R", size=5, family="auto"), None) == "include"
+
+    @pytest.mark.parametrize("setting", ["include", "exclude", "only"])
+    def test_an_explicit_setting_never_depends_on_who_is_watching(self, setting):
+        from shortlist.engine.household import Household
+        from shortlist.engine.rows import _family_means
+
+        spec = RowSpec(slug="r", name_template="R", size=5, family=setting)
+
+        assert {
+            _family_means(spec, Household(label=label, source="none")) for label in ("kids", "family", "adult", None)
+        } == {setting}
+
+
+class TestAPooledHousehold:
+    """The engine ranks a household's Plex Home profiles as one person and says so with `group`."""
+
+    POOLED: ClassVar[dict] = {**FAMILY, "group": 895220}
+
+    def test_the_group_rides_along_whatever_decided_the_label(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient([_item(10, "Cartoon", kids=True)], household=self.POOLED))
+        ctx.config.rows = [RowSpec(slug="picked", name_template="Picked", size=5, family="auto")]
+        mock_plextv.users = [plextv_user(100, "sarah")]
+
+        pinned = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100, household_override="kids")]).users[0]
+        auto = pipeline_mod.run(ctx, [make_profile("sarah", account_id=100)]).users[0]
+
+        assert (pinned.household["label"], pinned.household["source"], pinned.household["group"]) == (
+            "kids",
+            "override",
+            895220,
+        )
+        assert (auto.household["label"], auto.household["group"]) == ("family", 895220)
+
+    def test_nobody_who_is_not_pooled_carries_the_key(self, ctx, mock_plextv):
+        ctx.recommender = HttpRecommender(FakeEngineClient([_item(10, "Cartoon")], household=FAMILY))
+
+        assert "group" not in _run(ctx, mock_plextv).household
+
+    def test_the_group_survives_counts_the_engine_got_wrong(self):
+        """An identity fact, not a viewing one — and an engine with a counts bug labels nobody, which
+        is exactly when "this profile is pooled and unpinned" most needs saying."""
+        from shortlist.engine.household import resolve_household
+
+        household = resolve_household(make_profile("s"), {"kids_titles": "lots", "group": 895220}, EngineConfig())
+
+        assert (household.label, household.source, household.group) == (None, "none", 895220)
+        assert household.as_dict()["group"] == 895220
+
+    @pytest.mark.parametrize("junk", ["895220", True, None, 1.5, {"id": 1}])
+    def test_a_group_that_is_not_an_account_id_is_ignored(self, junk):
+        from shortlist.engine.household import resolve_household
+
+        household = resolve_household(make_profile("s"), {**FAMILY, "group": junk}, EngineConfig())
+
+        assert household.group is None and household.label == "family"
 
 
 class TestClassify:

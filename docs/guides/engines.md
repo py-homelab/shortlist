@@ -144,7 +144,11 @@ The answer, best first:
   how many of the titles this person watched over the engine's recent window were children's titles.
   Shortlist turns the counts into adult / family / kids with its own thresholds (see
   [Children's and family titles](rows.md#childrens-and-family-titles)); `label` is the engine's own
-  suggestion, shown beside Shortlist's.
+  suggestion, shown beside Shortlist's. An engine that ranks several accounts as ONE person (a
+  household's Plex Home profiles) adds `"group": <the account id they are pooled under>` to every one
+  of them: their counts are then identical, so Shortlist cannot tell a children's profile from the
+  adults' by viewing, and it uses `group` to warn the owner about a pooled profile whose household
+  was never set by hand.
 
 Only `tmdb_id` and `media_type` (`movie` | `show`) are required per item; a malformed item is
 skipped, not fatal. Send a token as `Authorization: Bearer …` if you set one. Shortlist retries a

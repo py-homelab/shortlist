@@ -971,6 +971,63 @@ def _proxy_sign_in_unverifiable(session: Session, store: SettingsStore) -> dict 
     }
 
 
+def _pooled_profile_with_no_household_of_its_own(session: Session) -> dict | None:
+    """A Plex Home profile the engine ranks TOGETHER with another account, left on "auto".
+
+    For a household split into profiles — a children's one, an adults' one — the engine pools their
+    watching and reports every one of them the same counts, so "auto" labels them all alike. The
+    owner's per-person setting is the ONLY thing that makes the children's profile a children's
+    profile. Lose it, or never set it, and nothing fails: the profile is simply built as whatever the
+    shared history says, adult titles and all, and looks like a working system until somebody notices.
+
+    Only the pooled MEMBERS: the account the others are pooled under is the household's own, and
+    "auto" is a fine answer for it. Read from each person's last-run household, so it appears after
+    the first run that pooled them, and clears the moment the setting is made.
+    """
+    from shortlist.server.db.models import User
+
+    unset = [
+        user
+        for user in session.query(User).filter(User.enabled.is_(True), User.removed_at.is_(None))
+        if isinstance(user.household, dict)
+        and isinstance(user.household.get("group"), int)
+        and user.household["group"] != user.plex_account_id
+        and (user.prefs or {}).get("household") not in ("adult", "family", "kids")
+    ]
+    if not unset:
+        return None
+    unset.sort(key=lambda u: u.id)
+    names = ", ".join(u.display_name for u in unset)
+    labels = ", ".join(sorted({str(u.household.get("label") or "unlabelled") for u in unset}))
+    return {
+        # Keyed to WHO is unset, so dismissing it for one profile does not hide the next one.
+        "id": "pooled-household-" + "-".join(str(u.id) for u in unset),
+        "severity": "warning",
+        "title": (
+            f"{names} shares a watch history and has no household of its own"
+            if len(unset) == 1
+            else f"{names} share a watch history and have no household of their own"
+        ),
+        "body": (
+            (
+                "Your recommendation engine ranks this profile together with another account, so its own "
+                f"viewing cannot say who watches on it — it is currently built as: {labels}. If it is a "
+                "children's profile, its rows will hold the household's adult titles until you say so. "
+                if len(unset) == 1
+                else "Your recommendation engine ranks these profiles together with another account, so "
+                f"their own viewing cannot say who watches on each — they are currently built as: {labels}. "
+                "If one is a children's profile, its rows will hold the household's adult titles until you "
+                "say so. "
+            )
+            + "Open the person and choose who watches under that account, rather than leaving it to be "
+            "decided from what they watch."
+        ),
+        "action_url": f"/users/{unset[0].id}",
+        "action_label": "Choose who watches there",
+        "dismissable": True,
+    }
+
+
 def build_notifications(session: Session, store: SettingsStore, current_version: str) -> list[dict]:
     """Every currently-firing notification the owner hasn't dismissed, most severe first. Dismissal is
     by id, and each dismissable id encodes its state (the run id, the version), so a NEW failure or a
@@ -992,6 +1049,7 @@ def build_notifications(session: Session, store: SettingsStore, current_version:
         _playback_listener_down(store),
         _engine_in_trouble(session, store),
         _proxy_sign_in_unverifiable(session, store),
+        _pooled_profile_with_no_household_of_its_own(session),
     ]
     dismissed = set(store.get(DISMISSED_KEY) or [])
     order = {"error": 0, "warning": 1, "info": 2}

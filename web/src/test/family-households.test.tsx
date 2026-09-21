@@ -54,4 +54,20 @@ describe("householdSummary", () => {
     );
     expect(householdSummary(null)).toMatch(/Not decided yet/);
   });
+
+  it("warns that a pooled profile's counts are the whole household's", () => {
+    // Identical for every profile the engine ranks together, so they cannot say who watches on THIS
+    // one — and this is the page where "decide from what they watch" is trusted to do exactly that.
+    const pooled = { label: "family", source: "engine", kids_titles: 66, window_titles: 187, window_days: 365, group: 895220 };
+    expect(householdSummary(pooled as User["household"])).toMatch(
+      /12 months\. Those counts are the whole household’s .* Choose above instead\.$/,
+    );
+    // Not on the account the others are pooled UNDER: deciding IT from the household's viewing is right.
+    expect(householdSummary(pooled as User["household"], 895220)).not.toMatch(/Choose above/);
+    expect(householdSummary(pooled as User["household"], 856698746)).toMatch(/Choose above/);
+    // Once the owner HAS chosen, there is nothing left to warn about.
+    expect(
+      householdSummary({ ...pooled, label: "kids", source: "override" } as User["household"]),
+    ).toBe("Set by you: a child’s own account.");
+  });
 });

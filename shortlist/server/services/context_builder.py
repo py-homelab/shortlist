@@ -918,6 +918,7 @@ class ContextBuilder:
                     household_override=(
                         prefs.get("household") if prefs.get("household") in HOUSEHOLD_OVERRIDES else "auto"
                     ),
+                    last_household=user.household if isinstance(user.household, dict) else None,
                 )
             )
         return profiles

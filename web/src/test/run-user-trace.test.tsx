@@ -809,6 +809,60 @@ describe("TraceView — the flow explains freshness, the cut and release date", 
     expect(screen.getByText(/2 finished in the last 30 days/i)).toBeInTheDocument();
   });
 
+  it("says what a row left on automatic came to for a kids account", () => {
+    render(
+      <TraceView
+        data={withSelection({ family: "auto", family_means: "only" })}
+      />,
+    );
+    expect(
+      screen.getByText(/this is a kids account, so the row holds only children's titles/i),
+    ).toBeInTheDocument();
+  });
+
+  it("says so for an account shared with children, and nothing for anyone else", () => {
+    const { unmount } = render(
+      <TraceView
+        data={withSelection({ family: "auto", family_means: "exclude" })}
+      />,
+    );
+    expect(
+      screen.getByText(/shared with children, so their titles are left to the family row/i),
+    ).toBeInTheDocument();
+    unmount();
+
+    render(
+      <TraceView
+        data={withSelection({ family: "auto", family_means: "include" })}
+      />,
+    );
+    expect(screen.queryByText(/kids account|shared with children/i)).toBeNull();
+  });
+
+  it("says an emptied kids row took its old copy down, and describes no ranking", () => {
+    // Nothing was built and nothing ranked, so neither "built fresh" nor the cut may be claimed.
+    render(
+      <TraceView
+        data={withSelection({
+          decision: "emptied",
+          delivered: 0,
+          candidates: 0,
+          family: "auto",
+          family_means: "only",
+          removed: true,
+          cut_cap: undefined,
+          recency: undefined,
+        })}
+      />,
+    );
+    expect(
+      screen.getByText(/its old copy comes down rather than being left showing what it held before/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/the row may hold only children's titles/i)).toBeInTheDocument();
+    expect(screen.queryByText(/built fresh/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/candidates survived filtering/i)).not.toBeInTheDocument();
+  });
+
   it("names a settings change as the reason a row rebuilt early", () => {
     render(
       <TraceView data={withSelection({ decision: "settings_changed" })} />,

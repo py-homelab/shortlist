@@ -41,7 +41,12 @@ from shortlist.server.services.watch_events import (
     tmdb_by_rating_key,
 )
 
-NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+# Relative to the real clock, not a fixed date. `engagement(..., "30")` windows against the REAL now,
+# so a fixed NOW passed for a month and then, on the day it slid out of that window, began failing on
+# every branch at once (2026-09-21, thirty days after the date that used to be written here).
+# Ten days back: inside that window with room to spare, and old enough that a stopped title has had
+# time to count as dropped rather than still being watched.
+NOW = (datetime.now(UTC) - timedelta(days=10)).replace(hour=12, minute=0, second=0, microsecond=0)
 
 
 @pytest.fixture

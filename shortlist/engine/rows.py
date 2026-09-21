@@ -1085,6 +1085,12 @@ def row_recipe(policy: RowPolicy, spec: RowSpec) -> str:
             effective_cold_start(spec, policy.cfg),
             # Only when set away from the default, so no existing row's recipe changes on upgrade.
             *((f"family={spec.family}",) if spec.family != "include" else ()),
+            # What "auto" CAME TO, only when that is "only" — so pinning a profile "kids" rebuilds its
+            # rows that night, frozen ones included. Without it the recipe reads `family=auto` before
+            # and after, and an adult pick tonight's answer happens not to mention rides on in a
+            # child's row until the next refresh night — or for ever, on a frozen row. Conditional for
+            # the usual reason: nobody else's fingerprint changes on upgrade.
+            *(("means=only",) if spec.family == "auto" and _family_means(spec, policy.household) == "only" else ()),
             *((hashlib.blake2b(repr(sorted(blocked)).encode(), digest_size=8).hexdigest(),) if blocked else ()),
             # Rewatch rows only, for the same reason the blocked seeds are conditional: an unconditional
             # part would mismatch every other row's stored recipe and rebuild the server on the night
@@ -1098,15 +1104,39 @@ def row_recipe(policy: RowPolicy, spec: RowSpec) -> str:
     )
 
 
+def _family_means(spec: RowSpec, household: Household | None) -> str:
+    """What this row's `family` setting comes to for THIS person: "include", "exclude" or "only".
+
+    "auto" is the only setting that depends on who is watching:
+
+    * a FAMILY household (grown-ups and children under one account) — children's titles are left OUT
+      of the row, because they have a row of their own;
+    * a KIDS account (a child's own profile) — the row holds ONLY children's titles. It used to admit
+      everything, which for a child's profile meant five rows of the household's adult taste: Plex's
+      parental restrictions then hid most of each row, and what was left was whatever happened to
+      slip under the rating limit rather than anything chosen for a child;
+    * an adult, or a person nothing could label — everything, as every row behaved before `family`.
+
+    The one place this is decided, so the filter, the carried-pick re-check and the cold start cannot
+    come to different answers about the same row.
+    """
+    if spec.family != "auto":
+        return spec.family
+    if household is None:
+        return "include"
+    if household.is_family:
+        return "exclude"
+    if household.is_kids:
+        return "only"
+    return "include"
+
+
 def _family_admits(spec: RowSpec, candidate: Candidate, household: Household | None = None) -> bool:
-    """Whether this row's `family` setting lets a candidate in (see `RowSpec.family`). "auto" leaves
-    children's titles out for a FAMILY household only — anyone else, or a person nothing could label,
-    keeps them."""
-    if spec.family == "auto":
-        return not (candidate.kids and household is not None and household.is_family)
-    if spec.family == "exclude":
+    """Whether this row's `family` setting lets a candidate in, for this person (`_family_means`)."""
+    means = _family_means(spec, household)
+    if means == "exclude":
         return not candidate.kids
-    if spec.family == "only":
+    if means == "only":
         return candidate.kids
     return True
 
@@ -1114,9 +1144,7 @@ def _family_admits(spec: RowSpec, candidate: Candidate, household: Household | N
 def _family_constrains(spec: RowSpec, household: Household | None) -> bool:
     """Whether this row's `family` setting actually keeps anything out for THIS person — the case
     where a pick carried over from an earlier run has to be re-checked rather than trusted."""
-    if spec.family in ("only", "exclude"):
-        return True
-    return spec.family == "auto" and household is not None and household.is_family
+    return _family_means(spec, household) != "include"
 
 
 class _EngineView(NamedTuple):
@@ -1682,34 +1710,134 @@ def _take_row_down(
     _forget(report, spec, removed_in)
 
 
-def _settle_household(policy: RowPolicy) -> list[RowSpec]:
-    """Decide who watches under this account from tonight's pools, and take down any family-only row a
-    person is not a family household for. Returns the rows still to build.
+def _emptied_for_a_kids_account(policy: RowPolicy, spec: RowSpec, section, size: int) -> bool:
+    """An "auto" row on a kids account with nothing to show in this library: take its old copy down.
+
+    Delivery's rule is that a library a row has no picks for is LEFT ALONE, which is right when the
+    alternative is deleting a good row over one thin night. It is wrong here. Until the day this
+    account was labelled kids its "auto" rows held everything, so the copy being left alone is a row
+    of the household's grown-up titles on a child's profile — and with five such rows drawing
+    children's titles from one answer without replacement, the later ones coming up empty is the
+    ordinary case, not a rare one. Returns False (and does nothing) for every other row and person.
+
+    Also the only record of it: an empty section writes no trace entry, so the run page would show
+    the row as simply absent.
+    """
+    if not (spec.family == "auto" and _family_means(spec, policy.household) == "only"):
+        return False
+    if policy.kids_genres_unreadable:
+        # TMDB could not say which finished titles are children's viewing, so "nothing to show" is
+        # tonight's blind spot, not a finding — and the log has just said the row is being HELD.
+        return False
+    ctx, user = policy.ctx, policy.user
+    built_as = ctx.previous_recipes.get((user.slug, spec.slug, str(section.key)), "")
+    if "means=only" in built_as.split("|"):
+        # The copy that is up was itself built as a children's row (`row_recipe` records what "auto"
+        # came to). It is not the grown-up row this exists to remove, so the ordinary rule applies and
+        # one thin night — an engine mid-rebuild answering with nothing — does not delete a good row.
+        return False
+    diff = policy.report.diff if policy.report.diff is not None else CollectionDiff()
+    listed = len(diff.deleted)
+    with ctx.write_lock:
+        removed_in = remove_row(
+            ctx.plex,
+            user,
+            policy.cfg,
+            spec,
+            dry_run=policy.cfg.dry_run,
+            diff=diff,
+            sections=[section],
+            delivered_keys=_ledger_keys(ctx, user, spec),
+            other_rows=policy.cfg.per_person_rows(),
+        )
+    # The ledger must stop calling a deleted collection live — `_take_row_down` does the same, and its
+    # reasons apply doubly here: an emptied section persists no picks, so this path REPEATS nightly.
+    _forget(policy.report, spec, removed_in)
+    # Under a dry run nothing is removed, and the diff is where "would be" is recorded.
+    found = bool(removed_in) or len(diff.deleted) > listed
+    logger.info(
+        "{}: row '{}' has no children's titles for section '{}' — {}",
+        user.username,
+        spec.slug,
+        getattr(section, "title", section.key),
+        "its old copy comes down" if found else "nothing to build there",
+    )
+    policy.report.trace.setdefault("selection", []).append(
+        {
+            "row": spec.slug,
+            "library": getattr(section, "title", str(section.key)),
+            "decision": "emptied",
+            "size": size,
+            "delivered": 0,
+            "candidates": 0,
+            "family": spec.family,
+            "family_means": "only",
+            "removed": found,
+        }
+    )
+    return True
+
+
+def _not_for_this_household(spec: RowSpec, household: Household) -> tuple[str, str] | None:
+    """Why a row is not built for this household — `(trace reason, log sentence)` — or None to build it.
+
+    The two family-SPLIT settings only mean something for a household that has a split to make:
+
+    * "only" is the family shelf. An adult has no use for one. Nor does a KIDS account, and that one
+      is deliberate rather than inherited: every "auto" row of theirs already holds only children's
+      titles (`_family_means`), so a separate family shelf is a sixth row of the same thing, drawn
+      from the same answer, under a name that reads oddly on a child's own profile.
+    * "exclude" is the grown-ups' half of the split. On a KIDS account it could only ever hold titles
+      that are NOT for children, which is the one thing that account should never be handed.
+
+    "include" is never taken down: it is the owner saying "everything", explicitly, per row.
+    """
+    if household.label is None or household.is_family:
+        return None
+    if spec.family == "only":
+        if household.is_kids:
+            return "kids_rows_are_already_childrens_titles", "this account's own rows are already children's titles"
+        return "not_a_family_household", f"a family row, and this account is {household.label}"
+    if spec.family == "exclude" and household.is_kids:
+        return "no_grown_ups_row_on_a_kids_account", "a row of everything BUT children's titles, on a kids account"
+    return None
+
+
+def _settle_household(policy: RowPolicy, *, cold: bool = False) -> list[RowSpec]:
+    """Decide who watches under this account from tonight's pools, and take down any row that makes no
+    sense for that household (`_not_for_this_household`). Returns the rows still to build.
 
     A family-only row for someone nothing could label (no engine counts, no override) is kept and
     built as a plain children's-titles row — the owner asked for it explicitly, and "unknown" is not
     evidence that nobody there watches with children.
+
+    Runs on a cold start too, where no pool has reported anything: the owner's per-person override
+    needs no engine, and a child's profile pinned "kids" must not get a cold row of the server's
+    top-rated films because it happens to be new.
     """
     reported = next((p.household for p in policy.pool_cache.values() if p.household), None)
-    household = resolve_household(policy.user, reported, policy.cfg)
+    # "builtin" is the one engine that never reports a household; anything else is one that does and,
+    # tonight, may simply not have been reachable (the fallback ranks with the built-in one then).
+    engine_reports = getattr(policy.ctx.recommender, "name", "builtin") != "builtin"
+    household = resolve_household(policy.user, reported, policy.cfg, engine_reports=engine_reports)
     policy.household = household
-    policy.report.household = household.as_dict()
-    if household.label is None or household.is_family:
-        return policy.specs
+    if household.source in ("override", "engine") or not (cold or engine_reports):
+        # Only what tonight actually ESTABLISHED is reported, because the run is persisted over what
+        # the last good run found. A cold start asks no engine, and an engine that was unreachable said
+        # nothing: writing "unknown" (or last night's label re-stamped as tonight's) would flip this
+        # person's request page out of its lane and silence the pooled-profile warning on exactly the
+        # night nothing could be checked. With the built-in engine "unknown" IS the finding, as ever.
+        policy.report.household = household.as_dict()
     keep = []
     for spec in policy.specs:
-        if spec.family != "only":
+        verdict = _not_for_this_household(spec, household)
+        if verdict is None:
             keep.append(spec)
             continue
-        logger.info(
-            "{}: row '{}' not built — a family row, and this account is {} ({})",
-            policy.user.username,
-            spec.slug,
-            household.label,
-            household.source,
-        )
+        reason, sentence = verdict
+        logger.info("{}: row '{}' not built — {} ({})", policy.user.username, spec.slug, sentence, household.source)
         _take_row_down(policy.ctx, policy.user, policy.cfg, spec, policy.report)
-        policy.report.rows_considered[spec.slug] = "not_a_family_household"
+        policy.report.rows_considered[spec.slug] = reason
     return keep
 
 
@@ -2643,14 +2771,16 @@ def _build_section_picks(
             cold_seen = policy.visible([cold_copy.get(p.tmdb_id, p.rating_key) for p in cands])
             if cold_seen is not None:
                 cands = [p for p in cands if cold_copy.get(p.tmdb_id, p.rating_key) in cold_seen]
-            if spec.family == "only":
+            if _family_means(spec, policy.household) == "only":
                 # The server's top-rated titles carry no classification, and a cold start has no history
-                # to read one from — so on the one setting where "unclassified" means "refused", a short
-                # row beats one padded with titles nobody vetted. A rewatch row's `led`, built below, is
-                # classified and is prepended after this; a non-rewatch `only` row ships empty tonight.
-                # `exclude` and `auto` admit an unclassified title (as `_family_admits` does), so they
-                # fill as before — and `auto` cannot constrain here at all, the household being settled
-                # only on the warm path.
+                # to read one from — so where "unclassified" means "refused", a short row beats one
+                # padded with titles nobody vetted. A rewatch row's `led`, built below, is classified
+                # and is prepended after this; a non-rewatch row ships empty tonight. That covers an
+                # `only` row and an `auto` row on an account the owner pinned "kids" — the override
+                # needs no engine, so it is known here even though nothing has been ranked.
+                # `exclude` admits an unclassified title (as `_family_admits` does), so it fills as
+                # before; so does `auto` for a household only an engine's counts could have labelled,
+                # since on a cold start there are none.
                 cands = []
             cands = cands[:k]
             rewatches = library_cooling = 0
@@ -2692,7 +2822,14 @@ def _build_section_picks(
                 seen = policy.zero_pct_exclusions()
                 cands = [*led, *(p for p in cands if (p.tmdb_id, p.media_type) not in seen)][:k]
                 rewatches = len(history)
+            if not cands and _emptied_for_a_kids_account(policy, spec, section, k):
+                continue
             ranked_cold = [replace(p, rank=i + 1) for i, p in enumerate(cands)]
+            if spec.family == "auto" and _family_means(spec, policy.household) == "only":
+                # A cold row normally records no recipe. This one records that it was built as a
+                # children's row, which is what tells `_emptied_for_a_kids_account` on a later thin
+                # night that the copy that is up is not the grown-up row it exists to remove.
+                ranked_cold = [replace(p, recipe=row_recipe(policy, spec)) for p in ranked_cold]
             # Ordered like any other row: a cold-start user who set their row to Shuffled expects it
             # to shuffle, and "their history is thin" is no reason to hand back a different feature.
             # No `ratings` override — a cold row is drawn from the library's top-rated, and spending
@@ -2711,6 +2848,8 @@ def _build_section_picks(
                     "delivered": len(ranked_cold),
                     "candidates": len(cands),
                     "pick_order": spec.pick_order,
+                    **({"family": spec.family} if spec.family != "include" else {}),
+                    **({"family_means": _family_means(spec, policy.household)} if spec.family == "auto" else {}),
                     **(
                         {
                             "rewatch": True,
@@ -2799,7 +2938,14 @@ def _build_section_picks(
             prior_valid = [p for p in prior_valid if sec_idx[p.tmdb_id] in seen]
         recipe = row_recipe(policy, spec)
         was = ctx.previous_recipes.get((user.slug, spec.slug, str(section.key)), "")
-        recipe_changed = bool(was) and was != recipe
+        recipe_changed = (bool(was) and was != recipe) or (
+            # No recipe on record — a row built on a cold start, or before recipes were kept — says
+            # nothing about what it was built AS. Everywhere else that is read as "unchanged", which
+            # is the safe reading for churn. For a row that must now hold only children's titles it is
+            # the unsafe one: the picks being carried are the server's top-rated films, on a child's
+            # profile, under a run page saying "holds only children's titles" — for ever, if frozen.
+            not was and bool(prior_valid) and spec.family == "auto" and _family_means(spec, policy.household) == "only"
+        )
         # `due` is what the CADENCE says; `refresh` is what we actually do. They differ only when the
         # idle hold intervenes, and both are reported — the trace has to be able to say "it was due
         # tonight and we held it", which a single flag cannot distinguish from "it was not due".
@@ -2851,7 +2997,11 @@ def _build_section_picks(
                 )
                 continue
             refresh = recipe_changed = False
-            recipe = was or recipe
+            # Keep what was on record — INCLUDING nothing. With no recipe on record, stamping tonight's
+            # onto picks this hold is carrying would record a row of the server's top-rated films as
+            # "built as a children's row" (`means=only`), and tomorrow nothing would look changed.
+            unrecorded_kids_row = not was and spec.family == "auto" and _family_means(spec, policy.household) == "only"
+            recipe = "" if unrecorded_kids_row else (was or recipe)
         # A rebuild night is also when an UNCONFIRMED carried pick goes. The engine answers at most
         # `limit_per_media` titles, so a pick that has since fallen out of that answer is neither
         # confirmed nor contradicted — and on a carry-forward night that is no reason to touch it (a row
@@ -2967,6 +3117,8 @@ def _build_section_picks(
             # stamping) — build a fresh full row, exactly like a first run. Also reached on a refresh
             # night when `_seed_moved` says the seed this row is NAMED after has changed: carrying
             # anything forward would leave the title claiming a watch the contents no longer answer to.
+            if not sub and _emptied_for_a_kids_account(policy, spec, section, k):
+                continue
             if not sub:
                 # Say so: this is the ONLY exit that leaves a library with no collection and no
                 # trace entry, so without a line here "why is my Movies row empty?" cannot be
@@ -3057,6 +3209,9 @@ def _build_section_picks(
                 "rewatch": bool(spec.rewatch),
                 "unstarted_only": bool(spec.unstarted_only),
                 **({"family": spec.family} if spec.family != "include" else {}),
+                # What "auto" came to for this person — the setting alone does not say, and "why is
+                # this row all cartoons?" is answered by exactly this.
+                **({"family_means": _family_means(spec, policy.household)} if spec.family == "auto" else {}),
                 # How many finished titles this library could offer a rewatch row tonight, and how
                 # many the cooldown held back — the two numbers behind "why is it topped up?".
                 **(
@@ -3341,8 +3496,26 @@ def _run_user(
     base_cold: list[Pick] = []
     try:
         warm = not cold and _warm_start(policy, library_of_watch, library_of_seed)
-        if not cold:
-            policy.specs = specs = _settle_household(policy)
+        # Cold or warm: an override needs no pool to have reported anything (`_settle_household`).
+        wanted_rows = len(specs)
+        policy.specs = specs = _settle_household(policy, cold=cold)
+        if not specs and (cold or (not warm and thin)):
+            # Every row due tonight is one this household does not get, and they are on (or headed
+            # for) the cold path — which sizes itself from the rows it is handed and has none. It
+            # used to be unreachable: the household was only ever settled for a warm person.
+            user_report.status = "skipped"
+            user_report.reason = (
+                f"{'The row' if wanted_rows == 1 else f'All {wanted_rows} rows'} due in this run "
+                f"{'is' if wanted_rows == 1 else 'are'} not built for this account's household "
+                f"({policy.household.label}), so there was nothing to build."
+            )
+            return bool(dormant)
+        if not specs:
+            # Warm, so the run goes on (their request page was already built) — but "ok" with no rows
+            # and no reason reads as a run that simply did nothing.
+            user_report.reason = (
+                f"Every row due in this run is one this account's household ({policy.household.label}) does not get."
+            )
         if not cold and not warm and thin:
             # The engine took them on and answered with nothing — the ordinary cold start, arrived at
             # late. Rows set to skip a cold start come off now, exactly as they would have up front.

@@ -16,7 +16,10 @@ export type RowDecision =
   | "not_due"
   | "muted"
   | "not_in_audience"
-  | "out_of_season";
+  | "out_of_season"
+  | "not_a_family_household"
+  | "kids_rows_are_already_childrens_titles"
+  | "no_grown_ups_row_on_a_kids_account";
 
 export type RunRowPerson = {
   decision: RowDecision | null;
@@ -82,6 +85,9 @@ const DECISIONS = new Set<string>([
   "muted",
   "not_in_audience",
   "out_of_season",
+  "not_a_family_household",
+  "kids_rows_are_already_childrens_titles",
+  "no_grown_ups_row_on_a_kids_account",
 ]);
 
 function asDecision(value: unknown): RowDecision | null {
@@ -335,7 +341,15 @@ export function rowCounts(group: RunRowGroup): {
     if (person.result.status === "pending") continue;
     if (person.result.status === "error") counts.failed += 1;
     else if (person.decision === "muted") counts.muted += 1;
-    else if (person.decision === "not_in_audience") counts.notInAudience += 1;
+    else if (
+      person.decision === "not_in_audience" ||
+      // The household decided they do not get this row. Counted with the audience rather than as
+      // "built": their status is "ok" because their OTHER rows were built, not this one.
+      person.decision === "not_a_family_household" ||
+      person.decision === "kids_rows_are_already_childrens_titles" ||
+      person.decision === "no_grown_ups_row_on_a_kids_account"
+    )
+      counts.notInAudience += 1;
     else if (
       person.result.breakdown.length > 0 ||
       person.result.status === "ok"

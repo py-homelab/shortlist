@@ -103,6 +103,38 @@ describe("groupRunByRow", () => {
     ]);
   });
 
+  it("keeps the household's decisions rather than reading them as not recorded", () => {
+    // Anything outside the known set becomes `null`, which the page shows as a gap in the run's own
+    // record. These three are decisions the run MADE, about a child's or a grown-up's account.
+    const { groups } = groupRunByRow(
+      run({
+        users: [
+          user({
+            rows_considered: { picked: "kids_rows_are_already_childrens_titles" },
+            breakdown: breakdown({ row_slug: "picked", library_title: "Movies", library_key: "1" }),
+          }),
+          user({
+            slug: "second",
+            rows_considered: { picked: "no_grown_ups_row_on_a_kids_account" },
+          }),
+          user({
+            slug: "third",
+            rows_considered: { picked: "not_a_family_household" },
+          }),
+          user({ slug: "fourth", rows_considered: { picked: "something_newer_than_this_page" } }),
+        ],
+      }),
+      CONFIG_NAMES,
+    );
+
+    expect(groups[0].people.map((p) => p.decision)).toEqual([
+      "kids_rows_are_already_childrens_titles",
+      "no_grown_ups_row_on_a_kids_account",
+      "not_a_family_household",
+      null,
+    ]);
+  });
+
   it("names a multi-library row once and lists its libraries separately", () => {
     // The bug that made Movies look like it never ran: `picked` delivered BOTH libraries, and
     // taking the row's name from a delivered title kept whichever arrived last.
@@ -218,6 +250,34 @@ describe("groupRunByRow", () => {
     expect(rowSummary(groups[0]!)).toBe(
       "1 of 3 built · 1 muted · 1 not in the audience",
     );
+  });
+
+  it("does not count someone the household kept a row from as having had it built", () => {
+    // Their status is "ok" because their OTHER rows were built, which used to count this one as built.
+    const { groups } = groupRunByRow(
+      run({
+        users: [
+          user({ slug: "a", rows_considered: { picked: "due" } }),
+          user({
+            slug: "kid",
+            status: "ok",
+            rows_considered: { picked: "kids_rows_are_already_childrens_titles" },
+          }),
+          user({
+            slug: "grown-up",
+            status: "ok",
+            rows_considered: { picked: "not_a_family_household" },
+          }),
+        ],
+      }),
+      CONFIG_NAMES,
+    );
+
+    expect(rowCounts(groups[0]!)).toMatchObject({
+      people: 3,
+      built: 1,
+      notInAudience: 2,
+    });
   });
 
   it("marks a row that sat out the run because it is out of season", () => {

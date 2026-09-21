@@ -402,7 +402,7 @@ function deliveryNote(
             className={
               entry.decision === "carried_forward" ||
               entry.decision === "held_idle" ||
-              entry.decision === "held_unbuilt"
+              entry.decision === "held_unbuilt" || entry.decision === "emptied"
                 ? "text-muted-foreground"
                 : "text-foreground"
             }
@@ -417,9 +417,25 @@ function deliveryNote(
 
 function decisionLine(entry: TraceSelection): string {
   const line = cadenceLine(entry);
-  return entry.rewatch && entry.rewatches !== undefined
-    ? `${line} ${rewatchLine(entry)}`
-    : line;
+  const withRewatch =
+    entry.rewatch && entry.rewatches !== undefined
+      ? `${line} ${rewatchLine(entry)}`
+      : line;
+  const family = familyLine(entry);
+  return family ? `${withRewatch} ${family}` : withRewatch;
+}
+
+/** What a row left on "automatic" came to for THIS person. The setting alone does not say, and it is
+ *  the whole answer to "why is this row all cartoons?" — or "why are there none?". Silent when it
+ *  came to nothing special, which is nearly everyone. */
+function familyLine(entry: TraceSelection): string {
+  if (entry.decision === "emptied")
+    return "This is a kids account, so the row may hold only children's titles.";
+  if (entry.family_means === "only")
+    return "This is a kids account, so the row holds only children's titles.";
+  if (entry.family_means === "exclude")
+    return "This account is shared with children, so their titles are left to the family row.";
+  return "";
 }
 
 /** A watch-it-again row is built from history, so the count of finished titles is what explains a
@@ -463,6 +479,10 @@ function cadenceLine(entry: TraceSelection): string {
           ? ` ${entry.family_dropped} of the titles it is still showing ${entry.family_dropped === 1 ? "is" : "are"} no longer allowed by its children's-title setting, and will go when it next rebuilds.`
           : ""
       }`;
+    case "emptied":
+      return entry.removed
+        ? "— nothing to show here tonight: no children's titles were left for this library, so its old copy comes down rather than being left showing what it held before."
+        : "— nothing to show here tonight: no children's titles were left for this library.";
     default:
       return "— built fresh.";
   }
@@ -586,7 +606,10 @@ function LibraryFlow({
   sharedRow?: boolean;
 }) {
   // A held row was never ranked, so it takes no part in the shortlist step's prose or its count.
-  const ranked = selection.filter((entry) => entry.decision !== "held_unbuilt");
+  // Neither ranked anything: a held row kept what it had, an emptied one had nothing to rank.
+  const ranked = selection.filter(
+    (entry) => entry.decision !== "held_unbuilt" && entry.decision !== "emptied",
+  );
   const searchNoun = mediaLabel(lib.media).toLowerCase();
   const hasWeb = Boolean(lib.web || lib.webSource);
   const placesSearched = lib.sources.length + (hasWeb ? 1 : 0);

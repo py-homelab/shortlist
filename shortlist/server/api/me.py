@@ -88,7 +88,7 @@ async def me(request: Request) -> dict:
         with request.app.state.sessions() as session:
             user = _person(request, session)
             seerr = _seerr_cache(request).view(user.plex_account_id)
-            view = picks.build_view(session, user, seerr)
+            view = picks.for_this_account(user, picks.build_view(session, user, seerr))
             session.commit()  # lapsed `later`s deleted on read
             return {
                 "state": view["state"],
@@ -132,7 +132,7 @@ async def suggestions(request: Request, family: str = "auto") -> dict:
         with request.app.state.sessions() as session:
             user = _person(request, session)
             seerr = _seerr_cache(request).view(user.plex_account_id)
-            view = picks.build_view(session, user, seerr)
+            view = picks.for_this_account(user, picks.build_view(session, user, seerr))
             session.commit()
             lane = picks.family_lane(user, family)
             shown = picks.family_filter(view["items"], lane)
@@ -233,7 +233,7 @@ async def act(body: PickActionIn, request: Request) -> dict:
                 return {"ok": True, "restored": restored}
 
             seerr = _seerr_cache(request).view(user.plex_account_id)
-            view = picks.build_view(session, user, seerr)
+            view = picks.for_this_account(user, picks.build_view(session, user, seerr))
             item = next(
                 (i for i in view["items"] if i["tmdb_id"] == body.tmdb_id and i["media_type"] == body.media_type), None
             )
@@ -341,7 +341,7 @@ async def seen(body: PickSeenIn, request: Request) -> dict:
             if limiter.limited(user.id, "seen", picks.RATE_SEEN_PER_MIN):
                 raise HTTPException(status_code=429, detail="slow down")
             seerr = _seerr_cache(request).view(user.plex_account_id)
-            view = picks.build_view(session, user, seerr)
+            view = picks.for_this_account(user, picks.build_view(session, user, seerr))
             mine = {(i["tmdb_id"], i["media_type"]): i.get("source") or "" for i in view["items"]}
             rows = [
                 (it.tmdb_id, it.media_type, it.surface, it.position, mine[(it.tmdb_id, it.media_type)])
