@@ -38,7 +38,13 @@ from shortlist.server.services.watch_events import (
     tmdb_by_rating_key,
 )
 
-NOW = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
+# Relative to the real clock, not a fixed date. Code that windows against the REAL now makes a fixed
+# NOW pass for a month and then fail on every branch the day it slides out (`test_watch_audit` did on
+# 2026-09-21). This file: would age out the same way — three of its engagement tests fail once the
+# fixed date is months old.
+# Ten days back keeps it inside a 30-day window with room to spare, and old enough for a stopped
+# title to have settled.
+NOW = (datetime.now(UTC) - timedelta(days=10)).replace(hour=12, minute=0, second=0, microsecond=0)
 
 
 @pytest.fixture

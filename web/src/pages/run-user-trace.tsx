@@ -422,7 +422,12 @@ function decisionLine(entry: TraceSelection): string {
       ? `${line} ${rewatchLine(entry)}`
       : line;
   const family = familyLine(entry);
-  return family ? `${withRewatch} ${family}` : withRewatch;
+  const said = family ? `${withRewatch} ${family}` : withRewatch;
+  // Why a watch-it-again row changed though it was not due to: without this line a frozen row that
+  // moved reads as a bug.
+  return entry.elsewhere_dropped
+    ? `${said} ${entry.elsewhere_dropped} filler ${entry.elsewhere_dropped === 1 ? "title was" : "titles were"} taken out because another of their rows already shows ${entry.elsewhere_dropped === 1 ? "it" : "them"}.`
+    : said;
 }
 
 /** What a row left on "automatic" came to for THIS person. The setting alone does not say, and it is

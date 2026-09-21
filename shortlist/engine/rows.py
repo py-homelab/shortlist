@@ -681,6 +681,16 @@ def _refused_carried(
     return refused
 
 
+def _sibling_picks_last_night(ctx: EngineContext, user: UserProfile, spec: RowSpec) -> frozenset:
+    """What this person's OTHER rows held after the last run, in any library."""
+    return frozenset(
+        (pick.tmdb_id, pick.media_type)
+        for (slug, row, _section), picks in ctx.previous_picks.items()
+        if slug == user.slug and row != spec.slug
+        for pick in picks
+    )
+
+
 def _started_shows(watched_shows: dict[int, tuple[int, int | None]]) -> set[tuple[int, MediaType]]:
     """Shows this person has watched ANY episode of — what an "unstarted only" row must exclude.
 
@@ -2695,8 +2705,13 @@ def _build_section_picks(
     pool_for_row: list[Candidate],
     taste: set[tuple[int, MediaType]] | None = None,
     engine_view: _EngineView | None = None,
+    elsewhere: frozenset[tuple[int, MediaType]] = frozenset(),
 ) -> dict[str, list[Pick]]:
     """This row's picks for each library it targets — carried forward, refreshed, or built fresh.
+
+    ``elsewhere`` is what this person's earlier rows already hold tonight, given only where rows draw
+    without replacement (an engine-ranked pool). The pool arrives already narrowed by it; it is passed
+    as well for the one thing the pool cannot reach — a rewatch row's CARRIED top-up (see below).
 
     A row runs PER LIBRARY, not per media type: each library gets its own full collection of k,
     curated from that library's own contents. So a server with two movie libraries (Movies + 4K)
@@ -2894,7 +2909,15 @@ def _build_section_picks(
             # A rewatch row's picks come from history, which the pool never holds: without this every
             # carried pick would read as "not mentioned tonight" on a rebuild night.
             mentioned = mentioned | history_keys
-            sub = [*history, *(c for c in sub if (c.tmdb_id, c.media_type) not in history_keys)]
+            # The top-up. Besides what earlier rows hold tonight (already out of `sub`), it leaves
+            # alone what a sibling row held LAST night: a sibling that refreshes rotates a title out,
+            # and the freed title would otherwise land here the same night and swap back on its next
+            # refresh — a row set never to rebuild, rewriting itself on every sibling's cadence.
+            rotating = _sibling_picks_last_night(ctx, user, spec) if elsewhere else frozenset()
+            sub = [
+                *history,
+                *(c for c in sub if (c.tmdb_id, c.media_type) not in history_keys | rotating),
+            ]
         # str(section.key): previous_picks is keyed by the PickRow.section_key STRING column, so the
         # live section key (which may not be a str) must be coerced or carry-forward silently misses.
         prior_valid = _reusable_prior(
@@ -2917,6 +2940,33 @@ def _build_section_picks(
             recently_finished=cooling,
             season=policy.season_titles(spec),
         )
+        elsewhere_dropped = 0
+        if spec.rewatch and elsewhere:
+            # A rewatch row leads with what they have finished and TOPS UP from the same pool its
+            # sibling rows draw from. Tonight's top-up can no longer repeat a sibling (the pool came in
+            # without `elsewhere`), but a top-up this row CARRIES from an earlier night still can: on a
+            # thin history the pads were the head of the pool, which is exactly what "Picked for You"
+            # holds. Only the pads: anything they have FINISHED is this row's own wherever else it
+            # appears — asked of the whole finished set, not tonight's scan of it, which is a window
+            # that moves with taste and would call a finished title outside it a pad.
+            repeats = {
+                (p.tmdb_id, p.media_type)
+                for p in prior_valid
+                if (p.tmdb_id, p.media_type) in elsewhere and (p.tmdb_id, p.media_type) not in finished
+            }
+            survivors = [p for p in prior_valid if (p.tmdb_id, p.media_type) not in repeats]
+            if repeats and (survivors or sub):
+                logger.info(
+                    "{}: row '{}' dropped {} carried top-up title(s) another of their rows already holds",
+                    user.username,
+                    spec.slug,
+                    len(repeats),
+                )
+                prior_valid, elsewhere_dropped = survivors, len(repeats)
+            # Otherwise every pick it carries is a repeat AND there is nothing to put in their place.
+            # Dropping them would build nothing, and a library a row builds nothing for is left alone —
+            # so the same pads would stay on Plex, come back as "carried" tomorrow and be dropped again,
+            # nightly, with no trace. Carried as they are until there is something to replace them with.
         # A children's-title rule is the engine's classification, which can change under a carried pick.
         family_out = family_out | _refused_carried(policy, spec, prior_valid, finished, kind)
         kept_prior = [p for p in prior_valid if (p.tmdb_id, p.media_type) not in family_out]
@@ -3199,6 +3249,9 @@ def _build_section_picks(
                 "carried": len(prior_valid),
                 **({"family_dropped": family_dropped} if family_dropped else {}),
                 **({"unconfirmed_dropped": unconfirmed_dropped} if unconfirmed_dropped else {}),
+                # Carried top-up titles dropped because another of this person's rows holds them — the
+                # one reason a frozen watch-it-again row changes, so it has to be sayable.
+                **({"elsewhere_dropped": elsewhere_dropped} if elsewhere_dropped else {}),
                 "new": len(new_keys),
                 "refresh_night": due,  # the CADENCE's answer; `decision` says whether we acted on it
                 "rebuild_every_days": refresh_days or None,  # 0 = frozen, never rebuilt
@@ -3566,7 +3619,13 @@ def _run_user(
     # list per pool, and rows that differ only in size, cadence or watched rule share that pool — so
     # without this every such row is the same list's head, and a person sees one title three times on
     # their Home. Only engine-ranked pools draw without replacement: Shortlist's own engine keeps its
-    # upstream behaviour, and the rewatch row (built from history) is left alone.
+    # upstream behaviour.
+    #
+    # The rewatch row was exempt at first, as "built from history". Only its LEAD is: what it cannot
+    # fill from finished titles it tops up from this same pool, so on a thin history ("already seen":
+    # two rewatches and three pads) the pads were the head of the pool — the very titles "Picked for
+    # You" had just taken. Found on a child's new profile, where 16 visible shows made it the norm.
+    # Its finished titles never come from the pool, so narrowing the pool cannot remove one.
     placed: set[tuple[int, MediaType]] = set()
 
     for spec in specs:
@@ -3580,6 +3639,7 @@ def _run_user(
             pool_for_row: list[Candidate] = []
             engine_view = _EngineView(frozenset(), frozenset())
             taste: set[tuple[int, MediaType]] = set()
+            drawn_elsewhere: frozenset[tuple[int, MediaType]] = frozenset()
             if not cold:
                 # This row's own pool: its sources, its media and its libraries — already narrowed to
                 # all three BEFORE the pre-rank truncation, so nothing this row could show was cut by
@@ -3601,7 +3661,8 @@ def _run_user(
                 if recency != ctx.config.recency:
                     pool_for_row = policy.cut_at_recency(spec, in_library, recency)
                 elsewhere = 0
-                if not spec.rewatch and placed and any(is_external(c) for c in pool_for_row):
+                if placed and any(is_external(c) for c in pool_for_row):
+                    drawn_elsewhere = frozenset(placed)
                     kept = [c for c in pool_for_row if (c.tmdb_id, c.media_type) not in placed]
                     elsewhere = len(pool_for_row) - len(kept)
                     pool_for_row = kept
@@ -3626,6 +3687,7 @@ def _run_user(
                 pool_for_row=pool_for_row,
                 taste=taste,
                 engine_view=engine_view,
+                elsewhere=drawn_elsewhere,
             )
             # Stamp each pick with the row AND the library it belongs to, so the user page can group picks
             # per row and the effectiveness report can split a multi-library row into one line per library.
