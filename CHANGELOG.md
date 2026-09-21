@@ -6,6 +6,40 @@ All notable changes to this project are documented here. This project follows
 
 ## [Unreleased]
 
+## [1.9.1-py.11] - 2026-09-21 (py-homelab fork)
+
+### Added
+
+- **Your title labels decide what is a children's title for that account's rows.** py.10 let a
+  labelled title be *seen* by an account restricted by rating; its rows still held only what the
+  engine calls a children's title, so the documentary you admitted for a child could be found and never
+  recommended. Now, in every row of theirs that holds only children's titles, a title carrying one of
+  the account's "also show" labels counts as one and a title carrying a "never show" label never does
+  (hidden wins on a title carrying both, as it does in the Plex restriction). Shortlist asks Plex, as
+  the owner, which titles carry each label — one listing per label per library per run plus one read
+  of each library's label list, and nothing at all for an account with no labels or with no such row.
+  It reaches fresh picks, carried picks and a watch-it-again row's finished titles (where the label
+  answers before TMDB is asked, so a title TMDB knows no genres for is still decided); rows that leave
+  children's titles OUT are untouched, and a cold-start placeholder row does not consult the labels
+  (except that a watch-it-again row still leads with a finished title you labelled). Naming or
+  removing a label rebuilds that account's children's rows on the next run the labels can be read,
+  frozen ones included; a title you label in Plex LATER enters at each row's next rebuild. The run
+  page says how many titles the labels decided. On a night Plex cannot be asked, a row the labels
+  decide is carried exactly as it is — not refreshed, nothing dropped on a guess, only topped up from
+  the engine if it is short — and the run page says so; a row first built on such a night is rebuilt
+  once the labels can be read. A label Plex does not have (a typo) is named in the log. No migration,
+  no new settings.
+  The one-off effect of upgrading: an account that already has labels gets its children's rows rebuilt
+  once.
+
+### Changed
+
+- The guide no longer calls TV labels unmeasured: recorded on a live server
+  (`pms_share_filter_title_labels.json`), a labelled show outside the ratings opened with all of its
+  episodes and a hidden show inside them was a 404 with all of its. How Plex lists titles by label is
+  recorded too (`pms_label_listing.json`): no inline labels on a listing, a label that does not exist
+  is an empty 200 and never an error, and a label on a show matches no episode.
+
 ## [1.9.1-py.10] - 2026-09-21 (py-homelab fork)
 
 ### Added

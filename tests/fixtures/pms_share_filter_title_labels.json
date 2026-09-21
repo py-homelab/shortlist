@@ -1,0 +1,54 @@
+{
+  "_why": [
+    "1.9.1-py.10 writes an owner's own title labels into an account's share filter: an ADMIT label as one",
+    "more alternative in every allow group, a HIDE label beside the row excludes. The movie half of 'an",
+    "OR'd label admits TITLES' was already recorded (pms_share_filter_allow_lists.json, 'grouping'). This",
+    "records the TV half, and what the code and the guide had only expected: a label on a SHOW carries the",
+    "show's episodes with it, in both directions.",
+    "",
+    "Measured on the live server the day py.10 was deployed, by Shortlist's own privacy pass writing one",
+    "managed Home profile's filters (no hand-written filter), then reading AS that profile with its own",
+    "server token. All reads are GETs.",
+    "",
+    "Conclusions the code and docs rely on:",
+    "1. A show rated OUTSIDE the allow list that carries the admit label is visible, and so is every one of",
+    "   its episodes — on allLeaves and by key.",
+    "2. A show rated INSIDE the allow list that carries the hide label is a 404, and so is every episode.",
+    "3. Movies behave the same by key; unrated and 'Not Rated' titles are admitted by the label alone.",
+    "4. The admit label joined the existing own-row label clause ('label=Shortlist_kids,KidsAllow'); the",
+    "   hide label joined the enforced exclude clause. The account's own rows stayed visible, nobody",
+    "   else's filter changed."
+  ],
+  "recorded": "2026-09-21",
+  "pms_version": "1.43",
+  "labels": {"admit": "KidsAllow", "hide": "KidsDeny"},
+  "filters_as_written": {
+    "filterMovies": "contentRating=G%2CTV-G%2CPG|label=Shortlist_kids%2CKidsAllow&label!=<12 Shortlist_ values>%2CShortlist_adults%2CKidsDeny",
+    "filterTelevision": "contentRating=TV-Y%2CTV-Y7%2CTV-Y7-FV|label=Shortlist_kids%2CKidsAllow&label!=<12 Shortlist_ values>%2CShortlist_adults%2CKidsDeny"
+  },
+  "ledger_as_written": {
+    "filterMovies": {"admit": ["KidsAllow"], "hide": ["KidsDeny"]},
+    "filterTelevision": {"admit": ["KidsAllow"], "hide": ["KidsDeny"]}
+  },
+  "labelled": {"movies": {"KidsAllow": 4, "KidsDeny": 61}, "shows": {"KidsAllow": 6, "KidsDeny": 2}},
+  "listing_as_account": {
+    "movies": {"before": 295, "after": 238, "by_rating": {"G": 63, "PG": 169, "": 3, "TV-G": 2, "Not Rated": 1}},
+    "shows": {"before": 16, "after": 20, "by_rating": {"TV-Y7": 8, "TV-Y": 6, "TV-G": 3, "TV-PG": 3}}
+  },
+  "shows_as_account": [
+    {"title": "Planet Earth II", "rating": "TV-G", "label": "KidsAllow", "show": 200, "allLeaves": 200, "episodes_seen": 6, "episodes": 6, "episode_by_key": 200},
+    {"title": "Planet Earth", "rating": "TV-PG", "label": "KidsAllow", "show": 200, "allLeaves": 200, "episodes_seen": 11, "episodes": 11, "episode_by_key": 200},
+    {"title": "MasterChef", "rating": "TV-Y", "label": "KidsDeny", "show": 404, "allLeaves": 404, "episodes_seen": 0, "episodes": 46, "episode_by_key": 404},
+    {"title": "Princess Hours", "rating": "TV-Y7-FV", "label": "KidsDeny", "show": 404, "allLeaves": 404, "episodes_seen": 0, "episodes": 24, "episode_by_key": 404},
+    {"title": "Bluey", "rating": "TV-Y", "label": null, "show": 200, "allLeaves": 200, "episodes_seen": 152, "episodes": 152, "episode_by_key": 200},
+    {"title": "Fixer Upper", "rating": "TV-G", "label": null, "show": 404, "allLeaves": 404, "episodes_seen": 0, "episodes": null, "episode_by_key": 404}
+  ],
+  "movies_as_account": [
+    {"title": "2001: A Space Odyssey", "rating": "G", "label": "KidsDeny", "by_key": 404},
+    {"title": "Casablanca", "rating": "PG", "label": "KidsDeny", "by_key": 404},
+    {"title": "Scooby-Doo and the Witch's Ghost", "rating": "Not Rated", "label": "KidsAllow", "by_key": 200},
+    {"title": "Sinbad", "rating": "", "label": "KidsAllow", "by_key": 200},
+    {"title": "Toy Story", "rating": "G", "label": null, "by_key": 200},
+    {"title": "(an unlabelled Not Rated film)", "rating": "Not Rated", "label": null, "by_key": 404}
+  ]
+}

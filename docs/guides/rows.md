@@ -145,7 +145,26 @@ says what the last run decided and lets you override it (**Who watches under thi
 counts come from the engine: an [engine of your own](engines.md) that reports each person's viewing
 (`household` in its answer). With Shortlist's own engine nobody is sorted, "Decided per person"
 keeps children's titles, and a family row is a plain children's-titles row for everyone it is set
-up for. What counts as a children's title is the engine's call.
+up for. What counts as a children's title is the engine's call — with one exception, which is yours.
+
+**Your own labels decide it for one account.** If you have named labels on a person's page (**Also
+show / Never show titles labelled …**, see [the interface guide](interface.md)), then in every row of
+theirs that holds only children's titles a title you labelled "also show" **is** a children's title,
+whatever its rating or genres, and one you labelled "never show" is not, however it is rated. The
+engine can tell that Planet Earth is not made for children and that a TV-Y cooking competition is;
+only you can say that the first is for this child and the second is not. It applies to their rows'
+fresh picks, to picks a row is carrying, and to a watch-it-again row's finished titles (there the
+label answers before TMDB is asked, so it decides even a title TMDB knows no genres for); the run
+page says how many titles it decided. Naming or removing a label on their page rebuilds those rows on
+the next run, frozen ones included; a title you put the label on later comes in at each row's next
+rebuild. It changes nothing in a row that leaves children's titles OUT — an "also show" label on a
+teenager's account says "for them", not "for children" — and a brand-new account's placeholder row,
+built before there is any history, does not consult the labels (a watch-it-again row still leads
+with a finished title you labelled). If Plex cannot be asked which titles carry the labels, those
+rows are carried that night exactly as they are — not refreshed, nothing dropped on a guess, topped up
+from the engine only if short — the run page says so, and a settings change or a first build made
+that night takes effect on the first night the labels can be read. A label Plex does not have at all
+(a typo) is named in the log.
 
 **A household split into Plex Home profiles.** If your engine ranks several accounts as one person —
 a parents' profile and a children's profile sharing the household's history — it reports every one

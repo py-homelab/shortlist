@@ -874,6 +874,30 @@ describe("TraceView — the flow explains freshness, the cut and release date", 
     ).toBeInTheDocument();
   });
 
+  it("says where the owner's labels overruled the engine about a children's title", () => {
+    render(
+      <TraceView
+        data={withSelection({ decision: "rebuilt", label_admitted: 2, label_refused: 1 })}
+      />,
+    );
+    expect(
+      screen.getByText(/2 titles could be picked because you labelled them for this account/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/1 title that would count as children's was left out because you labelled it never to show here/i),
+    ).toBeInTheDocument();
+  });
+
+  it("says when the labels could not be read, and nothing about labels otherwise", () => {
+    const { unmount } = render(
+      <TraceView data={withSelection({ decision: "rebuilt", title_labels_unreadable: true })} />,
+    );
+    expect(screen.getByText(/so the row was kept as it was/i)).toBeInTheDocument();
+    unmount();
+    render(<TraceView data={withSelection({ decision: "rebuilt" })} />);
+    expect(screen.queryByText(/labelled/i)).not.toBeInTheDocument();
+  });
+
   it("names a settings change as the reason a row rebuilt early", () => {
     render(
       <TraceView data={withSelection({ decision: "settings_changed" })} />,
